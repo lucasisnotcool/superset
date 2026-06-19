@@ -401,3 +401,18 @@ or:
 SUPERSET_AGENT_ADAPTER=mcp
 AI_AGENT_MODEL_PROVIDER=openai
 ```
+
+Azure OpenAI deployments can use either Superset adapter mode:
+
+```bash
+SUPERSET_AGENT_ADAPTER=rest
+AI_AGENT_MODEL_PROVIDER=azure_openai
+AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
+AZURE_OPENAI_KEY=...
+AZURE_OPENAI_MODEL=your-deployment-name
+AZURE_OPENAI_API_VERSION=2024-02-15-preview
+```
+
+`AZURE_OPENAI_MODEL` is the Azure deployment name. This model-provider setting
+does not change the Superset adapter contract; REST and MCP payloads remain the
+same.

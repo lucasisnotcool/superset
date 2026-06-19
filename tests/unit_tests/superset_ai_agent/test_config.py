@@ -64,3 +64,26 @@ def test_agent_config_reads_superset_adapter_environment(monkeypatch) -> None:
         "http://localhost:9000",
         "http://localhost:8088",
     )
+
+
+def test_agent_config_reads_azure_openai_environment(monkeypatch) -> None:
+    monkeypatch.setenv("AI_AGENT_MODEL_PROVIDER", "AZURE_OPENAI")
+    monkeypatch.setenv(
+        "AZURE_OPENAI_ENDPOINT",
+        "https://azure-openai.example.com/",
+    )
+    monkeypatch.setenv("AZURE_OPENAI_KEY", "azure-key")
+    monkeypatch.setenv("AZURE_OPENAI_MODEL", "sql-deployment")
+    monkeypatch.setenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+    monkeypatch.setenv("AZURE_OPENAI_STRUCTURED_OUTPUT", "JSON_OBJECT")
+
+    config = AgentConfig.from_env()
+
+    assert config.model_provider == "azure_openai"
+    assert config.azure_openai_endpoint == "https://azure-openai.example.com/"
+    assert config.azure_openai_key == "azure-key"
+    assert config.azure_openai_model == "sql-deployment"
+    assert config.azure_openai_api_version == "2024-02-15-preview"
+    assert config.azure_openai_structured_output == "json_object"
+    assert config.default_model() == "sql-deployment"
+    assert config.model_base_url() == "https://azure-openai.example.com"

@@ -242,13 +242,19 @@ validate_ai_agent_config() {
                 require_ai_agent_config OPENAI_COMPATIBLE_API_KEY
             fi
             ;;
+        azure_openai)
+            require_ai_agent_config AZURE_OPENAI_ENDPOINT
+            require_ai_agent_config AZURE_OPENAI_KEY
+            require_ai_agent_config AZURE_OPENAI_MODEL
+            require_ai_agent_config AZURE_OPENAI_API_VERSION
+            ;;
         ollama)
             echo "ERROR: Ollama is not supported by the Docker AI agent smoke stack." >&2
-            echo "Use AI_AGENT_MODEL_PROVIDER=openai or openai_compatible in docker/.env-ai-agent." >&2
+            echo "Use AI_AGENT_MODEL_PROVIDER=openai, openai_compatible, or azure_openai in docker/.env-ai-agent." >&2
             return 1
             ;;
         *)
-            echo "ERROR: AI_AGENT_MODEL_PROVIDER must be openai or openai_compatible for Docker startup." >&2
+            echo "ERROR: AI_AGENT_MODEL_PROVIDER must be openai, openai_compatible, or azure_openai for Docker startup." >&2
             return 1
             ;;
     esac

@@ -25,6 +25,7 @@ import httpx
 import pytest
 
 from superset_ai_agent.config import AgentConfig
+from superset_ai_agent.llm.azure_openai import AzureOpenAIModelClient
 from superset_ai_agent.llm.base import ChatMessage, ModelProviderError
 from superset_ai_agent.llm.factory import create_model_client
 from superset_ai_agent.llm.ollama import OllamaModelClient
@@ -98,6 +99,38 @@ def test_model_factory_selects_openai_compatible() -> None:
     )
 
     assert isinstance(client, OpenAICompatibleModelClient)
+
+
+def test_model_factory_selects_azure_openai() -> None:
+    client = create_model_client(
+        AgentConfig(
+            model_provider="azure_openai",
+            azure_openai_endpoint="https://azure-openai.example.com",
+            azure_openai_key="test-key",
+            azure_openai_model="sql-deployment",
+            azure_openai_api_version="2024-02-15-preview",
+        )
+    )
+
+    assert isinstance(client, AzureOpenAIModelClient)
+
+
+def test_azure_openai_client_rejects_missing_config() -> None:
+    with pytest.raises(ValueError, match="AZURE_OPENAI_ENDPOINT"):
+        AzureOpenAIModelClient(AgentConfig(model_provider="azure_openai"))
+
+
+def test_azure_openai_client_rejects_invalid_structured_output_mode() -> None:
+    with pytest.raises(ValueError, match="AZURE_OPENAI_STRUCTURED_OUTPUT"):
+        AzureOpenAIModelClient(
+            AgentConfig(
+                model_provider="azure_openai",
+                azure_openai_endpoint="https://azure-openai.example.com",
+                azure_openai_key="test-key",
+                azure_openai_model="sql-deployment",
+                azure_openai_structured_output="invalid",  # type: ignore[arg-type]
+            )
+        )
 
 
 def test_openai_compatible_client_rejects_invalid_structured_output_mode() -> None:
@@ -215,6 +248,123 @@ def test_strict_json_schema_closes_nested_objects_without_mutating_input() -> No
     )
     assert "additionalProperties" not in schema
     assert "additionalProperties" not in schema["properties"]["metadata"]
+
+
+def test_azure_openai_client_posts_chat_completion_payload() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/openai/deployments":
+            return httpx.Response(200, json={"data": [{"id": "sql-deployment"}]})
+        body = json.loads(request.content)
+        assert request.url.path == (
+            "/openai/deployments/sql-deployment/chat/completions"
+        )
+        assert request.url.params["api-version"] == "2024-02-15-preview"
+        assert request.headers["api-key"] == "test-key"
+        assert "authorization" not in request.headers
+        assert "model" not in body
+        assert body["response_format"]["type"] == "json_schema"
+        assert (
+            body["response_format"]["json_schema"]["schema"]["additionalProperties"]
+            is False
+        )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"sql":"select 1","explanation":"ok"}',
+                        }
+                    }
+                ]
+            },
+        )
+
+    client = AzureOpenAIModelClient(
+        AgentConfig(
+            model_provider="azure_openai",
+            azure_openai_endpoint="https://azure-openai.example.com/openai",
+            azure_openai_key="test-key",
+            azure_openai_model="sql-deployment",
+            azure_openai_api_version="2024-02-15-preview",
+        ),
+        transport=httpx.MockTransport(handler),
+    )
+
+    result = client.chat(
+        [ChatMessage(role="user", content="return sql")],
+        format_schema=SCHEMA,
+    )
+
+    assert result.content == '{"sql":"select 1","explanation":"ok"}'
+    assert client.is_reachable() is True
+    assert client.list_models()[0].name == "sql-deployment"
+    assert requests[-1].url.path == "/openai/deployments"
+
+
+def test_azure_openai_client_falls_back_when_schema_is_rejected() -> None:
+    seen_formats: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        response_format = body.get("response_format", {})
+        seen_formats.append(response_format.get("type", "prompt_only"))
+        if response_format.get("type") == "json_schema":
+            return httpx.Response(400, json={"error": "unsupported response_format"})
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"sql":"select 1","explanation":"ok"}',
+                        }
+                    }
+                ]
+            },
+        )
+
+    client = AzureOpenAIModelClient(
+        AgentConfig(
+            model_provider="azure_openai",
+            azure_openai_endpoint="https://azure-openai.example.com",
+            azure_openai_key="test-key",
+            azure_openai_model="sql-deployment",
+        ),
+        transport=httpx.MockTransport(handler),
+    )
+
+    result = client.chat(
+        [ChatMessage(role="user", content="return sql")],
+        format_schema=SCHEMA,
+    )
+
+    assert result.content == '{"sql":"select 1","explanation":"ok"}'
+    assert seen_formats == ["json_schema", "json_object"]
+
+
+def test_azure_openai_client_raises_sanitized_provider_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, text="bad key")
+
+    client = AzureOpenAIModelClient(
+        AgentConfig(
+            model_provider="azure_openai",
+            azure_openai_endpoint="https://azure-openai.example.com",
+            azure_openai_key="secret-key",
+            azure_openai_model="sql-deployment",
+        ),
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(ModelProviderError) as exc_info:
+        client.chat([ChatMessage(role="user", content="return sql")])
+
+    assert "secret-key" not in str(exc_info.value)
+    assert "HTTP 401" in str(exc_info.value)
 
 
 def test_openai_compatible_client_falls_back_when_schema_is_rejected() -> None:

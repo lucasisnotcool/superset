@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 from superset_ai_agent.config import AgentConfig
+from superset_ai_agent.llm.azure_openai import AzureOpenAIModelClient
 from superset_ai_agent.llm.base import ModelClient
 from superset_ai_agent.llm.ollama import OllamaModelClient
 from superset_ai_agent.llm.openai_client import OpenAIModelClient
@@ -34,7 +35,10 @@ def create_model_client(config: AgentConfig) -> ModelClient:
         return OpenAIModelClient(config)
     if provider == "openai_compatible":
         return OpenAICompatibleModelClient(config)
+    if provider == "azure_openai":
+        return AzureOpenAIModelClient(config)
     raise ValueError(
         "Unsupported AI_AGENT_MODEL_PROVIDER value "
-        f"{provider!r}. Expected one of: ollama, openai, openai_compatible."
+        f"{provider!r}. Expected one of: ollama, openai, openai_compatible, "
+        "azure_openai."
     )

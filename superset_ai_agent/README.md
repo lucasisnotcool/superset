@@ -13,7 +13,7 @@ other agent UI.
 Client / Superset extension
   -> FastAPI service
   -> LangGraph text-to-SQL workflow
-  -> Ollama / OpenAI / OpenAI-compatible model
+  -> Ollama / OpenAI / OpenAI-compatible / Azure OpenAI model
   -> SupersetClient adapter
   -> Superset metadata and governed SQL execution
 ```
@@ -128,6 +128,17 @@ OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_MODEL=gpt-4.1-mini
 ```
 
+For Azure OpenAI, set `AZURE_OPENAI_MODEL` to the Azure deployment name:
+
+```env
+AI_AGENT_MODEL_PROVIDER=azure_openai
+AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
+AZURE_OPENAI_KEY=your_key
+AZURE_OPENAI_MODEL=your-deployment-name
+AZURE_OPENAI_API_VERSION=2024-02-15-preview
+AZURE_OPENAI_STRUCTURED_OUTPUT=json_schema
+```
+
 Start Docker from WSL2 or Git Bash:
 
 ```bash
@@ -232,6 +243,18 @@ $env:OPENAI_COMPATIBLE_MODEL="your_model"
 uvicorn superset_ai_agent.app:app --reload --port 5050
 ```
 
+Or start the AI agent with Azure OpenAI:
+
+```powershell
+.\venv\Scripts\Activate.ps1
+$env:AI_AGENT_MODEL_PROVIDER="azure_openai"
+$env:AZURE_OPENAI_ENDPOINT="https://your-resource.openai.azure.com"
+$env:AZURE_OPENAI_KEY="your_key"
+$env:AZURE_OPENAI_MODEL="your-deployment-name"
+$env:AZURE_OPENAI_API_VERSION="2024-02-15-preview"
+uvicorn superset_ai_agent.app:app --reload --port 5050
+```
+
 Open the frontend:
 
 ```text
@@ -247,6 +270,7 @@ The backend chooses a model provider with `AI_AGENT_MODEL_PROVIDER`.
 | `ollama` | Working local path | Real local Ollama + unit tests |
 | `openai` | Implemented | Mocked locally; deploy smoke required |
 | `openai_compatible` | Implemented | Mocked locally; deploy smoke required |
+| `azure_openai` | Implemented | Mocked locally; deploy smoke required |
 
 Ollama:
 
@@ -285,6 +309,22 @@ The OpenAI-compatible client uses direct HTTP calls to `/chat/completions` with
 minimal headers. If a gateway rejects JSON-schema structured output with a
 client-side validation error, it falls back to JSON-object mode and then
 prompt-only JSON instructions.
+
+Azure OpenAI:
+
+```bash
+export AI_AGENT_MODEL_PROVIDER=azure_openai
+export AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
+export AZURE_OPENAI_KEY=...
+export AZURE_OPENAI_MODEL=your-deployment-name
+export AZURE_OPENAI_API_VERSION=2024-02-15-preview
+export AZURE_OPENAI_STRUCTURED_OUTPUT=json_schema
+```
+
+The Azure OpenAI client calls the deployment-specific chat completions endpoint
+using the `api-key` header. `AZURE_OPENAI_MODEL` is the Azure deployment name.
+If a deployment rejects JSON-schema structured output, the client falls back to
+JSON-object mode and then prompt-only JSON instructions.
 
 ## SQL Lab Panel
 
@@ -335,8 +375,9 @@ Execution is off by default. Keep it off while testing prompt quality.
   agent process.
 - The `rest` and `mcp` Superset adapters are implemented with mocked local
   transport tests; validate them against real Superset services in Docker.
-- OpenAI and OpenAI-compatible providers are mocked locally; validate them in
-  the deployment environment with real credentials and gateway URLs.
+- OpenAI, OpenAI-compatible, and Azure OpenAI providers are mocked locally;
+  validate them in the deployment environment with real credentials and gateway
+  URLs.
 - No RAG, skills, eval suite, or user identity propagation is implemented yet.
 - SQL validation is a conservative POC guard, not a complete security boundary.
 - Review generated SQL before running it.

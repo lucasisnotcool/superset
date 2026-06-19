@@ -22,7 +22,12 @@ from dataclasses import dataclass
 from typing import cast, Literal
 
 SupersetAdapterMode = Literal["local", "rest", "mcp"]
-ModelProviderMode = Literal["ollama", "openai", "openai_compatible"]
+ModelProviderMode = Literal[
+    "ollama",
+    "openai",
+    "openai_compatible",
+    "azure_openai",
+]
 StructuredOutputMode = Literal["json_schema", "json_object", "prompt_only"]
 
 
@@ -56,6 +61,11 @@ class AgentConfig:
     openai_compatible_model: str | None = None
     openai_compatible_require_api_key: bool = True
     openai_compatible_structured_output: StructuredOutputMode = "json_schema"
+    azure_openai_endpoint: str | None = None
+    azure_openai_key: str | None = None
+    azure_openai_model: str | None = None
+    azure_openai_api_version: str = "2024-02-15-preview"
+    azure_openai_structured_output: StructuredOutputMode = "json_schema"
     default_sql_limit: int = 1000
     max_repair_attempts: int = 1
     max_context_datasets: int = 8
@@ -120,6 +130,26 @@ class AgentConfig:
                 os.getenv(
                     "OPENAI_COMPATIBLE_STRUCTURED_OUTPUT",
                     cls.openai_compatible_structured_output,
+                )
+                .strip()
+                .lower(),
+            ),
+            azure_openai_endpoint=(
+                os.getenv("AZURE_OPENAI_ENDPOINT") or cls.azure_openai_endpoint
+            ),
+            azure_openai_key=os.getenv("AZURE_OPENAI_KEY") or cls.azure_openai_key,
+            azure_openai_model=(
+                os.getenv("AZURE_OPENAI_MODEL") or cls.azure_openai_model
+            ),
+            azure_openai_api_version=os.getenv(
+                "AZURE_OPENAI_API_VERSION",
+                cls.azure_openai_api_version,
+            ),
+            azure_openai_structured_output=cast(
+                StructuredOutputMode,
+                os.getenv(
+                    "AZURE_OPENAI_STRUCTURED_OUTPUT",
+                    cls.azure_openai_structured_output,
                 )
                 .strip()
                 .lower(),
@@ -198,6 +228,8 @@ class AgentConfig:
             return self.openai_model
         if self.model_provider == "openai_compatible":
             return self.openai_compatible_model or ""
+        if self.model_provider == "azure_openai":
+            return self.azure_openai_model or ""
         return self.ollama_model
 
     def model_base_url(self) -> str:
@@ -207,4 +239,6 @@ class AgentConfig:
             return self.openai_base_url.rstrip("/")
         if self.model_provider == "openai_compatible":
             return (self.openai_compatible_base_url or "").rstrip("/")
+        if self.model_provider == "azure_openai":
+            return (self.azure_openai_endpoint or "").rstrip("/")
         return self.ollama_base_url.rstrip("/")
