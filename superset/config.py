@@ -411,7 +411,7 @@ APP_NAME = "Superset"
 APP_ICON = "/static/assets/images/superset-logo-horiz.png"
 
 # Specify where clicking the logo would take the user'
-# Default value of None will take you to '/superset/welcome'
+# Default value of None will take you to SQL Lab.
 # You can also specify a relative URL e.g. '/superset/welcome' or '/dashboards/list'
 # or you can specify a full URL e.g. 'https://foo.bar'
 LOGO_TARGET_PATH = None

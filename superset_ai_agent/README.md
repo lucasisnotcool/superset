@@ -246,6 +246,18 @@ Or stop the stack from WSL2/Git Bash:
 ./scripts/docker-compose-ai-up.sh down
 ```
 
+To restart and refresh the stack:
+```powershell
+.\scripts\docker-compose-ai-up.ps1 restart -Service superset
+```
+
+Or Bash:
+
+```bash
+./scripts/docker-compose-ai-up.sh restart superset
+```
+
+
 ### Native Dev From A Fresh Clone
 
 Use native dev when changing the AI agent or frontend. Ollama is supported only

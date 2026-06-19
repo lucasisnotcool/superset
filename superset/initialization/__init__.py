@@ -65,7 +65,10 @@ from superset.extensions import (
 )
 from superset.extensions.context import extension_context
 from superset.security import SupersetSecurityManager
-from superset.semantic_layers.labels import database_connections_menu_label
+from superset.semantic_layers.labels import (
+    database_connections_menu_label,
+    datasets_label,
+)
 from superset.sql.parse import SQLGLOT_DIALECTS
 from superset.superset_typing import FlaskResponse
 from superset.utils.core import is_test, pessimistic_connection_handling
@@ -323,25 +326,28 @@ class SupersetAppInitializer:  # pylint: disable=too-many-public-methods
             "Dashboards",
             label=_("Dashboards"),
             icon="fa-dashboard",
-            category="",
-            category_icon="",
+            category="Visualisation",
+            category_label=_("Visualisation"),
+            category_icon="fa-bar-chart",
         )
         appbuilder.add_view(
             SliceModelView,
             "Charts",
             label=_("Charts"),
             icon="fa-bar-chart",
-            category="",
-            category_icon="",
+            category="Visualisation",
+            category_label=_("Visualisation"),
+            category_icon="fa-bar-chart",
         )
 
         appbuilder.add_link(
             "Datasets",
-            label=_("Datasets"),
+            label=datasets_label(),
             href=f"{app_root}/tablemodelview/list/",
             icon="fa-table",
-            category="",
-            category_icon="",
+            category="Visualisation",
+            category_label=_("Visualisation"),
+            category_icon="fa-bar-chart",
         )
 
         appbuilder.add_view(
@@ -471,27 +477,25 @@ class SupersetAppInitializer:  # pylint: disable=too-many-public-methods
             "SQL Editor",
             label=_("SQL Lab"),
             href=f"{app_root}/sqllab/",
-            category_icon="fa-flask",
             icon="fa-flask",
-            category="SQL Lab",
-            category_label=_("SQL"),
+            category="",
+            category_icon="",
         )
         appbuilder.add_link(
             "Saved Queries",
             label=_("Saved Queries"),
             href=f"{app_root}/savedqueryview/list/",
             icon="fa-save",
-            category="SQL Lab",
-            category_label=_("SQL"),
+            category="",
+            category_icon="",
         )
         appbuilder.add_link(
             "Query Search",
             label=_("Query History"),
             href=f"{app_root}/sqllab/history/",
             icon="fa-search",
-            category_icon="fa-flask",
-            category="SQL Lab",
-            category_label=_("SQL Lab"),
+            category="",
+            category_icon="",
         )
         appbuilder.add_view(
             TagModelView,
@@ -1106,7 +1110,7 @@ class SupersetAppInitializer:  # pylint: disable=too-many-public-methods
 class SupersetIndexView(IndexView):
     @expose("/")
     def index(self) -> FlaskResponse:
-        return redirect(url_for("Superset.welcome"))
+        return redirect(url_for("SqllabView.root"))
 
     @expose("/lang/<string:locale>")
     @safe

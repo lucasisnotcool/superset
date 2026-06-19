@@ -285,7 +285,7 @@ def menu_data(user: User) -> dict[str, Any]:
     return {
         "menu": appbuilder.menu.get_data(),
         "brand": {
-            "path": app.config["LOGO_TARGET_PATH"] or url_for("Superset.welcome"),
+            "path": app.config["LOGO_TARGET_PATH"] or url_for("SqllabView.root"),
             "icon": appbuilder.app_icon,
             "alt": appbuilder.app_name,
             "tooltip": app.config["LOGO_TOOLTIP"],
