@@ -90,6 +90,154 @@ curl http://localhost:5051/health
 curl http://localhost:9000/ai-agent/health
 ```
 
+## Windows PowerShell Fresh Setup
+
+Run these commands from the repository root. Docker startup scripts are Bash
+scripts, so use WSL2 or Git Bash for Docker commands. Native Python, Node, and
+smoke-test commands can run in PowerShell.
+
+### Docker Smoke From A Fresh Clone
+
+Docker must use OpenAI or an OpenAI-compatible API. Do not configure Ollama in
+`docker/.env-ai-agent`.
+
+```powershell
+git clone <repo-url>
+cd superset
+Copy-Item docker/.env-ai-agent.example docker/.env-ai-agent
+notepad docker/.env-ai-agent
+```
+
+For an OpenAI-compatible gateway, set:
+
+```env
+AI_AGENT_MODEL_PROVIDER=openai_compatible
+OPENAI_COMPATIBLE_BASE_URL=https://your-gateway.example.com/v1
+OPENAI_COMPATIBLE_API_KEY=your_key
+OPENAI_COMPATIBLE_MODEL=your_model
+OPENAI_COMPATIBLE_REQUIRE_API_KEY=true
+OPENAI_COMPATIBLE_STRUCTURED_OUTPUT=json_schema
+```
+
+For direct OpenAI, set:
+
+```env
+AI_AGENT_MODEL_PROVIDER=openai
+OPENAI_API_KEY=your_key
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=gpt-4.1-mini
+```
+
+Start Docker from WSL2 or Git Bash:
+
+```bash
+./scripts/docker-compose-ai-up.sh -d
+./scripts/docker-compose-ai-up.sh ps
+```
+
+The script prints the actual URLs. If a default port is busy, it chooses the
+next available port.
+
+Common endpoints:
+
+```text
+Superset: http://localhost:8088
+Frontend dev server / proxy: http://localhost:9000
+AI Agent: http://localhost:5050 or http://localhost:5051
+AI Proxy: http://localhost:9000/ai-agent
+```
+
+Smoke-test from PowerShell:
+
+```powershell
+curl.exe http://localhost:9000/ai-agent/health
+curl.exe http://localhost:5050/health
+```
+
+If the script assigned `5051`, use:
+
+```powershell
+curl.exe http://localhost:5051/health
+```
+
+Follow logs from WSL2 or Git Bash:
+
+```bash
+./scripts/docker-compose-ai-up.sh logs -f superset-ai-agent
+```
+
+Stop the stack from WSL2 or Git Bash:
+
+```bash
+./scripts/docker-compose-ai-up.sh down
+```
+
+### Native Dev From A Fresh Clone
+
+Use native dev when changing the AI agent or frontend. Ollama is supported only
+for local native development.
+
+```powershell
+git clone <repo-url>
+cd superset
+py -3.11 -m venv venv
+.\venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements-ai-agent.txt
+```
+
+If you are running the Superset backend natively too:
+
+```powershell
+python -m pip install -r requirements/development.txt
+python -m pip install -e .
+superset db upgrade
+superset fab create-admin --username admin --firstname Admin --lastname User --email admin@superset.local --password admin
+superset init
+superset load-examples
+superset run -p 8088 --with-threads --reload --debugger --debug
+```
+
+If native Superset dependencies fail on Windows, run Superset with Docker and
+run only the AI agent natively.
+
+Install and start the frontend in a second PowerShell window:
+
+```powershell
+cd superset-frontend
+npm install
+$env:SUPERSET_AI_AGENT_PROXY="http://127.0.0.1:5050"
+npm run dev-server
+```
+
+Start the AI agent with Ollama in a third PowerShell window:
+
+```powershell
+.\venv\Scripts\Activate.ps1
+$env:AI_AGENT_MODEL_PROVIDER="ollama"
+$env:OLLAMA_BASE_URL="http://localhost:11434"
+$env:AI_AGENT_MODEL="qwen2.5-coder:7b"
+$env:SUPERSET_AGENT_ADAPTER="local"
+uvicorn superset_ai_agent.app:app --reload --port 5050
+```
+
+Or start the AI agent with an OpenAI-compatible API:
+
+```powershell
+.\venv\Scripts\Activate.ps1
+$env:AI_AGENT_MODEL_PROVIDER="openai_compatible"
+$env:OPENAI_COMPATIBLE_BASE_URL="https://your-gateway.example.com/v1"
+$env:OPENAI_COMPATIBLE_API_KEY="your_key"
+$env:OPENAI_COMPATIBLE_MODEL="your_model"
+uvicorn superset_ai_agent.app:app --reload --port 5050
+```
+
+Open the frontend:
+
+```text
+http://localhost:9000
+```
+
 ## Model Providers
 
 The backend chooses a model provider with `AI_AGENT_MODEL_PROVIDER`.
