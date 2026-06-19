@@ -64,10 +64,23 @@ Create the agent env file and fill in model credentials:
 cp docker/.env-ai-agent.example docker/.env-ai-agent
 ```
 
+PowerShell:
+
+```powershell
+Copy-Item docker/.env-ai-agent.example docker/.env-ai-agent
+notepad docker/.env-ai-agent
+```
+
 Start Superset, the frontend dev server, nginx, and the standalone agent:
 
 ```bash
 make up-ai
+```
+
+PowerShell:
+
+```powershell
+.\scripts\docker-compose-ai-up.ps1
 ```
 
 For detached mode:
@@ -76,12 +89,36 @@ For detached mode:
 make up-ai-detached
 ```
 
+PowerShell:
+
+```powershell
+.\scripts\docker-compose-ai-up.ps1 -Detached
+```
+
 The `make` targets use `scripts/docker-compose-ai-up.sh`, which assigns free
-host ports and validates `docker/.env-ai-agent` before startup. On ARM64 Docker
-engines it also applies the Superset Python compatibility override needed for
-the current `cryptography` wheel. x86 Linux and Windows Docker engines keep the
-normal pinned dependency set unless `SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION` is
-set explicitly.
+host ports and validates `docker/.env-ai-agent` before startup. PowerShell can
+use `scripts/docker-compose-ai-up.ps1`, which mirrors the same Docker smoke
+workflow with PowerShell-style flags. On ARM64 Docker engines these helpers also
+apply the Superset Python compatibility override needed for the current
+`cryptography` wheel. x86 Linux and Windows Docker engines keep the normal
+pinned dependency set unless `SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION` is set
+explicitly.
+
+PowerShell helper commands:
+
+```powershell
+.\scripts\docker-compose-ai-up.ps1 dry-run
+.\scripts\docker-compose-ai-up.ps1 ports
+.\scripts\docker-compose-ai-up.ps1 ps
+.\scripts\docker-compose-ai-up.ps1 logs -Follow -Service superset-ai-agent
+.\scripts\docker-compose-ai-up.ps1 down
+```
+
+If Windows blocks script execution, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\docker-compose-ai-up.ps1 -Detached
+```
 
 Smoke-test the service:
 
@@ -90,11 +127,18 @@ curl http://localhost:5051/health
 curl http://localhost:9000/ai-agent/health
 ```
 
+PowerShell:
+
+```powershell
+curl.exe http://localhost:5051/health
+curl.exe http://localhost:9000/ai-agent/health
+```
+
 ## Windows PowerShell Fresh Setup
 
-Run these commands from the repository root. Docker startup scripts are Bash
-scripts, so use WSL2 or Git Bash for Docker commands. Native Python, Node, and
-smoke-test commands can run in PowerShell.
+Run these commands from the repository root. Use
+`scripts/docker-compose-ai-up.ps1` for native PowerShell Docker smoke tests, or
+use `scripts/docker-compose-ai-up.sh` from WSL2/Git Bash.
 
 ### Docker Smoke From A Fresh Clone
 
@@ -139,7 +183,14 @@ AZURE_OPENAI_API_VERSION=2024-02-15-preview
 AZURE_OPENAI_STRUCTURED_OUTPUT=json_schema
 ```
 
-Start Docker from WSL2 or Git Bash:
+Start Docker from PowerShell:
+
+```powershell
+.\scripts\docker-compose-ai-up.ps1 -Detached
+.\scripts\docker-compose-ai-up.ps1 ps
+```
+
+Or start Docker from WSL2/Git Bash:
 
 ```bash
 ./scripts/docker-compose-ai-up.sh -d
@@ -171,13 +222,25 @@ If the script assigned `5051`, use:
 curl.exe http://localhost:5051/health
 ```
 
-Follow logs from WSL2 or Git Bash:
+Follow logs from PowerShell:
+
+```powershell
+.\scripts\docker-compose-ai-up.ps1 logs -Follow -Service superset-ai-agent
+```
+
+Or follow logs from WSL2/Git Bash:
 
 ```bash
 ./scripts/docker-compose-ai-up.sh logs -f superset-ai-agent
 ```
 
-Stop the stack from WSL2 or Git Bash:
+Stop the stack from PowerShell:
+
+```powershell
+.\scripts\docker-compose-ai-up.ps1 down
+```
+
+Or stop the stack from WSL2/Git Bash:
 
 ```bash
 ./scripts/docker-compose-ai-up.sh down
