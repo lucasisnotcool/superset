@@ -120,6 +120,14 @@ WEBDRIVER_BASEURL_USER_FRIENDLY = (
 )
 SQLLAB_CTAS_NO_LIMIT = True
 
+if os.getenv("SUPERSET_ENV") == "development" and os.getenv(
+    "SUPERSET_DOCKER_RELAX_CSP",
+    "true",
+).lower() in {"1", "true", "yes", "on"}:
+    from superset.config import TALISMAN_DEV_CONFIG as _TALISMAN_DEV_CONFIG
+
+    TALISMAN_CONFIG = _TALISMAN_DEV_CONFIG
+
 log_level_text = os.getenv("SUPERSET_LOG_LEVEL", "INFO")
 LOG_LEVEL = getattr(logging, log_level_text.upper(), logging.INFO)
 

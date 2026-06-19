@@ -18,7 +18,7 @@
 # Python version installed; we need 3.10-3.11
 PYTHON=`command -v python3.11 || command -v python3.10`
 
-.PHONY: install superset venv pre-commit up down logs ps nuke ports open
+.PHONY: install superset venv pre-commit up down logs ps nuke ports open ai-agent ai-agent-test up-ai up-ai-detached down-ai logs-ai ps-ai
 
 install: superset pre-commit
 
@@ -112,6 +112,27 @@ report-celery-beat:
 
 admin-user:
 	superset fab create-admin
+
+ai-agent:
+	uvicorn superset_ai_agent.app:app --reload --port 5050
+
+ai-agent-test:
+	pytest tests/unit_tests/superset_ai_agent
+
+up-ai:
+	./scripts/docker-compose-ai-up.sh
+
+up-ai-detached:
+	./scripts/docker-compose-ai-up.sh -d
+
+logs-ai:
+	./scripts/docker-compose-ai-up.sh logs -f superset-ai-agent
+
+down-ai:
+	./scripts/docker-compose-ai-up.sh down
+
+ps-ai:
+	./scripts/docker-compose-ai-up.sh ps
 
 # Docker Compose with auto-assigned ports (for running multiple instances)
 up:

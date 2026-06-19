@@ -119,6 +119,7 @@ superset/translations/**/messages.mo
 superset/translations/translation_index.json
 
 docker/requirements-local.txt
+docker/.env-ai-agent
 
 cache/
 docker/*local*

@@ -25,6 +25,8 @@
 # - Set SUPERSET_LOG_LEVEL=debug in docker/.env-local for detailed Superset logs
 # -----------------------------------------------------------------------
 x-superset-user: &superset-user root
+x-superset-python-env: &superset-python-env
+  SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION: ${SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION:-}
 x-superset-volumes: &superset-volumes
   # /app/pythonpath_docker will be appended to the PYTHONPATH in the final container
   - ./docker:/app/docker
@@ -73,12 +75,12 @@ services:
       - |
         url="http://host.docker.internal:9000/static/assets/manifest.json"
         max_attempts=150  # ~5 minutes at 2s intervals
-        echo "Waiting for webpack dev server at $url..."
+        echo "Waiting for webpack dev server at $$url..."
         attempt=0
-        until curl -sf --max-time 5 -o /dev/null "$url"; do
-          attempt=$((attempt + 1))
-          if [ "$attempt" -ge "$max_attempts" ]; then
-            echo "ERROR: webpack dev server did not serve $url after $max_attempts attempts (~5 minutes)." >&2
+        until curl -sf --max-time 5 -o /dev/null "$$url"; do
+          attempt=$$((attempt + 1))
+          if [ "$$attempt" -ge "$$max_attempts" ]; then
+            echo "ERROR: webpack dev server did not serve $$url after $$max_attempts attempts (~5 minutes)." >&2
             echo "Is the dev server running? With BUILD_SUPERSET_FRONTEND_IN_DOCKER=false you must start it on the host (e.g. 'npm run dev' in superset-frontend)." >&2
             exit 1
           fi
@@ -126,6 +128,8 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     user: *superset-user
+    environment:
+      <<: *superset-python-env
     depends_on:
       superset-init:
         condition: service_completed_successfully
@@ -178,6 +182,8 @@ services:
       redis:
         condition: service_started
     user: *superset-user
+    environment:
+      <<: *superset-python-env
     volumes: *superset-volumes
     healthcheck:
       disable: true
@@ -222,6 +228,7 @@ services:
       - path: docker/.env-local # optional override
         required: false
     environment:
+      <<: *superset-python-env
       CELERYD_CONCURRENCY: 2
     restart: unless-stopped
     depends_on:
@@ -250,6 +257,8 @@ services:
     depends_on:
       - superset-worker
     user: *superset-user
+    environment:
+      <<: *superset-python-env
     volumes: *superset-volumes
     healthcheck:
       disable: true
@@ -266,6 +275,7 @@ services:
     profiles:
       - optional
     environment:
+      <<: *superset-python-env
       DATABASE_HOST: localhost
       DATABASE_DB: test
       REDIS_CELERY_DB: 2

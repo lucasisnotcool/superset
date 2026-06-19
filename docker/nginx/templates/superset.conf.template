@@ -25,6 +25,11 @@ upstream superset_websocket {
     keepalive 100;
 }
 
+upstream superset_ai_agent {
+    server ${SUPERSET_AI_AGENT_UPSTREAM};
+    keepalive 20;
+}
+
 server {
     listen 80 default_server;
     server_name  _;
@@ -41,6 +46,17 @@ server {
         proxy_pass http://host.docker.internal:9000;  # Proxy to superset-node
         proxy_http_version 1.1;
         proxy_set_header Host $host;
+    }
+
+    location /ai-agent/ {
+        proxy_pass http://superset_ai_agent/;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        port_in_redirect off;
+        proxy_connect_timeout 300;
     }
 
     location ${SUPERSET_APP_ROOT} {

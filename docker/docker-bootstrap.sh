@@ -34,6 +34,18 @@ if [ "$DEV_MODE" == "true" ]; then
 fi
 REQUIREMENTS_LOCAL="/app/docker/requirements-local.txt"
 PORT=${PORT:-8088}
+
+apply_python_compat_overrides() {
+  if [ -n "${SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION:-}" ] && [ "$(whoami)" = "root" ]; then
+    echo "Installing Docker compatibility override: cryptography==${SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION}"
+    if command -v uv > /dev/null 2>&1; then
+      uv pip install --force-reinstall "cryptography==${SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION}"
+    else
+      pip install --force-reinstall "cryptography==${SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION}"
+    fi
+  fi
+}
+
 # If Cypress run – overwrite the password for admin and export env variables
 if [ "$CYPRESS_CONFIG" == "true" ]; then
     export SUPERSET_TESTENV=true
@@ -66,6 +78,8 @@ if [ -f "${REQUIREMENTS_LOCAL}" ]; then
 else
   echo "Skipping local overrides"
 fi
+
+apply_python_compat_overrides
 
 case "${1}" in
   worker)

@@ -149,6 +149,9 @@ const plugins = [
     'process.env.REDUX_DEFAULT_MIDDLEWARE':
       process.env.REDUX_DEFAULT_MIDDLEWARE,
     'process.env.SCARF_ANALYTICS': JSON.stringify(process.env.SCARF_ANALYTICS),
+    'process.env.SUPERSET_AI_AGENT_URL': JSON.stringify(
+      process.env.SUPERSET_AI_AGENT_URL || '/ai-agent',
+    ),
   }),
 
   new CopyPlugin({
@@ -699,7 +702,15 @@ if (isDevMode) {
         '.local',
       ]),
     ],
-    proxy: [() => proxyConfig],
+    proxy: [
+      {
+        context: ['/ai-agent'],
+        target: process.env.SUPERSET_AI_AGENT_PROXY || 'http://127.0.0.1:5050',
+        changeOrigin: true,
+        pathRewrite: { '^/ai-agent': '' },
+      },
+      () => proxyConfig,
+    ],
     client: {
       overlay: {
         errors: true,

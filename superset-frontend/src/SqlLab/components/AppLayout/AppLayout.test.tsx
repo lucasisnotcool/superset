@@ -27,6 +27,7 @@ import {
 } from 'spec/helpers/extensionTestHelpers';
 import AppLayout from './index';
 
+jest.mock('../AiAgentPanel', () => () => <div>AI SQL Panel</div>);
 jest.mock('src/components/ResizableSidebar/useStoredSidebarWidth');
 jest.mock('src/components/Splitter', () => {
   const Splitter = ({
@@ -68,12 +69,12 @@ beforeEach(() => {
 
 afterEach(cleanupExtensions);
 
-test('renders two panels', () => {
+test('renders three panels', () => {
   const { getAllByTestId } = render(<AppLayout {...defaultProps} />, {
     useRedux: true,
     initialState,
   });
-  expect(getAllByTestId('mock-panel')).toHaveLength(2);
+  expect(getAllByTestId('mock-panel')).toHaveLength(3);
 });
 
 test('renders children', () => {
@@ -99,12 +100,12 @@ test('calls setWidth on sidebar resize when not hidden', async () => {
   await waitFor(() => expect(setWidth).toHaveBeenCalled());
 });
 
-test('right sidebar is hidden when no extensions registered', () => {
-  const { queryByText } = render(<AppLayout {...defaultProps} />, {
+test('right sidebar renders built-in agent panel when no extensions registered', () => {
+  const { getByText, queryByText } = render(<AppLayout {...defaultProps} />, {
     useRedux: true,
     initialState,
   });
-  // No right sidebar content — the third Splitter.Panel is conditionally omitted
+  expect(getByText('AI SQL Panel')).toBeInTheDocument();
   expect(queryByText('Right Sidebar Content')).not.toBeInTheDocument();
 });
 
@@ -125,6 +126,7 @@ test('renders right sidebar when view is contributed at rightSidebar location', 
   );
 
   expect(getByText('Child')).toBeInTheDocument();
+  expect(getByText('AI SQL Panel')).toBeInTheDocument();
   expect(getByText('Right Sidebar Content')).toBeInTheDocument();
   expect(getAllByTestId('mock-panel')).toHaveLength(3);
 });

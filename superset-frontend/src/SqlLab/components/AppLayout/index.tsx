@@ -33,6 +33,7 @@ import {
 import { ViewLocations } from 'src/SqlLab/contributions';
 import ViewListExtension from 'src/components/ViewListExtension';
 
+import AiAgentPanel from '../AiAgentPanel';
 import SqlEditorLeftBar from '../SqlEditorLeftBar';
 import StatusBar from '../StatusBar';
 
@@ -125,21 +126,22 @@ const AppLayout: React.FC<{ children?: React.ReactNode }> = ({ children }) => {
           </StyledSidebar>
         </Splitter.Panel>
         <Splitter.Panel className="sqllab-body">{children}</Splitter.Panel>
-        {viewItems.length > 0 && (
-          <Splitter.Panel
-            collapsible={{
-              start: true,
-              end: true,
-              showCollapsibleIcon: true,
-            }}
-            size={rightWidth}
-            min={SQL_EDITOR_RIGHTBAR_WIDTH}
-          >
-            <ContentWrapper>
+        <Splitter.Panel
+          collapsible={{
+            start: true,
+            end: true,
+            showCollapsibleIcon: true,
+          }}
+          size={rightWidth}
+          min={SQL_EDITOR_RIGHTBAR_WIDTH}
+        >
+          <ContentWrapper>
+            <AiAgentPanel />
+            {viewItems.length > 0 && (
               <ViewListExtension viewId={ViewLocations.sqllab.rightSidebar} />
-            </ContentWrapper>
-          </Splitter.Panel>
-        )}
+            )}
+          </ContentWrapper>
+        </Splitter.Panel>
       </Splitter>
       <StatusBar />
     </StyledContainer>
