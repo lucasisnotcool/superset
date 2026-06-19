@@ -44,10 +44,36 @@ function Invoke-Compose {
     }
 }
 
+function Invoke-DockerAllowFailure {
+    param([string[]]$DockerArguments)
+
+    $hasNativePreference = Test-Path Variable:\PSNativeCommandUseErrorActionPreference
+    if ($hasNativePreference) {
+        $previousNativePreference = $PSNativeCommandUseErrorActionPreference
+        $PSNativeCommandUseErrorActionPreference = $false
+    }
+
+    try {
+        & docker @DockerArguments 2>$null
+    } finally {
+        if ($hasNativePreference) {
+            $PSNativeCommandUseErrorActionPreference = $previousNativePreference
+        }
+    }
+}
+
 function Get-DockerArch {
-    $arch = (& docker info --format "{{.Architecture}}" 2>$null)
+    $arch = Invoke-DockerAllowFailure -DockerArguments @(
+        "info",
+        "--format",
+        "{{.Architecture}}"
+    )
     if (-not $arch) {
-        $arch = (& docker version --format "{{.Server.Arch}}" 2>$null)
+        $arch = Invoke-DockerAllowFailure -DockerArguments @(
+            "version",
+            "--format",
+            "{{.Server.Arch}}"
+        )
     }
     if (-not $arch) {
         return ""
@@ -206,7 +232,12 @@ function Get-RunningPort {
 
     Push-Location $RepoRoot
     try {
-        $output = (& docker compose @ComposeFiles port $ComposeService $ContainerPort 2>$null)
+        $dockerArguments = @("compose") + $ComposeFiles + @(
+            "port",
+            $ComposeService,
+            [string]$ContainerPort
+        )
+        $output = Invoke-DockerAllowFailure -DockerArguments $dockerArguments
         if ($LASTEXITCODE -eq 0 -and $output) {
             $lastLine = @($output)[-1]
             return [int]($lastLine -split ":")[-1]
@@ -221,7 +252,12 @@ function Get-RunningPort {
 function Test-ProjectRunning {
     Push-Location $RepoRoot
     try {
-        $output = (& docker compose @ComposeFiles ps --status running 2>$null)
+        $dockerArguments = @("compose") + $ComposeFiles + @(
+            "ps",
+            "--status",
+            "running"
+        )
+        $output = Invoke-DockerAllowFailure -DockerArguments $dockerArguments
         return ($LASTEXITCODE -eq 0 -and (($output -join "`n") -match [regex]::Escape($ProjectName)))
     } finally {
         Pop-Location
