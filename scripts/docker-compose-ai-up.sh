@@ -99,86 +99,21 @@ PY
     fi
 }
 
-find_consecutive_port_block() {
+find_available_port() {
     local base_port=$1
-    local count=$2
     local max_attempts=100
-    local start
-    local offset
-    local available
+    local port
 
-    for ((start=base_port; start<base_port+max_attempts; start++)); do
-        available=1
-        for ((offset=0; offset<count; offset++)); do
-            if ! is_port_available "$((start + offset))"; then
-                available=0
-                break
-            fi
-        done
-        if [[ "$available" == "1" ]]; then
-            echo "$start"
+    for ((port=base_port; port<base_port+max_attempts; port++)); do
+        if is_port_available "$port"; then
+            echo "$port"
             return 0
         fi
     done
 
-    echo "ERROR: Could not find $count consecutive available ports starting from $base_port" >&2
+    echo "ERROR: Could not find an available port starting from $base_port" >&2
     return 1
 }
-
-set_consecutive_ports() {
-    local base_port=$1
-
-    NGINX_HOST_PORT=$base_port
-    SUPERSET_HOST_PORT=$((base_port + 1))
-    NODE_HOST_PORT=$((base_port + 2))
-    WEBSOCKET_HOST_PORT=$((base_port + 3))
-    CYPRESS_HOST_PORT=$((base_port + 4))
-    DATABASE_HOST_PORT=$((base_port + 5))
-    REDIS_HOST_PORT=$((base_port + 6))
-    AI_AGENT_HOST_PORT=$((base_port + 7))
-}
-
-case "${1:-}" in
-    down|stop|logs|ps|exec|restart)
-        export COMPOSE_PROJECT_NAME="$PROJECT_NAME"
-        cd "$REPO_ROOT"
-        docker compose "${COMPOSE_FILES[@]}" "$@"
-        exit 0
-        ;;
-    nuke)
-        export COMPOSE_PROJECT_NAME="$PROJECT_NAME"
-        cd "$REPO_ROOT"
-        echo "Removing containers, volumes, and locally-built images for $PROJECT_NAME..."
-        docker compose "${COMPOSE_FILES[@]}" down -v --rmi local
-        exit 0
-        ;;
-esac
-
-echo "Finding available ports for Superset + AI agent..."
-configure_python_compatibility
-PORT_BASE=$(find_consecutive_port_block 8090 8)
-set_consecutive_ports "$PORT_BASE"
-
-export COMPOSE_PROJECT_NAME="$PROJECT_NAME"
-export NGINX_HOST_PORT
-export SUPERSET_HOST_PORT
-export NODE_HOST_PORT
-export WEBSOCKET_HOST_PORT
-export CYPRESS_HOST_PORT
-export DATABASE_HOST_PORT
-export REDIS_HOST_PORT
-export AI_AGENT_HOST_PORT
-export SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION
-
-cd "$REPO_ROOT"
-
-if [ ! -f "$AI_AGENT_ENV_FILE" ]; then
-    echo "ERROR: $AI_AGENT_ENV_FILE is required." >&2
-    echo "Create it with: cp superset_ai_agent/.env.example $AI_AGENT_ENV_FILE" >&2
-    echo "Then fill in the model provider credentials." >&2
-    echo "If you already have docker/.env-ai-agent, move those values into $AI_AGENT_ENV_FILE." >&2
-    exit 1
-fi
 
 read_ai_agent_env_value() {
     local key=$1
@@ -284,11 +219,9 @@ validate_ai_agent_config() {
 }
 
 get_running_port() {
-    local service=$1
-    local container_port=$2
-    local fallback=$3
+    local fallback=$1
     local running_port
-    running_port=$(docker compose "${COMPOSE_FILES[@]}" port "$service" "$container_port" 2>/dev/null | cut -d: -f2)
+    running_port=$(docker compose "${COMPOSE_FILES[@]}" port nginx 80 2>/dev/null | cut -d: -f2)
     if [[ -n "$running_port" ]]; then
         echo "$running_port"
     else
@@ -296,56 +229,58 @@ get_running_port() {
     fi
 }
 
-if docker compose "${COMPOSE_FILES[@]}" ps --status running 2>/dev/null | grep -q "$PROJECT_NAME"; then
-    NGINX_HOST_PORT=$(get_running_port nginx 80 "$NGINX_HOST_PORT")
-    SUPERSET_HOST_PORT=$(get_running_port superset 8088 "$SUPERSET_HOST_PORT")
-    NODE_HOST_PORT=$(get_running_port superset-node 9000 "$NODE_HOST_PORT")
-    WEBSOCKET_HOST_PORT=$(get_running_port superset-websocket 8080 "$WEBSOCKET_HOST_PORT")
-    DATABASE_HOST_PORT=$(get_running_port db 5432 "$DATABASE_HOST_PORT")
-    REDIS_HOST_PORT=$(get_running_port redis 6379 "$REDIS_HOST_PORT")
-    AI_AGENT_HOST_PORT=$(get_running_port superset-ai-agent 5050 "$AI_AGENT_HOST_PORT")
-fi
-
 print_connection_info() {
     echo ""
     echo "Superset + AI agent ($PROJECT_NAME):"
-    echo "   Dev Server: http://localhost:$NODE_HOST_PORT"
-    echo "   Superset:   http://localhost:$SUPERSET_HOST_PORT"
-    echo "   Nginx:      http://localhost:$NGINX_HOST_PORT"
-    echo "   AI Agent:   http://localhost:$AI_AGENT_HOST_PORT"
-    echo "   AI Proxy:   http://localhost:$NODE_HOST_PORT/ai-agent"
-    echo "   WebSocket:  localhost:$WEBSOCKET_HOST_PORT"
-    echo "   Cypress:    http://localhost:$CYPRESS_HOST_PORT"
-    echo "   Database:   localhost:$DATABASE_HOST_PORT"
-    echo "   Redis:      localhost:$REDIS_HOST_PORT"
+    echo "   Site:     http://localhost:$NGINX_HOST_PORT"
+    echo "   AI proxy: http://localhost:$NGINX_HOST_PORT/ai-agent"
+    echo "   Internal services are reachable only on the Docker network."
     if [[ -n "$SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION" ]]; then
         echo "   Python compat: cryptography==$SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION"
     fi
     echo ""
 }
 
+export COMPOSE_PROJECT_NAME="$PROJECT_NAME"
+cd "$REPO_ROOT"
+
+case "${1:-}" in
+    down|stop|logs|ps|exec|restart)
+        docker compose "${COMPOSE_FILES[@]}" "$@"
+        exit 0
+        ;;
+    nuke)
+        echo "Removing containers, volumes, and locally-built images for $PROJECT_NAME..."
+        docker compose "${COMPOSE_FILES[@]}" down -v --rmi local
+        exit 0
+        ;;
+esac
+
+configure_python_compatibility
+
+if [ ! -f "$AI_AGENT_ENV_FILE" ]; then
+    echo "ERROR: $AI_AGENT_ENV_FILE is required." >&2
+    echo "Create it with: cp superset_ai_agent/.env.example $AI_AGENT_ENV_FILE" >&2
+    echo "Then fill in the model provider credentials." >&2
+    echo "If you already have docker/.env-ai-agent, move those values into $AI_AGENT_ENV_FILE." >&2
+    exit 1
+fi
+
+NGINX_HOST_PORT=$(find_available_port 8090)
+if docker compose "${COMPOSE_FILES[@]}" ps --status running 2>/dev/null | grep -q "$PROJECT_NAME"; then
+    NGINX_HOST_PORT=$(get_running_port "$NGINX_HOST_PORT")
+fi
+
+export NGINX_HOST_PORT
+export SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION
+
 print_connection_info
 
 case "${1:-}" in
     --dry-run)
         echo "Dry run complete. To start, run without --dry-run."
-        exit 0
-        ;;
-    --env)
-        echo "export COMPOSE_PROJECT_NAME='$PROJECT_NAME'"
-        echo "export NGINX_HOST_PORT=$NGINX_HOST_PORT"
-        echo "export SUPERSET_HOST_PORT=$SUPERSET_HOST_PORT"
-        echo "export NODE_HOST_PORT=$NODE_HOST_PORT"
-        echo "export WEBSOCKET_HOST_PORT=$WEBSOCKET_HOST_PORT"
-        echo "export CYPRESS_HOST_PORT=$CYPRESS_HOST_PORT"
-        echo "export DATABASE_HOST_PORT=$DATABASE_HOST_PORT"
-        echo "export REDIS_HOST_PORT=$REDIS_HOST_PORT"
-        echo "export AI_AGENT_HOST_PORT=$AI_AGENT_HOST_PORT"
-        echo "export SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION='$SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION'"
-        exit 0
         ;;
     ports)
-        exit 0
         ;;
     *)
         validate_ai_agent_config

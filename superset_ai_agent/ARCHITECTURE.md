@@ -164,7 +164,7 @@ store, so tests can replace external services without changing route code.
 | `docker/nginx/templates/superset.conf.template` | Nginx route | Proxies `/ai-agent/` to `SUPERSET_AI_AGENT_UPSTREAM`. |
 | `docker/Dockerfile.ai-agent` | Agent image | Installs `requirements-ai-agent.txt` and runs the standalone service. |
 | `superset_ai_agent/.env.example` | Agent env template | Shared model provider, Superset adapter, limits, logging, and CORS defaults for native and Docker runs. Docker Compose overrides only container-network topology. |
-| `scripts/docker-compose-ai-up.sh` and `.ps1` | Dev helpers | Allocate ports, validate agent env, and start the Superset plus AI stack. |
+| `scripts/docker-compose-ai-up.sh` and `.ps1` | Dev helpers | Allocate the public site port, validate agent env, and start the Superset plus AI stack. |
 
 ## Agent Graphs
 
@@ -264,8 +264,8 @@ only sees `AI_AGENT_MAX_PROMPT_RESULT_ROWS` rows per execution observation.
 ## Standalone Agent API
 
 These routes are served by `superset_ai_agent/app.py`, typically on host port
-`8097` for native development, container port `5050` in Docker, or through
-`/ai-agent` from webpack/nginx.
+`8097` for native development, container port `5050` in Docker, and through
+`/ai-agent` from nginx on the Docker site port.
 
 | Method | Path | Request model | Response model | Purpose |
 | --- | --- | --- | --- | --- |

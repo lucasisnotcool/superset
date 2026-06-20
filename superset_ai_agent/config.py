@@ -87,8 +87,9 @@ class AgentConfig:
     superset_sql_poll_interval_seconds: float = 0.5
     superset_mcp_auth_token: str | None = None
     cors_allowed_origins: tuple[str, ...] = (
-        "http://localhost:8091",
-        "http://127.0.0.1:8091",
+        "http://localhost",
+        "http://localhost:8090",
+        "http://127.0.0.1:8090",
         "http://localhost:8092",
         "http://127.0.0.1:8092",
     )

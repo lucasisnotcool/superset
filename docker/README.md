@@ -75,22 +75,31 @@ The database will initialize itself upon startup via the init container ([`super
 To run the container, simply run: `docker compose up`
 
 After waiting several minutes for Superset initialization to finish, open
-[`http://localhost:8092`](http://localhost:8092) for the frontend development
-server. The default Docker host port block is:
+[`http://localhost:8090`](http://localhost:8090) for the nginx-served
+development site. Docker Compose publishes only this one host port by default;
+all other services communicate on the internal Docker network.
 
-| Service | Host URL or port | Injected by |
-| --- | --- | --- |
-| Nginx | `http://localhost:8090` | `NGINX_HOST_PORT` |
-| Superset backend | `http://localhost:8091` | `SUPERSET_HOST_PORT` |
-| Frontend dev server | `http://localhost:8092` | `NODE_HOST_PORT` |
-| WebSocket | `localhost:8093` | `WEBSOCKET_HOST_PORT` |
-| Cypress backend | `http://localhost:8094` | `CYPRESS_HOST_PORT` |
-| Database | `localhost:8095` | `DATABASE_HOST_PORT` |
-| Redis | `localhost:8096` | `REDIS_HOST_PORT` |
-| AI agent with `docker-compose.ai-agent.yml` | `http://localhost:8097` | `AI_AGENT_HOST_PORT` |
+| Service | Address |
+| --- | --- |
+| Public site | `http://localhost:8090` |
+| Superset backend | `superset:8088` inside Docker |
+| Frontend dev server | `superset-node:9000` inside Docker |
+| WebSocket | `superset-websocket:8080` inside Docker |
+| Database | `db:5432` inside Docker |
+| Redis | `redis:6379` inside Docker |
+| AI agent with `docker-compose.ai-agent.yml` | `superset-ai-agent:5050` inside Docker, proxied at `/ai-agent` |
 
 Container-internal service ports stay at their defaults, such as Superset
 `8088`, webpack `9000`, Postgres `5432`, and Redis `6379`.
+
+Nginx reaches services through Docker DNS by default:
+`SUPERSET_APP_UPSTREAM=superset:8088`,
+`SUPERSET_NODE_UPSTREAM=superset-node:9000`, and
+`SUPERSET_WEBSOCKET_UPSTREAM=superset-websocket:8080`.
+
+The helper scripts export the selected `NGINX_HOST_PORT`. If you override the
+site port and run plain `docker compose` commands, pass the override file with
+`--env-file docker/.env-local` so Compose uses it for port interpolation.
 
 ### Running Multiple Instances
 
@@ -102,8 +111,8 @@ make up
 
 This automatically:
 - Generates a unique project name from your directory
-- Finds available ports starting with the `8090` host port block
-- Displays the assigned URLs before starting
+- Finds an available site port starting with `8090`
+- Displays the assigned site URL before starting
 
 Available commands (run from repo root):
 

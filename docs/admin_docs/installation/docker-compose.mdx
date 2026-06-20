@@ -111,11 +111,11 @@ from within docker. This will slow down the startup, but will fix various npm-re
 For a lighter development setup that uses fewer resources and supports running multiple instances:
 
 ```bash
-# Single lightweight instance (default port 8092)
+# Single lightweight instance (default port 8090)
 docker compose -f docker-compose-light.yml up
 
 # Multiple instances with different ports:
-# copy docker/.env-local.example for each clone, edit NODE_HOST_PORT, then pass it
+# copy docker/.env-local.example for each clone, edit NGINX_HOST_PORT, then pass it
 # with --env-file docker/.env-local.
 ```
 
@@ -126,8 +126,8 @@ This configuration includes:
 - In-memory caching (no Redis)
 - Isolated volumes and networks per instance
 
-Access each instance at `http://localhost:{NODE_HOST_PORT}` (for example,
-`http://localhost:8092`).
+Access each instance at `http://localhost:{NGINX_HOST_PORT}` (for example,
+`http://localhost:8090`).
 
 ### Option #3 - build a set of immutable images from the local branch
 
@@ -231,7 +231,7 @@ your terminal and/or in your `docker/.env` file.
 
 Your local Superset instance also includes a Postgres server to store your data and is already
 pre-loaded with some example datasets that ship with Superset. You can access Superset now via your
-web browser by visiting `http://localhost:8092`. Note that many browsers now default to `https` - if
+web browser by visiting `http://localhost:8090`. Note that many browsers now default to `https` - if
 yours is one of them, please make sure it uses `http`.
 
 Log in with the default username and password:

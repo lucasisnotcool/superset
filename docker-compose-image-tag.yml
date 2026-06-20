@@ -64,7 +64,7 @@ services:
     user: "root"
     restart: unless-stopped
     ports:
-      - ${SUPERSET_HOST_PORT:-8091}:8088
+      - ${NGINX_HOST_PORT:-8090}:8088
     depends_on:
       superset-init:
         condition: service_completed_successfully

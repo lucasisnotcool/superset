@@ -104,24 +104,17 @@ Start Superset, the frontend dev server, nginx, and the standalone agent:
 ./scripts/docker-compose-ai-up.sh ps
 ```
 
-The helper validates `superset_ai_agent/.env`, finds a consecutive host port
-block starting at `8090` when available, and prints the actual URLs. The
-default AI smoke block is:
+The helper validates `superset_ai_agent/.env`, finds a single host port
+starting at `8090` when available, and prints the actual site URL. The default
+Docker smoke URL is:
 
 ```text
-Nginx: http://localhost:8090
-Superset: http://localhost:8091
-Frontend dev server / proxy: http://localhost:8092
-WebSocket: localhost:8093
-Cypress backend: http://localhost:8094
-Database: localhost:8095
-Redis: localhost:8096
-AI Agent: http://localhost:8097
-AI Proxy: http://localhost:8092/ai-agent
+Site: http://localhost:8090
+AI proxy: http://localhost:8090/ai-agent
 ```
 
-If that block is busy, the helper shifts the entire block together. Use the
-printed ports when they differ from the defaults.
+All other Docker services are reachable only inside the Compose network. If
+`8090` is busy, the helper prints the selected replacement port.
 
 On ARM64 Docker engines the helper also applies the Superset Python
 compatibility override needed for the pinned dependency set. x86 Linux and
@@ -131,16 +124,15 @@ Windows Docker engines keep the normal pinned dependency set unless
 Smoke-test the service:
 
 ```bash
-curl http://localhost:8097/health
-curl http://localhost:8092/ai-agent/health
+curl http://localhost:8090/health
+curl http://localhost:8090/ai-agent/health
 ```
 
-If the script printed another block, use the printed frontend and AI agent
-ports:
+If the script printed another site port, use that port:
 
 ```bash
-curl http://localhost:<NODE_HOST_PORT>/ai-agent/health
-curl http://localhost:<AI_AGENT_HOST_PORT>/health
+curl http://localhost:<NGINX_HOST_PORT>/health
+curl http://localhost:<NGINX_HOST_PORT>/ai-agent/health
 ```
 
 Bash helper commands:
@@ -175,16 +167,16 @@ cp superset_ai_agent/.env.example superset_ai_agent/.env
 nano superset_ai_agent/.env
 ```
 
-Keep the native Superset and frontend URLs aligned with the 809x local port
-block. The shared env file defaults to the REST adapter so native and Docker
-exercise the same Superset boundary:
+Native dev uses local process ports and is separate from Docker's single
+published port. The shared env file defaults to the REST adapter so native and
+Docker exercise the same Superset boundary:
 
 ```env
 SUPERSET_AGENT_ADAPTER=rest
 SUPERSET_BASE_URL=http://localhost:8091
 SUPERSET_USERNAME=admin
 SUPERSET_PASSWORD=admin
-AI_AGENT_CORS_ALLOWED_ORIGINS=http://localhost:8091,http://127.0.0.1:8091,http://localhost:8092,http://127.0.0.1:8092
+AI_AGENT_CORS_ALLOWED_ORIGINS=http://localhost:8090,http://127.0.0.1:8090,http://localhost:8092,http://127.0.0.1:8092
 ```
 
 If you are running the Superset backend natively too:
@@ -204,7 +196,7 @@ Install and start the frontend in a second terminal:
 ```bash
 cd superset-frontend
 npm install
-npm run dev-server -- --port=8092 --env=--supersetPort=8091
+npm run dev-server
 ```
 
 Start the AI agent in a third terminal from the repository root:
@@ -284,9 +276,10 @@ JSON-object mode and then prompt-only JSON instructions.
 ## SQL Lab Conversation Panel
 
 The Superset frontend includes a Copilot-style SQL Lab right-sidebar chat panel
-that calls this standalone service. In native development, run the frontend on
-`8092` and the AI agent on `8097` as shown above. The frontend proxies
-`/ai-agent` to the native AI agent by default.
+that calls this standalone service. In Docker, open `http://localhost:8090`;
+nginx proxies `/ai-agent` to the agent container. In native development, run
+the frontend on `8092` and the AI agent on `8097` as shown above. The frontend
+proxies `/ai-agent` to the native AI agent by default.
 
 The panel keeps a conversation transcript, tracks the active SQL Lab database
 and schema as context, and treats generated SQL as an artifact. SQL artifacts
@@ -324,7 +317,10 @@ persistence are deferred. The boundary is `ConversationStore` in
 `superset_ai_agent/conversations/store.py`; a persistent store can implement
 that protocol without changing the graph or UI API.
 
-## Smoke Test
+## Native API Smoke Test
+
+For Docker, use the `/ai-agent` route on the site URL printed by the helper.
+Use these direct API calls only when running the AI agent natively.
 
 ```bash
 curl http://localhost:8097/health

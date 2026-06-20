@@ -37,8 +37,8 @@ if [ "$BUILD_SUPERSET_FRONTEND_IN_DOCKER" = "true" ]; then
 
     echo "Start webpack dev server"
     # start the webpack dev server, serving dynamically on the container's
-    # internal port 9000. The default host mapping is http://localhost:8092,
-    # and it proxies to Superset through the container network.
+    # internal port 9000. Nginx proxies browser traffic to it through the
+    # Docker network.
     npm run dev-server
 
 else

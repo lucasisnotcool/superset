@@ -26,8 +26,6 @@ services:
     environment:
       SUPERSET_BASE_URL: http://superset:8088
       SUPERSET_MCP_URL: http://superset-mcp:8098/mcp
-    ports:
-      - "127.0.0.1:${AI_AGENT_HOST_PORT:-8097}:5050"
     depends_on:
       superset:
         condition: service_started

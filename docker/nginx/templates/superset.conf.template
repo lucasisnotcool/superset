@@ -16,12 +16,17 @@
 # under the License.
 
 upstream superset_app {
-    server host.docker.internal:${SUPERSET_HOST_PORT};
+    server ${SUPERSET_APP_UPSTREAM};
     keepalive 100;
 }
 
 upstream superset_websocket {
-    server host.docker.internal:${WEBSOCKET_HOST_PORT};
+    server ${SUPERSET_WEBSOCKET_UPSTREAM};
+    keepalive 100;
+}
+
+upstream superset_node {
+    server ${SUPERSET_NODE_UPSTREAM};
     keepalive 100;
 }
 
@@ -43,9 +48,9 @@ server {
     }
 
     location ${SUPERSET_APP_ROOT}/static {
-        proxy_pass http://host.docker.internal:${NODE_HOST_PORT};  # Proxy to superset-node
+        proxy_pass http://superset_node;
         proxy_http_version 1.1;
-        proxy_set_header Host $host;
+        proxy_set_header Host localhost;
     }
 
     location /ai-agent/ {
