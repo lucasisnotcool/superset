@@ -62,11 +62,21 @@
 x-superset-user: &superset-user root
 x-superset-volumes: &superset-volumes
   # /app/pythonpath_docker will be appended to the PYTHONPATH in the final container
-  - ./docker:/app/docker
-  - ./superset:/app/superset
-  - ./superset-frontend:/app/superset-frontend
-  - superset_home_light:/app/superset_home
-  - ./tests:/app/tests
+  - type: bind
+    source: ./docker
+    target: /app/docker
+  - type: bind
+    source: ./superset
+    target: /app/superset
+  - type: bind
+    source: ./superset-frontend
+    target: /app/superset-frontend
+  - type: volume
+    source: superset_home_light
+    target: /app/superset_home
+  - type: bind
+    source: ./tests
+    target: /app/tests
 x-common-build: &common-build
   context: .
   target: ${SUPERSET_BUILD_TARGET:-dev} # can use `dev` (default) or `lean`
@@ -88,8 +98,12 @@ services:
     image: postgres:17
     restart: unless-stopped
     volumes:
-      - db_home_light:/var/lib/postgresql/data
-      - ./docker/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d
+      - type: volume
+        source: db_home_light
+        target: /var/lib/postgresql/data
+      - type: bind
+        source: ./docker/docker-entrypoint-initdb.d
+        target: /docker-entrypoint-initdb.d
     environment:
       POSTGRES_DB: superset_light
     command: postgres -c max_connections=200
