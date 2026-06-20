@@ -41,8 +41,8 @@ if [ "$BUILD_SUPERSET_FRONTEND_IN_DOCKER" = "true" ]; then
     # internal port 9000. Nginx proxies browser traffic to it through the
     # Docker network.
     exec npm run dev-server -- \
-        --devserverHost="${WEBPACK_DEVSERVER_HOST:-0.0.0.0}" \
-        --devserverPort="${WEBPACK_DEVSERVER_PORT:-9000}"
+        --host "${WEBPACK_DEVSERVER_HOST:-0.0.0.0}" \
+        --port "${WEBPACK_DEVSERVER_PORT:-9000}"
 
 else
     echo "Skipping frontend build steps - YOU NEED TO RUN IT MANUALLY ON THE HOST!"
