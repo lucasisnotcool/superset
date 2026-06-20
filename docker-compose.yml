@@ -86,6 +86,7 @@ services:
       - /bin/bash
       - -c
       - |
+        /docker-entrypoint.d/20-envsubst-on-templates.sh
         node_upstream="$${SUPERSET_NODE_UPSTREAM:-superset-node:9000}"
         url="http://$${node_upstream}/static/assets/manifest.json"
         max_attempts=150  # ~5 minutes at 2s intervals
