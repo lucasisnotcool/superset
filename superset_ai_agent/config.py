@@ -75,12 +75,12 @@ class AgentConfig:
     max_history_messages: int = 12
     max_prompt_result_rows: int = 5
     max_agent_sql_iterations: int = 3
-    superset_agent_adapter: SupersetAdapterMode = "local"
+    superset_agent_adapter: SupersetAdapterMode = "rest"
     superset_base_url: str = "http://localhost:8091"
     superset_mcp_url: str = "http://localhost:8098/mcp"
     superset_auth_token: str | None = None
-    superset_username: str | None = None
-    superset_password: str | None = None
+    superset_username: str | None = "admin"
+    superset_password: str | None = "admin"  # noqa: S105
     superset_auth_provider: str = "db"
     superset_csrf_token: str | None = None
     superset_sql_poll_attempts: int = 10

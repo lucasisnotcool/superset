@@ -113,7 +113,7 @@ admin-user:
 	superset fab create-admin
 
 ai-agent:
-	uvicorn superset_ai_agent.app:app --reload --env-file .env.ai-agent --port 8097
+	uvicorn superset_ai_agent.app:app --reload --env-file superset_ai_agent/.env --port 8097
 
 ai-agent-test:
 	pytest tests/unit_tests/superset_ai_agent

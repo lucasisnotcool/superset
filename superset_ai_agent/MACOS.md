@@ -50,17 +50,17 @@ Run these commands from the repository root.
 ### Docker Smoke
 
 Docker smoke tests should use OpenAI, Azure OpenAI, or an OpenAI-compatible
-provider. Do not configure Ollama in `docker/.env-ai-agent`.
+provider. Ollama is only supported for native agent development.
 
-Create the Docker agent env file and edit it:
+Create the shared agent env file and edit it:
 
 ```bash
-cp docker/.env-ai-agent.example docker/.env-ai-agent
-nano docker/.env-ai-agent
+cp superset_ai_agent/.env.example superset_ai_agent/.env
+nano superset_ai_agent/.env
 ```
 
 For an OpenAI-compatible gateway, set these values in
-`docker/.env-ai-agent`:
+`superset_ai_agent/.env`:
 
 ```env
 AI_AGENT_MODEL_PROVIDER=openai_compatible
@@ -104,7 +104,7 @@ Start Superset, the frontend dev server, nginx, and the standalone agent:
 ./scripts/docker-compose-ai-up.sh ps
 ```
 
-The helper validates `docker/.env-ai-agent`, finds a consecutive host port
+The helper validates `superset_ai_agent/.env`, finds a consecutive host port
 block starting at `8090` when available, and prints the actual URLs. The
 default AI smoke block is:
 
@@ -171,15 +171,19 @@ python -m pip install -r requirements-ai-agent.txt
 Create the native agent env file and edit it:
 
 ```bash
-cp superset_ai_agent/.env.example .env.ai-agent
-nano .env.ai-agent
+cp superset_ai_agent/.env.example superset_ai_agent/.env
+nano superset_ai_agent/.env
 ```
 
 Keep the native Superset and frontend URLs aligned with the 809x local port
-block:
+block. The shared env file defaults to the REST adapter so native and Docker
+exercise the same Superset boundary:
 
 ```env
+SUPERSET_AGENT_ADAPTER=rest
 SUPERSET_BASE_URL=http://localhost:8091
+SUPERSET_USERNAME=admin
+SUPERSET_PASSWORD=admin
 AI_AGENT_CORS_ALLOWED_ORIGINS=http://localhost:8091,http://127.0.0.1:8091,http://localhost:8092,http://127.0.0.1:8092
 ```
 
@@ -207,7 +211,7 @@ Start the AI agent in a third terminal from the repository root:
 
 ```bash
 source venv/bin/activate
-uvicorn superset_ai_agent.app:app --reload --env-file .env.ai-agent --port 8097
+uvicorn superset_ai_agent.app:app --reload --env-file superset_ai_agent/.env --port 8097
 ```
 
 Open the frontend:
@@ -219,8 +223,7 @@ http://localhost:8092
 ## Model Providers
 
 The backend chooses a model provider with `AI_AGENT_MODEL_PROVIDER`. Set these
-values in `docker/.env-ai-agent` for Docker smoke tests or `.env.ai-agent` for
-native development.
+values in `superset_ai_agent/.env`.
 
 | Provider | Status | Local test coverage |
 | --- | --- | --- |
@@ -306,7 +309,7 @@ the model, and stop when it can answer. The loop is capped by
 `AI_AGENT_MAX_SQL_ITERATIONS`.
 
 Conversation state is process-local by default. These values can be edited in
-`.env.ai-agent` or `docker/.env-ai-agent`:
+`superset_ai_agent/.env`:
 
 ```env
 AI_AGENT_CONVERSATION_STORE=memory

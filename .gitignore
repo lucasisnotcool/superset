@@ -119,7 +119,10 @@ superset/translations/**/messages.mo
 superset/translations/translation_index.json
 
 docker/requirements-local.txt
+# Legacy per-Docker AI agent env file. Keep ignored so old secret files do not
+# appear in git status after moving to superset_ai_agent/.env.
 docker/.env-ai-agent
+superset_ai_agent/.env
 
 cache/
 docker/*local*

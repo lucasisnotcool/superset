@@ -22,6 +22,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 COMPOSE_FILES=(-f docker-compose.yml -f docker-compose.ai-agent.yml)
+AI_AGENT_ENV_FILE="superset_ai_agent/.env"
 
 DIR_NAME=$(basename "$REPO_ROOT")
 PROJECT_NAME=$(echo "$DIR_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')
@@ -171,10 +172,11 @@ export SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION
 
 cd "$REPO_ROOT"
 
-if [ ! -f docker/.env-ai-agent ]; then
-    echo "ERROR: docker/.env-ai-agent is required." >&2
-    echo "Create it with: cp docker/.env-ai-agent.example docker/.env-ai-agent" >&2
-    echo "Then fill in OpenAI or OpenAI-compatible credentials." >&2
+if [ ! -f "$AI_AGENT_ENV_FILE" ]; then
+    echo "ERROR: $AI_AGENT_ENV_FILE is required." >&2
+    echo "Create it with: cp superset_ai_agent/.env.example $AI_AGENT_ENV_FILE" >&2
+    echo "Then fill in the model provider credentials." >&2
+    echo "If you already have docker/.env-ai-agent, move those values into $AI_AGENT_ENV_FILE." >&2
     exit 1
 fi
 
@@ -195,7 +197,7 @@ read_ai_agent_env_value() {
                 print value
             }
         }
-    ' docker/.env-ai-agent | tail -n 1)
+    ' "$AI_AGENT_ENV_FILE" | tail -n 1)
     value="${value%\"}"
     value="${value#\"}"
     value="${value%\'}"
@@ -223,14 +225,31 @@ require_ai_agent_config() {
     local value
     value=$(ai_agent_config_value "$key")
     if [[ -z "$value" ]]; then
-        echo "ERROR: $key must be set in docker/.env-ai-agent for Docker AI agent startup." >&2
+        echo "ERROR: $key must be set in $AI_AGENT_ENV_FILE for Docker AI agent startup." >&2
         return 1
     fi
 }
 
 validate_ai_agent_config() {
+    local adapter
     local provider
     local require_key
+    adapter=$(ai_agent_config_value SUPERSET_AGENT_ADAPTER)
+    adapter="${adapter:-rest}"
+    case "$adapter" in
+        rest|mcp)
+            ;;
+        local)
+            echo "ERROR: SUPERSET_AGENT_ADAPTER=local is not supported by the Docker AI agent smoke stack." >&2
+            echo "Use SUPERSET_AGENT_ADAPTER=rest or mcp in $AI_AGENT_ENV_FILE." >&2
+            return 1
+            ;;
+        *)
+            echo "ERROR: SUPERSET_AGENT_ADAPTER must be rest or mcp for Docker startup." >&2
+            return 1
+            ;;
+    esac
+
     provider=$(ai_agent_config_value AI_AGENT_MODEL_PROVIDER)
     provider="${provider:-openai_compatible}"
 
@@ -254,7 +273,7 @@ validate_ai_agent_config() {
             ;;
         ollama)
             echo "ERROR: Ollama is not supported by the Docker AI agent smoke stack." >&2
-            echo "Use AI_AGENT_MODEL_PROVIDER=openai, openai_compatible, or azure_openai in docker/.env-ai-agent." >&2
+            echo "Use AI_AGENT_MODEL_PROVIDER=openai, openai_compatible, or azure_openai in $AI_AGENT_ENV_FILE." >&2
             return 1
             ;;
         *)

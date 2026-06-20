@@ -28,6 +28,7 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Split-Path -Parent $ScriptDir
 $ComposeFiles = @("-f", "docker-compose.yml", "-f", "docker-compose.ai-agent.yml")
+$AiAgentEnvFile = Join-Path $RepoRoot "superset_ai_agent/.env"
 $ProjectName = [regex]::Replace((Split-Path -Leaf $RepoRoot).ToLowerInvariant(), "[^a-z0-9]+", "-").Trim("-")
 
 function Invoke-Compose {
@@ -151,7 +152,7 @@ function Set-ConsecutivePorts {
 function Read-AiAgentEnvValue {
     param([string]$Key)
 
-    $envFile = Join-Path $RepoRoot "docker/.env-ai-agent"
+    $envFile = $AiAgentEnvFile
     if (-not (Test-Path $envFile)) {
         return $null
     }
@@ -202,11 +203,28 @@ function Require-AiAgentConfig {
 
     $value = Get-AiAgentConfigValue -Key $Key
     if (-not $value) {
-        throw "$Key must be set in docker/.env-ai-agent for Docker AI agent startup."
+        throw "$Key must be set in superset_ai_agent/.env for Docker AI agent startup."
     }
 }
 
 function Test-AiAgentConfig {
+    $adapter = Get-AiAgentConfigValue -Key "SUPERSET_AGENT_ADAPTER"
+    if (-not $adapter) {
+        $adapter = "rest"
+    }
+    $adapter = $adapter.Trim().ToLowerInvariant()
+
+    switch ($adapter) {
+        "rest" {}
+        "mcp" {}
+        "local" {
+            throw "SUPERSET_AGENT_ADAPTER=local is not supported by the Docker AI agent smoke stack. Use SUPERSET_AGENT_ADAPTER=rest or mcp in superset_ai_agent/.env."
+        }
+        default {
+            throw "SUPERSET_AGENT_ADAPTER must be rest or mcp for Docker startup."
+        }
+    }
+
     $provider = Get-AiAgentConfigValue -Key "AI_AGENT_MODEL_PROVIDER"
     if (-not $provider) {
         $provider = "openai_compatible"
@@ -235,7 +253,7 @@ function Test-AiAgentConfig {
             Require-AiAgentConfig -Key "AZURE_OPENAI_API_VERSION"
         }
         "ollama" {
-            throw "Ollama is not supported by the Docker AI agent smoke stack. Use AI_AGENT_MODEL_PROVIDER=openai, openai_compatible, or azure_openai in docker/.env-ai-agent."
+            throw "Ollama is not supported by the Docker AI agent smoke stack. Use AI_AGENT_MODEL_PROVIDER=openai, openai_compatible, or azure_openai in superset_ai_agent/.env."
         }
         default {
             throw "AI_AGENT_MODEL_PROVIDER must be openai, openai_compatible, or azure_openai for Docker startup."
@@ -349,9 +367,9 @@ Set-PythonCompatibility
 $portBase = Find-ConsecutivePortBlock -BasePort 8090 -Count 8
 Set-ConsecutivePorts -BasePort $portBase
 
-$envFile = Join-Path $RepoRoot "docker/.env-ai-agent"
+$envFile = $AiAgentEnvFile
 if (-not (Test-Path $envFile)) {
-    throw "docker/.env-ai-agent is required. Create it with: Copy-Item docker/.env-ai-agent.example docker/.env-ai-agent"
+    throw "superset_ai_agent/.env is required. Create it with: Copy-Item superset_ai_agent/.env.example superset_ai_agent/.env. If you already have docker/.env-ai-agent, move those values into superset_ai_agent/.env."
 }
 
 if (Test-ProjectRunning) {

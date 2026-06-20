@@ -35,6 +35,7 @@
 **/*.swp
 **/.terser-plugin-cache/
 **/node_modules/
+superset_ai_agent/.env
 
 tests/
 docs/

@@ -163,7 +163,7 @@ store, so tests can replace external services without changing route code.
 | `docker-compose.ai-agent.yml` | Compose extension | Adds `superset-ai-agent`, sets SQL Lab frontend env vars, and wires nginx to the agent. |
 | `docker/nginx/templates/superset.conf.template` | Nginx route | Proxies `/ai-agent/` to `SUPERSET_AI_AGENT_UPSTREAM`. |
 | `docker/Dockerfile.ai-agent` | Agent image | Installs `requirements-ai-agent.txt` and runs the standalone service. |
-| `docker/.env-ai-agent.example` | Agent env template | Model provider, Superset adapter, limits, logging, and CORS defaults for Docker smoke tests. |
+| `superset_ai_agent/.env.example` | Agent env template | Shared model provider, Superset adapter, limits, logging, and CORS defaults for native and Docker runs. Docker Compose overrides only container-network topology. |
 | `scripts/docker-compose-ai-up.sh` and `.ps1` | Dev helpers | Allocate ports, validate agent env, and start the Superset plus AI stack. |
 
 ## Agent Graphs
@@ -485,16 +485,16 @@ syntax, or comments, improve this with AST-aware limit detection.
 | `AI_AGENT_MAX_HISTORY_MESSAGES` | `12` | Conversation messages included in prompt history. |
 | `AI_AGENT_MAX_PROMPT_RESULT_ROWS` | `5` | Execution rows included in follow-up prompt observations. |
 | `AI_AGENT_MAX_SQL_ITERATIONS` | `3` | Max automatic execute/observe/redraft cycles per turn. |
-| `SUPERSET_AGENT_ADAPTER` | `local` | One of `local`, `rest`, `mcp`. |
+| `SUPERSET_AGENT_ADAPTER` | `rest` | One of `local`, `rest`, `mcp`. |
 | `SUPERSET_BASE_URL` | `http://localhost:8091` | Superset REST base URL for native development. Docker uses the internal service URL `http://superset:8088`. |
 | `SUPERSET_MCP_URL` | `http://localhost:8098/mcp` | Superset MCP JSON-RPC URL. |
-| `SUPERSET_AUTH_TOKEN`, `SUPERSET_USERNAME`, `SUPERSET_PASSWORD` | unset | REST authentication options. |
+| `SUPERSET_AUTH_TOKEN`, `SUPERSET_USERNAME`, `SUPERSET_PASSWORD` | token unset, username/password `admin` | REST authentication options. |
 | `SUPERSET_MCP_AUTH_TOKEN` | falls back to `SUPERSET_AUTH_TOKEN` | MCP bearer token. |
 | `SUPERSET_SQL_POLL_ATTEMPTS` | `10` | REST SQL Lab results polling attempts. |
 | `SUPERSET_SQL_POLL_INTERVAL_SECONDS` | `0.5` | Delay between REST SQL Lab result polls. |
 | `AI_AGENT_CORS_ALLOWED_ORIGINS` | local Superset/dev URLs | Browser origins allowed by FastAPI CORS. |
 | `AI_AGENT_LOG_LEVEL` | `INFO` | Agent log level. |
-| `AI_AGENT_SUPPRESS_SUPERSET_LOGS` | `true` | Quiets Superset logs when using the local adapter. |
+| `AI_AGENT_SUPPRESS_SUPERSET_LOGS` | `true` | Quiets Superset logs in the agent process. |
 
 ## Development Checklist For SQL Robustness Work
 
