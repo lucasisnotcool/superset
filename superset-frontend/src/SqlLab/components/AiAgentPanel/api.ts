@@ -18,6 +18,7 @@
  */
 
 export type AgentStatus = 'ok' | 'needs_review' | 'error';
+export type ExecutionMode = 'manual' | 'read_only' | 'auto';
 
 export interface AgentTraceEvent {
   step: string;
@@ -54,6 +55,73 @@ export interface AgentQueryResponse {
     row_count: number;
   } | null;
   trace: AgentTraceEvent[];
+}
+
+export interface ConversationScope {
+  database_id: number;
+  schema_name?: string | null;
+  dataset_ids: number[];
+  query_editor_id?: string | null;
+  current_sql?: string | null;
+  selected_text?: string | null;
+}
+
+export interface ConversationArtifact {
+  type: 'sql';
+  sql: string;
+  explanation?: string | null;
+  validation?: SqlValidationResult | null;
+  execution_result?: {
+    columns: string[];
+    rows: Record<string, unknown>[];
+    row_count: number;
+  } | null;
+  trace: AgentTraceEvent[];
+}
+
+export interface ConversationMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  created_at: string;
+  artifacts: ConversationArtifact[];
+}
+
+export interface Conversation {
+  id: string;
+  title: string;
+  owner_id: string;
+  scope: ConversationScope;
+  messages: ConversationMessage[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ConversationSummary {
+  id: string;
+  title: string;
+  owner_id: string;
+  database_id: number;
+  schema_name?: string | null;
+  updated_at: string;
+  last_message?: string | null;
+}
+
+export interface ConversationTurnRequest {
+  message: string;
+  scope: ConversationScope;
+  execution_mode: ExecutionMode;
+  execute?: boolean;
+  model?: string | null;
+}
+
+export interface ConversationTurnResponse {
+  status: AgentStatus;
+  conversation_id: string;
+  message: ConversationMessage;
+  artifacts: ConversationArtifact[];
+  trace: AgentTraceEvent[];
+  conversation: Conversation;
 }
 
 export interface AgentHealthResponse {
@@ -95,4 +163,41 @@ export const queryAgent = (payload: AgentQueryRequest) =>
   requestJson<AgentQueryResponse>('/agent/query', {
     method: 'POST',
     body: JSON.stringify(payload),
+  });
+
+export const validateSql = (sql: string, dialect?: string | null) =>
+  requestJson<SqlValidationResult>('/agent/validate-sql', {
+    method: 'POST',
+    body: JSON.stringify({ sql, dialect: dialect || null }),
+  });
+
+export const createConversation = (scope: ConversationScope) =>
+  requestJson<Conversation>('/agent/conversations', {
+    method: 'POST',
+    body: JSON.stringify({ scope }),
+  });
+
+export const listConversations = () =>
+  requestJson<ConversationSummary[]>('/agent/conversations', { method: 'GET' });
+
+export const getConversation = (conversationId: string) =>
+  requestJson<Conversation>(`/agent/conversations/${conversationId}`, {
+    method: 'GET',
+  });
+
+export const sendConversationMessage = (
+  conversationId: string,
+  payload: ConversationTurnRequest,
+) =>
+  requestJson<ConversationTurnResponse>(
+    `/agent/conversations/${conversationId}/messages`,
+    {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    },
+  );
+
+export const deleteConversation = (conversationId: string) =>
+  requestJson<{ deleted: boolean }>(`/agent/conversations/${conversationId}`, {
+    method: 'DELETE',
   });

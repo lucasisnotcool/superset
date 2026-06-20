@@ -17,10 +17,17 @@
 
 from __future__ import annotations
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from superset_ai_agent.app import create_app
 from superset_ai_agent.config import AgentConfig
+from superset_ai_agent.conversations.memory import InMemoryConversationStore
+from superset_ai_agent.conversations.schemas import (
+    ConversationMessage,
+    ConversationTurnRequest,
+    ConversationTurnResponse,
+)
 from superset_ai_agent.schemas import (
     AgentQueryRequest,
     AgentQueryResponse,
@@ -56,12 +63,52 @@ class StaticGraph:
         )
 
 
-def test_health_and_models_use_injected_ollama_client() -> None:
-    app = create_app(
+class StaticConversationGraph:
+    def __init__(self, store: InMemoryConversationStore):
+        self.store = store
+
+    def run(
+        self,
+        *,
+        conversation_id: str,
+        request: ConversationTurnRequest,
+        owner_id: str = "local",
+    ) -> ConversationTurnResponse:
+        message = ConversationMessage(
+            role="assistant",
+            content=f"Answered: {request.message}",
+        )
+        conversation = self.store.append(
+            conversation_id,
+            ConversationMessage(role="user", content=request.message),
+            owner_id=owner_id,
+        )
+        conversation = self.store.append(
+            conversation_id,
+            message,
+            owner_id=owner_id,
+        )
+        return ConversationTurnResponse(
+            status="ok",
+            conversation_id=conversation_id,
+            message=message,
+            conversation=conversation,
+        )
+
+
+def _create_test_app(store: InMemoryConversationStore | None = None) -> FastAPI:
+    active_store = store or InMemoryConversationStore()
+    return create_app(
         config=AgentConfig(),
         ollama_client=FakeOllamaClient(),
         text_to_sql_graph=StaticGraph(),
+        conversation_graph=StaticConversationGraph(active_store),
+        conversation_store=active_store,
     )
+
+
+def test_health_and_models_use_injected_ollama_client() -> None:
+    app = _create_test_app()
     client = TestClient(app)
 
     health = client.get("/health").json()
@@ -72,10 +119,13 @@ def test_health_and_models_use_injected_ollama_client() -> None:
 
 
 def test_agent_query_returns_error_payload_when_graph_fails() -> None:
+    store = InMemoryConversationStore()
     app = create_app(
         config=AgentConfig(),
         ollama_client=FakeOllamaClient(),
         text_to_sql_graph=RaisingGraph(),
+        conversation_graph=StaticConversationGraph(store),
+        conversation_store=store,
     )
     client = TestClient(app)
 
@@ -95,10 +145,13 @@ def test_agent_query_returns_error_payload_when_graph_fails() -> None:
 
 
 def test_validate_sql_endpoint_adds_limit() -> None:
+    store = InMemoryConversationStore()
     app = create_app(
         config=AgentConfig(default_sql_limit=25),
         ollama_client=FakeOllamaClient(),
         text_to_sql_graph=StaticGraph(),
+        conversation_graph=StaticConversationGraph(store),
+        conversation_store=store,
     )
     client = TestClient(app)
 
@@ -111,3 +164,49 @@ def test_validate_sql_endpoint_adds_limit() -> None:
     body = response.json()
     assert body["is_valid"] is True
     assert body["normalized_sql"] == "select * from birth_names\nLIMIT 25"
+
+
+def test_conversation_endpoints_create_list_message_and_delete() -> None:
+    app = _create_test_app()
+    client = TestClient(app)
+
+    create_response = client.post(
+        "/agent/conversations",
+        json={
+            "scope": {
+                "database_id": 1,
+                "schema_name": None,
+                "dataset_ids": [16],
+            },
+        },
+    )
+
+    assert create_response.status_code == 200
+    conversation_id = create_response.json()["id"]
+    assert client.get("/agent/conversations").json()[0]["id"] == conversation_id
+
+    message_response = client.post(
+        f"/agent/conversations/{conversation_id}/messages",
+        json={
+            "message": "What columns are available?",
+            "scope": {
+                "database_id": 1,
+                "schema_name": None,
+                "dataset_ids": [16],
+            },
+            "execution_mode": "manual",
+        },
+    )
+
+    assert message_response.status_code == 200
+    body = message_response.json()
+    assert body["status"] == "ok"
+    assert [message["role"] for message in body["conversation"]["messages"]] == [
+        "user",
+        "assistant",
+    ]
+
+    delete_response = client.delete(f"/agent/conversations/{conversation_id}")
+    assert delete_response.status_code == 200
+    assert delete_response.json() == {"deleted": True}
+    assert client.get(f"/agent/conversations/{conversation_id}").status_code == 404

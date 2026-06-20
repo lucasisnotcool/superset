@@ -58,59 +58,49 @@ is_port_available() {
     fi
 }
 
-# Track ports we've already claimed in this session
-CLAIMED_PORTS=""
-
-# Function to check if port is available and not already claimed
-is_port_free() {
-    local port=$1
-    # Check not already claimed by us
-    if [[ " $CLAIMED_PORTS " =~ " $port " ]]; then
-        return 1
-    fi
-    # Check not in use on system
-    is_port_available $port
-}
-
-# Function to find and claim next available port starting from base
-# Sets the result in the variable named by $2
-find_and_claim_port() {
+# Function to find a consecutive block of available host ports
+find_consecutive_port_block() {
     local base_port=$1
-    local var_name=$2
+    local count=$2
     local max_attempts=100
-    local port=$base_port
+    local start
+    local offset
+    local available
 
-    for ((i=0; i<max_attempts; i++)); do
-        if is_port_free $port; then
-            CLAIMED_PORTS="$CLAIMED_PORTS $port"
-            eval "$var_name=$port"
+    for ((start=base_port; start<base_port+max_attempts; start++)); do
+        available=1
+        for ((offset=0; offset<count; offset++)); do
+            if ! is_port_available "$((start + offset))"; then
+                available=0
+                break
+            fi
+        done
+        if [[ "$available" == "1" ]]; then
+            echo "$start"
             return 0
         fi
-        ((port++))
     done
 
-    echo "ERROR: Could not find available port starting from $base_port" >&2
+    echo "ERROR: Could not find $count consecutive available ports starting from $base_port" >&2
     return 1
 }
 
-# Base ports (defaults from docker-compose.yml)
-BASE_NGINX=80
-BASE_SUPERSET=8088
-BASE_NODE=9000
-BASE_WEBSOCKET=8080
-BASE_CYPRESS=8081
-BASE_DATABASE=5432
-BASE_REDIS=6379
+set_consecutive_ports() {
+    local base_port=$1
+
+    NGINX_PORT=$base_port
+    SUPERSET_PORT=$((base_port + 1))
+    NODE_PORT=$((base_port + 2))
+    WEBSOCKET_PORT=$((base_port + 3))
+    CYPRESS_PORT=$((base_port + 4))
+    DATABASE_HOST_PORT=$((base_port + 5))
+    REDIS_HOST_PORT=$((base_port + 6))
+}
 
 # Find available ports (no subshells - claims persist correctly)
 echo "🔍 Finding available ports..."
-find_and_claim_port $BASE_NGINX NGINX_PORT
-find_and_claim_port $BASE_SUPERSET SUPERSET_PORT
-find_and_claim_port $BASE_NODE NODE_PORT
-find_and_claim_port $BASE_WEBSOCKET WEBSOCKET_PORT
-find_and_claim_port $BASE_CYPRESS CYPRESS_PORT
-find_and_claim_port $BASE_DATABASE DATABASE_PORT
-find_and_claim_port $BASE_REDIS REDIS_PORT
+PORT_BASE=$(find_consecutive_port_block 8080 7)
+set_consecutive_ports "$PORT_BASE"
 
 # Export for docker-compose
 export COMPOSE_PROJECT_NAME="$PROJECT_NAME"
@@ -136,8 +126,8 @@ if docker compose ps --status running 2>/dev/null | grep -q "$PROJECT_NAME"; the
     SUPERSET_PORT=$(get_running_port superset 8088 $SUPERSET_PORT)
     NODE_PORT=$(get_running_port superset-node 9000 $NODE_PORT)
     WEBSOCKET_PORT=$(get_running_port superset-websocket 8080 $WEBSOCKET_PORT)
-    DATABASE_PORT=$(get_running_port db 5432 $DATABASE_PORT)
-    REDIS_PORT=$(get_running_port redis 6379 $REDIS_PORT)
+    DATABASE_HOST_PORT=$(get_running_port db 5432 $DATABASE_HOST_PORT)
+    REDIS_HOST_PORT=$(get_running_port redis 6379 $REDIS_HOST_PORT)
 fi
 
 export NGINX_PORT
@@ -145,8 +135,8 @@ export SUPERSET_PORT
 export NODE_PORT
 export WEBSOCKET_PORT
 export CYPRESS_PORT
-export DATABASE_PORT
-export REDIS_PORT
+export DATABASE_HOST_PORT
+export REDIS_HOST_PORT
 
 # Function to print connection info
 print_connection_info() {
@@ -156,8 +146,9 @@ print_connection_info() {
     echo "   Superset:   http://localhost:$SUPERSET_PORT"
     echo "   Nginx:      http://localhost:$NGINX_PORT"
     echo "   WebSocket:  localhost:$WEBSOCKET_PORT"
-    echo "   Database:   localhost:$DATABASE_PORT"
-    echo "   Redis:      localhost:$REDIS_PORT"
+    echo "   Cypress:    http://localhost:$CYPRESS_PORT"
+    echo "   Database:   localhost:$DATABASE_HOST_PORT"
+    echo "   Redis:      localhost:$REDIS_HOST_PORT"
     echo ""
 }
 
@@ -189,8 +180,8 @@ case "${1:-}" in
         echo "export NODE_PORT=$NODE_PORT"
         echo "export WEBSOCKET_PORT=$WEBSOCKET_PORT"
         echo "export CYPRESS_PORT=$CYPRESS_PORT"
-        echo "export DATABASE_PORT=$DATABASE_PORT"
-        echo "export REDIS_PORT=$REDIS_PORT"
+        echo "export DATABASE_HOST_PORT=$DATABASE_HOST_PORT"
+        echo "export REDIS_HOST_PORT=$REDIS_HOST_PORT"
         exit 0
         ;;
     ports)

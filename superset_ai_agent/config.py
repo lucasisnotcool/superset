@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import cast, Literal
 
 SupersetAdapterMode = Literal["local", "rest", "mcp"]
+ConversationStoreMode = Literal["memory"]
 ModelProviderMode = Literal[
     "ollama",
     "openai",
@@ -70,6 +71,10 @@ class AgentConfig:
     max_repair_attempts: int = 1
     max_context_datasets: int = 8
     max_sample_rows: int = 5
+    conversation_store: ConversationStoreMode = "memory"
+    max_history_messages: int = 12
+    max_prompt_result_rows: int = 5
+    max_agent_sql_iterations: int = 3
     superset_agent_adapter: SupersetAdapterMode = "local"
     superset_base_url: str = "http://localhost:8088"
     superset_mcp_url: str = "http://localhost:5008/mcp"
@@ -89,9 +94,7 @@ class AgentConfig:
     )
     log_level: str = "INFO"
     suppress_superset_logs: bool = True
-    local_superset_secret_key: str = (
-        "ai-agent-local-dev-secret-key-not-for-production"  # noqa: S105
-    )
+    local_superset_secret_key: str = "ai-agent-local-dev-secret-key-not-for-production"  # noqa: S105
 
     @classmethod
     def from_env(cls) -> "AgentConfig":
@@ -110,16 +113,14 @@ class AgentConfig:
             openai_base_url=os.getenv("OPENAI_BASE_URL", cls.openai_base_url),
             openai_model=os.getenv("OPENAI_MODEL", cls.openai_model),
             openai_compatible_api_key=(
-                os.getenv("OPENAI_COMPATIBLE_API_KEY")
-                or cls.openai_compatible_api_key
+                os.getenv("OPENAI_COMPATIBLE_API_KEY") or cls.openai_compatible_api_key
             ),
             openai_compatible_base_url=(
                 os.getenv("OPENAI_COMPATIBLE_BASE_URL")
                 or cls.openai_compatible_base_url
             ),
             openai_compatible_model=(
-                os.getenv("OPENAI_COMPATIBLE_MODEL")
-                or cls.openai_compatible_model
+                os.getenv("OPENAI_COMPATIBLE_MODEL") or cls.openai_compatible_model
             ),
             openai_compatible_require_api_key=_env_bool(
                 "OPENAI_COMPATIBLE_REQUIRE_API_KEY",
@@ -168,6 +169,30 @@ class AgentConfig:
             ),
             max_sample_rows=int(
                 os.getenv("AI_AGENT_MAX_SAMPLE_ROWS", str(cls.max_sample_rows))
+            ),
+            conversation_store=cast(
+                ConversationStoreMode,
+                os.getenv("AI_AGENT_CONVERSATION_STORE", cls.conversation_store)
+                .strip()
+                .lower(),
+            ),
+            max_history_messages=int(
+                os.getenv(
+                    "AI_AGENT_MAX_HISTORY_MESSAGES",
+                    str(cls.max_history_messages),
+                )
+            ),
+            max_prompt_result_rows=int(
+                os.getenv(
+                    "AI_AGENT_MAX_PROMPT_RESULT_ROWS",
+                    str(cls.max_prompt_result_rows),
+                )
+            ),
+            max_agent_sql_iterations=int(
+                os.getenv(
+                    "AI_AGENT_MAX_SQL_ITERATIONS",
+                    str(cls.max_agent_sql_iterations),
+                )
             ),
             superset_agent_adapter=cast(
                 SupersetAdapterMode,

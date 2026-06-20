@@ -24,6 +24,20 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.context.superset_metadata import SupersetMetadataContextProvider
+from superset_ai_agent.conversation_graph import ConversationGraph
+from superset_ai_agent.conversations.memory import InMemoryConversationStore
+from superset_ai_agent.conversations.schemas import (
+    Conversation,
+    ConversationCreateRequest,
+    ConversationSummary,
+    ConversationTurnRequest,
+    ConversationTurnResponse,
+)
+from superset_ai_agent.conversations.store import (
+    ConversationNotFoundError,
+    ConversationStore,
+    DEFAULT_OWNER_ID,
+)
 from superset_ai_agent.graph import TextToSqlGraph
 from superset_ai_agent.integrations.superset.factory import create_superset_client
 from superset_ai_agent.llm.factory import create_model_client
@@ -32,17 +46,20 @@ from superset_ai_agent.schemas import (
     AgentQueryResponse,
     HealthResponse,
     ModelInfo,
+    SqlValidation,
     ValidateSqlRequest,
 )
 from superset_ai_agent.tools.sql import validate_read_only_sql
 
 
-def create_app(
+def create_app(  # noqa: C901
     *,
     config: AgentConfig | None = None,
     model_client: Any | None = None,
     ollama_client: Any | None = None,
     text_to_sql_graph: Any | None = None,
+    conversation_graph: Any | None = None,
+    conversation_store: ConversationStore | None = None,
 ) -> FastAPI:
     """Create the standalone AI agent API.
 
@@ -54,24 +71,36 @@ def create_app(
         model_client or ollama_client or create_model_client(app_config)
     )
 
-    if text_to_sql_graph is None:
+    active_conversation_store = conversation_store or _create_conversation_store(
+        app_config
+    )
+
+    if text_to_sql_graph is None or conversation_graph is None:
         superset_client = create_superset_client(app_config)
         context_provider = SupersetMetadataContextProvider(superset_client)
-        graph = TextToSqlGraph(
+        graph = text_to_sql_graph or TextToSqlGraph(
             config=app_config,
             model_client=active_model_client,
             context_provider=context_provider,
             superset_client=superset_client,
         )
+        active_conversation_graph = conversation_graph or ConversationGraph(
+            config=app_config,
+            model_client=active_model_client,
+            context_provider=context_provider,
+            superset_client=superset_client,
+            conversation_store=active_conversation_store,
+        )
     else:
         graph = text_to_sql_graph
+        active_conversation_graph = conversation_graph
 
     api = FastAPI(title=app_config.app_name, version="0.1.0")
     api.add_middleware(
         CORSMiddleware,
         allow_origins=list(app_config.cors_allowed_origins),
         allow_credentials=True,
-        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_methods=["DELETE", "GET", "POST", "OPTIONS"],
         allow_headers=["*"],
     )
 
@@ -110,8 +139,78 @@ def create_app(
         except Exception as ex:  # pylint: disable=broad-except
             return _agent_error_response(str(ex))
 
+    @api.post("/agent/conversations", response_model=Conversation)
+    def create_conversation(request: ConversationCreateRequest) -> Conversation:
+        """Create a conversation scoped to the active Superset context."""
+
+        return active_conversation_store.create(
+            request.scope,
+            owner_id=DEFAULT_OWNER_ID,
+        )
+
+    @api.get("/agent/conversations", response_model=list[ConversationSummary])
+    def list_conversations() -> list[ConversationSummary]:
+        """List conversation summaries for the current integration identity."""
+
+        return active_conversation_store.list(owner_id=DEFAULT_OWNER_ID)
+
+    @api.get("/agent/conversations/{conversation_id}", response_model=Conversation)
+    def get_conversation(conversation_id: str) -> Conversation:
+        """Return a conversation transcript."""
+
+        try:
+            return active_conversation_store.get(
+                conversation_id,
+                owner_id=DEFAULT_OWNER_ID,
+            )
+        except ConversationNotFoundError as ex:
+            raise HTTPException(
+                status_code=404,
+                detail="Conversation not found.",
+            ) from ex
+
+    @api.post(
+        "/agent/conversations/{conversation_id}/messages",
+        response_model=ConversationTurnResponse,
+    )
+    def send_conversation_message(
+        conversation_id: str,
+        request: ConversationTurnRequest,
+    ) -> ConversationTurnResponse:
+        """Append a user message and run a conversational agent turn."""
+
+        try:
+            return active_conversation_graph.run(
+                conversation_id=conversation_id,
+                request=request,
+                owner_id=DEFAULT_OWNER_ID,
+            )
+        except ConversationNotFoundError as ex:
+            raise HTTPException(
+                status_code=404,
+                detail="Conversation not found.",
+            ) from ex
+        except Exception as ex:  # pylint: disable=broad-except
+            raise HTTPException(status_code=502, detail=str(ex)) from ex
+
+    @api.delete("/agent/conversations/{conversation_id}")
+    def delete_conversation(conversation_id: str) -> dict[str, bool]:
+        """Delete a conversation transcript."""
+
+        try:
+            active_conversation_store.delete(
+                conversation_id,
+                owner_id=DEFAULT_OWNER_ID,
+            )
+        except ConversationNotFoundError as ex:
+            raise HTTPException(
+                status_code=404,
+                detail="Conversation not found.",
+            ) from ex
+        return {"deleted": True}
+
     @api.post("/agent/validate-sql")
-    def validate_sql(request: ValidateSqlRequest):
+    def validate_sql(request: ValidateSqlRequest) -> SqlValidation:
         """Validate SQL without invoking the model."""
 
         return validate_read_only_sql(
@@ -121,6 +220,15 @@ def create_app(
         )
 
     return api
+
+
+def _create_conversation_store(config: AgentConfig) -> ConversationStore:
+    if config.conversation_store == "memory":
+        return InMemoryConversationStore()
+    raise ValueError(
+        "Unsupported AI_AGENT_CONVERSATION_STORE value "
+        f"{config.conversation_store!r}. Expected: memory."
+    )
 
 
 def _agent_error_response(message: str) -> AgentQueryResponse:

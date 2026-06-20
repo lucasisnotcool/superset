@@ -17,7 +17,17 @@
  * under the License.
  */
 import fetchMock from 'fetch-mock';
-import { getAgentBaseUrl, getAgentHealth, queryAgent } from './api';
+import {
+  createConversation,
+  deleteConversation,
+  getAgentBaseUrl,
+  getAgentHealth,
+  getConversation,
+  listConversations,
+  queryAgent,
+  sendConversationMessage,
+  validateSql,
+} from './api';
 
 const originalAgentUrl = process.env.SUPERSET_AI_AGENT_URL;
 
@@ -83,5 +93,115 @@ test('queryAgent posts typed payload to agent backend', async () => {
     schema_name: null,
     dataset_ids: [16],
     execute: false,
+  });
+});
+
+test('validateSql posts SQL validation payload', async () => {
+  fetchMock.post('http://agent.local/agent/validate-sql', {
+    is_valid: true,
+    is_read_only: true,
+    normalized_sql: 'select 1',
+    dialect: 'sqlite',
+    errors: [],
+  });
+
+  const response = await validateSql('select 1', 'sqlite');
+
+  const [call] = fetchMock.callHistory.calls(
+    'http://agent.local/agent/validate-sql',
+  );
+  expect(response.is_valid).toBe(true);
+  expect(JSON.parse(String(call.options.body))).toEqual({
+    sql: 'select 1',
+    dialect: 'sqlite',
+  });
+});
+
+test('conversation API helpers use typed conversation endpoints', async () => {
+  const conversation = {
+    id: 'conversation-1',
+    title: 'Show top names',
+    owner_id: 'local',
+    scope: {
+      database_id: 1,
+      schema_name: null,
+      dataset_ids: [16],
+      query_editor_id: 'editor-1',
+      current_sql: 'select 1',
+      selected_text: null,
+    },
+    messages: [],
+    created_at: '2026-06-19T00:00:00Z',
+    updated_at: '2026-06-19T00:00:00Z',
+  };
+  fetchMock.post('http://agent.local/agent/conversations', conversation);
+  fetchMock.get('http://agent.local/agent/conversations', [
+    {
+      id: 'conversation-1',
+      title: 'Show top names',
+      owner_id: 'local',
+      database_id: 1,
+      schema_name: null,
+      updated_at: '2026-06-19T00:00:00Z',
+      last_message: null,
+    },
+  ]);
+  fetchMock.get(
+    'http://agent.local/agent/conversations/conversation-1',
+    conversation,
+  );
+  fetchMock.post(
+    'http://agent.local/agent/conversations/conversation-1/messages',
+    {
+      status: 'ok',
+      conversation_id: 'conversation-1',
+      message: {
+        id: 'message-2',
+        role: 'assistant',
+        content: 'Answer',
+        created_at: '2026-06-19T00:00:00Z',
+        artifacts: [],
+      },
+      artifacts: [],
+      trace: [],
+      conversation,
+    },
+  );
+  fetchMock.delete('http://agent.local/agent/conversations/conversation-1', {
+    deleted: true,
+  });
+
+  const scope = {
+    database_id: 1,
+    schema_name: null,
+    dataset_ids: [16],
+    query_editor_id: 'editor-1',
+    current_sql: 'select 1',
+    selected_text: null,
+  };
+
+  expect((await createConversation(scope)).id).toBe('conversation-1');
+  expect(await listConversations()).toHaveLength(1);
+  expect((await getConversation('conversation-1')).title).toBe(
+    'Show top names',
+  );
+  expect(
+    (
+      await sendConversationMessage('conversation-1', {
+        message: 'What columns?',
+        scope,
+        execution_mode: 'manual',
+      })
+    ).message.content,
+  ).toBe('Answer');
+  expect((await deleteConversation('conversation-1')).deleted).toBe(true);
+
+  const [messageCall] = fetchMock.callHistory.calls(
+    'http://agent.local/agent/conversations/conversation-1/messages',
+  );
+  expect(JSON.parse(String(messageCall.options.body))).toEqual({
+    message: 'What columns?',
+    scope,
+    execution_mode: 'manual',
   });
 });

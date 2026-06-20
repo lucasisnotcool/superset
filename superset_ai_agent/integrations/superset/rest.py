@@ -339,8 +339,10 @@ def _normalize_dataset(payload: dict[str, Any]) -> DatasetMetadata:
     database_id = data.get("database_id")
     if database_id is None and isinstance(database, dict):
         database_id = database.get("id")
-    columns = data.get("columns") if isinstance(data.get("columns"), list) else []
-    metrics = data.get("metrics") if isinstance(data.get("metrics"), list) else []
+    raw_columns = data.get("columns")
+    columns: list[Any] = raw_columns if isinstance(raw_columns, list) else []
+    raw_metrics = data.get("metrics")
+    metrics: list[Any] = raw_metrics if isinstance(raw_metrics, list) else []
     return DatasetMetadata(
         id=int(data.get("id") or 0),
         table_name=str(data.get("table_name") or ""),
@@ -409,9 +411,7 @@ def _normalize_column_names(
         for column in columns:
             if isinstance(column, dict):
                 name = (
-                    column.get("name")
-                    or column.get("column_name")
-                    or column.get("key")
+                    column.get("name") or column.get("column_name") or column.get("key")
                 )
                 if name:
                     names.append(str(name))

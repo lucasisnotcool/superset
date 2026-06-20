@@ -113,19 +113,39 @@ function Test-PortAvailable {
     }
 }
 
-$ClaimedPorts = @{}
+function Find-ConsecutivePortBlock {
+    param(
+        [int]$BasePort,
+        [int]$Count
+    )
 
-function Find-AndClaimPort {
-    param([int]$BasePort)
-
-    for ($port = $BasePort; $port -lt ($BasePort + 100); $port++) {
-        if (-not $ClaimedPorts.ContainsKey($port) -and (Test-PortAvailable -Port $port)) {
-            $ClaimedPorts[$port] = $true
-            return $port
+    for ($start = $BasePort; $start -lt ($BasePort + 100); $start++) {
+        $available = $true
+        for ($offset = 0; $offset -lt $Count; $offset++) {
+            if (-not (Test-PortAvailable -Port ($start + $offset))) {
+                $available = $false
+                break
+            }
+        }
+        if ($available) {
+            return $start
         }
     }
 
-    throw "Could not find available port starting from $BasePort"
+    throw "Could not find $Count consecutive available ports starting from $BasePort"
+}
+
+function Set-ConsecutivePorts {
+    param([int]$BasePort)
+
+    $env:NGINX_PORT = [string]$BasePort
+    $env:SUPERSET_PORT = [string]($BasePort + 1)
+    $env:NODE_PORT = [string]($BasePort + 2)
+    $env:WEBSOCKET_PORT = [string]($BasePort + 3)
+    $env:CYPRESS_PORT = [string]($BasePort + 4)
+    $env:DATABASE_HOST_PORT = [string]($BasePort + 5)
+    $env:REDIS_HOST_PORT = [string]($BasePort + 6)
+    $env:AI_AGENT_PORT = [string]($BasePort + 7)
 }
 
 function Read-AiAgentEnvValue {
@@ -273,8 +293,9 @@ function Show-ConnectionInfo {
     Write-Host "   AI Agent:   http://localhost:$env:AI_AGENT_PORT"
     Write-Host "   AI Proxy:   http://localhost:$env:NODE_PORT/ai-agent"
     Write-Host "   WebSocket:  localhost:$env:WEBSOCKET_PORT"
-    Write-Host "   Database:   localhost:$env:DATABASE_PORT"
-    Write-Host "   Redis:      localhost:$env:REDIS_PORT"
+    Write-Host "   Cypress:    http://localhost:$env:CYPRESS_PORT"
+    Write-Host "   Database:   localhost:$env:DATABASE_HOST_PORT"
+    Write-Host "   Redis:      localhost:$env:REDIS_HOST_PORT"
     if ($env:SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION) {
         Write-Host "   Python compat: cryptography==$env:SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION"
     }
@@ -325,14 +346,8 @@ switch ($Command) {
 Write-Host "Finding available ports for Superset + AI agent..."
 Set-PythonCompatibility
 
-$env:NGINX_PORT = [string](Find-AndClaimPort -BasePort 80)
-$env:SUPERSET_PORT = [string](Find-AndClaimPort -BasePort 8088)
-$env:NODE_PORT = [string](Find-AndClaimPort -BasePort 9000)
-$env:WEBSOCKET_PORT = [string](Find-AndClaimPort -BasePort 8080)
-$env:CYPRESS_PORT = [string](Find-AndClaimPort -BasePort 8081)
-$env:DATABASE_PORT = [string](Find-AndClaimPort -BasePort 5432)
-$env:REDIS_PORT = [string](Find-AndClaimPort -BasePort 6379)
-$env:AI_AGENT_PORT = [string](Find-AndClaimPort -BasePort 5050)
+$portBase = Find-ConsecutivePortBlock -BasePort 8080 -Count 8
+Set-ConsecutivePorts -BasePort $portBase
 
 $envFile = Join-Path $RepoRoot "docker/.env-ai-agent"
 if (-not (Test-Path $envFile)) {
@@ -344,8 +359,8 @@ if (Test-ProjectRunning) {
     $env:SUPERSET_PORT = [string](Get-RunningPort -ComposeService "superset" -ContainerPort 8088 -Fallback ([int]$env:SUPERSET_PORT))
     $env:NODE_PORT = [string](Get-RunningPort -ComposeService "superset-node" -ContainerPort 9000 -Fallback ([int]$env:NODE_PORT))
     $env:WEBSOCKET_PORT = [string](Get-RunningPort -ComposeService "superset-websocket" -ContainerPort 8080 -Fallback ([int]$env:WEBSOCKET_PORT))
-    $env:DATABASE_PORT = [string](Get-RunningPort -ComposeService "db" -ContainerPort 5432 -Fallback ([int]$env:DATABASE_PORT))
-    $env:REDIS_PORT = [string](Get-RunningPort -ComposeService "redis" -ContainerPort 6379 -Fallback ([int]$env:REDIS_PORT))
+    $env:DATABASE_HOST_PORT = [string](Get-RunningPort -ComposeService "db" -ContainerPort 5432 -Fallback ([int]$env:DATABASE_HOST_PORT))
+    $env:REDIS_HOST_PORT = [string](Get-RunningPort -ComposeService "redis" -ContainerPort 6379 -Fallback ([int]$env:REDIS_HOST_PORT))
     $env:AI_AGENT_PORT = [string](Get-RunningPort -ComposeService "superset-ai-agent" -ContainerPort 5050 -Fallback ([int]$env:AI_AGENT_PORT))
 }
 
@@ -363,8 +378,8 @@ switch ($Command) {
         Write-Host "`$env:NODE_PORT = `"$env:NODE_PORT`""
         Write-Host "`$env:WEBSOCKET_PORT = `"$env:WEBSOCKET_PORT`""
         Write-Host "`$env:CYPRESS_PORT = `"$env:CYPRESS_PORT`""
-        Write-Host "`$env:DATABASE_PORT = `"$env:DATABASE_PORT`""
-        Write-Host "`$env:REDIS_PORT = `"$env:REDIS_PORT`""
+        Write-Host "`$env:DATABASE_HOST_PORT = `"$env:DATABASE_HOST_PORT`""
+        Write-Host "`$env:REDIS_HOST_PORT = `"$env:REDIS_HOST_PORT`""
         Write-Host "`$env:AI_AGENT_PORT = `"$env:AI_AGENT_PORT`""
         Write-Host "`$env:SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION = `"$env:SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION`""
         exit 0

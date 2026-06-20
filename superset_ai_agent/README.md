@@ -1,7 +1,7 @@
 # Superset AI Agent POC
 
-Standalone Python API for a lightweight text-to-SQL agent using LangGraph and a
-pluggable model provider.
+Standalone Python API for lightweight conversational database assistance and
+text-to-SQL using LangGraph and a pluggable model provider.
 
 This proof of concept is intentionally separate from Superset core. It exposes
 a small API that can be called by a Superset extension, test client, or any
@@ -12,7 +12,7 @@ other agent UI.
 ```text
 Client / Superset extension
   -> FastAPI service
-  -> LangGraph text-to-SQL workflow
+  -> LangGraph conversation / text-to-SQL workflows
   -> Ollama / OpenAI / OpenAI-compatible / Azure OpenAI model
   -> SupersetClient adapter
   -> Superset metadata and governed SQL execution
@@ -123,15 +123,15 @@ powershell -ExecutionPolicy Bypass -File .\scripts\docker-compose-ai-up.ps1 -Det
 Smoke-test the service:
 
 ```bash
-curl http://localhost:5051/health
-curl http://localhost:9000/ai-agent/health
+curl http://localhost:8087/health
+curl http://localhost:8082/ai-agent/health
 ```
 
 PowerShell:
 
 ```powershell
-curl.exe http://localhost:5051/health
-curl.exe http://localhost:9000/ai-agent/health
+curl.exe http://localhost:8087/health
+curl.exe http://localhost:8082/ai-agent/health
 ```
 
 ## Windows PowerShell Fresh Setup
@@ -197,29 +197,41 @@ Or start Docker from WSL2/Git Bash:
 ./scripts/docker-compose-ai-up.sh ps
 ```
 
-The script prints the actual URLs. If a default port is busy, it chooses the
-next available port.
+The script prints the actual URLs. It assigns a consecutive host port block,
+starting at `8080` when available. The default AI smoke block is:
 
 Common endpoints:
 
 ```text
-Superset: http://localhost:8088
-Frontend dev server / proxy: http://localhost:9000
-AI Agent: http://localhost:5050 or http://localhost:5051
-AI Proxy: http://localhost:9000/ai-agent
+Nginx: http://localhost:8080
+Superset: http://localhost:8081
+Frontend dev server / proxy: http://localhost:8082
+WebSocket: localhost:8083
+Cypress backend: http://localhost:8084
+Database: localhost:8085
+Redis: localhost:8086
+AI Agent: http://localhost:8087
+AI Proxy: http://localhost:8082/ai-agent
 ```
+
+If that block is busy, the helper shifts the entire block together. In
+`docker/.env-local`, use `DATABASE_HOST_PORT` and `REDIS_HOST_PORT` for
+host-facing port mappings. Keep `DATABASE_PORT=5432` and `REDIS_PORT=6379`
+unless the internal service ports are also changed.
 
 Smoke-test from PowerShell:
 
 ```powershell
-curl.exe http://localhost:9000/ai-agent/health
-curl.exe http://localhost:5050/health
+curl.exe http://localhost:8082/ai-agent/health
+curl.exe http://localhost:8087/health
 ```
 
-If the script assigned `5051`, use:
+If the script printed another block, use the printed frontend and AI agent
+ports:
 
 ```powershell
-curl.exe http://localhost:5051/health
+curl.exe http://localhost:<NODE_PORT>/ai-agent/health
+curl.exe http://localhost:<AI_AGENT_PORT>/health
 ```
 
 Follow logs from PowerShell:
@@ -248,6 +260,7 @@ Or stop the stack from WSL2/Git Bash:
 
 To restart and refresh the stack:
 ```powershell
+docker compose -f docker-compose.yml -f docker-compose.ai-agent.yml exec superset superset init
 .\scripts\docker-compose-ai-up.ps1 restart -Service superset
 ```
 
@@ -401,18 +414,50 @@ using the `api-key` header. `AZURE_OPENAI_MODEL` is the Azure deployment name.
 If a deployment rejects JSON-schema structured output, the client falls back to
 JSON-object mode and then prompt-only JSON instructions.
 
-## SQL Lab Panel
+## SQL Lab Conversation Panel
 
-The Superset frontend includes a minimal SQL Lab right-sidebar panel that calls
-this standalone service. Start the frontend dev server with:
+The Superset frontend includes a Copilot-style SQL Lab right-sidebar chat panel
+that calls this standalone service. Start the frontend dev server with:
 
 ```bash
 cd superset-frontend
 SUPERSET_AI_AGENT_PROXY=http://127.0.0.1:5050 npm run dev-server
 ```
 
-The panel inserts generated SQL into the active SQL Lab editor. Query execution
-should stay in SQL Lab unless the agent request explicitly enables execution.
+The panel keeps a conversation transcript, tracks the active SQL Lab database
+and schema as context, and treats generated SQL as an artifact. SQL artifacts
+can be inserted into the active editor, copied, validated, or executed through
+an explicit follow-up turn.
+
+The composer exposes an execution-mode selector:
+
+- `manual`: generated SQL is returned for user approval and is not executed.
+- `read_only`: validated read-only SQL can be executed by the agent.
+- `auto`: the agent may automatically execute validated read-only SQL. The POC
+  does not execute DDL or DML in this mode.
+
+Every conversation SQL draft is parsed with `sqlglot`, limited to a single
+SELECT/CTE-style statement, checked for destructive keywords and expressions,
+and normalized with a conservative `LIMIT` before execution. The LangGraph
+conversation workflow can take multiple SQL tool turns in one run: draft SQL,
+validate it, execute it when the selected mode permits, feed the rows back to
+the model, and stop when it can answer. The loop is capped by
+`AI_AGENT_MAX_SQL_ITERATIONS`.
+
+Conversation state is process-local by default:
+
+```bash
+export AI_AGENT_CONVERSATION_STORE=memory
+export AI_AGENT_MAX_HISTORY_MESSAGES=12
+export AI_AGENT_MAX_PROMPT_RESULT_ROWS=5
+export AI_AGENT_MAX_SQL_ITERATIONS=3
+```
+
+The in-memory transcript store is intended for local development and smoke
+tests. Durable conversation memory, summarization, retrieval, and user-scoped
+persistence are deferred. The seam is `ConversationStore` in
+`superset_ai_agent/conversations/store.py`; a persistent store can implement
+that protocol without changing the graph or UI API.
 
 ## Smoke Test
 
@@ -444,6 +489,36 @@ curl -s http://localhost:5050/agent/query \
 
 Execution is off by default. Keep it off while testing prompt quality.
 
+Start a conversation:
+
+```bash
+curl -s http://localhost:5050/agent/conversations \
+  -H 'content-type: application/json' \
+  -d '{
+    "scope": {
+      "database_id": 1,
+      "schema_name": null,
+      "dataset_ids": [16]
+    }
+  }'
+```
+
+Send a conversation turn:
+
+```bash
+curl -s http://localhost:5050/agent/conversations/<conversation-id>/messages \
+  -H 'content-type: application/json' \
+  -d '{
+    "message": "Show the top 10 names by total births",
+    "scope": {
+      "database_id": 1,
+      "schema_name": null,
+      "dataset_ids": [16]
+    },
+    "execution_mode": "manual"
+  }'
+```
+
 ## POC Limitations
 
 - The `local` Superset adapter is for development and imports Superset in the
@@ -453,12 +528,17 @@ Execution is off by default. Keep it off while testing prompt quality.
 - OpenAI, OpenAI-compatible, and Azure OpenAI providers are mocked locally;
   validate them in the deployment environment with real credentials and gateway
   URLs.
-- No RAG, skills, eval suite, or user identity propagation is implemented yet.
+- Conversation transcripts use an in-memory development store by default.
+- Durable conversation memory, RAG, skills, eval suite, persistent conversation
+  store, or user identity propagation are not implemented yet.
 - SQL validation is a conservative POC guard, not a complete security boundary.
-- Review generated SQL before running it.
+- `auto` execution is intentionally limited to validated read-only SQL.
 
 ## Future Seams
 
+- Add persistent conversation stores, starting with SQLite or Redis.
+- Add durable conversation memory through summarization and retrieval while
+  keeping `ConversationStore` as the persistence boundary.
 - Harden the `rest` and `mcp` adapters against the target deployment auth
   setup.
 - Add more provider clients or route through LiteLLM/Bedrock as needed.
