@@ -202,6 +202,7 @@ services:
       superset: "http://superset:8088"
       # Webpack dev server must bind to 0.0.0.0 to be accessible from outside the container
       WEBPACK_DEVSERVER_HOST: "0.0.0.0"
+      WEBPACK_DEVSERVER_PORT: "9000"
     command: ["/app/docker/docker-frontend.sh"]
     env_file:
       - path: docker/.env # default

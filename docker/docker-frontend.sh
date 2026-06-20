@@ -36,10 +36,13 @@ if [ "$BUILD_SUPERSET_FRONTEND_IN_DOCKER" = "true" ]; then
     npm install
 
     echo "Start webpack dev server"
+    echo "Webpack dev server bind: ${WEBPACK_DEVSERVER_HOST:-0.0.0.0}:${WEBPACK_DEVSERVER_PORT:-9000}"
     # start the webpack dev server, serving dynamically on the container's
     # internal port 9000. Nginx proxies browser traffic to it through the
     # Docker network.
-    npm run dev-server
+    exec npm run dev-server -- \
+        --devserverHost="${WEBPACK_DEVSERVER_HOST:-0.0.0.0}" \
+        --devserverPort="${WEBPACK_DEVSERVER_PORT:-9000}"
 
 else
     echo "Skipping frontend build steps - YOU NEED TO RUN IT MANUALLY ON THE HOST!"
