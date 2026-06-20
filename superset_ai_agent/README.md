@@ -123,6 +123,12 @@ AI proxy: http://localhost:8090/ai-agent
 All other Docker services are reachable only inside the Compose network. If
 `8090` is busy, the helper prints the selected replacement port.
 
+On Windows, the PowerShell helper also includes `docker-compose.no-bind.yml`.
+That overlay avoids host bind mounts, which can be misparsed by some Windows
+Docker/Rancher setups. The Docker smoke stack runs from the code packaged into
+the images; rebuild the stack after changing Superset, frontend, Docker config,
+or AI agent source.
+
 On ARM64 Docker engines the helper also applies the Superset Python
 compatibility override needed for the pinned dependency set. x86 Linux and
 Windows Docker engines keep the normal pinned dependency set unless

@@ -141,6 +141,12 @@ From a subdirectory, use: `make -C $(git rev-parse --show-toplevel) up`
 While running, the container server will reload on modification of the Superset Python and JavaScript source code.
 Don't forget to reload the page to take the new frontend into account though.
 
+On Windows environments that cannot run host bind mounts reliably, use the
+Windows PowerShell AI helper. It includes
+[`../docker-compose.no-bind.yml`](../docker-compose.no-bind.yml), which runs the
+stack from code packaged into images instead of mounted from the host. Rebuild
+the stack after local source or Docker config changes.
+
 ## Production
 
 It is possible to run Superset in non-development mode by using [`docker-compose-non-dev.yml`](../docker-compose-non-dev.yml). This file excludes the volumes needed for development.

@@ -1,0 +1,230 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# -----------------------------------------------------------------------
+# No-bind Docker Compose stack for environments where host bind mounts are
+# unreliable. The Windows AI helper uses this file instead of docker-compose.yml.
+# Source and Docker config are packaged into images, so rebuild after changes.
+# -----------------------------------------------------------------------
+x-superset-user: &superset-user root
+x-superset-python-env: &superset-python-env
+  SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION: ${SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION:-}
+  DATABASE_PORT: "5432"
+  EXAMPLES_PORT: "5432"
+  REDIS_PORT: "6379"
+x-superset-runtime-volumes: &superset-runtime-volumes
+  - type: volume
+    source: superset_home
+    target: /app/superset_home
+  - type: volume
+    source: superset_data
+    target: /app/data
+x-common-build: &common-build
+  context: .
+  target: ${SUPERSET_BUILD_TARGET:-dev}
+  cache_from:
+    - apache/superset-cache:3.10-slim-trixie
+  args:
+    DEV_MODE: "true"
+    INCLUDE_CHROMIUM: ${INCLUDE_CHROMIUM:-false}
+    INCLUDE_FIREFOX: ${INCLUDE_FIREFOX:-false}
+    BUILD_TRANSLATIONS: ${BUILD_TRANSLATIONS:-false}
+
+services:
+  nginx:
+    env_file:
+      - path: docker/.env
+        required: true
+      - path: docker/.env-local
+        required: false
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.nginx
+    restart: unless-stopped
+    ports:
+      - "${NGINX_HOST_PORT:-8090}:80"
+    command:
+      - /bin/bash
+      - -c
+      - |
+        node_upstream="$${SUPERSET_NODE_UPSTREAM:-superset-node:9000}"
+        url="http://$${node_upstream}/static/assets/manifest.json"
+        max_attempts=150
+        echo "Waiting for webpack dev server at $$url..."
+        attempt=0
+        until curl -sf --max-time 5 -H 'Host: localhost' -o /dev/null "$$url"; do
+          attempt=$$((attempt + 1))
+          if [ "$$attempt" -ge "$$max_attempts" ]; then
+            echo "ERROR: webpack dev server did not serve $$url after $$max_attempts attempts (~5 minutes)." >&2
+            echo "Is the dev server running? This no-bind stack expects superset-node to run in Docker." >&2
+            exit 1
+          fi
+          sleep 2
+        done
+        echo "Webpack dev server is ready; starting nginx."
+        exec nginx -g 'daemon off;'
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    volumes:
+      - type: volume
+        source: redis
+        target: /data
+
+  db:
+    env_file:
+      - path: docker/.env
+        required: true
+      - path: docker/.env-local
+        required: false
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.postgres
+    restart: unless-stopped
+    volumes:
+      - type: volume
+        source: db_home
+        target: /var/lib/postgresql/data
+
+  superset:
+    env_file:
+      - path: docker/.env
+        required: true
+      - path: docker/.env-local
+        required: false
+    build:
+      <<: *common-build
+    command: ["/app/docker/docker-bootstrap.sh", "app"]
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    user: *superset-user
+    environment:
+      <<: *superset-python-env
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully
+    volumes: *superset-runtime-volumes
+
+  superset-websocket:
+    build: ./superset-websocket
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - redis
+    environment:
+      - PORT=8080
+      - LOG_LEVEL=info
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_SSL=false
+      - JWT_SECRET=CHANGE-ME-IN-PRODUCTION-GOTTA-BE-LONG-AND-SECRET
+      - JWT_COOKIE_NAME=async-token
+
+  superset-init:
+    build:
+      <<: *common-build
+    command: ["/app/docker/docker-init.sh"]
+    env_file:
+      - path: docker/.env
+        required: true
+      - path: docker/.env-local
+        required: false
+    depends_on:
+      db:
+        condition: service_started
+      redis:
+        condition: service_started
+    user: *superset-user
+    environment:
+      <<: *superset-python-env
+    volumes: *superset-runtime-volumes
+    healthcheck:
+      disable: true
+
+  superset-node:
+    build:
+      context: .
+      target: superset-node
+      args:
+        DEV_MODE: "true"
+        BUILD_TRANSLATIONS: ${BUILD_TRANSLATIONS:-false}
+    environment:
+      BUILD_SUPERSET_FRONTEND_IN_DOCKER: ${BUILD_SUPERSET_FRONTEND_IN_DOCKER:-true}
+      NPM_RUN_PRUNE: false
+      SCARF_ANALYTICS: "${SCARF_ANALYTICS:-}"
+      superset: "http://superset:8088"
+      WEBPACK_DEVSERVER_HOST: "0.0.0.0"
+    command: ["/app/docker/docker-frontend.sh"]
+    env_file:
+      - path: docker/.env
+        required: true
+      - path: docker/.env-local
+        required: false
+
+  superset-worker:
+    build:
+      <<: *common-build
+    command: ["/app/docker/docker-bootstrap.sh", "worker"]
+    env_file:
+      - path: docker/.env
+        required: true
+      - path: docker/.env-local
+        required: false
+    environment:
+      <<: *superset-python-env
+      CELERYD_CONCURRENCY: 2
+    restart: unless-stopped
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully
+    user: *superset-user
+    volumes: *superset-runtime-volumes
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A superset.tasks.celery_app:app inspect ping -d celery@$$HOSTNAME"]
+
+  superset-worker-beat:
+    build:
+      <<: *common-build
+    command: ["/app/docker/docker-bootstrap.sh", "beat"]
+    env_file:
+      - path: docker/.env
+        required: true
+      - path: docker/.env-local
+        required: false
+    restart: unless-stopped
+    depends_on:
+      - superset-worker
+    user: *superset-user
+    environment:
+      <<: *superset-python-env
+    volumes: *superset-runtime-volumes
+    healthcheck:
+      disable: true
+
+volumes:
+  superset_home:
+    external: false
+  db_home:
+    external: false
+  redis:
+    external: false
+  superset_data:
+    external: false

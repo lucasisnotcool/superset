@@ -27,7 +27,10 @@ $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Split-Path -Parent $ScriptDir
-$ComposeFiles = @("-f", "docker-compose.yml", "-f", "docker-compose.ai-agent.yml")
+$ComposeFiles = @(
+    "-f", "docker-compose.no-bind.yml",
+    "-f", "docker-compose.ai-agent.yml"
+)
 $AiAgentEnvFile = Join-Path $RepoRoot "superset_ai_agent/.env"
 $ProjectName = [regex]::Replace((Split-Path -Leaf $RepoRoot).ToLowerInvariant(), "[^a-z0-9]+", "-").Trim("-")
 
@@ -272,6 +275,7 @@ function Show-ConnectionInfo {
     Write-Host "   Site:     http://localhost:$env:NGINX_HOST_PORT"
     Write-Host "   AI proxy: http://localhost:$env:NGINX_HOST_PORT/ai-agent"
     Write-Host "   Internal services are reachable only on the Docker network."
+    Write-Host "   Docker mode: packaged images, no host bind mounts."
     if ($env:SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION) {
         Write-Host "   Python compat: cryptography==$env:SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION"
     }
