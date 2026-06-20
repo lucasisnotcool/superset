@@ -45,9 +45,12 @@ into `./docker/pythonpath_dev/superset_config_docker.py` (git-ignored) and fill 
 
 #### WebSocket Configuration
 
-To customize the WebSocket server configuration, create `./docker/superset-websocket/config.json` (git-ignored) based on [`./docker/superset-websocket/config.example.json`](./superset-websocket/config.example.json).
+The Docker Compose stack configures the WebSocket server through the
+`superset-websocket.environment` entries in [`../docker-compose.yml`](../docker-compose.yml).
+It does not mount a host-side `config.json`.
 
-Then update the `superset-websocket`.`volumes` config to mount it.
+For local WebSocket changes, use a `docker-compose-override.yml` file and
+override the `superset-websocket.environment` values there.
 
 #### Docker Compose Overrides
 
@@ -68,7 +71,11 @@ Steps:
 
 ## Initializing Database
 
-The database will initialize itself upon startup via the init container ([`superset-init`](./docker-init.sh)). This may take a minute.
+The database will initialize itself upon startup via the init container
+([`superset-init`](./docker-init.sh)). The Postgres image used by the compose
+files includes the scripts from [`./docker-entrypoint-initdb.d`](./docker-entrypoint-initdb.d),
+so compose does not need to bind-mount those scripts from the host. This may
+take a minute.
 
 ## Normal Operation
 

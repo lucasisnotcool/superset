@@ -71,19 +71,12 @@ services:
         required: true
       - path: docker/.env-local # optional override
         required: false
-    image: nginx:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.nginx
     restart: unless-stopped
     ports:
       - "${NGINX_HOST_PORT:-8090}:80"
-    volumes:
-      - type: bind
-        source: ./docker/nginx/nginx.conf
-        target: /etc/nginx/nginx.conf
-        read_only: true
-      - type: bind
-        source: ./docker/nginx/templates
-        target: /etc/nginx/templates
-        read_only: true
     # Wait for the webpack dev server's manifest.json to be served before
     # starting nginx. This prevents 404s on static assets at startup. By
     # default nginx targets the superset-node service over the Docker network;
@@ -124,15 +117,14 @@ services:
         required: true
       - path: docker/.env-local # optional override
         required: false
-    image: postgres:17
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.postgres
     restart: unless-stopped
     volumes:
       - type: volume
         source: db_home
         target: /var/lib/postgresql/data
-      - type: bind
-        source: ./docker/docker-entrypoint-initdb.d
-        target: /docker-entrypoint-initdb.d
 
   superset:
     env_file:
@@ -160,36 +152,14 @@ services:
       - "host.docker.internal:host-gateway"
     depends_on:
       - redis
-    # Mount everything in superset-websocket into container and
-    # then exclude node_modules and dist with bogus volume mount.
-    # This is necessary because host and container need to have
-    # their own, separate versions of these files. .dockerignore
-    # does not seem to work when starting the service through
-    # docker compose.
-    #
-    # For example, node_modules may contain libs with native bindings.
-    # Those bindings need to be compiled for each OS and the container
-    # OS is not necessarily the same as host OS.
-    volumes:
-      - type: bind
-        source: ./superset-websocket
-        target: /home/superset-websocket
-      - type: volume
-        target: /home/superset-websocket/node_modules
-      - type: volume
-        target: /home/superset-websocket/dist
-
-      # Mount config file. Create your own docker/superset-websocket/config.json
-      # for custom settings, then point to it here. Do not use this example in production.
-      - type: bind
-        source: ./docker/superset-websocket/config.example.json
-        target: /home/superset-websocket/config.json
-        read_only: true
     environment:
       - PORT=8080
+      - LOG_LEVEL=info
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - REDIS_SSL=false
+      - JWT_SECRET=CHANGE-ME-IN-PRODUCTION-GOTTA-BE-LONG-AND-SECRET
+      - JWT_COOKIE_NAME=async-token
 
   superset-init:
     build:

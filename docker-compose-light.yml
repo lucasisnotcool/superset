@@ -95,15 +95,14 @@ services:
         required: true
       - path: docker/.env-local # optional override
         required: false
-    image: postgres:17
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.postgres
     restart: unless-stopped
     volumes:
       - type: volume
         source: db_home_light
         target: /var/lib/postgresql/data
-      - type: bind
-        source: ./docker/docker-entrypoint-initdb.d
-        target: /docker-entrypoint-initdb.d
     environment:
       POSTGRES_DB: superset_light
     command: postgres -c max_connections=200

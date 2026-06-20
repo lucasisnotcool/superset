@@ -291,18 +291,9 @@ See `superset/config.py` for complete configuration options.
 
 ### WebSocket config for GAQ with Docker
 
-[35896](https://github.com/apache/superset/pull/35896) and [37624](https://github.com/apache/superset/pull/37624) updated documentation on how to run and configure Superset with Docker. Specifically for the WebSocket configuration, a new `docker/superset-websocket/config.example.json` was added to the repo, so that users could copy it to create a `docker/superset-websocket/config.json` file. The existing `docker/superset-websocket/config.json` was removed and git-ignored, so if you're using GAQ / WebSocket make sure to:
-- Stash/backup your existing `config.json` file, to re-apply it after (will get git-ignored going forward)
-- Update the `volumes` configuration for the `superset-websocket` service in your `docker-compose.override.yml` file, to include the `docker/superset-websocket/config.json` file. For example:
-``` yaml
-services:
-  superset-websocket:
-    volumes:
-      - ./superset-websocket:/home/superset-websocket
-      - /home/superset-websocket/node_modules
-      - /home/superset-websocket/dist
-      - ./docker/superset-websocket/config.json:/home/superset-websocket/config.json:ro
-```
+[35896](https://github.com/apache/superset/pull/35896) and [37624](https://github.com/apache/superset/pull/37624) updated documentation on how to run and configure Superset with Docker. The Docker Compose stack configures the WebSocket service through `superset-websocket.environment` in `docker-compose.yml`.
+
+If you're using GAQ / WebSocket with a local compose override, migrate custom values from any host-side `config.json` mount into `superset-websocket.environment` values in `docker-compose.override.yml`. The development compose stack does not require a WebSocket config bind mount.
 
 ### Example Data Loading Improvements
 
