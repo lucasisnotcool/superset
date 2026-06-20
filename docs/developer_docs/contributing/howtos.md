@@ -196,15 +196,11 @@ npm run playwright:report
 
 #### Cypress (DEPRECATED - will be removed)
 
-Cypress is being phased out in favor of Playwright but is still available:
+Cypress is being phased out in favor of Playwright but is still available.
+It defaults to `http://localhost:8092` in
+`superset-frontend/cypress-base/cypress.config.ts`.
 
 ```bash
-# Set base URL for Cypress
-export CYPRESS_BASE_URL='http://localhost:8088'
-export CYPRESS_DATABASE=test
-export CYPRESS_USERNAME=admin
-export CYPRESS_PASSWORD=admin
-
 # Navigate to Cypress directory
 cd superset-frontend/cypress-base
 
@@ -550,7 +546,7 @@ docker compose up
 
 **Backend**: Use Flask debug mode:
 ```bash
-FLASK_ENV=development superset run -p 8088 --with-threads --reload
+superset run -p 8091 --with-threads --reload
 ```
 
 ### Performance Profiling
@@ -583,7 +579,7 @@ superset db downgrade
 Add to your shell profile:
 
 ```bash
-alias sdev='FLASK_ENV=development superset run -p 8088 --with-threads --reload'
+alias sdev='superset run -p 8091 --with-threads --reload'
 alias stest='pytest tests/unit_tests'
 alias slint='pre-commit run --all-files'
 alias sfront='cd superset-frontend && npm run dev-server'
@@ -627,7 +623,7 @@ superset init
 
 ```bash
 # Find process using port
-lsof -i :8088
+lsof -i :8091
 # Kill process
 kill -9 [PID]
 ```

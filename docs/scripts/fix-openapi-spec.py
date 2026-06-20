@@ -334,7 +334,7 @@ def generate_code_sample(
     samples = []
 
     # cURL sample
-    curl_cmd = f'curl -X {method.upper()} "http://localhost:8088{example_path}"'
+    curl_cmd = f'curl -X {method.upper()} "http://localhost:8091{example_path}"'
     curl_cmd += ' \\\n  -H "Authorization: Bearer $ACCESS_TOKEN"'
     if has_body:
         curl_cmd += ' \\\n  -H "Content-Type: application/json"'
@@ -353,7 +353,7 @@ def generate_code_sample(
         python_code = f"""import requests
 
 response = requests.get(
-    "http://localhost:8088{example_path}",
+    "http://localhost:8091{example_path}",
     headers={{"Authorization": "Bearer " + access_token}}
 )
 print(response.json())"""
@@ -361,7 +361,7 @@ print(response.json())"""
         python_code = f"""import requests
 
 response = requests.post(
-    "http://localhost:8088{example_path}",
+    "http://localhost:8091{example_path}",
     headers={{"Authorization": "Bearer " + access_token}},
     json={{"key": "value"}}
 )
@@ -370,7 +370,7 @@ print(response.json())"""
         python_code = f"""import requests
 
 response = requests.put(
-    "http://localhost:8088{example_path}",
+    "http://localhost:8091{example_path}",
     headers={{"Authorization": "Bearer " + access_token}},
     json={{"key": "value"}}
 )
@@ -379,7 +379,7 @@ print(response.json())"""
         python_code = f"""import requests
 
 response = requests.delete(
-    "http://localhost:8088{example_path}",
+    "http://localhost:8091{example_path}",
     headers={{"Authorization": "Bearer " + access_token}}
 )
 print(response.status_code)"""
@@ -387,7 +387,7 @@ print(response.status_code)"""
         python_code = f"""import requests
 
 response = requests.{method.lower()}(
-    "http://localhost:8088{example_path}",
+    "http://localhost:8091{example_path}",
     headers={{"Authorization": "Bearer " + access_token}}
 )
 print(response.json())"""
@@ -403,7 +403,7 @@ print(response.json())"""
     # JavaScript sample
     if method.lower() == "get":
         js_code = f"""const response = await fetch(
-  "http://localhost:8088{example_path}",
+  "http://localhost:8091{example_path}",
   {{
     headers: {{
       "Authorization": `Bearer ${{accessToken}}`
@@ -414,7 +414,7 @@ const data = await response.json();
 console.log(data);"""
     elif method.lower() in ["post", "put", "patch"]:
         js_code = f"""const response = await fetch(
-  "http://localhost:8088{example_path}",
+  "http://localhost:8091{example_path}",
   {{
     method: "{method.upper()}",
     headers: {{
@@ -428,7 +428,7 @@ const data = await response.json();
 console.log(data);"""
     else:
         js_code = f"""const response = await fetch(
-  "http://localhost:8088{example_path}",
+  "http://localhost:8091{example_path}",
   {{
     method: "{method.upper()}",
     headers: {{
@@ -477,7 +477,7 @@ def configure_servers(spec: dict[str, Any]) -> bool:
     """Configure server URLs with variables for flexible API testing."""
     new_servers = [
         {
-            "url": "http://localhost:8088",
+            "url": "http://localhost:8091",
             "description": "Local development server",
         },
         {

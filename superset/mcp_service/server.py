@@ -835,7 +835,7 @@ def _build_starlette_middleware(
 
 def run_server(
     host: str = "127.0.0.1",
-    port: int = 5008,
+    port: int = 8098,
     debug: bool = False,
     use_factory_config: bool = False,
     event_store_config: dict[str, Any] | None = None,

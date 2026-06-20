@@ -70,7 +70,7 @@ const isDebug = args.includes('--debug') || process.env.MCP_DEBUG === '1';
 const showHelp = args.includes('--help') || args.includes('-h');
 
 // Configuration
-const DEFAULT_PORT = process.env.MCP_PORT || '5008';
+const DEFAULT_PORT = process.env.MCP_PORT || '8098';
 const DEFAULT_HOST = process.env.MCP_HOST || '127.0.0.1';
 
 // Show help

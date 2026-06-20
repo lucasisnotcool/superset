@@ -71,7 +71,7 @@ Note that:
   [docker-compose.yml](https://github.com/apache/superset/blob/master/docker-compose.yml)
 - The local repository is mounted within the services, meaning updating
   the code on the host will be reflected in the docker images
-- Superset is served at localhost:9000/
+- Superset is served at localhost:8092/ through the frontend development server
 - You can login with admin/admin
 
 :::note
@@ -118,9 +118,9 @@ You can enter a `psql` shell (the official Postgres client) by running the follo
 docker compose exec db psql -U superset
 ```
 
-Also note that the database is exposed on port 5432, so you can connect to it using your favorite
+Also note that the database is exposed on host port 8095 by default, so you can connect to it using your favorite
 Postgres client or even SQL Lab itself directly in Superset by creating a new database connection
-to `localhost:5432`.
+to `localhost:8095`.
 
 ### Nuking the postgres database
 
@@ -151,7 +151,7 @@ make up
 
 This automatically:
 - Generates a unique project name from your directory name
-- Finds available ports (incrementing from 8088, 9000, etc. if already in use)
+- Finds available ports starting with the `8090` host port block
 - Displays the assigned URLs before starting
 
 Each clone gets isolated containers and volumes, so you can run them side-by-side without conflicts.
@@ -205,7 +205,7 @@ contributing to Apache Superset more accessible to developers worldwide.
    - Start all required services (PostgreSQL, Redis, etc.)
    - Initialize the database with example data
 
-3. **Access Superset**: Once ready, check the **PORTS** tab in VS Code for port `9001`.
+3. **Access Superset**: Once ready, check the **PORTS** tab in VS Code for port `8092`.
    Click the globe icon to open Superset in your browser.
    - Default credentials: `admin` / `admin`
 
@@ -331,7 +331,7 @@ docker compose up
 
 Validate your environment:
 ```bash
-curl -f http://localhost:8088/health && echo "✅ Superset ready"
+curl -f http://localhost:8091/health && echo "✅ Superset ready"
 ```
 
 ### LLM Session Best Practices
@@ -349,7 +349,7 @@ curl -f http://localhost:8088/health && echo "✅ Superset ready"
 ```bash
 # Frontend development
 cd superset-frontend
-npm run dev          # Development server on http://localhost:9000
+npm run dev-server   # Development server on http://localhost:8092
 npm run test         # Run all tests
 npm run test -- filename.test.tsx  # Run single test file
 npm run lint         # Linting and type checking
@@ -408,7 +408,7 @@ superset load-examples
 # Start the Flask dev web server from inside your virtualenv.
 # Note that your page may not have CSS at this point.
 # See instructions below on how to build the front-end assets.
-superset run -p 8088 --with-threads --reload --debugger --debug
+superset run -p 8091 --with-threads --reload --debugger --debug
 ```
 
 Or you can install it via our Makefile
@@ -432,7 +432,7 @@ $ make pre-commit
 via `.flaskenv`, however, if needed, it should be set to `superset.app:create_app()`**
 
 If you have made changes to the FAB-managed templates, which are not built the same way as the newer, React-powered front-end assets, you need to start the app without the `--with-threads` argument like so:
-`superset run -p 8088 --reload --debugger --debug`
+`superset run -p 8091 --reload --debugger --debug`
 
 #### Dependencies
 
@@ -473,7 +473,7 @@ def FLASK_APP_MUTATOR(app):
 Then make sure you run your WSGI server using the right worker type:
 
 ```bash
-gunicorn "superset.app:create_app()" -k "geventwebsocket.gunicorn.workers.GeventWebSocketWorker" -b 127.0.0.1:8088 --reload
+gunicorn "superset.app:create_app()" -k "geventwebsocket.gunicorn.workers.GeventWebSocketWorker" -b 127.0.0.1:8091 --reload
 ```
 
 ### Frontend
@@ -578,36 +578,36 @@ sudo sysctl -p
 
 #### Webpack dev server
 
-The dev server by default starts at `http://localhost:9000` and proxies the backend requests to `http://localhost:8088`.
+The dev server by default starts at `http://localhost:8092` and proxies the backend requests to `http://localhost:8091`.
 
 So a typical development workflow is the following:
 
-1. [run Superset locally](#flask-server) using Flask, on port `8088` — but don't access it directly,<br/>
+1. [run Superset locally](#flask-server) using Flask, on port `8091` — but don't access it directly,<br/>
 
    ```bash
    # Install Superset and dependencies, plus load your virtual environment first, as detailed above.
-   superset run -p 8088 --with-threads --reload --debugger --debug
+   superset run -p 8091 --with-threads --reload --debugger --debug
    ```
 
-2. in parallel, run the Webpack dev server locally on port `9000`,<br/>
+2. in parallel, run the Webpack dev server locally on port `8092`,<br/>
 
    ```bash
    npm run dev-server
    ```
 
-3. access `http://localhost:9000` (the Webpack server, _not_ Flask) in your web browser. This will use the hot-reloading front-end assets from the Webpack development server while redirecting back-end queries to Flask/Superset: your changes on Superset codebase — either front or back-end — will then be reflected live in the browser.
+3. access `http://localhost:8092` (the Webpack server, _not_ Flask) in your web browser. This will use the hot-reloading front-end assets from the Webpack development server while redirecting back-end queries to Flask/Superset: your changes on Superset codebase — either front or back-end — will then be reflected live in the browser.
 
 It's possible to change the Webpack server settings:
 
 ```bash
-# Start the dev server at http://localhost:9000
+# Start the dev server at http://localhost:8092
 npm run dev-server
 
 # Run the dev server on a non-default port
-npm run dev-server -- --port=9001
+npm run dev-server -- --port=8098
 
 # Proxy backend requests to a Flask server running on a non-default port
-npm run dev-server -- --env=--supersetPort=8081
+npm run dev-server -- --env=--supersetPort=8098
 
 # Proxy to a remote backend but serve local assets
 npm run dev-server -- --env=--superset=https://superset-dev.example.com
@@ -841,7 +841,7 @@ For debugging locally using VSCode, you can configure a launch configuration fil
         "FLASK_APP": "superset",
         "SUPERSET_ENV": "development"
       },
-      "args": ["run", "-p 8088", "--with-threads", "--reload", "--debugger"],
+      "args": ["run", "-p 8091", "--with-threads", "--reload", "--debugger"],
       "jinja": true,
       "justMyCode": true
     }
@@ -866,7 +866,7 @@ superset:
 +   cap_add:
 +     - SYS_PTRACE
     ports:
-      - 8088:8088
+      - 8091:8088
 +     - 5678:5678
     user: "root"
     depends_on: *superset-depends-on

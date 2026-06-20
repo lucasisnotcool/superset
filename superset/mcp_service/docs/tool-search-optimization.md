@@ -74,7 +74,7 @@ For Claude Desktop (`claude_desktop_config.json`), add the Superset MCP server w
       "command": "npx",
       "args": ["@superset/mcp-server", "--stdio"],
       "env": {
-        "SUPERSET_URL": "http://localhost:8088",
+        "SUPERSET_URL": "http://localhost:8091",
         "SUPERSET_ACCESS_TOKEN": "your-token"
       },
       "toolConfig": {

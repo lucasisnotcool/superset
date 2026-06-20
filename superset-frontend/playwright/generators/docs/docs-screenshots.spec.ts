@@ -25,7 +25,7 @@
  *
  * Run locally:
  *   cd superset-frontend
- *   PLAYWRIGHT_BASE_URL=http://localhost:8088 PLAYWRIGHT_ADMIN_PASSWORD=admin npm run docs:screenshots
+ *   PLAYWRIGHT_BASE_URL=http://localhost:8092 PLAYWRIGHT_ADMIN_PASSWORD=admin npm run docs:screenshots
  *
  * Or directly:
  *   npx playwright test --config=playwright/generators/playwright.config.ts docs/

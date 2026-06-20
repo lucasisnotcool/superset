@@ -44,9 +44,9 @@ def get_superset_base_url() -> str:
     Get the Superset base URL from configuration.
 
     Returns:
-        Base URL for Superset web server (e.g., "http://localhost:9001")
+        Base URL for Superset web server (e.g., "http://localhost:8092")
     """
-    default_url = "http://localhost:9001"
+    default_url = "http://localhost:8092"
 
     try:
         config = current_app.config
@@ -63,7 +63,7 @@ def get_mcp_service_url() -> str:
 
     In production, the MCP service is typically accessed via the main
     Superset URL with /mcp prefix. In development,
-    it's accessed directly on port 5008.
+    it's accessed directly on port 8098.
 
     Returns:
         Base URL for MCP service endpoints
@@ -87,5 +87,5 @@ def get_mcp_service_url() -> str:
     except Exception as e:
         logger.debug("Config access failed: %s", e)
 
-    # Development fallback - direct access to MCP service on port 5008
-    return "http://localhost:5008"
+    # Development fallback - direct access to MCP service on port 8098
+    return "http://localhost:8098"

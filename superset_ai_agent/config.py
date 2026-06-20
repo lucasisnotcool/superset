@@ -76,8 +76,8 @@ class AgentConfig:
     max_prompt_result_rows: int = 5
     max_agent_sql_iterations: int = 3
     superset_agent_adapter: SupersetAdapterMode = "local"
-    superset_base_url: str = "http://localhost:8088"
-    superset_mcp_url: str = "http://localhost:5008/mcp"
+    superset_base_url: str = "http://localhost:8091"
+    superset_mcp_url: str = "http://localhost:8098/mcp"
     superset_auth_token: str | None = None
     superset_username: str | None = None
     superset_password: str | None = None
@@ -87,10 +87,10 @@ class AgentConfig:
     superset_sql_poll_interval_seconds: float = 0.5
     superset_mcp_auth_token: str | None = None
     cors_allowed_origins: tuple[str, ...] = (
-        "http://localhost:8088",
-        "http://127.0.0.1:8088",
-        "http://localhost:9000",
-        "http://127.0.0.1:9000",
+        "http://localhost:8091",
+        "http://127.0.0.1:8091",
+        "http://localhost:8092",
+        "http://127.0.0.1:8092",
     )
     log_level: str = "INFO"
     suppress_superset_logs: bool = True

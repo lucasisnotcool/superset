@@ -36,15 +36,15 @@ logger = logging.getLogger(__name__)
 # MCP Service Configuration
 # Note: MCP_DEV_USERNAME MUST be configured in superset_config.py
 # There is no default value - the service will fail if not set
-SUPERSET_WEBSERVER_ADDRESS = "http://localhost:9001"
+SUPERSET_WEBSERVER_ADDRESS = "http://localhost:8091"
 
 # WebDriver Configuration for screenshots
-WEBDRIVER_BASEURL = "http://localhost:9001/"
+WEBDRIVER_BASEURL = "http://localhost:8092/"
 WEBDRIVER_BASEURL_USER_FRIENDLY = WEBDRIVER_BASEURL
 
 # MCP Service Host/Port
 MCP_SERVICE_HOST = "localhost"
-MCP_SERVICE_PORT = 5008
+MCP_SERVICE_PORT = 8098
 
 # Bug-report support contact surfaced by the generate_bug_report tool. Each
 # deployment should override this in superset_config.py to point users at the

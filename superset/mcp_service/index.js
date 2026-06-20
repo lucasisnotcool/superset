@@ -31,7 +31,7 @@ class SupersetMCPServer {
         this.options = {
             transport: options.transport || 'http',
             host: options.host || '127.0.0.1',
-            port: options.port || 5008,
+            port: options.port || 8098,
             debug: options.debug || false,
             pythonPath: options.pythonPath || null,
             supersetRoot: options.supersetRoot || null,

@@ -180,7 +180,7 @@ All debugging artifacts are available in the HTML report for easy analysis.
 ## Configuration
 
 - **Config**: `playwright.config.ts` - matches Cypress settings
-- **Base URL**: `http://localhost:8088` (assumes Superset running)
+- **Base URL**: `http://localhost:8092` (assumes Superset running)
 - **Browsers**: Chrome only for Phase 1 (YAGNI)
 - **Retries**: 2 in CI, 0 locally (matches Cypress)
 

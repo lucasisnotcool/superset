@@ -215,7 +215,7 @@ The `tenant_id` claim could be used in future versions to:
 
 **Example Command**:
 ```bash
-superset mcp run --port 5008
+superset mcp run --port 8098
 ```
 
 ### Multi-Process Deployment
@@ -224,7 +224,7 @@ superset mcp run --port 5008
 ```bash
 gunicorn \
   --workers 4 \
-  --bind 0.0.0.0:5008 \
+  --bind 0.0.0.0:8098 \
   --worker-class uvicorn.workers.UvicornWorker \
   superset.mcp_service.server:app
 ```
@@ -250,7 +250,7 @@ gunicorn \
 **Docker**:
 ```dockerfile
 FROM apache/superset:latest
-CMD ["superset", "mcp", "run", "--port", "5008"]
+CMD ["superset", "mcp", "run", "--port", "8098"]
 ```
 
 **Kubernetes Deployment**:
@@ -272,9 +272,9 @@ spec:
       containers:
       - name: mcp
         image: apache/superset:latest
-        command: ["superset", "mcp", "run", "--port", "5008"]
+        command: ["superset", "mcp", "run", "--port", "8098"]
         ports:
-        - containerPort: 5008
+        - containerPort: 8098
         env:
         - name: SUPERSET_CONFIG_PATH
           value: /app/pythonpath/superset_config.py
@@ -438,9 +438,9 @@ finally:
 **Option 1: Nginx Round-Robin**:
 ```nginx
 upstream mcp_backend {
-    server mcp-1:5008;
-    server mcp-2:5008;
-    server mcp-3:5008;
+    server mcp-1:8098;
+    server mcp-2:8098;
+    server mcp-3:8098;
 }
 
 server {
@@ -460,8 +460,8 @@ spec:
   selector:
     app: superset-mcp
   ports:
-  - port: 5008
-    targetPort: 5008
+  - port: 8098
+    targetPort: 8098
   type: ClusterIP
 ```
 
@@ -497,8 +497,8 @@ def health_check() -> HealthCheckResponse:
 ```nginx
 # Nginx example
 upstream mcp_backend {
-    server mcp-1:5008 max_fails=3 fail_timeout=30s;
-    server mcp-2:5008 max_fails=3 fail_timeout=30s;
+    server mcp-1:8098 max_fails=3 fail_timeout=30s;
+    server mcp-2:8098 max_fails=3 fail_timeout=30s;
 }
 ```
 
@@ -507,13 +507,13 @@ upstream mcp_backend {
 livenessProbe:
   httpGet:
     path: /health
-    port: 5008
+    port: 8098
   initialDelaySeconds: 30
   periodSeconds: 10
 readinessProbe:
   httpGet:
     path: /health
-    port: 5008
+    port: 8098
   initialDelaySeconds: 10
   periodSeconds: 5
 ```
@@ -604,9 +604,9 @@ sequenceDiagram
 ```mermaid
 graph TD
     LB[Load Balancer<br/>Nginx/K8s Service]
-    MCP1[MCP Instance 1<br/>port 5008]
-    MCP2[MCP Instance 2<br/>port 5008]
-    MCP3[MCP Instance 3<br/>port 5008]
+    MCP1[MCP Instance 1<br/>port 8098]
+    MCP2[MCP Instance 2<br/>port 8098]
+    MCP3[MCP Instance 3<br/>port 8098]
     DB[(Superset Database<br/>shared connection pool)]
 
     LB --> MCP1

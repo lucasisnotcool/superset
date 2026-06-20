@@ -127,14 +127,14 @@ find_consecutive_port_block() {
 set_consecutive_ports() {
     local base_port=$1
 
-    NGINX_PORT=$base_port
-    SUPERSET_PORT=$((base_port + 1))
-    NODE_PORT=$((base_port + 2))
-    WEBSOCKET_PORT=$((base_port + 3))
-    CYPRESS_PORT=$((base_port + 4))
+    NGINX_HOST_PORT=$base_port
+    SUPERSET_HOST_PORT=$((base_port + 1))
+    NODE_HOST_PORT=$((base_port + 2))
+    WEBSOCKET_HOST_PORT=$((base_port + 3))
+    CYPRESS_HOST_PORT=$((base_port + 4))
     DATABASE_HOST_PORT=$((base_port + 5))
     REDIS_HOST_PORT=$((base_port + 6))
-    AI_AGENT_PORT=$((base_port + 7))
+    AI_AGENT_HOST_PORT=$((base_port + 7))
 }
 
 case "${1:-}" in
@@ -155,18 +155,18 @@ esac
 
 echo "Finding available ports for Superset + AI agent..."
 configure_python_compatibility
-PORT_BASE=$(find_consecutive_port_block 8080 8)
+PORT_BASE=$(find_consecutive_port_block 8090 8)
 set_consecutive_ports "$PORT_BASE"
 
 export COMPOSE_PROJECT_NAME="$PROJECT_NAME"
-export NGINX_PORT
-export SUPERSET_PORT
-export NODE_PORT
-export WEBSOCKET_PORT
-export CYPRESS_PORT
+export NGINX_HOST_PORT
+export SUPERSET_HOST_PORT
+export NODE_HOST_PORT
+export WEBSOCKET_HOST_PORT
+export CYPRESS_HOST_PORT
 export DATABASE_HOST_PORT
 export REDIS_HOST_PORT
-export AI_AGENT_PORT
+export AI_AGENT_HOST_PORT
 export SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION
 
 cd "$REPO_ROOT"
@@ -278,25 +278,25 @@ get_running_port() {
 }
 
 if docker compose "${COMPOSE_FILES[@]}" ps --status running 2>/dev/null | grep -q "$PROJECT_NAME"; then
-    NGINX_PORT=$(get_running_port nginx 80 "$NGINX_PORT")
-    SUPERSET_PORT=$(get_running_port superset 8088 "$SUPERSET_PORT")
-    NODE_PORT=$(get_running_port superset-node 9000 "$NODE_PORT")
-    WEBSOCKET_PORT=$(get_running_port superset-websocket 8080 "$WEBSOCKET_PORT")
+    NGINX_HOST_PORT=$(get_running_port nginx 80 "$NGINX_HOST_PORT")
+    SUPERSET_HOST_PORT=$(get_running_port superset 8088 "$SUPERSET_HOST_PORT")
+    NODE_HOST_PORT=$(get_running_port superset-node 9000 "$NODE_HOST_PORT")
+    WEBSOCKET_HOST_PORT=$(get_running_port superset-websocket 8080 "$WEBSOCKET_HOST_PORT")
     DATABASE_HOST_PORT=$(get_running_port db 5432 "$DATABASE_HOST_PORT")
     REDIS_HOST_PORT=$(get_running_port redis 6379 "$REDIS_HOST_PORT")
-    AI_AGENT_PORT=$(get_running_port superset-ai-agent 5050 "$AI_AGENT_PORT")
+    AI_AGENT_HOST_PORT=$(get_running_port superset-ai-agent 5050 "$AI_AGENT_HOST_PORT")
 fi
 
 print_connection_info() {
     echo ""
     echo "Superset + AI agent ($PROJECT_NAME):"
-    echo "   Dev Server: http://localhost:$NODE_PORT"
-    echo "   Superset:   http://localhost:$SUPERSET_PORT"
-    echo "   Nginx:      http://localhost:$NGINX_PORT"
-    echo "   AI Agent:   http://localhost:$AI_AGENT_PORT"
-    echo "   AI Proxy:   http://localhost:$NODE_PORT/ai-agent"
-    echo "   WebSocket:  localhost:$WEBSOCKET_PORT"
-    echo "   Cypress:    http://localhost:$CYPRESS_PORT"
+    echo "   Dev Server: http://localhost:$NODE_HOST_PORT"
+    echo "   Superset:   http://localhost:$SUPERSET_HOST_PORT"
+    echo "   Nginx:      http://localhost:$NGINX_HOST_PORT"
+    echo "   AI Agent:   http://localhost:$AI_AGENT_HOST_PORT"
+    echo "   AI Proxy:   http://localhost:$NODE_HOST_PORT/ai-agent"
+    echo "   WebSocket:  localhost:$WEBSOCKET_HOST_PORT"
+    echo "   Cypress:    http://localhost:$CYPRESS_HOST_PORT"
     echo "   Database:   localhost:$DATABASE_HOST_PORT"
     echo "   Redis:      localhost:$REDIS_HOST_PORT"
     if [[ -n "$SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION" ]]; then
@@ -314,14 +314,14 @@ case "${1:-}" in
         ;;
     --env)
         echo "export COMPOSE_PROJECT_NAME='$PROJECT_NAME'"
-        echo "export NGINX_PORT=$NGINX_PORT"
-        echo "export SUPERSET_PORT=$SUPERSET_PORT"
-        echo "export NODE_PORT=$NODE_PORT"
-        echo "export WEBSOCKET_PORT=$WEBSOCKET_PORT"
-        echo "export CYPRESS_PORT=$CYPRESS_PORT"
+        echo "export NGINX_HOST_PORT=$NGINX_HOST_PORT"
+        echo "export SUPERSET_HOST_PORT=$SUPERSET_HOST_PORT"
+        echo "export NODE_HOST_PORT=$NODE_HOST_PORT"
+        echo "export WEBSOCKET_HOST_PORT=$WEBSOCKET_HOST_PORT"
+        echo "export CYPRESS_HOST_PORT=$CYPRESS_HOST_PORT"
         echo "export DATABASE_HOST_PORT=$DATABASE_HOST_PORT"
         echo "export REDIS_HOST_PORT=$REDIS_HOST_PORT"
-        echo "export AI_AGENT_PORT=$AI_AGENT_PORT"
+        echo "export AI_AGENT_HOST_PORT=$AI_AGENT_HOST_PORT"
         echo "export SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION='$SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION'"
         exit 0
         ;;

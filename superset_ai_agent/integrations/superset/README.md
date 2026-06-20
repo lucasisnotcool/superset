@@ -11,8 +11,8 @@ MCP transport details directly.
 
 ```bash
 SUPERSET_AGENT_ADAPTER=local|rest|mcp
-SUPERSET_BASE_URL=http://localhost:8088
-SUPERSET_MCP_URL=http://localhost:5008/mcp
+SUPERSET_BASE_URL=http://localhost:8091
+SUPERSET_MCP_URL=http://localhost:8098/mcp
 ```
 
 | Mode | Class | Purpose |
@@ -218,7 +218,7 @@ If SQL Lab returns a results key, the REST adapter polls
 
 ```bash
 SUPERSET_AGENT_ADAPTER=mcp
-SUPERSET_MCP_URL=http://superset-mcp:5008/mcp
+SUPERSET_MCP_URL=http://superset-mcp:8098/mcp
 SUPERSET_MCP_AUTH_TOKEN=...
 ```
 

@@ -57,9 +57,9 @@ docker exec -it superset-superset-light-1 superset db upgrade
 docker exec -it superset-superset-light-1 superset init
 ```
 
-**That's it!** ✨
-- Superset frontend is running at http://localhost:9001 (login: admin/admin)
-- MCP service is running on port 5008
+**That's it!**
+- Superset frontend is running at http://localhost:8092 (login: admin/admin)
+- MCP service is running on port 8098
 - Now configure Claude Desktop (see Step 2 below)
 
 #### What Docker Compose does:
@@ -71,8 +71,13 @@ docker exec -it superset-superset-light-1 superset init
 
 #### Customizing ports:
 ```bash
-# Use different ports if defaults are in use
-NODE_PORT=9002 MCP_PORT=5009 docker-compose -f docker-compose-light.yml --profile mcp up -d
+cp docker/.env-local.example docker/.env-local
+```
+
+Edit `docker/.env-local`, then start Compose with that file:
+
+```bash
+docker compose --env-file docker/.env-local -f docker-compose-light.yml --profile mcp up -d
 ```
 
 ### Option 2: Manual Setup
@@ -113,10 +118,10 @@ WTF_CSRF_TIME_LIMIT = None
 # REQUIRED: Set this to your actual Superset username
 # The service will fail if not configured
 MCP_DEV_USERNAME = 'admin'
-SUPERSET_WEBSERVER_ADDRESS = 'http://localhost:9001'
+SUPERSET_WEBSERVER_ADDRESS = 'http://localhost:8091'
 
 # WebDriver Configuration for screenshots
-WEBDRIVER_BASEURL = 'http://localhost:9001/'
+WEBDRIVER_BASEURL = 'http://localhost:8092/'
 WEBDRIVER_BASEURL_USER_FRIENDLY = WEBDRIVER_BASEURL
 
 EOF
@@ -135,23 +140,23 @@ superset fab create-admin \
   --password admin
 
 # 7. Start Superset (in one terminal)
-superset run -p 9001 --with-threads --reload --debugger
+superset run -p 8091 --with-threads --reload --debugger
 
 # 8. Start frontend (in another terminal)
 cd superset-frontend && npm run dev
 
 # 9. Start MCP service (in another terminal, only if you want MCP features)
 source venv/bin/activate
-superset mcp run --port 5008 --debug
+superset mcp run --port 8098 --debug
 ```
 
-Access Superset at http://localhost:9001 (login: admin/admin)
+Access Superset at http://localhost:8092 (login: admin/admin)
 
 ## 🔌 Step 2: Connect Claude Desktop
 
 ### For Docker Setup
 
-Since the MCP service runs inside Docker on port 5008, you need to connect Claude Desktop to the HTTP endpoint:
+Since the MCP service runs inside Docker on port 8098, you need to connect Claude Desktop to the HTTP endpoint:
 
 Add this to your Claude Desktop config file:
 
@@ -257,7 +262,7 @@ graph TB
     end
 
     subgraph "MCP Service Deployment"
-        MCPApp[MCP Service<br/>FastMCP Server<br/>Port: 5008]
+        MCPApp[MCP Service<br/>FastMCP Server<br/>Port: 8098]
         MCPHPA[HPA<br/>2-3 replicas]
     end
 
@@ -364,10 +369,10 @@ supersetNode:
         - "-c"
         - |
           pip install fastmcp && \
-          superset mcp run --host 0.0.0.0 --port 5008
+          superset mcp run --host 0.0.0.0 --port 8098
       ports:
         - name: mcp
-          containerPort: 5008
+          containerPort: 8098
           protocol: TCP
       env:
         - name: FLASK_APP
@@ -394,13 +399,13 @@ supersetNode:
       livenessProbe:
         httpGet:
           path: /health
-          port: 5008
+          port: 8098
         initialDelaySeconds: 30
         periodSeconds: 15
       readinessProbe:
         httpGet:
           path: /health
-          port: 5008
+          port: 8098
         initialDelaySeconds: 15
         periodSeconds: 10
 
@@ -409,10 +414,10 @@ configOverrides:
   mcp_config: |
     # MCP Service Configuration
     MCP_DEV_USERNAME = 'admin'
-    SUPERSET_WEBSERVER_ADDRESS = 'http://localhost:8088'
+    SUPERSET_WEBSERVER_ADDRESS = 'http://localhost:8091'
 
     # WebDriver for screenshots (adjust based on your setup)
-    WEBDRIVER_BASEURL = 'http://localhost:8088/'
+    WEBDRIVER_BASEURL = 'http://localhost:8092/'
     WEBDRIVER_BASEURL_USER_FRIENDLY = WEBDRIVER_BASEURL
 
 # Secret configuration
@@ -488,10 +493,10 @@ spec:
             - "-c"
             - |
               pip install fastmcp && \
-              superset mcp run --host 0.0.0.0 --port 5008
+              superset mcp run --host 0.0.0.0 --port 8098
           ports:
             - name: mcp
-              containerPort: 5008
+              containerPort: 8098
               protocol: TCP
           env:
             - name: FLASK_APP
@@ -523,7 +528,7 @@ spec:
           livenessProbe:
             httpGet:
               path: /health
-              port: 5008
+              port: 8098
             initialDelaySeconds: 30
             timeoutSeconds: 5
             failureThreshold: 3
@@ -531,7 +536,7 @@ spec:
           readinessProbe:
             httpGet:
               path: /health
-              port: 5008
+              port: 8098
             initialDelaySeconds: 15
             timeoutSeconds: 5
             failureThreshold: 3
@@ -539,7 +544,7 @@ spec:
           startupProbe:
             httpGet:
               path: /health
-              port: 5008
+              port: 8098
             initialDelaySeconds: 10
             timeoutSeconds: 5
             failureThreshold: 30
@@ -559,8 +564,8 @@ metadata:
 spec:
   type: ClusterIP
   ports:
-    - port: 5008
-      targetPort: 5008
+    - port: 8098
+      targetPort: 8098
       protocol: TCP
       name: mcp
   selector:
@@ -636,7 +641,7 @@ spec:
               service:
                 name: superset-mcp
                 port:
-                  number: 5008
+                  number: 8098
           # Route all other requests to Superset
           - path: /
             pathType: Prefix
@@ -675,7 +680,7 @@ kubectl get ingress -n superset
 | `MCP_DEV_USERNAME` | Superset username for MCP authentication | `admin` |
 | `MCP_AUTH_ENABLED` | Enable/disable authentication | `true` |
 | `MCP_JWT_PUBLIC_KEY` | JWT public key for token validation | - |
-| `SUPERSET_WEBSERVER_ADDRESS` | Internal Superset URL | `http://localhost:8088` |
+| `SUPERSET_WEBSERVER_ADDRESS` | Superset URL for local development | `http://localhost:8091` |
 | `WEBDRIVER_BASEURL` | URL for screenshot generation | Same as webserver |
 
 #### superset_config.py Options
@@ -730,7 +735,7 @@ WEBDRIVER_OPTION_ARGS = ['--headless', '--no-sandbox']
                  name: ingress-nginx
          ports:
            - protocol: TCP
-             port: 5008
+             port: 8098
      egress:
        - to:
            - podSelector:
@@ -765,7 +770,7 @@ Add Prometheus annotations for metrics scraping:
 metadata:
   annotations:
     prometheus.io/scrape: "true"
-    prometheus.io/port: "5008"
+    prometheus.io/port: "8098"
     prometheus.io/path: "/metrics"
 ```
 
@@ -781,10 +786,10 @@ kubectl logs -n superset -l app=superset-mcp -f
 
 ```bash
 # Port-forward to test locally
-kubectl port-forward -n superset svc/superset-mcp 5008:5008
+kubectl port-forward -n superset svc/superset-mcp 8098:8098
 
 # Test health endpoint
-curl http://localhost:5008/health
+curl http://localhost:8098/health
 ```
 
 #### Common Issues

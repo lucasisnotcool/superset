@@ -60,11 +60,11 @@ services:
     image: nginx:latest
     restart: unless-stopped
     environment:
-      SUPERSET_HOST_PORT: ${SUPERSET_PORT:-8088}
-      WEBSOCKET_HOST_PORT: ${WEBSOCKET_PORT:-8080}
-      NODE_HOST_PORT: ${NODE_PORT:-9000}
+      SUPERSET_HOST_PORT: ${SUPERSET_HOST_PORT:-8091}
+      WEBSOCKET_HOST_PORT: ${WEBSOCKET_HOST_PORT:-8093}
+      NODE_HOST_PORT: ${NODE_HOST_PORT:-8092}
     ports:
-      - "${NGINX_PORT:-80}:80"
+      - "${NGINX_HOST_PORT:-8090}:80"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -100,7 +100,7 @@ services:
     image: redis:7
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
+      - "127.0.0.1:${REDIS_HOST_PORT:-8096}:6379"
     volumes:
       - redis:/data
 
@@ -113,7 +113,7 @@ services:
     image: postgres:17
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${DATABASE_HOST_PORT:-5432}:5432"
+      - "127.0.0.1:${DATABASE_HOST_PORT:-8095}:5432"
     volumes:
       - db_home:/var/lib/postgresql/data
       - ./docker/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d
@@ -129,9 +129,9 @@ services:
     command: ["/app/docker/docker-bootstrap.sh", "app"]
     restart: unless-stopped
     ports:
-      - ${SUPERSET_PORT:-8088}:8088
+      - ${SUPERSET_HOST_PORT:-8091}:8088
       # When in cypress-mode ->
-      - ${CYPRESS_PORT:-8081}:8081
+      - ${CYPRESS_HOST_PORT:-8094}:8081
     extra_hosts:
       - "host.docker.internal:host-gateway"
     user: *superset-user
@@ -145,7 +145,7 @@ services:
   superset-websocket:
     build: ./superset-websocket
     ports:
-      - ${WEBSOCKET_PORT:-8080}:8080
+      - ${WEBSOCKET_HOST_PORT:-8093}:8080
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -216,7 +216,7 @@ services:
       # Webpack dev server must bind to 0.0.0.0 to be accessible from outside the container
       WEBPACK_DEVSERVER_HOST: "0.0.0.0"
     ports:
-      - "127.0.0.1:${NODE_PORT:-9000}:9000"  # exposing the dynamic webpack dev server
+      - "127.0.0.1:${NODE_HOST_PORT:-8092}:9000"  # exposing the dynamic webpack dev server
     command: ["/app/docker/docker-frontend.sh"]
     env_file:
       - path: docker/.env # default

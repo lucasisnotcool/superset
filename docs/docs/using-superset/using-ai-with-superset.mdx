@@ -160,7 +160,7 @@ Edit your Claude Desktop config file:
 {
   "mcpServers": {
     "superset": {
-      "url": "http://localhost:5008/mcp"
+      "url": "http://localhost:8098/mcp"
     }
   }
 }
@@ -178,7 +178,7 @@ If your admin has enabled JWT authentication, you may need to include a token:
       "args": [
         "-y",
         "mcp-remote@latest",
-        "http://your-superset-host:5008/mcp",
+        "http://your-superset-host:8098/mcp",
         "--header",
         "Authorization: Bearer YOUR_TOKEN"
       ]
@@ -196,7 +196,7 @@ Add to your project's `.mcp.json`:
   "mcpServers": {
     "superset": {
       "type": "url",
-      "url": "http://localhost:5008/mcp"
+      "url": "http://localhost:8098/mcp"
     }
   }
 }
@@ -292,7 +292,7 @@ Ask your admin for the MCP server URL and any authentication tokens you need.
 
 - Confirm the MCP server URL with your admin
 - For Claude Desktop: fully quit the app (not just close the window) and restart after config changes
-- Check that the URL path ends with `/mcp` (e.g., `http://localhost:5008/mcp`)
+- Check that the URL path ends with `/mcp` (e.g., `http://localhost:8098/mcp`)
 
 ### "Permission denied" or missing data
 

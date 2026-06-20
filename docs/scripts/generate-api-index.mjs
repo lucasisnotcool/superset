@@ -184,13 +184,13 @@ Most API endpoints require authentication via JWT tokens.
 
 \`\`\`bash
 # 1. Get a JWT token
-curl -X POST http://localhost:8088/api/v1/security/login \\
+curl -X POST http://localhost:8091/api/v1/security/login \\
   -H "Content-Type: application/json" \\
   -d '{"username": "admin", "password": "admin", "provider": "db"}'
 
 # 2. Use the access_token from the response
 curl -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \\
-  http://localhost:8088/api/v1/dashboard/
+  http://localhost:8091/api/v1/dashboard/
 \`\`\`
 
 #### Security Endpoints

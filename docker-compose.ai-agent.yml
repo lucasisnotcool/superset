@@ -24,7 +24,7 @@ services:
       - path: docker/.env-ai-agent
         required: true
     ports:
-      - "127.0.0.1:${AI_AGENT_PORT:-5050}:5050"
+      - "127.0.0.1:${AI_AGENT_HOST_PORT:-8097}:5050"
     depends_on:
       superset:
         condition: service_started

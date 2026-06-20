@@ -38,14 +38,35 @@ def _mark_objects_closed(value: Any) -> None:
     if not isinstance(value, dict):
         return
 
-    if value.get("type") == "object" or "properties" in value:
-        value["additionalProperties"] = False
+    _close_object_schema(value)
+    _mark_dict_children(value, ("$defs", "definitions", "properties"))
+    _mark_schema_children(
+        value, ("items", "prefixItems", "anyOf", "allOf", "oneOf", "not")
+    )
+    _strip_null_default(value)
 
-    for child_key in ("$defs", "definitions", "properties"):
+
+def _close_object_schema(value: dict[str, Any]) -> None:
+    properties = value.get("properties")
+    if value.get("type") == "object" or isinstance(properties, dict):
+        value["additionalProperties"] = False
+        if isinstance(properties, dict):
+            value["required"] = list(properties.keys())
+
+
+def _mark_dict_children(value: dict[str, Any], child_keys: tuple[str, ...]) -> None:
+    for child_key in child_keys:
         if child_key in value and isinstance(value[child_key], dict):
             for child in value[child_key].values():
                 _mark_objects_closed(child)
 
-    for child_key in ("items", "prefixItems", "anyOf", "allOf", "oneOf", "not"):
+
+def _mark_schema_children(value: dict[str, Any], child_keys: tuple[str, ...]) -> None:
+    for child_key in child_keys:
         if child_key in value:
             _mark_objects_closed(value[child_key])
+
+
+def _strip_null_default(value: dict[str, Any]) -> None:
+    if value.get("default") is None:
+        value.pop("default", None)

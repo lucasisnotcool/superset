@@ -34,7 +34,7 @@ import { EmbeddedPage } from '../../pages/EmbeddedPage';
  * Superset domain (Flask server) — set by CI or defaults to local dev
  */
 const SUPERSET_DOMAIN = (() => {
-  const url = process.env.PLAYWRIGHT_BASE_URL || 'http://localhost:8088';
+  const url = process.env.PLAYWRIGHT_BASE_URL || 'http://localhost:8092';
   return url.replace(/\/+$/, '');
 })();
 

@@ -39,12 +39,13 @@ SCHEMA = {
         "sql": {"type": "string"},
         "explanation": {"type": "string"},
     },
-    "required": ["sql", "explanation"],
+    "required": ["explanation"],
 }
 
 STRICT_SCHEMA = {
     **SCHEMA,
     "additionalProperties": False,
+    "required": ["sql", "explanation"],
 }
 
 
@@ -181,6 +182,7 @@ def test_openai_compatible_client_posts_chat_completion_payload() -> None:
         assert request.headers["authorization"] == "Bearer test-key"
         assert body["model"] == "custom-model"
         assert body["response_format"]["type"] == "json_schema"
+        assert body["response_format"]["json_schema"]["schema"] == STRICT_SCHEMA
         assert (
             body["response_format"]["json_schema"]["schema"]["additionalProperties"]
             is False
@@ -218,36 +220,63 @@ def test_openai_compatible_client_posts_chat_completion_payload() -> None:
 
 
 def test_strict_json_schema_closes_nested_objects_without_mutating_input() -> None:
-    schema = {
+    schema: dict[str, Any] = {
         "type": "object",
         "properties": {
             "sql": {"type": "string"},
             "metadata": {
                 "type": "object",
-                "properties": {"dialect": {"type": "string"}},
+                "properties": {
+                    "dialect": {"type": "string"},
+                    "catalog": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "default": None,
+                    },
+                },
                 "required": ["dialect"],
             },
             "items": {
                 "type": "array",
                 "items": {
                     "type": "object",
-                    "properties": {"name": {"type": "string"}},
+                    "properties": {
+                        "name": {"type": "string"},
+                        "description": {
+                            "anyOf": [{"type": "string"}, {"type": "null"}],
+                        },
+                    },
                     "required": ["name"],
                 },
             },
         },
-        "required": ["sql", "metadata", "items"],
+        "required": ["sql"],
     }
 
     strict_schema = to_strict_json_schema(schema)
 
     assert strict_schema["additionalProperties"] is False
+    assert strict_schema["required"] == ["sql", "metadata", "items"]
     assert strict_schema["properties"]["metadata"]["additionalProperties"] is False
+    assert strict_schema["properties"]["metadata"]["required"] == [
+        "dialect",
+        "catalog",
+    ]
+    assert (
+        "default"
+        not in strict_schema["properties"]["metadata"]["properties"]["catalog"]
+    )
     assert (
         strict_schema["properties"]["items"]["items"]["additionalProperties"] is False
     )
+    assert strict_schema["properties"]["items"]["items"]["required"] == [
+        "name",
+        "description",
+    ]
     assert "additionalProperties" not in schema
     assert "additionalProperties" not in schema["properties"]["metadata"]
+    assert schema["required"] == ["sql"]
+    assert schema["properties"]["metadata"]["required"] == ["dialect"]
+    assert schema["properties"]["metadata"]["properties"]["catalog"]["default"] is None
 
 
 def test_azure_openai_client_posts_chat_completion_payload() -> None:
@@ -266,6 +295,7 @@ def test_azure_openai_client_posts_chat_completion_payload() -> None:
         assert "authorization" not in request.headers
         assert "model" not in body
         assert body["response_format"]["type"] == "json_schema"
+        assert body["response_format"]["json_schema"]["schema"] == STRICT_SCHEMA
         assert (
             body["response_format"]["json_schema"]["schema"]["additionalProperties"]
             is False

@@ -39,7 +39,7 @@ import { TIMEOUT } from './utils/constants';
 async function globalSetup(config: FullConfig) {
   // Get baseURL with fallback to default
   // FullConfig.use doesn't exist in the type - baseURL is only in projects[0].use
-  const baseURL = config.projects[0]?.use?.baseURL || 'http://localhost:8088';
+  const baseURL = config.projects[0]?.use?.baseURL || 'http://localhost:8092';
 
   // Test credentials - can be overridden via environment variables
   const adminUsername = process.env.PLAYWRIGHT_ADMIN_USERNAME || 'admin';

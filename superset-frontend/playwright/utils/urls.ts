@@ -24,8 +24,8 @@
  * playwright.config.ts normalizes baseURL to always end with '/' to ensure
  * correct URL resolution with APP_PREFIX (e.g., /app/prefix/).
  *
- * Example: baseURL='http://localhost:8088/app/prefix/' + 'tablemodelview/list'
- *        = 'http://localhost:8088/app/prefix/tablemodelview/list'
+ * Example: baseURL='http://localhost:8092/app/prefix/' + 'tablemodelview/list'
+ *        = 'http://localhost:8092/app/prefix/tablemodelview/list'
  */
 export const URL = {
   CHART_ADD: 'chart/add',

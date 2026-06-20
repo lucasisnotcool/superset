@@ -164,7 +164,7 @@ def main() -> None:
         # Run with specified transport
         if transport == "streamable-http":
             host = os.environ.get("FASTMCP_HOST", "127.0.0.1")
-            port = int(os.environ.get("FASTMCP_PORT", "5008"))
+            port = int(os.environ.get("FASTMCP_PORT", "8098"))
             mcp.run(transport=transport, host=host, port=port, stateless_http=True)
         else:
             mcp.run(transport=transport)

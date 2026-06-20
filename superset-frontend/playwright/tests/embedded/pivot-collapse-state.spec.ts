@@ -50,13 +50,16 @@ import {
   getGuestToken,
 } from '../../helpers/api/embedded';
 import { apiPost, apiPut } from '../../helpers/api/requests';
-import { apiPostDashboard, apiDeleteDashboard } from '../../helpers/api/dashboard';
+import {
+  apiPostDashboard,
+  apiDeleteDashboard,
+} from '../../helpers/api/dashboard';
 import { apiDeleteChart } from '../../helpers/api/chart';
 import { EmbeddedPage } from '../../pages/EmbeddedPage';
 import { EMBEDDED } from '../../utils/constants';
 
 const SUPERSET_DOMAIN = (() => {
-  const url = process.env.PLAYWRIGHT_BASE_URL || 'http://localhost:8088';
+  const url = process.env.PLAYWRIGHT_BASE_URL || 'http://localhost:8092';
   return url.replace(/\/+$/, '');
 })();
 const SUPERSET_BASE_URL = SUPERSET_DOMAIN.endsWith('/')

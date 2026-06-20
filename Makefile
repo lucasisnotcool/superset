@@ -91,7 +91,7 @@ js-format:
 	cd superset-frontend; npm run prettier
 
 flask-app:
-	flask run -p 8088 --reload --debugger
+	flask run -p 8091 --reload --debugger
 
 node-app:
 	cd superset-frontend; npm run dev-server
@@ -101,8 +101,7 @@ build-cypress:
 	cd superset-frontend/cypress-base; npm ci
 
 open-cypress:
-	if ! [ $(port) ]; then cd superset-frontend/cypress-base; CYPRESS_BASE_URL=http://localhost:9000 npm run cypress open; fi
-	cd superset-frontend/cypress-base; CYPRESS_BASE_URL=http://localhost:$(port) npm run cypress open
+	if ! [ $(port) ]; then cd superset-frontend/cypress-base; npm run cypress open; else cd superset-frontend/cypress-base; npm run cypress open -- --config baseUrl=http://localhost:$(port); fi
 
 report-celery-worker:
 	celery --app=superset.tasks.celery_app:app worker
@@ -114,7 +113,7 @@ admin-user:
 	superset fab create-admin
 
 ai-agent:
-	uvicorn superset_ai_agent.app:app --reload --port 5050
+	uvicorn superset_ai_agent.app:app --reload --env-file .env.ai-agent --port 8097
 
 ai-agent-test:
 	pytest tests/unit_tests/superset_ai_agent

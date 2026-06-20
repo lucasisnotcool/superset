@@ -116,13 +116,13 @@ MCP_JWT_SECRET = "your-shared-secret-key"
 ```bash
 # Using curl
 curl -H "Authorization: Bearer YOUR_JWT_TOKEN" \
-     http://localhost:5008/list_charts
+     http://localhost:8098/list_charts
 
 # Using MCP client (Claude Desktop)
 {
   "mcpServers": {
     "superset": {
-      "url": "http://localhost:5008",
+      "url": "http://localhost:8098",
       "headers": {
         "Authorization": "Bearer YOUR_JWT_TOKEN"
       }

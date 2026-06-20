@@ -74,8 +74,23 @@ The database will initialize itself upon startup via the init container ([`super
 
 To run the container, simply run: `docker compose up`
 
-After waiting several minutes for Superset initialization to finish, you can open a browser and view [`http://localhost:8088`](http://localhost:8088)
-to start your journey.
+After waiting several minutes for Superset initialization to finish, open
+[`http://localhost:8092`](http://localhost:8092) for the frontend development
+server. The default Docker host port block is:
+
+| Service | Host URL or port | Injected by |
+| --- | --- | --- |
+| Nginx | `http://localhost:8090` | `NGINX_HOST_PORT` |
+| Superset backend | `http://localhost:8091` | `SUPERSET_HOST_PORT` |
+| Frontend dev server | `http://localhost:8092` | `NODE_HOST_PORT` |
+| WebSocket | `localhost:8093` | `WEBSOCKET_HOST_PORT` |
+| Cypress backend | `http://localhost:8094` | `CYPRESS_HOST_PORT` |
+| Database | `localhost:8095` | `DATABASE_HOST_PORT` |
+| Redis | `localhost:8096` | `REDIS_HOST_PORT` |
+| AI agent with `docker-compose.ai-agent.yml` | `http://localhost:8097` | `AI_AGENT_HOST_PORT` |
+
+Container-internal service ports stay at their defaults, such as Superset
+`8088`, webpack `9000`, Postgres `5432`, and Redis `6379`.
 
 ### Running Multiple Instances
 
@@ -87,7 +102,7 @@ make up
 
 This automatically:
 - Generates a unique project name from your directory
-- Finds available ports (incrementing from defaults if in use)
+- Finds available ports starting with the `8090` host port block
 - Displays the assigned URLs before starting
 
 Available commands (run from repo root):

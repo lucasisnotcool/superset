@@ -36,8 +36,9 @@ if [ "$BUILD_SUPERSET_FRONTEND_IN_DOCKER" = "true" ]; then
     npm install
 
     echo "Start webpack dev server"
-    # start the webpack dev server, serving dynamically at http://localhost:9000
-    # it proxies to the backend served at http://localhost:8088
+    # start the webpack dev server, serving dynamically on the container's
+    # internal port 9000. The default host mapping is http://localhost:8092,
+    # and it proxies to Superset through the container network.
     npm run dev-server
 
 else

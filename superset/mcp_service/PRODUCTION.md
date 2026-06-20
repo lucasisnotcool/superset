@@ -497,7 +497,7 @@ MCP_DEV_USERNAME = None  # Disable dev auth
 
 # Service binding
 MCP_SERVICE_HOST = "0.0.0.0"  # Listen on all interfaces
-MCP_SERVICE_PORT = 5008
+MCP_SERVICE_PORT = 8098
 
 # Security settings
 MCP_SESSION_CONFIG = {
@@ -550,7 +550,7 @@ WorkingDirectory=/opt/superset
 Environment="SUPERSET_CONFIG_PATH=/opt/superset/superset_config.py"
 Environment="FLASK_APP=superset"
 
-ExecStart=/opt/superset/venv/bin/superset mcp run --port 5008
+ExecStart=/opt/superset/venv/bin/superset mcp run --port 8098
 
 # Restart policy
 Restart=always
@@ -595,7 +595,7 @@ journalctl -u superset-mcp -f
 ```ini
 # /etc/supervisor/conf.d/superset-mcp.conf
 [program:superset-mcp]
-command=/opt/superset/venv/bin/superset mcp run --port 5008
+command=/opt/superset/venv/bin/superset mcp run --port 8098
 directory=/opt/superset
 user=superset
 autostart=true
@@ -630,10 +630,10 @@ RUN pip install apache-superset[fastmcp]
 COPY superset_config.py /app/pythonpath/
 
 # Expose MCP port
-EXPOSE 5008
+EXPOSE 8098
 
 # Run MCP service
-CMD ["superset", "mcp", "run", "--port", "5008"]
+CMD ["superset", "mcp", "run", "--port", "8098"]
 ```
 
 **Build and Run**:
@@ -645,7 +645,7 @@ docker build -t superset-mcp:latest .
 # Run container
 docker run -d \
   --name superset-mcp \
-  -p 5008:5008 \
+  -p 8098:8098 \
   -v /opt/superset/superset_config.py:/app/pythonpath/superset_config.py:ro \
   -e SUPERSET_CONFIG_PATH=/app/pythonpath/superset_config.py \
   superset-mcp:latest
@@ -679,9 +679,9 @@ spec:
       containers:
       - name: mcp
         image: apache/superset:latest
-        command: ["superset", "mcp", "run", "--port", "5008"]
+        command: ["superset", "mcp", "run", "--port", "8098"]
         ports:
-        - containerPort: 5008
+        - containerPort: 8098
           name: mcp
         env:
         - name: SUPERSET_CONFIG_PATH
@@ -702,13 +702,13 @@ spec:
         livenessProbe:
           httpGet:
             path: /health
-            port: 5008
+            port: 8098
           initialDelaySeconds: 30
           periodSeconds: 10
         readinessProbe:
           httpGet:
             path: /health
-            port: 5008
+            port: 8098
           initialDelaySeconds: 10
           periodSeconds: 5
       volumes:
@@ -724,8 +724,8 @@ spec:
   selector:
     app: superset-mcp
   ports:
-  - port: 5008
-    targetPort: 5008
+  - port: 8098
+    targetPort: 8098
     name: mcp
   type: ClusterIP
 ---
@@ -778,9 +778,9 @@ kubectl logs -l app=superset-mcp -f
 # /etc/nginx/sites-available/mcp.yourcompany.com
 upstream mcp_backend {
     # Health checks
-    server mcp-1:5008 max_fails=3 fail_timeout=30s;
-    server mcp-2:5008 max_fails=3 fail_timeout=30s;
-    server mcp-3:5008 max_fails=3 fail_timeout=30s;
+    server mcp-1:8098 max_fails=3 fail_timeout=30s;
+    server mcp-2:8098 max_fails=3 fail_timeout=30s;
+    server mcp-3:8098 max_fails=3 fail_timeout=30s;
 }
 
 # Rate limiting
@@ -877,8 +877,8 @@ systemctl reload nginx
 
     # Proxy configuration
     ProxyPreserveHost On
-    ProxyPass / http://localhost:5008/
-    ProxyPassReverse / http://localhost:5008/
+    ProxyPass / http://localhost:8098/
+    ProxyPassReverse / http://localhost:8098/
 
     # Timeouts
     ProxyTimeout 60
@@ -926,7 +926,7 @@ scrape_configs:
   - job_name: 'superset-mcp'
     scrape_interval: 15s
     static_configs:
-      - targets: ['mcp-1:5008', 'mcp-2:5008', 'mcp-3:5008']
+      - targets: ['mcp-1:8098', 'mcp-2:8098', 'mcp-3:8098']
     metrics_path: /metrics
 ```
 
@@ -1240,7 +1240,7 @@ journalctl -u superset-mcp -n 100
 **Solution**:
 - Verify all required config keys present
 - Test database connection: `superset db upgrade`
-- Check port availability: `netstat -tuln | grep 5008`
+- Check port availability: `netstat -tuln | grep 8098`
 
 ---
 

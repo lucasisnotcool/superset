@@ -64,7 +64,7 @@ const {
 } = parsedArgs;
 
 // Precedence: CLI args > env vars > defaults
-const devserverPort = cliPort || process.env.WEBPACK_DEVSERVER_PORT || 9000;
+const devserverPort = cliPort || process.env.WEBPACK_DEVSERVER_PORT || 8092;
 const devserverHost =
   cliHost || process.env.WEBPACK_DEVSERVER_HOST || '127.0.0.1';
 
@@ -705,7 +705,7 @@ if (isDevMode) {
     proxy: [
       {
         context: ['/ai-agent'],
-        target: process.env.SUPERSET_AI_AGENT_PROXY || 'http://127.0.0.1:5050',
+        target: process.env.SUPERSET_AI_AGENT_PROXY || 'http://127.0.0.1:8097',
         changeOrigin: true,
         pathRewrite: { '^/ai-agent': '' },
       },

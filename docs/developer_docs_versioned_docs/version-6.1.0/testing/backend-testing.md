@@ -118,7 +118,7 @@ SMTP_PASSWORD = ""
 SMTP_MAIL_FROM = "superset@localhost"
 
 # Must match where your frontend is running
-WEBDRIVER_BASEURL = "http://localhost:9000/"
+WEBDRIVER_BASEURL = "http://localhost:8092/"
 
 ALERT_REPORTS_EXECUTE_AS = [ExecutorType.OWNER]
 

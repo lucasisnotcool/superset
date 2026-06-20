@@ -609,7 +609,7 @@ Ensure you have Python 3.9+ and Node.js 16+ installed before proceeding.
    ```
 
 :::tip Success Check
-Navigate to http://localhost:8088 and login with admin/admin
+Navigate to http://localhost:8091 and login with admin/admin
 :::
 ```
 
@@ -628,7 +628,7 @@ Returns a list of charts.
 
 **Example Request:**
 ```bash
-curl -X GET "http://localhost:8088/api/v1/chart/" \
+curl -X GET "http://localhost:8091/api/v1/chart/" \
   -H "Authorization: Bearer YOUR_ACCESS_TOKEN"
 ```
 

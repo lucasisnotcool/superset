@@ -25,7 +25,7 @@ time superset load_test_users
 time superset load_examples --load-test-data
 time superset init
 echo "[completed python build steps]"
-PORT='8081'
+PORT='8094'
 flask run -p $PORT --with-threads --reload --debugger &
 
 #block on the longer running javascript process
@@ -36,11 +36,11 @@ echo "[completed js build steps]"
 #setup cypress
 cd cypress-base
 time npm ci
-export CYPRESS_BASE_URL="http://localhost:${PORT}"
+CYPRESS_CONFIG="baseUrl=http://localhost:${PORT},video=false"
 if [ -n "$1" ]; then
     CYPRESS_PATH='cypress/e2e/'${1}'/*'
-    time npm run cypress-run-chrome -- --spec "$CYPRESS_PATH" --record false --config video=false || true
+    time npm run cypress-run-chrome -- --spec "$CYPRESS_PATH" --record false --config "$CYPRESS_CONFIG" || true
 else
-    time npm run cypress-run-chrome -- --record false --config video=false || true
+    time npm run cypress-run-chrome -- --record false --config "$CYPRESS_CONFIG" || true
 fi
 kill %1

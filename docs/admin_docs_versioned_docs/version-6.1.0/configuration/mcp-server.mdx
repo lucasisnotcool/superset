@@ -36,7 +36,7 @@ See **[Using AI with Superset](/user-docs/using-superset/using-ai-with-superset)
 
 ```mermaid
 flowchart LR
-    A["AI Client<br/>(Claude, ChatGPT, etc.)"] -- "MCP protocol<br/>(HTTP + JSON-RPC)" --> B["MCP Server<br/>(:5008/mcp)"]
+    A["AI Client<br/>(Claude, ChatGPT, etc.)"] -- "MCP protocol<br/>(HTTP + JSON-RPC)" --> B["MCP Server<br/>(:8098/mcp)"]
     B -- "Superset context<br/>(app, db, RBAC)" --> C["Superset<br/>(:8088)"]
     C --> D[("Database<br/>(Postgres)")]
 ```
@@ -52,13 +52,13 @@ Get the MCP server running locally and connect an AI client in three steps.
 The MCP server runs as a separate process alongside Superset:
 
 ```bash
-superset mcp run --host 127.0.0.1 --port 5008
+superset mcp run --host 127.0.0.1 --port 8098
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--host` | `127.0.0.1` | Host to bind to |
-| `--port` | `5008` | Port to bind to |
+| `--port` | `8098` | Port to bind to |
 | `--debug` | off | Enable debug logging |
 
 The endpoint is available at `http://<host>:<port>/mcp`.
@@ -84,7 +84,7 @@ Point your MCP client at the server. For **Claude Desktop**, edit the config fil
 {
   "mcpServers": {
     "superset": {
-      "url": "http://localhost:5008/mcp"
+      "url": "http://localhost:8098/mcp"
     }
   }
 }
@@ -263,7 +263,7 @@ MCP_AUTH_FACTORY = my_custom_auth_factory
 {
   "mcpServers": {
     "superset": {
-      "url": "http://localhost:5008/mcp"
+      "url": "http://localhost:8098/mcp"
     }
   }
 }
@@ -279,7 +279,7 @@ MCP_AUTH_FACTORY = my_custom_auth_factory
       "args": [
         "-y",
         "mcp-remote@latest",
-        "http://your-superset-host:5008/mcp",
+        "http://your-superset-host:8098/mcp",
         "--header",
         "Authorization: Bearer YOUR_TOKEN"
       ]
@@ -297,7 +297,7 @@ Add to your project's `.mcp.json`:
   "mcpServers": {
     "superset": {
       "type": "url",
-      "url": "http://localhost:5008/mcp"
+      "url": "http://localhost:8098/mcp"
     }
   }
 }
@@ -310,7 +310,7 @@ With authentication:
   "mcpServers": {
     "superset": {
       "type": "url",
-      "url": "http://localhost:5008/mcp",
+      "url": "http://localhost:8098/mcp",
       "headers": {
         "Authorization": "Bearer YOUR_TOKEN"
       }
@@ -349,7 +349,7 @@ ChatGPT MCP connectors require a Pro, Team, Enterprise, or Edu plan.
 Call the MCP server directly with any HTTP client:
 
 ```bash
-curl -X POST http://localhost:5008/mcp \
+curl -X POST http://localhost:8098/mcp \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer YOUR_JWT_TOKEN' \
   -d '{"jsonrpc": "2.0", "method": "tools/list", "id": 1}'
@@ -368,19 +368,19 @@ flowchart TD
     subgraph host["Host / VM"]
         direction TB
         S["Superset<br/>:8088"] --> DB[("Postgres")]
-        M["MCP Server<br/>:5008"] --> DB
+        M["MCP Server<br/>:8098"] --> DB
     end
     C["AI Client"] -- "HTTPS" --> P["Reverse Proxy<br/>(Nginx / Caddy)"]
     U["Browser"] -- "HTTPS" --> P
     P -- ":8088" --> S
-    P -- ":5008/mcp" --> M
+    P -- ":8098/mcp" --> M
 ```
 
 **superset_config.py:**
 
 ```python
 MCP_SERVICE_HOST = "0.0.0.0"
-MCP_SERVICE_PORT = 5008
+MCP_SERVICE_PORT = 8098
 MCP_DEV_USERNAME = "admin"  # or enable JWT auth
 
 # If behind a reverse proxy, set the public-facing URL so
@@ -392,10 +392,10 @@ MCP_SERVICE_URL = "https://superset.example.com"
 
 ```bash
 # Terminal 1 -- Superset web server
-superset run -h 0.0.0.0 -p 8088
+superset run -h 0.0.0.0 -p 8091
 
 # Terminal 2 -- MCP server
-superset mcp run --host 0.0.0.0 --port 5008
+superset mcp run --host 0.0.0.0 --port 8098
 ```
 
 **Nginx reverse proxy with TLS:**
@@ -410,14 +410,14 @@ server {
 
     # Superset web UI
     location / {
-        proxy_pass http://127.0.0.1:8088;
+        proxy_pass http://127.0.0.1:8091;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
     }
 
     # MCP endpoint
     location /mcp {
-        proxy_pass http://127.0.0.1:5008/mcp;
+        proxy_pass http://127.0.0.1:8098/mcp;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header Authorization $http_authorization;
@@ -443,9 +443,9 @@ services:
 
   mcp:
     image: apache/superset:latest
-    command: ["superset", "mcp", "run", "--host", "0.0.0.0", "--port", "5008"]
+    command: ["superset", "mcp", "run", "--host", "0.0.0.0", "--port", "8098"]
     ports:
-      - "5008:5008"
+      - "8098:8098"
     volumes:
       - ./superset_config.py:/app/superset_config.py
     environment:
@@ -497,7 +497,7 @@ All MCP settings go in `superset_config.py`. Defaults are defined in `superset/m
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `MCP_SERVICE_HOST` | `"localhost"` | Host the MCP server binds to |
-| `MCP_SERVICE_PORT` | `5008` | Port the MCP server binds to |
+| `MCP_SERVICE_PORT` | `8098` | Port the MCP server binds to |
 | `MCP_SERVICE_URL` | `None` | Public base URL for MCP-generated links (set this when behind a reverse proxy) |
 | `MCP_DEBUG` | `False` | Enable debug logging |
 | `MCP_DEV_USERNAME` | -- | Superset username for development mode (no auth) |
@@ -761,7 +761,7 @@ Mutating tools (`generate_chart`, `update_chart`, `execute_sql`, `generate_dashb
 
 - Verify `fastmcp` is installed: `pip install fastmcp`
 - Check that `MCP_DEV_USERNAME` is set if auth is disabled -- the server requires a user identity
-- Confirm the port is not already in use: `lsof -i :5008`
+- Confirm the port is not already in use: `lsof -i :8098`
 
 ### 401 Unauthorized
 
@@ -782,7 +782,7 @@ Mutating tools (`generate_chart`, `update_chart`, `execute_sql`, `generate_dashb
 - Verify the MCP server URL is reachable from the client machine
 - For Claude Desktop: fully quit the app (not just close the window) and restart after config changes
 - For remote access: ensure your firewall and reverse proxy allow traffic to the MCP port
-- Confirm the URL path ends with `/mcp` (e.g., `http://localhost:5008/mcp`)
+- Confirm the URL path ends with `/mcp` (e.g., `http://localhost:8098/mcp`)
 
 ### Permission errors on tool calls
 

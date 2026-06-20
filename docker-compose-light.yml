@@ -21,11 +21,11 @@
 #
 # RUNNING SUPERSET:
 # 1. Start services: docker-compose -f docker-compose-light.yml up
-# 2. Access at: http://localhost:9001 (or NODE_PORT if specified)
+# 2. Access at: http://localhost:8092 (or NODE_HOST_PORT if specified)
 #
 # RUNNING MULTIPLE INSTANCES:
 # - Use different project names: docker-compose -p project1 -f docker-compose-light.yml up
-# - Use different NODE_PORT values: NODE_PORT=9002 docker-compose -p project2 -f docker-compose-light.yml up
+# - Use different NODE_HOST_PORT values with docker compose --env-file
 # - Volumes are isolated by project name (e.g., project1_db_home_light, project2_db_home_light)
 # - Database name is intentionally different (superset_light) to prevent accidental cross-connections
 #
@@ -172,7 +172,7 @@ services:
       WEBPACK_DEVSERVER_HOST: "${WEBPACK_DEVSERVER_HOST:-0.0.0.0}"
       WEBPACK_DEVSERVER_PORT: "${WEBPACK_DEVSERVER_PORT:-9000}"
     ports:
-      - "${NODE_PORT:-9001}:9000"  # Parameterized port, accessible on all interfaces
+      - "${NODE_HOST_PORT:-8092}:9000"  # Parameterized host port, accessible on all interfaces
     command: ["/app/docker/docker-frontend.sh"]
     env_file:
       - path: docker/.env # default

@@ -31,7 +31,7 @@ import path from 'path';
 // eslint-disable-next-line import/no-extraneous-dependencies
 import { defineConfig } from '@playwright/test';
 
-const serverURL = process.env.PLAYWRIGHT_BASE_URL || 'http://localhost:8088';
+const serverURL = process.env.PLAYWRIGHT_BASE_URL || 'http://localhost:8092';
 const baseURL = serverURL.endsWith('/') ? serverURL : `${serverURL}/`;
 
 export default defineConfig({

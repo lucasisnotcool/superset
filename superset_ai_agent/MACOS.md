@@ -1,14 +1,29 @@
-# Superset AI Agent POC
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# Superset AI Agent POC on macOS
 
 Standalone Python API for lightweight conversational database assistance and
 text-to-SQL using LangGraph and a pluggable model provider.
 
-This proof of concept is intentionally separate from Superset core. It exposes
-a small API that can be called by a Superset extension, test client, or any
-other agent UI.
-
-This README contains Windows PowerShell instructions. For macOS or other Bash
-workflows, use [MACOS.md](MACOS.md).
+This document contains macOS and Bash instructions. Windows PowerShell
+instructions are in [README.md](README.md).
 
 ## Architecture
 
@@ -28,7 +43,7 @@ For a file-by-file architecture map, runtime diagrams, agent endpoints,
 Superset REST/MCP surfaces, and SQL robustness extension points, see
 `ARCHITECTURE.md`.
 
-## Windows PowerShell Fresh Setup
+## macOS Bash Fresh Setup
 
 Run these commands from the repository root.
 
@@ -39,9 +54,9 @@ provider. Do not configure Ollama in `docker/.env-ai-agent`.
 
 Create the Docker agent env file and edit it:
 
-```powershell
-Copy-Item docker/.env-ai-agent.example docker/.env-ai-agent
-notepad docker/.env-ai-agent
+```bash
+cp docker/.env-ai-agent.example docker/.env-ai-agent
+nano docker/.env-ai-agent
 ```
 
 For an OpenAI-compatible gateway, set these values in
@@ -84,9 +99,9 @@ AZURE_OPENAI_STRUCTURED_OUTPUT=json_schema
 
 Start Superset, the frontend dev server, nginx, and the standalone agent:
 
-```powershell
-.\scripts\docker-compose-ai-up.ps1 -Detached
-.\scripts\docker-compose-ai-up.ps1 ps
+```bash
+./scripts/docker-compose-ai-up.sh -d
+./scripts/docker-compose-ai-up.sh ps
 ```
 
 The helper validates `docker/.env-ai-agent`, finds a consecutive host port
@@ -115,34 +130,28 @@ Windows Docker engines keep the normal pinned dependency set unless
 
 Smoke-test the service:
 
-```powershell
-curl.exe http://localhost:8097/health
-curl.exe http://localhost:8092/ai-agent/health
+```bash
+curl http://localhost:8097/health
+curl http://localhost:8092/ai-agent/health
 ```
 
 If the script printed another block, use the printed frontend and AI agent
 ports:
 
-```powershell
-curl.exe http://localhost:<NODE_HOST_PORT>/ai-agent/health
-curl.exe http://localhost:<AI_AGENT_HOST_PORT>/health
+```bash
+curl http://localhost:<NODE_HOST_PORT>/ai-agent/health
+curl http://localhost:<AI_AGENT_HOST_PORT>/health
 ```
 
-PowerShell helper commands:
+Bash helper commands:
 
-```powershell
-.\scripts\docker-compose-ai-up.ps1 dry-run
-.\scripts\docker-compose-ai-up.ps1 ports
-.\scripts\docker-compose-ai-up.ps1 ps
-.\scripts\docker-compose-ai-up.ps1 logs -Follow -Service superset-ai-agent
-.\scripts\docker-compose-ai-up.ps1 restart -Service superset
-.\scripts\docker-compose-ai-up.ps1 down
-```
-
-If Windows blocks script execution, run:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\docker-compose-ai-up.ps1 -Detached
+```bash
+./scripts/docker-compose-ai-up.sh --dry-run
+./scripts/docker-compose-ai-up.sh ports
+./scripts/docker-compose-ai-up.sh ps
+./scripts/docker-compose-ai-up.sh logs -f superset-ai-agent
+./scripts/docker-compose-ai-up.sh restart superset
+./scripts/docker-compose-ai-up.sh down
 ```
 
 ### Native Dev
@@ -152,18 +161,18 @@ for local native development.
 
 Install Python dependencies:
 
-```powershell
-py -3.11 -m venv venv
-.\venv\Scripts\Activate.ps1
+```bash
+python3.11 -m venv venv
+source venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements-ai-agent.txt
 ```
 
 Create the native agent env file and edit it:
 
-```powershell
-Copy-Item superset_ai_agent/.env.example .env.ai-agent
-notepad .env.ai-agent
+```bash
+cp superset_ai_agent/.env.example .env.ai-agent
+nano .env.ai-agent
 ```
 
 Keep the native Superset and frontend URLs aligned with the 809x local port
@@ -176,7 +185,7 @@ AI_AGENT_CORS_ALLOWED_ORIGINS=http://localhost:8091,http://127.0.0.1:8091,http:/
 
 If you are running the Superset backend natively too:
 
-```powershell
+```bash
 python -m pip install -r requirements/development.txt
 python -m pip install -e .
 superset db upgrade
@@ -186,21 +195,18 @@ superset load-examples
 superset run -p 8091 --with-threads --reload --debugger --debug
 ```
 
-If native Superset dependencies fail on Windows, run Superset with Docker and
-run only the AI agent natively.
+Install and start the frontend in a second terminal:
 
-Install and start the frontend in a second PowerShell window:
-
-```powershell
+```bash
 cd superset-frontend
 npm install
 npm run dev-server -- --port=8092 --env=--supersetPort=8091
 ```
 
-Start the AI agent in a third PowerShell window from the repository root:
+Start the AI agent in a third terminal from the repository root:
 
-```powershell
-.\venv\Scripts\Activate.ps1
+```bash
+source venv/bin/activate
 uvicorn superset_ai_agent.app:app --reload --env-file .env.ai-agent --port 8097
 ```
 
@@ -317,35 +323,62 @@ that protocol without changing the graph or UI API.
 
 ## Smoke Test
 
-```powershell
-curl.exe http://localhost:8097/health
-curl.exe http://localhost:8097/models
+```bash
+curl http://localhost:8097/health
+curl http://localhost:8097/models
 ```
 
 Validate SQL without calling the model:
 
-```powershell
-Invoke-RestMethod -Uri http://localhost:8097/agent/validate-sql -Method Post -ContentType "application/json" -Body '{"sql":"select * from birth_names","dialect":"sqlite"}'
+```bash
+curl -s http://localhost:8097/agent/validate-sql \
+  -H 'content-type: application/json' \
+  -d '{"sql": "select * from birth_names", "dialect": "sqlite"}'
 ```
 
 Generate SQL:
 
-```powershell
-Invoke-RestMethod -Uri http://localhost:8097/agent/query -Method Post -ContentType "application/json" -Body '{"question":"Show the top 10 names by total births","database_id":1,"dataset_ids":[16],"execute":false}'
+```bash
+curl -s http://localhost:8097/agent/query \
+  -H 'content-type: application/json' \
+  -d '{
+    "question": "Show the top 10 names by total births",
+    "database_id": 1,
+    "dataset_ids": [16],
+    "execute": false
+  }'
 ```
 
 Execution is off by default. Keep it off while testing prompt quality.
 
 Start a conversation:
 
-```powershell
-Invoke-RestMethod -Uri http://localhost:8097/agent/conversations -Method Post -ContentType "application/json" -Body '{"scope":{"database_id":1,"schema_name":null,"dataset_ids":[16]}}'
+```bash
+curl -s http://localhost:8097/agent/conversations \
+  -H 'content-type: application/json' \
+  -d '{
+    "scope": {
+      "database_id": 1,
+      "schema_name": null,
+      "dataset_ids": [16]
+    }
+  }'
 ```
 
 Send a conversation turn:
 
-```powershell
-Invoke-RestMethod -Uri http://localhost:8097/agent/conversations/<conversation-id>/messages -Method Post -ContentType "application/json" -Body '{"message":"Show the top 10 names by total births","scope":{"database_id":1,"schema_name":null,"dataset_ids":[16]},"execution_mode":"manual"}'
+```bash
+curl -s http://localhost:8097/agent/conversations/<conversation-id>/messages \
+  -H 'content-type: application/json' \
+  -d '{
+    "message": "Show the top 10 names by total births",
+    "scope": {
+      "database_id": 1,
+      "schema_name": null,
+      "dataset_ids": [16]
+    },
+    "execution_mode": "manual"
+  }'
 ```
 
 ## POC Limitations

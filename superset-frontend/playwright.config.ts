@@ -62,10 +62,10 @@ export default defineConfig({
 
   // Global test setup
   use: {
-    // Use environment variable for base URL in CI, default to localhost:8088 for local
+    // Use environment variable for base URL in CI, default to localhost:8092 for local
     // Normalize to always end with '/' to prevent URL resolution issues with APP_PREFIX
     baseURL: (() => {
-      const url = process.env.PLAYWRIGHT_BASE_URL || 'http://localhost:8088';
+      const url = process.env.PLAYWRIGHT_BASE_URL || 'http://localhost:8092';
       return url.endsWith('/') ? url : `${url}/`;
     })(),
 
@@ -164,7 +164,7 @@ export default defineConfig({
     : (() => {
         // Support custom base URL (e.g., http://localhost:9012/app/prefix/)
         const baseUrl =
-          process.env.PLAYWRIGHT_BASE_URL || 'http://localhost:8088';
+          process.env.PLAYWRIGHT_BASE_URL || 'http://localhost:8092';
         // Extract origin (scheme + host + port) for health check
         // Health endpoint is always at /health regardless of app prefix
         const healthUrl = new URL('/health', new URL(baseUrl).origin).href;

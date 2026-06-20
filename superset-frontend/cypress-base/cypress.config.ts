@@ -76,7 +76,7 @@ export default defineConfig({
       // eslint-disable-next-line global-require,import/extensions
       return config;
     },
-    baseUrl: 'http://localhost:8088',
+    baseUrl: 'http://localhost:8092',
     excludeSpecPattern: ['**/_skip.*'],
     experimentalRunAllSpecs: true,
     specPattern: ['cypress/e2e/**/*.{js,jsx,ts,tsx}'],

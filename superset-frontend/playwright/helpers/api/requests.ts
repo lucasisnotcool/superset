@@ -69,7 +69,7 @@ async function withTransientRetry<T>(fn: () => Promise<T>): Promise<T> {
 function getBaseUrl(): string {
   // Use environment variable which includes path prefix if configured
   // Normalize to always end with '/' (matches playwright.config.ts normalization)
-  const url = process.env.PLAYWRIGHT_BASE_URL || 'http://localhost:8088';
+  const url = process.env.PLAYWRIGHT_BASE_URL || 'http://localhost:8092';
   return url.endsWith('/') ? url : `${url}/`;
 }
 

@@ -16,7 +16,7 @@
 # specific language governing permissions and limitations
 # under the License.
 """
-Simple MCP proxy server that connects to FastMCP server on localhost:5008
+Simple MCP proxy server that connects to FastMCP server on localhost:8098
 """
 
 import logging
@@ -57,7 +57,7 @@ def main() -> None:
         logger.info("Starting MCP proxy server...")
 
         # Create a proxy to the remote FastMCP server
-        proxy = FastMCP.as_proxy("http://localhost:5008/mcp/", name="MCP Proxy")
+        proxy = FastMCP.as_proxy("http://localhost:8098/mcp/", name="MCP Proxy")
 
         logger.info("Proxy created successfully, starting...")
 

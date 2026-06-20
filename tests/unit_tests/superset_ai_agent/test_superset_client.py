@@ -202,14 +202,14 @@ def test_rest_adapter_is_wired_as_skeleton() -> None:
     client = SupersetRestClient(
         AgentConfig(
             superset_agent_adapter="rest",
-            superset_base_url="http://localhost:8088/",
+            superset_base_url="http://localhost:8091/",
             superset_username="admin",
             superset_password="admin",  # noqa: S106
         ),
         transport=httpx.MockTransport(handler),
     )
 
-    assert client.base_url == "http://localhost:8088"
+    assert client.base_url == "http://localhost:8091"
     assert client.list_databases()[0].name == "examples"
     assert client.get_database_dialect(1) == "sqlite"
     assert client.list_datasets(database_id=1)[0].table_name == "birth_names"
@@ -325,13 +325,13 @@ def test_mcp_adapter_calls_tools_and_normalizes_results() -> None:
     client = SupersetMcpClient(
         AgentConfig(
             superset_agent_adapter="mcp",
-            superset_mcp_url="http://localhost:5008/mcp",
+            superset_mcp_url="http://localhost:8098/mcp",
             superset_mcp_auth_token="mcp-token",  # noqa: S106
         ),
         transport=httpx.MockTransport(handler),
     )
 
-    assert client.mcp_url == "http://localhost:5008/mcp"
+    assert client.mcp_url == "http://localhost:8098/mcp"
     assert client.get_tool_schema("execute_sql") == {"type": "object"}
     assert client.list_databases()[0].name == "examples"
 
@@ -353,7 +353,7 @@ def test_mcp_adapter_raises_on_tool_error() -> None:
     client = SupersetMcpClient(
         AgentConfig(
             superset_agent_adapter="mcp",
-            superset_mcp_url="http://localhost:5008/mcp",
+            superset_mcp_url="http://localhost:8098/mcp",
         ),
         transport=httpx.MockTransport(handler),
     )
