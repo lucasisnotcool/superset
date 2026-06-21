@@ -126,8 +126,10 @@ All other Docker services are reachable only inside the Compose network. If
 On Windows, the PowerShell helper also includes `docker-compose.no-bind.yml`.
 That overlay avoids host bind mounts, which can be misparsed by some Windows
 Docker/Rancher setups. The Docker smoke stack runs from the code packaged into
-the images; rebuild the stack after changing Superset, frontend, Docker config,
-or AI agent source.
+the images. A Docker-managed `superset_static_assets` volume shares the webpack
+manifest from `superset-node` to the Superset Flask container, so the page can
+render the SPA script tags without host mounts. Rebuild the stack after changing
+Superset, frontend, Docker config, or AI agent source.
 
 On ARM64 Docker engines the helper also applies the Superset Python
 compatibility override needed for the pinned dependency set. x86 Linux and

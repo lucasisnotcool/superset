@@ -161,7 +161,7 @@ store, so tests can replace external services without changing route code.
 | `superset-frontend/src/SqlLab/components/AiAgentPanel/*.test.*` | Frontend tests | Coverage for API URL handling and panel behavior. |
 | `superset-frontend/webpack.config.js` | Dev proxy | Rewrites `/ai-agent/*` to `SUPERSET_AI_AGENT_PROXY` or `http://127.0.0.1:8097`. |
 | `docker-compose.ai-agent.yml` | Compose extension | Adds `superset-ai-agent`, sets SQL Lab frontend env vars, and wires nginx to the agent. |
-| `docker-compose.no-bind.yml` | Compose extension | Used by the Windows PowerShell helper to run the AI smoke stack without host bind mounts. |
+| `docker-compose.no-bind.yml` | Compose extension | Used by the Windows PowerShell helper to run the AI smoke stack without host bind mounts. Shares webpack assets through the `superset_static_assets` named volume. |
 | `docker/nginx/templates/superset.conf.template` | Nginx route | Proxies `/ai-agent/` to `SUPERSET_AI_AGENT_UPSTREAM`. |
 | `docker/Dockerfile.ai-agent` | Agent image | Installs `requirements-ai-agent.txt` and runs the standalone service. |
 | `superset_ai_agent/.env.example` | Agent env template | Shared model provider, Superset adapter, limits, logging, and CORS defaults for native and Docker runs. Docker Compose overrides only container-network topology. |

@@ -144,8 +144,10 @@ Don't forget to reload the page to take the new frontend into account though.
 On Windows environments that cannot run host bind mounts reliably, use the
 Windows PowerShell AI helper. It includes
 [`../docker-compose.no-bind.yml`](../docker-compose.no-bind.yml), which runs the
-stack from code packaged into images instead of mounted from the host. Rebuild
-the stack after local source or Docker config changes.
+stack from code packaged into images instead of mounted from the host. The
+no-bind stack uses a Docker-managed `superset_static_assets` volume so Flask can
+read the webpack manifest written by `superset-node`. Rebuild the stack after
+local source or Docker config changes.
 
 ## Production
 

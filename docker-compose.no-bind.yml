@@ -33,6 +33,12 @@ x-superset-runtime-volumes: &superset-runtime-volumes
   - type: volume
     source: superset_data
     target: /app/data
+  # Flask reads the webpack manifest from this path when rendering SPA pages.
+  # The no-bind stack cannot share it through the host filesystem, so
+  # superset-node writes webpack assets into this Docker-managed volume.
+  - type: volume
+    source: superset_static_assets
+    target: /app/superset/static/assets
 x-common-build: &common-build
   context: .
   target: ${SUPERSET_BUILD_TARGET:-dev}
@@ -184,6 +190,10 @@ services:
         required: true
       - path: docker/.env-local
         required: false
+    volumes:
+      - type: volume
+        source: superset_static_assets
+        target: /app/superset/static/assets
 
   superset-worker:
     build:
@@ -235,4 +245,6 @@ volumes:
   redis:
     external: false
   superset_data:
+    external: false
+  superset_static_assets:
     external: false
