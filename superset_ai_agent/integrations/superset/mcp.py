@@ -149,6 +149,7 @@ class SupersetMcpClient:
         self,
         *,
         database_id: int,
+        schema_name: str | None = None,
         limit: int,
     ) -> Any:
         """Return raw `list_datasets` MCP tool payload for a database."""
@@ -163,6 +164,8 @@ class SupersetMcpClient:
                     "value": database.name,
                 }
             )
+        if schema_name is not None:
+            filters.append({"col": "schema", "opr": "eq", "value": schema_name})
         return self.call_tool(
             "list_datasets",
             {
@@ -215,6 +218,7 @@ class SupersetMcpClient:
         *,
         database_id: int,
         sql: str,
+        catalog_name: str | None = None,
         schema_name: str | None = None,
         limit: int = 1000,
     ) -> Any:
@@ -226,6 +230,7 @@ class SupersetMcpClient:
                 "request": {
                     "database_id": database_id,
                     "sql": sql,
+                    "catalog": catalog_name,
                     "schema": schema_name,
                     "limit": limit,
                     "timeout": 30,
@@ -245,28 +250,44 @@ class SupersetMcpClient:
         self,
         *,
         database_id: int,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
         dataset_ids: list[int] | None = None,
         limit: int = 8,
     ) -> list[DatasetMetadata]:
         """List dataset metadata through MCP."""
 
         if dataset_ids:
-            return [
+            datasets = [
                 _normalize_dataset(_as_dict(self.get_dataset_raw(dataset_id)))
                 for dataset_id in dataset_ids
             ]
-        payload = _as_dict(self.list_datasets_raw(database_id=database_id, limit=limit))
+            return [
+                dataset
+                for dataset in datasets
+                if schema_name is None or dataset.schema_name == schema_name
+            ]
+        payload = _as_dict(
+            self.list_datasets_raw(
+                database_id=database_id,
+                schema_name=schema_name,
+                limit=limit,
+            )
+        )
         datasets = [_normalize_dataset(item) for item in _items(payload, "datasets")]
         return [
             _normalize_dataset(_as_dict(self.get_dataset_raw(dataset.id)))
             for dataset in datasets
             if dataset.id and dataset.database_id in {0, database_id}
+            and (schema_name is None or dataset.schema_name == schema_name)
         ]
 
     def get_agent_context(
         self,
         *,
         database_id: int,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
         dataset_ids: list[int] | None = None,
     ) -> AgentContext:
         """Build compact metadata context from MCP tools."""
@@ -274,6 +295,8 @@ class SupersetMcpClient:
         database = _normalize_database(_as_dict(self.get_database_raw(database_id)))
         datasets = self.list_datasets(
             database_id=database_id,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
             dataset_ids=dataset_ids,
             limit=self.config.max_context_datasets,
         )
@@ -284,6 +307,7 @@ class SupersetMcpClient:
         *,
         database_id: int,
         sql: str,
+        catalog_name: str | None = None,
         schema_name: str | None = None,
         limit: int = 1000,
     ) -> ExecutionResult:
@@ -293,6 +317,7 @@ class SupersetMcpClient:
             self.execute_sql_raw(
                 database_id=database_id,
                 sql=sql,
+                catalog_name=catalog_name,
                 schema_name=schema_name,
                 limit=limit,
             )
@@ -301,7 +326,22 @@ class SupersetMcpClient:
             raise SupersetAdapterError(
                 f"Superset MCP execute_sql failed: {payload.get('error')}"
             )
-        return _normalize_execution_result(payload, adapter="mcp")
+        result = _normalize_execution_result(payload, adapter="mcp")
+        audit = result.audit
+        if audit is None:
+            return result
+        return result.model_copy(
+            update={
+                "audit": audit.model_copy(
+                    update={
+                        "database_id": audit.database_id or database_id,
+                        "catalog_name": audit.catalog_name or catalog_name,
+                        "schema_name": audit.schema_name or schema_name,
+                        "row_limit": audit.row_limit or limit,
+                    }
+                )
+            }
+        )
 
     def get_database_dialect(self, database_id: int) -> str | None:
         """Return database backend from MCP metadata."""

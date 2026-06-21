@@ -343,6 +343,7 @@ const buildConversationScope = (
   datasetIds: number[],
 ): ConversationScope => ({
   database_id: databaseId,
+  catalog_name: queryEditor?.catalog || null,
   schema_name: queryEditor?.schema || null,
   dataset_ids: datasetIds,
   query_editor_id: queryEditor?.id || null,
@@ -682,6 +683,7 @@ const AiAgentPanel = () => {
               : t('Select a database')}
           </Chip>
           {queryEditor?.schema && <Chip>{queryEditor.schema}</Chip>}
+          {queryEditor?.catalog && <Chip>{queryEditor.catalog}</Chip>}
           {parsedDatasetIds.map(datasetId => (
             <Chip key={datasetId}>{t('Dataset %s', datasetId)}</Chip>
           ))}

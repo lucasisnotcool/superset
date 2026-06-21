@@ -56,7 +56,12 @@ def _store() -> SqlAlchemyConversationStore:
 
 
 def _scope(database_id: int = 1) -> ConversationScope:
-    return ConversationScope(database_id=database_id, dataset_ids=[42])
+    return ConversationScope(
+        database_id=database_id,
+        catalog_name="prod",
+        schema_name="pipeline",
+        dataset_ids=[42],
+    )
 
 
 def test_sqlalchemy_conversation_store_round_trips_messages_and_artifacts() -> None:
@@ -108,7 +113,10 @@ def test_sqlalchemy_conversation_store_round_trips_messages_and_artifacts() -> N
     assert saved_artifact.insight_cards[0].title == "Top stage"
     assert saved_artifact.chart_spec is not None
     assert saved_artifact.chart_spec.encoding.x == "stage"
-    assert store.list(owner_id="user-1")[0].last_message == "Closed leads."
+    summary = store.list(owner_id="user-1")[0]
+    assert summary.last_message == "Closed leads."
+    assert summary.catalog_name == "prod"
+    assert summary.schema_name == "pipeline"
 
 
 def test_sqlalchemy_conversation_store_isolates_owners() -> None:

@@ -159,6 +159,7 @@ def _summarize(conversation: Conversation) -> ConversationSummary:
         title=conversation.title,
         owner_id=conversation.owner_id,
         database_id=conversation.scope.database_id,
+        catalog_name=conversation.scope.catalog_name,
         schema_name=conversation.scope.schema_name,
         updated_at=conversation.updated_at,
         last_message=last_message,

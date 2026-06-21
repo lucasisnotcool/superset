@@ -39,6 +39,7 @@ def create_document(
     content_type: str,
     content: bytes,
     scope: ConversationScope,
+    project_id: str | None = None,
     owner_id: str = DEFAULT_OWNER_ID,
     config: AgentConfig,
     store: SemanticLayerStore,
@@ -55,6 +56,7 @@ def create_document(
     )
     checksum = hashlib.sha256(content).hexdigest()
     document = SemanticDocument(
+        project_id=project_id,
         filename=filename,
         content_type=normalized_type,
         size_bytes=len(content),

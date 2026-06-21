@@ -192,6 +192,7 @@ def test_rest_adapter_is_wired_as_skeleton() -> None:
             assert "session=csrf-session" in request.headers["cookie"]
             body = json.loads(request.content)
             assert body["database_id"] == 1
+            assert body["catalog"] == "prod"
             assert body["runAsync"] is False
             return httpx.Response(
                 200,
@@ -234,7 +235,11 @@ def test_rest_adapter_is_wired_as_skeleton() -> None:
     assert context.database.name == "examples"
     assert [column.name for column in context.datasets[0].columns] == ["name", "num"]
 
-    result = client.execute_sql(database_id=1, sql="select 1")
+    result = client.execute_sql(
+        database_id=1,
+        catalog_name="prod",
+        sql="select 1",
+    )
     assert result.columns == ["name", "total_births"]
     assert result.row_count == 1
     assert result.audit is not None
@@ -243,6 +248,7 @@ def test_rest_adapter_is_wired_as_skeleton() -> None:
     assert result.audit.results_key == "result-key"
     assert result.audit.executed_sql == "select 1"
     assert result.audit.database_id == 1
+    assert result.audit.catalog_name == "prod"
     assert requests[0].url.path == "/api/v1/security/login"
 
 
@@ -306,9 +312,15 @@ def test_rest_adapter_fetches_csrf_with_user_session_for_post() -> None:
         request_auth=SupersetRequestAuth(cookie_header="session=user-session"),
     )
 
-    result = client.execute_sql(database_id=1, sql="select 1")
+    result = client.execute_sql(
+        database_id=1,
+        catalog_name="prod",
+        sql="select 1",
+    )
 
     assert result.row_count == 1
+    assert result.audit is not None
+    assert result.audit.catalog_name == "prod"
     assert [request.url.path for request in requests] == [
         "/api/v1/security/csrf_token/",
         "/api/v1/sqllab/execute/",

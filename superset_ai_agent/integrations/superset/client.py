@@ -91,6 +91,8 @@ class SupersetClient(Protocol):
         self,
         *,
         database_id: int,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
         dataset_ids: list[int] | None = None,
         limit: int = 8,
     ) -> list[DatasetMetadata]:
@@ -100,6 +102,8 @@ class SupersetClient(Protocol):
         self,
         *,
         database_id: int,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
         dataset_ids: list[int] | None = None,
     ) -> AgentContext:
         """Build compact metadata context for the agent."""
@@ -109,6 +113,7 @@ class SupersetClient(Protocol):
         *,
         database_id: int,
         sql: str,
+        catalog_name: str | None = None,
         schema_name: str | None = None,
         limit: int = 1000,
     ) -> ExecutionResult:
@@ -163,6 +168,8 @@ class LocalSupersetClient:
         self,
         *,
         database_id: int,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
         dataset_ids: list[int] | None = None,
         limit: int = 8,
     ) -> list[DatasetMetadata]:
@@ -171,6 +178,8 @@ class LocalSupersetClient:
             from superset.connectors.sqla.models import SqlaTable
 
             query = db.session.query(SqlaTable).filter_by(database_id=database_id)
+            if schema_name is not None:
+                query = query.filter_by(schema=schema_name)
             if dataset_ids:
                 query = query.filter(SqlaTable.id.in_(dataset_ids))
             else:
@@ -181,6 +190,8 @@ class LocalSupersetClient:
         self,
         *,
         database_id: int,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
         dataset_ids: list[int] | None = None,
     ) -> AgentContext:
         databases = {database.id: database for database in self.list_databases()}
@@ -190,6 +201,8 @@ class LocalSupersetClient:
 
         datasets = self.list_datasets(
             database_id=database_id,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
             dataset_ids=dataset_ids,
             limit=self.config.max_context_datasets,
         )
@@ -200,6 +213,7 @@ class LocalSupersetClient:
         *,
         database_id: int,
         sql: str,
+        catalog_name: str | None = None,
         schema_name: str | None = None,
         limit: int = 1000,
     ) -> ExecutionResult:
@@ -219,6 +233,7 @@ class LocalSupersetClient:
                     adapter="local",
                     executed_sql=sql,
                     database_id=database_id,
+                    catalog_name=catalog_name,
                     schema_name=schema_name,
                     row_limit=limit,
                     source="local_superset_client",

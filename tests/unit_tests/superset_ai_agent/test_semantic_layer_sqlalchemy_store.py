@@ -47,10 +47,16 @@ def _store() -> SqlAlchemySemanticLayerStore:
 
 
 def test_sqlalchemy_semantic_layer_store_round_trips_state() -> None:
-    scope = ConversationScope(database_id=1, dataset_ids=[42])
+    scope = ConversationScope(
+        database_id=1,
+        catalog_name="prod",
+        schema_name="pipeline",
+        dataset_ids=[42],
+    )
     store = _store()
     document = store.save_document(
         SemanticDocument(
+            project_id="project-1",
             filename="notes.txt",
             content_type="text/plain",
             size_bytes=10,
@@ -74,6 +80,7 @@ def test_sqlalchemy_semantic_layer_store_round_trips_state() -> None:
     document = store.get_document(document.id, owner_id="user-1")
     version = store.save_version(
         SemanticLayerVersion(
+            project_id="project-1",
             scope=scope,
             scope_hash=scope_hash(scope),
             version="v1",
@@ -83,6 +90,7 @@ def test_sqlalchemy_semantic_layer_store_round_trips_state() -> None:
     )
     store.append_event(
         SemanticLayerEvent(
+            project_id="project-1",
             type="review_saved",
             scope=scope,
             document_id=document.id,
@@ -92,8 +100,24 @@ def test_sqlalchemy_semantic_layer_store_round_trips_state() -> None:
     )
 
     assert document.proposed_updates[0].approved is True
+    assert document.project_id == "project-1"
+    assert document.scope.catalog_name == "prod"
     assert store.list_approved_updates(scope, owner_id="user-1")[0].id == update.id
+    assert (
+        store.list_project_approved_updates("project-1", owner_id="user-1")[0].id
+        == update.id
+    )
     assert store.get_latest_version(scope, owner_id="user-1").id == version.id
-    assert store.get_state(scope, owner_id="user-1").document_count == 1
+    latest_version = store.get_latest_version(scope, owner_id="user-1")
+    assert latest_version is not None
+    assert latest_version.project_id == "project-1"
+    state = store.get_state(scope, owner_id="user-1")
+    assert state.document_count == 1
+    assert state.catalog_name == "prod"
+    assert state.project_id == "project-1"
+    assert store.get_project_state("project-1", owner_id="user-1").document_count == 1
     assert store.list_events(scope, owner_id="user-1")[0].type == "review_saved"
+    assert store.list_project_events("project-1", owner_id="user-1")[0].type == (
+        "review_saved"
+    )
     assert store.list_documents(scope, owner_id="user-2") == []

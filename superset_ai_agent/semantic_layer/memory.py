@@ -61,6 +61,18 @@ class InMemorySemanticLayerStore:
             if stored_owner_id == owner_id and scope_matches(document.scope, scope)
         ]
 
+    def list_project_documents(
+        self,
+        project_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> list[SemanticDocument]:
+        return [
+            document.model_copy(deep=True)
+            for stored_owner_id, document in self._documents.values()
+            if stored_owner_id == owner_id and document.project_id == project_id
+        ]
+
     def get_document(
         self,
         document_id: str,
@@ -112,6 +124,21 @@ class InMemorySemanticLayerStore:
             )
         return updates
 
+    def list_project_approved_updates(
+        self,
+        project_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> list[SemanticUpdate]:
+        updates: list[SemanticUpdate] = []
+        for document in self.list_project_documents(project_id, owner_id=owner_id):
+            updates.extend(
+                update.model_copy(deep=True)
+                for update in document.proposed_updates
+                if update.reviewed and update.approved
+            )
+        return updates
+
     def save_version(
         self,
         version: SemanticLayerVersion,
@@ -151,7 +178,9 @@ class InMemorySemanticLayerStore:
             None,
         )
         return SemanticLayerState(
+            project_id=None,
             database_id=scope.database_id,
+            catalog_name=scope.catalog_name,
             schema_name=scope.schema_name,
             dataset_ids=scope.dataset_ids,
             document_count=len(documents),
@@ -169,6 +198,43 @@ class InMemorySemanticLayerStore:
                 latest_version.version if latest_version is not None else None
             ),
             indexing_status=latest_version.status if latest_version else "idle",
+            last_error=last_error,
+        )
+
+    def get_project_state(
+        self,
+        project_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> SemanticLayerState:
+        documents = self.list_project_documents(project_id, owner_id=owner_id)
+        first_scope = documents[0].scope if documents else ConversationScope(
+            database_id=0,
+            dataset_ids=[],
+        )
+        last_error = next(
+            (document.error for document in documents if document.status == "error"),
+            None,
+        )
+        return SemanticLayerState(
+            project_id=project_id,
+            database_id=first_scope.database_id,
+            catalog_name=first_scope.catalog_name,
+            schema_name=first_scope.schema_name,
+            dataset_ids=first_scope.dataset_ids,
+            document_count=len(documents),
+            approved_document_count=len(
+                [
+                    document
+                    for document in documents
+                    if document.status in {"approved", "indexed"}
+                ]
+            ),
+            indexed_document_count=len(
+                [document for document in documents if document.status == "indexed"]
+            ),
+            semantic_layer_version=None,
+            indexing_status="idle",
             last_error=last_error,
         )
 
@@ -190,4 +256,16 @@ class InMemorySemanticLayerStore:
             event.model_copy(deep=True)
             for stored_owner_id, event in self._events
             if stored_owner_id == owner_id and scope_matches(event.scope, scope)
+        ]
+
+    def list_project_events(
+        self,
+        project_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> list[SemanticLayerEvent]:
+        return [
+            event.model_copy(deep=True)
+            for stored_owner_id, event in self._events
+            if stored_owner_id == owner_id and event.project_id == project_id
         ]

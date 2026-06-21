@@ -55,6 +55,14 @@ class SemanticLayerStore(Protocol):
     ) -> list[SemanticDocument]:
         """List documents for a scope."""
 
+    def list_project_documents(
+        self,
+        project_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> list[SemanticDocument]:
+        """List documents for a semantic project."""
+
     def get_document(
         self,
         document_id: str,
@@ -88,6 +96,14 @@ class SemanticLayerStore(Protocol):
     ) -> list[SemanticUpdate]:
         """Return reviewed, approved updates for a scope."""
 
+    def list_project_approved_updates(
+        self,
+        project_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> list[SemanticUpdate]:
+        """Return reviewed, approved updates for a semantic project."""
+
     def save_version(
         self,
         version: SemanticLayerVersion,
@@ -112,6 +128,14 @@ class SemanticLayerStore(Protocol):
     ) -> SemanticLayerState:
         """Return aggregate semantic-layer state for a scope."""
 
+    def get_project_state(
+        self,
+        project_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> SemanticLayerState:
+        """Return aggregate semantic-layer state for a semantic project."""
+
     def append_event(
         self,
         event: SemanticLayerEvent,
@@ -128,12 +152,21 @@ class SemanticLayerStore(Protocol):
     ) -> list[SemanticLayerEvent]:
         """List semantic-layer events for a scope."""
 
+    def list_project_events(
+        self,
+        project_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> list[SemanticLayerEvent]:
+        """List semantic-layer events for a semantic project."""
+
 
 def scope_hash(scope: ConversationScope) -> str:
     """Return a stable hash for a Superset semantic-layer scope."""
 
     payload = {
         "database_id": scope.database_id,
+        "catalog_name": scope.catalog_name,
         "schema_name": scope.schema_name,
         "dataset_ids": sorted(scope.dataset_ids),
     }
@@ -147,6 +180,7 @@ def scope_matches(left: ConversationScope, right: ConversationScope) -> bool:
 
     return (
         left.database_id == right.database_id
+        and left.catalog_name == right.catalog_name
         and left.schema_name == right.schema_name
         and sorted(left.dataset_ids) == sorted(right.dataset_ids)
     )

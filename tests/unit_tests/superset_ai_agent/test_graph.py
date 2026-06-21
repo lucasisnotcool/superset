@@ -34,6 +34,13 @@ from superset_ai_agent.schemas import (
     ExecutionResult,
     WrenContextArtifact,
 )
+from superset_ai_agent.semantic_layer.mdl_files import InMemoryMdlFileStore
+from superset_ai_agent.semantic_layer.projects import InMemorySemanticProjectStore
+from superset_ai_agent.semantic_layer.schemas import (
+    MdlFileCreateRequest,
+    MdlFileUpdateRequest,
+    SemanticProjectResolveRequest,
+)
 
 
 class FakeModelClient:
@@ -93,6 +100,7 @@ class FakeSupersetClient:
         *,
         database_id: int,
         sql: str,
+        catalog_name: str | None = None,
         schema_name: str | None = None,
         limit: int = 1000,
     ) -> ExecutionResult:
@@ -104,12 +112,17 @@ class FakeSupersetClient:
 
 
 class FakeWrenClient:
+    def __init__(self) -> None:
+        self.mdl_paths: list[str | None] = []
+
     def fetch_context(
         self,
         *,
         question: str,
         superset_context: AgentContext,
+        mdl_path: str | None = None,
     ) -> WrenContextArtifact:
+        self.mdl_paths.append(mdl_path)
         return WrenContextArtifact(
             enabled=True,
             available=True,
@@ -123,6 +136,7 @@ class FakeWrenClient:
         question: str,
         sql: str | None,
         context: AgentContext,
+        mdl_path: str | None = None,
     ) -> dict:
         return {
             "available": True,
@@ -168,6 +182,7 @@ def test_graph_generates_valid_sql_without_execution() -> None:
 
 
 def test_graph_records_wren_context_and_dry_plan() -> None:
+    wren_client = FakeWrenClient()
     graph = TextToSqlGraph(
         config=AgentConfig(wren_dry_plan_enabled=True),
         model_client=FakeModelClient(
@@ -175,7 +190,7 @@ def test_graph_records_wren_context_and_dry_plan() -> None:
         ),
         context_provider=FakeContextProvider(),
         superset_client=FakeSupersetClient(),
-        wren_client=FakeWrenClient(),
+        wren_client=wren_client,
     )
 
     response = graph.run(
@@ -195,6 +210,7 @@ def test_graph_records_wren_context_and_dry_plan() -> None:
         "matched_models": ["birth_names"],
         "sql_hash": "test",
     }
+    assert wren_client.mdl_paths == [None]
     assert [event.step for event in response.trace] == [
         "load_context",
         "load_wren_context",
@@ -202,6 +218,60 @@ def test_graph_records_wren_context_and_dry_plan() -> None:
         "dry_plan_with_wren",
         "validate_sql",
     ]
+
+
+def test_graph_materializes_schema_project_for_wren_context(tmp_path) -> None:
+    project_store = InMemorySemanticProjectStore()
+    mdl_store = InMemoryMdlFileStore()
+    project = project_store.resolve(
+        SemanticProjectResolveRequest(
+            database_id=1,
+            database_label="Examples",
+            schema_name="main",
+        ),
+        owner_id="analyst",
+    )
+    file = mdl_store.create(
+        project.id,
+        MdlFileCreateRequest(
+            path="models/birth_names.yaml",
+            content="models:\n  - name: birth_names\n",
+        ),
+        owner_id="analyst",
+    )
+    mdl_store.update(
+        file.id,
+        MdlFileUpdateRequest(status="active"),
+        owner_id="analyst",
+    )
+    wren_client = FakeWrenClient()
+    graph = TextToSqlGraph(
+        config=AgentConfig(agent_storage_dir=str(tmp_path)),
+        model_client=FakeModelClient(
+            "SELECT name, SUM(num) AS total_births FROM birth_names GROUP BY name"
+        ),
+        context_provider=FakeContextProvider(),
+        superset_client=FakeSupersetClient(),
+        wren_client=wren_client,
+        semantic_project_store=project_store,
+        mdl_file_store=mdl_store,
+    )
+
+    response = graph.run(
+        AgentQueryRequest(
+            question="Show total births",
+            database_id=1,
+            schema_name="main",
+        ),
+        owner_id="analyst",
+    )
+
+    assert response.wren_context is not None
+    assert response.wren_context.project_id == project.id
+    assert response.wren_context.materialized_file_count == 1
+    assert response.wren_context.mdl_path is not None
+    assert response.wren_context.mdl_path.endswith("mdl.json")
+    assert wren_client.mdl_paths == [response.wren_context.mdl_path]
 
 
 def test_graph_executes_valid_sql_when_requested() -> None:

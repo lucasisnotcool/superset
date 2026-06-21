@@ -146,20 +146,29 @@ class SupersetRestClient:
         self,
         *,
         database_id: int,
+        schema_name: str | None = None,
         limit: int,
     ) -> dict[str, Any]:
         """Return raw `GET /api/v1/dataset/` payload for a database."""
 
+        filters = (
+            "((col:database,opr:rel_o_m,value:%s))" % database_id
+            if schema_name is None
+            else (
+                "((col:database,opr:rel_o_m,value:%s),"
+                "(col:schema,opr:eq,value:'%s'))"
+            )
+            % (database_id, schema_name.replace("'", "\\'"))
+        )
         return self.request(
             "GET",
             "/api/v1/dataset/",
             params={
                 "q": (
                     "(page:0,page_size:%s,order_column:table_name,"
-                    "order_direction:asc,filters:!((col:database,opr:rel_o_m,"
-                    "value:%s)))"
+                    "order_direction:asc,filters:!%s)"
                 )
-                % (limit, database_id)
+                % (limit, filters)
             },
         )
 
@@ -173,6 +182,7 @@ class SupersetRestClient:
         *,
         database_id: int,
         sql: str,
+        catalog_name: str | None = None,
         schema_name: str | None = None,
         limit: int = 1000,
     ) -> dict[str, Any]:
@@ -181,7 +191,7 @@ class SupersetRestClient:
         payload = {
             "database_id": database_id,
             "sql": sql,
-            "catalog": None,
+            "catalog": catalog_name,
             "schema": schema_name,
             "queryLimit": limit,
             "runAsync": False,
@@ -224,28 +234,40 @@ class SupersetRestClient:
         self,
         *,
         database_id: int,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
         dataset_ids: list[int] | None = None,
         limit: int = 8,
     ) -> list[DatasetMetadata]:
         """List dataset metadata through Superset REST."""
 
         if dataset_ids:
-            return [
+            datasets = [
                 _normalize_dataset(self.get_dataset_raw(dataset_id))
                 for dataset_id in dataset_ids
             ]
-        payload = self.list_datasets_raw(database_id=database_id, limit=limit)
+            return _filter_datasets_by_scope(
+                datasets,
+                schema_name=schema_name,
+            )
+        payload = self.list_datasets_raw(
+            database_id=database_id,
+            schema_name=schema_name,
+            limit=limit,
+        )
         summaries = [_normalize_dataset(item) for item in _items(payload, "datasets")]
         return [
             _normalize_dataset(self.get_dataset_raw(summary.id))
             for summary in summaries
-            if summary.id
+            if summary.id and _dataset_matches_scope(summary, schema_name=schema_name)
         ]
 
     def get_agent_context(
         self,
         *,
         database_id: int,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
         dataset_ids: list[int] | None = None,
     ) -> AgentContext:
         """Build compact metadata context from REST database and dataset payloads."""
@@ -253,6 +275,8 @@ class SupersetRestClient:
         database = _normalize_database(self.get_database_raw(database_id))
         datasets = self.list_datasets(
             database_id=database_id,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
             dataset_ids=dataset_ids,
             limit=self.config.max_context_datasets,
         )
@@ -263,19 +287,28 @@ class SupersetRestClient:
         *,
         database_id: int,
         sql: str,
+        catalog_name: str | None = None,
         schema_name: str | None = None,
         limit: int = 1000,
     ) -> ExecutionResult:
         """Execute SQL through SQL Lab REST and normalize the result."""
 
-        return _normalize_execution_result(
+        result = _normalize_execution_result(
             self.execute_sql_raw(
                 database_id=database_id,
                 sql=sql,
+                catalog_name=catalog_name,
                 schema_name=schema_name,
                 limit=limit,
             ),
             adapter="rest",
+        )
+        return _with_request_audit(
+            result,
+            database_id=database_id,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            limit=limit,
         )
 
     def get_database_dialect(self, database_id: int) -> str | None:
@@ -473,6 +506,26 @@ def _normalize_metric(data: dict[str, Any]) -> MetricSummary:
     )
 
 
+def _filter_datasets_by_scope(
+    datasets: list[DatasetMetadata],
+    *,
+    schema_name: str | None,
+) -> list[DatasetMetadata]:
+    return [
+        dataset
+        for dataset in datasets
+        if _dataset_matches_scope(dataset, schema_name=schema_name)
+    ]
+
+
+def _dataset_matches_scope(
+    dataset: DatasetMetadata,
+    *,
+    schema_name: str | None,
+) -> bool:
+    return schema_name is None or dataset.schema_name == schema_name
+
+
 def _normalize_execution_result(
     payload: dict[str, Any],
     *,
@@ -552,10 +605,34 @@ def _normalize_audit_info(
         results_key=str(results_key) if results_key is not None else None,
         executed_sql=str(executed_sql) if executed_sql is not None else None,
         database_id=database_id,
+        catalog_name=result.get("catalog") or query.get("catalog"),
         schema_name=result.get("schema") or query.get("schema"),
         row_limit=row_limit,
         timeout_seconds=timeout_seconds,
         source="sqllab_rest" if adapter == "rest" else "superset_mcp",
+    )
+
+
+def _with_request_audit(
+    result: ExecutionResult,
+    *,
+    database_id: int,
+    catalog_name: str | None,
+    schema_name: str | None,
+    limit: int,
+) -> ExecutionResult:
+    audit = result.audit or AuditInfo(adapter="rest")
+    return result.model_copy(
+        update={
+            "audit": audit.model_copy(
+                update={
+                    "database_id": audit.database_id or database_id,
+                    "catalog_name": audit.catalog_name or catalog_name,
+                    "schema_name": audit.schema_name or schema_name,
+                    "row_limit": audit.row_limit or limit,
+                }
+            )
+        }
     )
 
 

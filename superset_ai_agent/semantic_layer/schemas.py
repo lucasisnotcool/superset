@@ -84,6 +84,7 @@ class SemanticDocument(BaseModel):
     """Uploaded semantic-layer source document."""
 
     id: str = Field(default_factory=_new_id)
+    project_id: str | None = None
     filename: str
     content_type: str
     size_bytes: int
@@ -113,7 +114,9 @@ class SemanticLayerReviewRequest(BaseModel):
 class SemanticLayerState(BaseModel):
     """Semantic-layer document and indexing state for one Superset scope."""
 
+    project_id: str | None = None
     database_id: int
+    catalog_name: str | None = None
     schema_name: str | None = None
     dataset_ids: list[int] = Field(default_factory=list)
     document_count: int
@@ -128,6 +131,7 @@ class SemanticLayerVersion(BaseModel):
     """Versioned reviewed semantic overlay for a Superset scope."""
 
     id: str = Field(default_factory=_new_id)
+    project_id: str | None = None
     scope: ConversationScope
     scope_hash: str
     version: str
@@ -149,9 +153,127 @@ class SemanticLayerEvent(BaseModel):
     """Semantic-layer event for polling or server-sent events."""
 
     id: str = Field(default_factory=_new_id)
+    project_id: str | None = None
     type: SemanticLayerEventType
     scope: ConversationScope
     document_id: str | None = None
     state: SemanticLayerState | None = None
     message: str
     created_at: datetime = Field(default_factory=_utc_now)
+
+
+SemanticProjectVisibility = Literal["private", "db_access", "custom"]
+SemanticProjectStatus = Literal["active", "archived"]
+SemanticPermission = Literal["read", "write", "admin"]
+MdlFileStatus = Literal["draft", "active", "deleted"]
+MdlFileSourceType = Literal["uploaded_mdl", "manual", "enriched_markdown"]
+MdlContentType = Literal["application/x-yaml", "text/yaml"]
+
+
+class SemanticProject(BaseModel):
+    """Schema-scoped Wren semantic project."""
+
+    id: str = Field(default_factory=_new_id)
+    name: str
+    description: str | None = None
+    owner_id: str
+    database_uri_fingerprint: str
+    database_backend: str | None = None
+    database_label: str | None = None
+    catalog_name: str | None = None
+    schema_name: str
+    schema_display_name: str | None = None
+    default_database_id: int | None = None
+    visibility: SemanticProjectVisibility = "db_access"
+    current_version_id: str | None = None
+    status: SemanticProjectStatus = "active"
+    permission: SemanticPermission = "admin"
+    created_at: datetime = Field(default_factory=_utc_now)
+    updated_at: datetime = Field(default_factory=_utc_now)
+    deleted_at: datetime | None = None
+
+
+class SemanticProjectResolveRequest(BaseModel):
+    """Resolve or create the schema project for a database/catalog/schema."""
+
+    database_id: int
+    database_label: str | None = None
+    database_backend: str | None = None
+    catalog_name: str | None = None
+    schema_name: str
+    supplied_uri: str | None = None
+    create_if_missing: bool = True
+
+
+class MdlValidationMessage(BaseModel):
+    """YAML/MDL validation message for editor annotations."""
+
+    line: int | None = None
+    column: int | None = None
+    severity: Literal["error", "warning", "info"] = "error"
+    message: str
+    code: str | None = None
+
+
+class MdlValidationResult(BaseModel):
+    """Validation result for one MDL YAML file."""
+
+    valid: bool
+    messages: list[MdlValidationMessage] = Field(default_factory=list)
+
+
+class MdlFile(BaseModel):
+    """One YAML file in a schema-scoped Wren MDL project."""
+
+    id: str = Field(default_factory=_new_id)
+    project_id: str
+    path: str
+    filename: str
+    content: str
+    content_type: MdlContentType = "application/x-yaml"
+    source_type: MdlFileSourceType = "manual"
+    status: MdlFileStatus = "draft"
+    validation: MdlValidationResult | None = None
+    checksum: str
+    source_document_id: str | None = None
+    created_by: str | None = None
+    updated_by: str | None = None
+    created_at: datetime = Field(default_factory=_utc_now)
+    updated_at: datetime = Field(default_factory=_utc_now)
+    deleted_at: datetime | None = None
+
+
+class MdlFileCreateRequest(BaseModel):
+    """Create a draft MDL YAML file."""
+
+    path: str
+    content: str
+    source_type: MdlFileSourceType = "manual"
+    source_document_id: str | None = None
+
+
+class MdlFileUpdateRequest(BaseModel):
+    """Update an MDL YAML file."""
+
+    path: str | None = None
+    content: str | None = None
+    status: MdlFileStatus | None = None
+
+
+class MdlEnrichmentProposal(BaseModel):
+    """Proposed MDL generated from a source document."""
+
+    source_document_id: str
+    proposed_path: str
+    proposed_yaml: str
+    validation: MdlValidationResult
+    warnings: list[str] = Field(default_factory=list)
+
+
+class WrenMaterializationResult(BaseModel):
+    """Result of writing active MDL files into a Wren project directory."""
+
+    project_id: str
+    path: str
+    file_count: int
+    checksum: str

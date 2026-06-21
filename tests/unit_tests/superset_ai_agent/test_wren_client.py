@@ -93,6 +93,25 @@ def test_file_wren_client_reports_unavailable_without_mdl() -> None:
     assert context.warnings
 
 
+def test_file_wren_client_uses_per_call_mdl_path(tmp_path) -> None:
+    mdl_path = tmp_path / "project" / "mdl.json"
+    mdl_path.parent.mkdir()
+    mdl_path.write_text(
+        json.dumps({"models": [{"name": "pipeline_moves"}]}),
+        encoding="utf-8",
+    )
+    client = FileWrenClient(AgentConfig(wren_mdl_path="/does/not/exist.json"))
+
+    context = client.fetch_context(
+        question="Show moves",
+        superset_context=_agent_context(),
+        mdl_path=str(mdl_path),
+    )
+
+    assert context.available is True
+    assert context.matched_models == ["pipeline_moves"]
+
+
 def test_wren_factory_rejects_execution_enabled() -> None:
     with pytest.raises(ValueError, match="Wren execution is not supported"):
         create_wren_client(AgentConfig(wren_execution_enabled=True))

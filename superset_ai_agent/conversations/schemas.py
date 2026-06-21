@@ -50,6 +50,7 @@ class ConversationScope(BaseModel):
     """Superset context attached to a conversation turn."""
 
     database_id: int
+    catalog_name: str | None = None
     schema_name: str | None = None
     dataset_ids: list[int] = Field(default_factory=list)
     query_editor_id: str | None = None
@@ -105,6 +106,7 @@ class ConversationSummary(BaseModel):
     title: str
     owner_id: str
     database_id: int
+    catalog_name: str | None = None
     schema_name: str | None = None
     updated_at: datetime
     last_message: str | None = None

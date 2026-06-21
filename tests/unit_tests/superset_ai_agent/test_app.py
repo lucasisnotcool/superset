@@ -49,17 +49,35 @@ class FakeOllamaClient:
 
 
 class RaisingGraph:
-    def run(self, request: AgentQueryRequest) -> AgentQueryResponse:
+    def run(
+        self,
+        request: AgentQueryRequest,
+        *,
+        owner_id: str = "default",
+    ) -> AgentQueryResponse:
+        _ = owner_id
         raise RuntimeError("ollama unavailable")
 
 
 class AuthRaisingGraph:
-    def run(self, request: AgentQueryRequest) -> AgentQueryResponse:
+    def run(
+        self,
+        request: AgentQueryRequest,
+        *,
+        owner_id: str = "default",
+    ) -> AgentQueryResponse:
+        _ = owner_id
         raise SupersetAuthError("Superset session expired.", status_code=401)
 
 
 class StaticGraph:
-    def run(self, request: AgentQueryRequest) -> AgentQueryResponse:
+    def run(
+        self,
+        request: AgentQueryRequest,
+        *,
+        owner_id: str = "default",
+    ) -> AgentQueryResponse:
+        _ = owner_id
         return AgentQueryResponse(
             status="needs_review",
             sql="select 1",

@@ -26,6 +26,23 @@ planning, and reviewed semantic-layer metadata, but SQL execution must continue
 to go through the configured Superset `SupersetClient`. The recommended governed
 execution adapter is the REST SQL Lab adapter.
 
+## Plan Precedence
+
+This document has evolved from the initial conversational analytics plan into a
+schema-scoped semantic-layer product plan. When sections conflict, use this
+precedence:
+
+1. Governance invariants always win.
+2. Sections 14 through 24 are the finalized direction for Wren semantic-layer
+   scoping, persistence, access, and UI.
+3. Earlier scope-based document routes and the existing AI-panel
+   `SemanticLayerDrawer` describe transitional baseline behavior only.
+4. The target UI for semantic-layer CRUD is the SQL Lab
+   `SemanticLayerEditor` tab opened from a database/schema node.
+5. The AI panel remains the conversational analytics and artifact surface; it
+   should show semantic-layer status and an "Open semantic layer" action, not
+   own MDL file CRUD.
+
 ## Confirmed Current Code Facts
 
 The current agent service is implemented in these files:
@@ -113,26 +130,37 @@ The frontend should render:
 - `Data - N rows` toggle and table
 - SQL, validation, trace, and audit collapsibles
 - recommended follow-up buttons
-- semantic-layer status, document upload, review, and indexing state
+- semantic-layer status and an action to open the SQL Lab semantic-layer editor
 
 ## Persistence And Identity Recommendation
 
-The current code intentionally keeps conversation state process-local:
+The initial agent kept conversation state process-local. The current
+implementation has both the original in-memory stores and durable SQLAlchemy
+stores:
 
 - `superset_ai_agent/conversations/store.py::ConversationStore` is a clean
   protocol boundary.
 - `superset_ai_agent/conversations/memory.py::InMemoryConversationStore` is the
-  only implementation.
-- `superset_ai_agent/config.py::ConversationStoreMode` only allows `"memory"`.
-- `superset_ai_agent/app.py::_create_conversation_store` always returns
-  `InMemoryConversationStore`.
-- All FastAPI conversation routes currently pass
-  `superset_ai_agent/conversations/store.py::DEFAULT_OWNER_ID`, which is
-  `"local"`.
+  local/test implementation.
+- `superset_ai_agent/conversations/sqlalchemy_store.py::SqlAlchemyConversationStore`
+  persists conversations, messages, and artifacts.
+- `superset_ai_agent/semantic_layer/memory.py::InMemorySemanticLayerStore` is
+  the local/test semantic-layer implementation.
+- `superset_ai_agent/semantic_layer/sqlalchemy_store.py::SqlAlchemySemanticLayerStore`
+  persists uploaded documents, proposed updates, reviewed updates, semantic
+  versions, and semantic-layer events.
+- `superset_ai_agent/persistence/models.py` defines the agent-owned tables.
+- `superset_ai_agent/app.py::_validate_identity_persistence_config` rejects
+  database-backed stores with static identity unless the explicit development
+  override is set.
+- `superset_ai_agent/auth.py::SupersetSessionIdentityProvider` validates the
+  inbound browser session with Superset `/api/v1/me/` and scopes persisted
+  state by the resolved Superset user.
 
-Persisting conversations or uploaded semantic-layer documents without changing
-identity would create shared state across users. Identity must be added before a
-database-backed store is enabled outside local development.
+Persisting conversations or uploaded semantic-layer documents with the static
+`"local"` identity would create shared state across users. Database-backed
+persistence must use `superset_session` or `signed_header` identity outside
+local development.
 
 Recommended storage model:
 
@@ -163,14 +191,14 @@ Wren retrieval caches.
 Avoid directly piggybacking the standalone agent onto Superset's metadata DB in
 Phase 1 because:
 
-- the AI-agent Docker image currently installs no SQLAlchemy or Alembic
-  dependency;
-- the standalone agent has no configured metadata database URI;
 - direct Superset DB writes would couple the agent to Superset app context,
   migrations, encryption configuration, and model internals;
-- Superset core tables do not solve the current owner identity problem;
+- Superset core tables do not own transient chat transcripts, upload drafts,
+  review queues, or Wren retrieval caches;
 - uploaded document review state has different lifecycle and retention needs
-  from Superset semantic-layer objects.
+  from Superset semantic-layer objects;
+- using Superset's DB as a connection string is acceptable only if the agent
+  owns its own tables and migrations, not if it mutates Superset internals.
 
 Recommended architecture:
 
@@ -400,6 +428,7 @@ class AiAgentConversation(Base):
     owner_id = mapped_column(String(255), index=True, nullable=False)
     title = mapped_column(String(255), nullable=False)
     database_id = mapped_column(Integer, nullable=False)
+    catalog_name = mapped_column(String(255), nullable=True)
     schema_name = mapped_column(String(255), nullable=True)
     scope = mapped_column(JSON, nullable=False)
     created_at = mapped_column(DateTime(timezone=True), nullable=False)
@@ -452,8 +481,10 @@ class AiAgentSemanticDocument(Base):
     __tablename__ = "ai_agent_semantic_documents"
 
     id = mapped_column(String(36), primary_key=True)
+    project_id = mapped_column(String(36), index=True, nullable=True)
     owner_id = mapped_column(String(255), index=True, nullable=False)
     database_id = mapped_column(Integer, nullable=False, index=True)
+    catalog_name = mapped_column(String(255), nullable=True)
     schema_name = mapped_column(String(255), nullable=True)
     dataset_ids = mapped_column(JSON, nullable=False)
     filename = mapped_column(String(512), nullable=False)
@@ -475,6 +506,7 @@ class AiAgentSemanticUpdate(Base):
     __tablename__ = "ai_agent_semantic_updates"
 
     id = mapped_column(String(36), primary_key=True)
+    project_id = mapped_column(String(36), index=True, nullable=True)
     document_id = mapped_column(
         String(36),
         ForeignKey("ai_agent_semantic_documents.id", ondelete="CASCADE"),
@@ -502,8 +534,10 @@ class AiAgentSemanticLayerVersion(Base):
     __tablename__ = "ai_agent_semantic_layer_versions"
 
     id = mapped_column(String(36), primary_key=True)
+    project_id = mapped_column(String(36), index=True, nullable=True)
     owner_id = mapped_column(String(255), index=True, nullable=False)
     database_id = mapped_column(Integer, nullable=False, index=True)
+    catalog_name = mapped_column(String(255), nullable=True)
     schema_name = mapped_column(String(255), nullable=True)
     dataset_ids = mapped_column(JSON, nullable=False)
     scope_hash = mapped_column(String(128), index=True, nullable=False)
@@ -520,6 +554,7 @@ class AiAgentWrenContextCache(Base):
     __tablename__ = "ai_agent_wren_context_cache"
 
     id = mapped_column(String(36), primary_key=True)
+    project_id = mapped_column(String(36), index=True, nullable=True)
     owner_id = mapped_column(String(255), index=True, nullable=False)
     scope_hash = mapped_column(String(128), index=True, nullable=False)
     question_hash = mapped_column(String(128), index=True, nullable=False)
@@ -532,6 +567,7 @@ class AiAgentEvent(Base):
     __tablename__ = "ai_agent_events"
 
     id = mapped_column(String(36), primary_key=True)
+    project_id = mapped_column(String(36), index=True, nullable=True)
     owner_id = mapped_column(String(255), index=True, nullable=False)
     scope = mapped_column(JSON, nullable=False)
     type = mapped_column(String(128), nullable=False, index=True)
@@ -579,6 +615,9 @@ Implementation notes:
 
 `SqlAlchemySemanticLayerStore` should implement the `SemanticLayerStore`
 protocol from the document section and own document/update/version/event state.
+Every project-aware method must filter by both `project_id` and `owner_id` or by
+an access decision from `SemanticAccessService`; direct project ID lookup alone
+is not sufficient.
 
 `file_storage.py` should keep raw uploaded bytes outside the DB:
 
@@ -644,6 +683,7 @@ class AuditInfo(BaseModel):
     results_key: str | None = None
     executed_sql: str | None = None
     database_id: int | None = None
+    catalog_name: str | None = None
     schema_name: str | None = None
     row_limit: int | None = None
     timeout_seconds: int | None = None
@@ -663,6 +703,18 @@ class WrenContextArtifact(BaseModel):
     dry_plan: dict[str, Any] | None = None
     warnings: list[str] = Field(default_factory=list)
 ```
+
+Extend `AgentQueryRequest` without breaking existing callers:
+
+```python
+catalog_name: str | None = None
+schema_name: str | None = None
+```
+
+Extend `ConversationScope` in
+`superset_ai_agent/conversations/schemas.py` the same way. Existing callers can
+omit `catalog_name`; Wren-backed retrieval should require `schema_name` and
+should include `catalog_name` when Superset/database metadata provides it.
 
 Extend `ExecutionResult`:
 
@@ -1116,6 +1168,8 @@ class WrenClient(Protocol):
         *,
         question: str,
         superset_context: AgentContext,
+        project: SemanticProject | None = None,
+        materialized_project_path: str | None = None,
     ) -> WrenContextArtifact:
         """Fetch Wren semantic context for an already permission-filtered scope."""
 
@@ -1124,6 +1178,7 @@ class WrenClient(Protocol):
         *,
         question: str,
         limit: int,
+        project: SemanticProject | None = None,
     ) -> list[dict[str, Any]]:
         """Return example questions, SQL patterns, or semantic memories."""
 
@@ -1133,6 +1188,8 @@ class WrenClient(Protocol):
         question: str,
         sql: str | None,
         context: AgentContext,
+        project: SemanticProject | None = None,
+        materialized_project_path: str | None = None,
     ) -> dict[str, Any]:
         """Return Wren planning metadata without executing SQL."""
 
@@ -1143,6 +1200,13 @@ class DisabledWrenClient:
     def is_available(self) -> bool:
         return False
 ```
+
+The existing file-backed client can keep the older `superset_context`-only
+signature as a compatibility shim while the project-aware implementation lands,
+but the finalized schema-scoped runtime should pass both the resolved
+`SemanticProject` and the materialized project directory into Wren. This
+prevents Wren from loading a global MDL path when a user selected only one
+database/schema.
 
 Do not include an execution method. If a future Wren SDK requires an execution
 capability on a lower-level object, keep it private and make `factory.py` fail
@@ -1166,6 +1230,11 @@ wren_context_limit: int = 8
 wren_example_limit: int = 5
 wren_semantic_doc_store_path: str | None = None
 wren_max_document_bytes: int = 2_000_000
+wren_mdl_upload_allowed_document_types: tuple[str, ...] = (
+    "application/x-yaml",
+    "text/yaml",
+    "text/markdown",
+)
 wren_allowed_document_types: tuple[str, ...] = (
     "text/plain",
     "text/markdown",
@@ -1187,6 +1256,7 @@ WREN_CONTEXT_LIMIT
 WREN_EXAMPLE_LIMIT
 WREN_SEMANTIC_DOC_STORE_PATH
 WREN_MAX_DOCUMENT_BYTES
+WREN_MDL_UPLOAD_ALLOWED_DOCUMENT_TYPES
 WREN_ALLOWED_DOCUMENT_TYPES
 ```
 
@@ -1232,6 +1302,16 @@ upload document
   -> graph retrieves approved Wren context
   -> SQL validates and executes through SupersetClient
 ```
+
+This section describes the transitional scope-based document workflow already
+started in the agent. The finalized product model is project-aware:
+
+- documents, proposed updates, generated MDL, versions, events, and Wren
+  materialization are scoped to a `SemanticProject`;
+- existing scope-based routes should remain only as compatibility wrappers that
+  resolve or create a project from `(database_id, catalog, schema_name)`;
+- the SQL Lab semantic editor tab is the primary UI for upload, review,
+  validation, deletion, and activation.
 
 Add:
 
@@ -1286,6 +1366,7 @@ class SemanticDocument(BaseModel):
     content_type: str
     size_bytes: int
     status: SemanticDocumentStatus = "uploaded"
+    project_id: str | None = None
     scope: ConversationScope
     checksum: str
     storage_uri: str
@@ -1307,7 +1388,9 @@ class SemanticLayerReviewRequest(BaseModel):
 
 
 class SemanticLayerState(BaseModel):
+    project_id: str | None = None
     database_id: int
+    catalog_name: str | None = None
     schema_name: str | None = None
     dataset_ids: list[int] = Field(default_factory=list)
     document_count: int
@@ -1316,6 +1399,20 @@ class SemanticLayerState(BaseModel):
     semantic_layer_version: str | None = None
     indexing_status: Literal["idle", "running", "error"] = "idle"
     last_error: str | None = None
+
+
+class SemanticLayerVersion(BaseModel):
+    id: str = Field(default_factory=_new_id)
+    project_id: str | None = None
+    scope: ConversationScope
+    scope_hash: str
+    version: str
+    status: Literal["idle", "running", "error"] = "idle"
+    mdl: dict[str, Any] | None = None
+    wren_context: WrenContextArtifact | None = None
+    source_update_ids: list[str] = Field(default_factory=list)
+    published_semantic_layer_uuid: str | None = None
+    created_at: datetime = Field(default_factory=_utc_now)
 
 
 class SemanticLayerEvent(BaseModel):
@@ -1328,6 +1425,7 @@ class SemanticLayerEvent(BaseModel):
         "index_completed",
         "index_failed",
     ]
+    project_id: str | None = None
     document_id: str | None = None
     state: SemanticLayerState | None = None
     message: str
@@ -1348,6 +1446,13 @@ class SemanticLayerStore(Protocol):
     def list_documents(
         self,
         scope: ConversationScope,
+        *,
+        owner_id: str,
+    ) -> list[SemanticDocument]: ...
+
+    def list_project_documents(
+        self,
+        project_id: str,
         *,
         owner_id: str,
     ) -> list[SemanticDocument]: ...
@@ -1381,6 +1486,13 @@ class SemanticLayerStore(Protocol):
         owner_id: str,
     ) -> SemanticLayerState: ...
 
+    def get_project_state(
+        self,
+        project_id: str,
+        *,
+        owner_id: str,
+    ) -> SemanticLayerState: ...
+
     def append_event(
         self,
         event: SemanticLayerEvent,
@@ -1394,7 +1506,18 @@ class SemanticLayerStore(Protocol):
         *,
         owner_id: str,
     ) -> list[SemanticLayerEvent]: ...
+
+    def list_project_events(
+        self,
+        project_id: str,
+        *,
+        owner_id: str,
+    ) -> list[SemanticLayerEvent]: ...
 ```
+
+The scope-based methods remain for compatibility. New SQL Lab semantic editor
+code should call the project-aware methods and should fail closed if a document,
+event, version, or MDL file references a project the user cannot access.
 
 Phase 1 should use `semantic_layer/sqlalchemy_store.py` plus
 `semantic_layer/file_storage.py`. The in-memory semantic-layer store should be
@@ -1450,13 +1573,23 @@ class CsvExtractor:
     ...
 ```
 
-Phase 1 should allow plain text, Markdown, CSV, and JSON. PDF and DOCX can be
-added behind optional dependencies after the review workflow is stable.
+The generic backend extractor may continue to support plain text, Markdown,
+CSV, and JSON for compatibility and tests. The finalized SQL Lab
+`SemanticLayerEditor` upload UI should expose only:
+
+- valid MDL YAML (`.yaml`, `.yml`);
+- Markdown business context (`.md`, `.markdown`) for Wren enrichment.
+
+Plain text, CSV, and JSON should not appear in the first SQL Lab editor UI
+unless a later enrichment design explains how users review the generated MDL.
+PDF and DOCX can be added behind optional dependencies after the review
+workflow is stable.
 
 Review/index workflow:
 
 - `documents.py::create_document` validates content type and size, computes a
-  checksum, extracts safe text, and creates `SemanticDocument`.
+  checksum, extracts safe text, and creates `SemanticDocument` under a resolved
+  `SemanticProject`.
 - `review.py::propose_updates` calls `WrenClient.preview_document_updates`
   using the permission-filtered `AgentContext`.
 - `review.py::apply_review` persists approved or edited `SemanticUpdate`
@@ -1477,9 +1610,19 @@ GET   /agent/semantic-layer/state
 GET   /agent/semantic-layer/events
 ```
 
+These scope-based routes are compatibility wrappers. New UI work should use the
+project routes in sections 16 and 21:
+
+```text
+POST  /agent/semantic-layer/projects/{project_id}/documents
+GET   /agent/semantic-layer/projects/{project_id}/documents
+PATCH /agent/semantic-layer/projects/{project_id}/documents/{document_id}/review
+POST  /agent/semantic-layer/projects/{project_id}/index/rebuild
+```
+
 `POST /agent/semantic-layer/documents` should accept `UploadFile` and a
-serialized `ConversationScope`. Add `python-multipart` to
-`requirements-ai-agent.txt` when implementing this route.
+serialized `ConversationScope`; project-aware upload should accept `UploadFile`
+plus the resolved `project_id`. `python-multipart` is required for both.
 
 Real-time behavior:
 
@@ -1490,7 +1633,8 @@ Real-time behavior:
 
 Security requirements for documents:
 
-- Scope every document to `database_id`, `schema_name`, and `dataset_ids`.
+- Scope every document to `project_id`, `database_id`, optional `catalog_name`,
+  `schema_name`, and `dataset_ids`.
 - Only approved updates affect Wren retrieval.
 - Never render uploaded HTML directly.
 - Enforce content-type and size allowlists.
@@ -1587,6 +1731,7 @@ def _normalize_audit_info(payload: dict[str, Any]) -> AuditInfo | None:
         results_key=query.get("resultsKey") or result.get("resultsKey"),
         executed_sql=query.get("executedSql") or query.get("executed_sql"),
         database_id=query.get("database_id"),
+        catalog_name=query.get("catalog"),
         schema_name=query.get("schema"),
         row_limit=query.get("limit"),
         source="sqllab_rest",
@@ -1652,6 +1797,7 @@ export interface AuditInfo {
   results_key?: string | null;
   executed_sql?: string | null;
   database_id?: number | null;
+  catalog_name?: string | null;
   schema_name?: string | null;
   row_limit?: number | null;
   timeout_seconds?: number | null;
@@ -1676,6 +1822,13 @@ export interface ExecutionResult {
   row_count: number;
   audit?: AuditInfo | null;
   is_truncated?: boolean;
+}
+
+export interface ConversationScope {
+  database_id: number;
+  catalog_name?: string | null;
+  schema_name?: string | null;
+  dataset_ids: number[];
 }
 ```
 
@@ -1728,9 +1881,6 @@ superset-frontend/src/SqlLab/components/AiAgentPanel/AiChartPreview.tsx
 superset-frontend/src/SqlLab/components/AiAgentPanel/DataPreviewToggle.tsx
 superset-frontend/src/SqlLab/components/AiAgentPanel/AuditInfoPanel.tsx
 superset-frontend/src/SqlLab/components/AiAgentPanel/FollowupQuestions.tsx
-superset-frontend/src/SqlLab/components/AiAgentPanel/SemanticLayerDrawer.tsx
-superset-frontend/src/SqlLab/components/AiAgentPanel/DocumentUpload.tsx
-superset-frontend/src/SqlLab/components/AiAgentPanel/DocumentReviewPanel.tsx
 superset-frontend/src/SqlLab/components/AiAgentPanel/SemanticLayerStateBadge.tsx
 ```
 
@@ -1758,15 +1908,18 @@ Do not wire `@superset-ui/core` `SuperChart` in Phase 1. Use `SuperChart` when
 the artifact can be translated into chart plugin form data or when saved chart
 creation is in scope.
 
-Semantic-layer UI:
+Semantic-layer UI target:
 
-- Add a semantic-layer button in the panel header.
-- Open `SemanticLayerDrawer`.
-- Show current state with `SemanticLayerStateBadge`.
-- Allow upload through `DocumentUpload`.
-- Show proposed updates in `DocumentReviewPanel`.
-- Require explicit approval before indexing updates.
-- Subscribe to SSE events while the drawer is open.
+- The AI panel should remain the conversation and artifact rendering surface.
+- Show the selected database/schema and semantic-layer status with
+  `SemanticLayerStateBadge`.
+- Add an "Open semantic layer" action that dispatches the SQL Lab
+  `openSemanticLayerEditor` action described in section 21.
+- Put MDL directory browsing, upload, delete, validation, enrichment review, and
+  materialization in `SemanticLayerEditor`, not in the AI panel.
+- The existing `SemanticLayerDrawer` can remain as a transitional UI for the
+  implemented upload/review baseline, but new MDL-directory behavior should be
+  built in the SQL Lab editor tab.
 
 ## 11. Governance and Security Checks
 
@@ -1885,9 +2038,7 @@ superset-frontend/src/SqlLab/components/AiAgentPanel/AiChartPreview.test.tsx
 superset-frontend/src/SqlLab/components/AiAgentPanel/DataPreviewToggle.test.tsx
 superset-frontend/src/SqlLab/components/AiAgentPanel/AuditInfoPanel.test.tsx
 superset-frontend/src/SqlLab/components/AiAgentPanel/FollowupQuestions.test.tsx
-superset-frontend/src/SqlLab/components/AiAgentPanel/SemanticLayerDrawer.test.tsx
-superset-frontend/src/SqlLab/components/AiAgentPanel/DocumentUpload.test.tsx
-superset-frontend/src/SqlLab/components/AiAgentPanel/DocumentReviewPanel.test.tsx
+superset-frontend/src/SqlLab/components/AiAgentPanel/SemanticLayerStateBadge.test.tsx
 ```
 
 Required frontend coverage:
@@ -1900,10 +2051,10 @@ Required frontend coverage:
 - data toggle opens and closes
 - audit info panel renders available metadata
 - follow-up click sends a conversation message
-- semantic-layer drawer opens
-- document upload calls the API
-- proposed updates can be approved or rejected
-- SSE events update semantic-layer state
+- semantic-layer status renders the selected database/schema scope
+- "Open semantic layer" dispatches the SQL Lab semantic editor action
+- full MDL editor behavior is covered by the `SemanticLayerEditor` tests in
+  section 21
 
 Governance tests:
 
@@ -1917,25 +2068,31 @@ Governance tests:
 
 ### Phase 0: Persistence And Identity Foundation
 
-Implement before enabling durable conversations or document review:
+Implemented baseline:
 
 - `superset_ai_agent/auth.py`
-- signed identity support for production deployments
+- `SupersetSessionIdentityProvider`
+- signed identity support for trusted proxy deployments
 - `superset_ai_agent/persistence/*`
 - SQLAlchemy/Alembic dependencies
-- agent persistence migrations
 - `SqlAlchemyConversationStore`
 - `SqlAlchemySemanticLayerStore`
 - local file document storage
 - Docker volume for SQLite development
 - Postgres-ready `AI_AGENT_DATABASE_URL`
 
+Remaining follow-up:
+
+- replace `Base.metadata.create_all` with real Alembic revisions;
+- add semantic project/grant/access-proof tables;
+- add object storage for uploaded document bytes.
+
 Keep `InMemoryConversationStore` available for tests and local throwaway runs,
 but document that production persistence requires non-static identity.
 
 ### Phase 1A: Analytics Artifacts, No Wren
 
-Implement:
+Implemented baseline:
 
 - schema extensions
 - deterministic result profiling
@@ -1958,7 +2115,20 @@ Implement:
 - Wren context artifact in traces/responses
 - example recall
 
-No Wren dry-plan and no document ingestion yet.
+Implemented baseline:
+
+- `superset_ai_agent/integrations/wren/client.py::FileWrenClient` reads local
+  MDL and memory files.
+- `superset_ai_agent/integrations/wren/factory.py::create_wren_client` fails
+  closed when `WREN_EXECUTION_ENABLED=true`.
+- `TextToSqlGraph._load_wren_context` and
+  `ConversationGraph._load_wren_context` attach optional context artifacts.
+
+Remaining follow-up:
+
+- add a real Wren API adapter once the stable Wren document/context/dry-plan
+  contracts are confirmed;
+- keep the file-backed adapter as the deterministic local/test fallback.
 
 ### Phase 1C: Wren Dry-Plan, Optional
 
@@ -1969,6 +2139,20 @@ Implement:
 - fail-soft behavior when Wren planning fails
 
 Superset validation and execution remain authoritative.
+
+Implemented baseline:
+
+- `TextToSqlGraph._dry_plan_with_wren` and
+  `ConversationGraph._dry_plan_with_wren` collect planning-only metadata when
+  `WREN_DRY_PLAN_ENABLED=true`.
+- The result is stored in `WrenContextArtifact.dry_plan`.
+
+Remaining follow-up:
+
+- replace the file-backed dry-plan metadata with a real Wren dry-plan adapter
+  when available;
+- add contract tests that prove Wren planning cannot veto, rewrite, or execute
+  SQL outside Superset validation/execution.
 
 ### Phase 1D: Document Upload, Review, and Real-Time Indexing
 
@@ -1984,6 +2168,30 @@ Implement:
 - approved update indexing into Wren context
 
 Only approved updates affect context.
+
+Implemented baseline:
+
+- `superset_ai_agent/semantic_layer/documents.py::create_document` validates,
+  stores, extracts, and proposes deterministic semantic updates.
+- `superset_ai_agent/semantic_layer/review.py::apply_review` persists human
+  review decisions.
+- `superset_ai_agent/semantic_layer/indexer.py::rebuild_index` creates a
+  reviewed semantic overlay and `WrenContextArtifact.context_items`.
+- `ConversationGraph._merge_indexed_semantic_context` merges the latest
+  reviewed semantic overlay into conversation-time Wren context.
+- `superset-frontend/src/SqlLab/components/AiAgentPanel/SemanticLayerDrawer.tsx`
+  supports upload, approve-all review, rebuild, and state refresh.
+
+Remaining follow-up:
+
+- replace the transitional drawer flow with the SQL Lab semantic editor tab in
+  section 21;
+- add granular frontend review/edit/reject controls for MDL files and
+  Markdown-enriched proposals;
+- add object-storage-backed document storage for multi-replica deployments;
+- add a real Wren document-ingestion adapter if Wren exposes a stable API;
+- merge reviewed semantic context into one-shot `/agent/query` without losing
+  per-user scoping.
 
 ### Phase 2: Superset-To-Wren MDL Export
 
@@ -2004,60 +2212,1548 @@ Implement:
 - conflict resolution for metric/description updates
 - optional translation from `ChartSpec` to Superset Explore/chart flows
 
-## Risks and Open Questions
+## 14. Revised Product Direction: Schema-Scoped Wren Semantic Layers
 
-Implementation risks:
+The next increment should treat Wren semantic layers as collaborative,
+schema-scoped assets rather than private conversation attachments. A database
+URI identifies the physical database, but the semantic-layer unit should be one
+schema within that database because a schema is the natural collection of
+related tables. A user who can prove access to a database should be able to
+discover all Wren semantic layers associated with schemas in that database, and
+then run the agent against exactly one selected database/schema pair.
 
-- static `"local"` identity would expose shared persisted history if enabled in
-  a multi-user deployment
-- operating a separate agent DB creates backup, migration, and retention
-  responsibilities outside Superset core
-- direct writes to Superset metadata DB could drift from Superset migrations or
-  bypass Superset command validation if used incorrectly
-- deterministic insights may overstate conclusions on truncated data
-- type inference can misclassify string-coded metrics or dates
-- chart rendering can grow into a parallel charting framework
-- audit payloads differ between REST, MCP, and local adapters
-- document-derived semantic updates can pollute context without careful review
-- Wren context can leak unauthorized semantic metadata if built globally
+The access model is intentionally separate from SQL execution:
 
-Questions for Wren maintainers:
+```text
+Superset / browser identity
+  -> proves user identity and request-scoped Superset credentials
+  -> proves database access through Superset or URI validation
+  -> resolves matching schema-level Wren semantic projects by DB fingerprint
+  -> user selects one database/schema for the agent run
+  -> filters semantic context to that schema and the user's partial/full access
+  -> still executes SQL only through SupersetClient.execute_sql
+```
 
-- What is the stable MDL schema for model descriptions, fields, measures, and
-  examples?
-- Can Wren operate on a request-scoped partial MDL?
-- What is the dry-plan API contract and failure mode?
-- How are document-derived semantic updates represented and versioned?
-- Can Wren expose source document references for retrieved context?
-- How should memory/examples be scoped by project, model, or user?
+Terms used in the follow-up design:
 
-Questions for Superset reviewers:
+| Term | Meaning |
+| --- | --- |
+| Analytics database | The user's warehouse or OLTP database queried through Superset SQL Lab. |
+| Analytics catalog | Optional namespace used by engines that expose catalogs. It should be included in the project key where supported. |
+| Analytics schema | The selected schema inside the analytics database/catalog. This is the primary Wren semantic-layer boundary. |
+| Superset metadata DB | Superset's own metadata database containing dashboards, datasets, users, databases, SQL Lab queries, semantic layers, etc. |
+| Agent-owned DB | The operational DB configured by `AI_AGENT_DATABASE_URL`, used by `superset_ai_agent` for conversations, documents, Wren semantic projects, versions, access proofs, events, and caches. |
+| Wren semantic project | A shareable semantic-layer project keyed by a canonical database URI fingerprint plus optional catalog and schema name. There should normally be one active project per database fingerprint/catalog/schema tuple. |
+| URI fingerprint | A one-way hash of a normalized database connection target. It must not include credentials or raw secrets. |
+| Access proof | A durable or short-lived record that a Superset user can access a database, schema, dataset subset, or matching URI. |
 
-- Should the agent remain standalone with an agent-owned DB, or should durable
-  conversation/document state eventually move into Superset core models?
-- What is the preferred authenticated proxy or signed identity mechanism for
-  `/ai-agent` routes?
-- Should analytics artifacts live on `ConversationArtifact` or a new artifact
-  type?
-- Should REST SQL Lab queries created by the agent include an explicit AI
-  source marker?
-- Should local adapter usage be hidden or warned against when Wren is enabled?
-- Should MCP execution be documented as governed but not equivalent to REST SQL
-  Lab strict dataset matching?
-- Should semantic-layer documents persist inside Superset metadata storage or
-  remain standalone agent state?
+This design allows the AI agent to behave as a database wrapper/editor while
+preserving the important governance rule: Wren controls semantics and planning,
+Superset controls execution.
 
-Avoid for now:
+Relationship between databases, schemas, and semantic layers:
 
-- Wren direct execution
-- automatic MDL mutation without user review
-- production persistence with `DEFAULT_OWNER_ID = "local"`
-- arbitrary agent tables inside Superset core without a Superset ownership,
-  migration, and API design
-- direct mutation of Superset `semantic_layers` or `semantic_views` outside
-  Superset commands or REST APIs
-- global document memory across unrelated datasets
-- document-driven permission changes
-- saved Superset chart creation from the agent
-- replacing Superset SQL validation with Wren planning
-- trusting document text over Superset metadata and permissions
+```text
+database URI / Superset Database
+  -> one database URI fingerprint
+  -> optional catalogs
+  -> many discovered schemas
+  -> one Wren semantic project per catalog/schema tuple
+  -> many tables, metrics, examples, documents, and versions inside that schema project
+```
+
+The user-facing label can remain `<database_label>.<schema_name>` for engines
+without catalogs. For catalog-aware engines, display
+`<database_label>.<catalog_name>.<schema_name>` where that avoids ambiguity.
+
+Query-time rule:
+
+- the UI must require a database and schema selection before a Wren-backed agent
+  run;
+- the backend should reject Wren semantic retrieval when `schema_name` is
+  missing and more than one schema project is available for the database;
+- the graph should load at most one schema-level semantic project for a run;
+- cross-schema analysis should be treated as a later explicit workflow, not the
+  default conversational query path.
+
+Large-schema rule:
+
+- a schema project can cover hundreds of tables, but the graph must not place
+  the full project in the prompt;
+- Wren retrieval should return a small ranked subset of models, fields,
+  metrics, examples, and documents within the selected schema;
+- the prompt should receive a schema-level synopsis plus top-k table/model
+  candidates, not every table in the schema;
+- table discovery and disambiguation should happen inside the selected schema
+  before SQL generation.
+
+## 15. Clarification: Agent-Owned DB Migrations
+
+The "agent-owned DB migrations" are not migrations for user data warehouses.
+They are also not Superset core metadata migrations unless an operator
+intentionally points `AI_AGENT_DATABASE_URL` at the same physical database with
+separate agent-owned tables.
+
+They are Alembic migrations for the standalone AI-agent operational database:
+
+```text
+AI_AGENT_DATABASE_URL=sqlite:///./.data/ai_agent.db
+AI_AGENT_DATABASE_URL=postgresql+psycopg://superset_ai_agent:...@host/db
+```
+
+Data stored in this DB:
+
+| Data | Current/planned tables | Notes |
+| --- | --- | --- |
+| Conversations | `ai_agent_conversations`, `ai_agent_messages`, `ai_agent_artifacts` | Chat history and optional artifacts. |
+| Uploaded documents | `ai_agent_semantic_documents`, `ai_agent_semantic_updates` | Metadata, extracted text, review status, checksums, storage URI, and `project_id`. Raw bytes should live in file/object storage. |
+| Semantic versions | `ai_agent_semantic_layer_versions` | Reviewed Wren context overlays, materialization metadata, source update IDs, and `project_id`. |
+| MDL files | New `ai_agent_semantic_mdl_files` | One row per MDL YAML file in a schema project, including content, path, status, validation state, source type, and source document reference. |
+| Wren retrieval/cache | `ai_agent_wren_context_cache` | Optional derived context cache. |
+| Semantic events | `ai_agent_events` | Upload/review/index events for UI polling/SSE. |
+| Wren project catalog | New `ai_agent_semantic_projects` | Shareable schema-scoped semantic layer registry keyed by DB fingerprint plus optional catalog plus schema. |
+| Access and sharing | New `ai_agent_semantic_project_grants`, `ai_agent_semantic_access_proofs` | Read/write/admin access and DB URI/database/schema proof records. |
+
+Data not stored in this DB:
+
+- user warehouse table data, except small result previews already persisted in
+  assistant artifacts when enabled;
+- Superset passwords, database credentials, or raw SQLAlchemy URIs;
+- Superset RBAC role definitions;
+- Wren direct query results.
+
+Replace `superset_ai_agent/persistence/database.py::run_migrations`, which
+currently calls `Base.metadata.create_all`, with a real Alembic lifecycle.
+
+Add:
+
+```text
+superset_ai_agent/persistence/alembic.ini
+superset_ai_agent/persistence/migrations/env.py
+superset_ai_agent/persistence/migrations/script.py.mako
+superset_ai_agent/persistence/migrations/versions/0001_initial_agent_tables.py
+superset_ai_agent/persistence/migrations/versions/0002_semantic_projects_access.py
+```
+
+`0001_initial_agent_tables.py` should create the tables already represented by
+`superset_ai_agent/persistence/models.py`.
+
+`0002_semantic_projects_access.py` should add:
+
+```python
+ai_agent_semantic_projects
+  id: string uuid primary key
+  name: string
+  description: text nullable
+  owner_id: string index
+  database_uri_fingerprint: string index not null
+  database_backend: string nullable
+  database_label: string nullable
+  catalog_name: string nullable
+  schema_name: string index not null
+  schema_display_name: string nullable
+  default_database_id: int nullable
+  visibility: "private" | "db_access" | "custom"
+  status: "active" | "archived"
+  current_version_id: string nullable
+  created_at, updated_at, deleted_at
+  partial unique index on
+    (database_uri_fingerprint, coalesce(catalog_name, ''), schema_name)
+    where deleted_at is null
+
+ai_agent_semantic_project_grants
+  id: string uuid primary key
+  project_id: string index
+  grantee_type: "user" | "group" | "db_access"
+  grantee_id: string
+  permission: "read" | "write" | "admin"
+  created_by: string
+  created_at
+
+ai_agent_semantic_access_proofs
+  id: string uuid primary key
+  owner_id: string index
+  proof_type: "superset_database" | "superset_dataset" | "validated_uri"
+  database_id: int nullable
+  schema_names: json not null
+  dataset_ids: json not null
+  database_uri_fingerprint: string index not null
+  access_level: "partial" | "full"
+  expires_at: datetime nullable
+  created_at
+
+ai_agent_semantic_mdl_files
+  id: string uuid primary key
+  project_id: string index not null
+  path: string not null
+  filename: string not null
+  content: text not null
+  content_type: "application/x-yaml" | "text/yaml"
+  source_type: "uploaded_mdl" | "manual" | "enriched_markdown"
+  status: "draft" | "active" | "deleted"
+  validation: json nullable
+  checksum: string index not null
+  source_document_id: string nullable
+  created_by: string
+  updated_by: string
+  created_at, updated_at, deleted_at
+  partial unique index on (project_id, path) where deleted_at is null
+
+existing tables
+  ai_agent_semantic_documents.project_id: string nullable index
+  ai_agent_semantic_documents.catalog_name: string nullable
+  ai_agent_semantic_updates.project_id: string nullable index
+  ai_agent_semantic_layer_versions.project_id: string nullable index
+  ai_agent_semantic_layer_versions.catalog_name: string nullable
+  ai_agent_events.project_id: string nullable index
+```
+
+Implementation files:
+
+```text
+superset_ai_agent/persistence/database.py
+superset_ai_agent/persistence/models.py
+superset_ai_agent/semantic_layer/projects.py
+superset_ai_agent/semantic_layer/access.py
+tests/unit_tests/superset_ai_agent/test_persistence_migrations.py
+tests/unit_tests/superset_ai_agent/test_semantic_layer_access.py
+tests/unit_tests/superset_ai_agent/test_semantic_layer_projects.py
+```
+
+Required behavior:
+
+- `run_migrations(config)` runs Alembic to head.
+- `create_all_for_tests(engine)` may exist only for isolated unit tests.
+- SQLAlchemy stores must work after Alembic migration without calling
+  `Base.metadata.create_all`.
+- Migrations are idempotent.
+- Raw database URIs and credentials are never persisted.
+- A semantic project is uniquely identified by
+  `(database_uri_fingerprint, catalog_name, schema_name)` while active. For
+  engines without catalogs, `catalog_name` is null/empty.
+- Active MDL files must contain validated YAML. Markdown uploads are source
+  documents and may create proposed YAML MDL files only after review.
+- Existing scope-based semantic documents, versions, and events may keep
+  `project_id` null after the migration. Compatibility routes should resolve a
+  schema project from the stored scope and backfill `project_id` lazily before
+  exposing those records in the SQL Lab semantic editor.
+- DB-level URI proofs can grant read discovery for all schema projects under the
+  matching fingerprint, but a query run still chooses one schema project.
+
+## 16. URI-Derived Semantic-Layer Access
+
+The proposed Wren scoping model should be implemented as a semantic access
+resolver that admits users into semantic projects when they can prove database
+access. The resolver has two jobs:
+
+1. discover schema projects the user can see for a database fingerprint;
+2. select exactly one schema project for an agent run.
+
+Access sources:
+
+| Source | Proof | Access effect |
+| --- | --- | --- |
+| Superset database access | `security_manager.raise_for_access(database=database)` succeeds through Superset REST/session behavior, or SQL Lab execution permissions prove access indirectly. | Read discovery for all schema projects under the matching DB fingerprint; project creation for schemas the user can access; optional write on existing `visibility=db_access` projects only when full schema/database proof and `semantic_full_access_grants_write=true`. |
+| Superset schema/dataset/table access | Permission-filtered `AgentContext.datasets` contains only authorized datasets for the requested schema. | Partial project read access filtered to the requested schema and authorized dataset/table scopes. |
+| Valid user-provided URI | Superset can validate a connection to the URI and the normalized URI fingerprint matches existing schema projects. | Read discovery for all schema projects found for that DB fingerprint; query-time use still requires choosing one schema. |
+| Explicit semantic grant | Agent project grant or future Superset semantic-layer permission. | Read/write/admin as granted. |
+
+For the standalone FastAPI agent, Superset permission proof should come through
+Superset REST calls made with the current user's session, not by importing
+`superset.security_manager` directly. Direct `security_manager` checks belong
+only in Superset core endpoints or commands if URI-derived semantic access is
+later promoted into Superset itself.
+
+Do not compare raw URIs. Add:
+
+```text
+superset_ai_agent/semantic_layer/uri_fingerprint.py
+```
+
+Functions:
+
+```python
+def normalize_database_uri_for_fingerprint(uri: str) -> NormalizedDatabaseUri:
+    """Strip credentials and normalize driver, host, port, database, and query keys."""
+
+
+def database_uri_fingerprint(uri: str, *, salt: str | None = None) -> str:
+    """Return a one-way fingerprint suitable for matching semantic projects."""
+
+
+def fingerprint_superset_database(database: DatabaseSummary) -> str | None:
+    """Compute a fingerprint when Superset exposes enough non-secret connection metadata."""
+```
+
+Normalization rules:
+
+- strip username, password, tokens, and secret query parameters;
+- lowercase scheme/driver and host;
+- normalize default ports;
+- preserve database name, catalog, and schema where they identify a logical DB;
+- include non-secret connection parameters only if they affect the logical
+  target;
+- use an operator-configured salt so hashes are not portable across deployments.
+
+Config additions:
+
+```python
+semantic_access_mode: Literal[
+    "superset_only",
+    "db_uri_match",
+    "superset_or_uri",
+] = "superset_or_uri"
+semantic_uri_fingerprint_salt: str | None = None
+semantic_uri_proof_ttl_seconds: int = 3600
+semantic_uri_match_requires_validation: bool = True
+semantic_partial_access_enabled: bool = True
+semantic_full_access_grants_write: bool = False
+```
+
+Environment variables:
+
+```text
+AI_AGENT_SEMANTIC_ACCESS_MODE=superset_or_uri
+AI_AGENT_SEMANTIC_URI_FINGERPRINT_SALT
+AI_AGENT_SEMANTIC_URI_PROOF_TTL_SECONDS
+AI_AGENT_SEMANTIC_URI_MATCH_REQUIRES_VALIDATION=true
+AI_AGENT_SEMANTIC_PARTIAL_ACCESS_ENABLED=true
+AI_AGENT_SEMANTIC_FULL_ACCESS_GRANTS_WRITE=false
+```
+
+Add:
+
+```text
+superset_ai_agent/semantic_layer/access.py
+```
+
+Core types:
+
+```python
+class SemanticPermission(str, Enum):
+    READ = "read"
+    WRITE = "write"
+    ADMIN = "admin"
+
+
+class SemanticAccessLevel(str, Enum):
+    PARTIAL = "partial"
+    FULL = "full"
+
+
+class SemanticAccessProof(BaseModel):
+    owner_id: str
+    proof_type: Literal["superset_database", "superset_dataset", "validated_uri"]
+    database_id: int | None = None
+    catalog_names: list[str] = Field(default_factory=list)
+    schema_names: list[str] = Field(default_factory=list)
+    dataset_ids: list[int] = Field(default_factory=list)
+    database_uri_fingerprint: str
+    access_level: SemanticAccessLevel
+    expires_at: datetime | None = None
+
+
+class SemanticAccessDecision(BaseModel):
+    project_id: str
+    catalog_name: str | None = None
+    schema_name: str
+    permission: SemanticPermission
+    access_level: SemanticAccessLevel
+    allowed_dataset_ids: list[int] = Field(default_factory=list)
+    reason: str
+```
+
+Core service:
+
+```python
+class SemanticAccessService:
+    def resolve_projects_for_scope(
+        self,
+        *,
+        identity: AgentIdentity,
+        agent_context: AgentContext,
+        supplied_uri: str | None = None,
+        requested_permission: SemanticPermission = SemanticPermission.READ,
+    ) -> list[SemanticAccessDecision]:
+        """Return schema projects the user can discover for this DB/scope."""
+
+    def resolve_project_for_run(
+        self,
+        *,
+        identity: AgentIdentity,
+        agent_context: AgentContext,
+        catalog_name: str | None = None,
+        schema_name: str,
+        supplied_uri: str | None = None,
+    ) -> SemanticAccessDecision:
+        """Return exactly one schema project for an agent run."""
+
+    def assert_project_permission(
+        self,
+        *,
+        identity: AgentIdentity,
+        project_id: str,
+        permission: SemanticPermission,
+        agent_context: AgentContext | None,
+        supplied_uri: str | None = None,
+    ) -> SemanticAccessDecision:
+        """Raise if the user cannot perform the semantic-layer operation."""
+```
+
+Graph integration:
+
+- `TextToSqlGraph._load_wren_context` and
+  `ConversationGraph._load_wren_context` should call the access service after
+  `load_context`.
+- One-shot and conversation requests should call `resolve_project_for_run`
+  using `request.schema_name`.
+- Wren receives only the selected schema project for the current run.
+- If `schema_name` is missing, the graph should skip Wren context or return a
+  structured error asking the user to select a schema; it should not load all
+  projects for the database into one prompt.
+- If access is partial, filter Wren context items by
+  `allowed_dataset_ids`, table names, or model scopes before prompt assembly.
+
+Large-schema query-time retrieval:
+
+```text
+selected database + optional catalog + selected schema
+  -> resolve one schema project
+  -> retrieve schema synopsis
+  -> rank candidate tables/models/metrics/examples for the question
+  -> include only top-k candidates in the prompt
+  -> generate SQL restricted to the selected schema
+```
+
+Add retrieval controls to `superset_ai_agent/config.py::AgentConfig`:
+
+```python
+wren_schema_table_candidate_limit: int = 12
+wren_schema_metric_candidate_limit: int = 20
+wren_schema_example_candidate_limit: int = 5
+wren_schema_document_candidate_limit: int = 5
+wren_schema_context_token_budget: int = 6000
+```
+
+Environment variables:
+
+```text
+WREN_SCHEMA_TABLE_CANDIDATE_LIMIT
+WREN_SCHEMA_METRIC_CANDIDATE_LIMIT
+WREN_SCHEMA_EXAMPLE_CANDIDATE_LIMIT
+WREN_SCHEMA_DOCUMENT_CANDIDATE_LIMIT
+WREN_SCHEMA_CONTEXT_TOKEN_BUDGET
+```
+
+Extend `WrenContextArtifact` or add a nested retrieval artifact:
+
+```python
+class WrenRetrievalArtifact(BaseModel):
+    project_id: str
+    schema_name: str
+    candidate_table_names: list[str] = Field(default_factory=list)
+    candidate_metric_names: list[str] = Field(default_factory=list)
+    candidate_example_ids: list[str] = Field(default_factory=list)
+    omitted_table_count: int = 0
+    context_truncated: bool = False
+```
+
+Implementation files:
+
+```text
+superset_ai_agent/semantic_layer/retrieval.py
+superset_ai_agent/integrations/wren/client.py
+superset_ai_agent/graph.py
+superset_ai_agent/conversation_graph.py
+tests/unit_tests/superset_ai_agent/test_semantic_layer_retrieval.py
+```
+
+Required behavior:
+
+- Retrieval never returns the full schema project when candidate counts exceed
+  configured limits.
+- The trace records selected schema, selected project, candidate counts, and
+  truncation.
+- SQL prompts include the selected schema name and should prefer fully
+  qualified table references when the dialect supports them.
+- Follow-up questions remain scoped to the selected schema unless the user
+  explicitly changes schema.
+
+Backend request-scope changes:
+
+- `superset_ai_agent/schemas.py::AgentQueryRequest.schema_name` can remain
+  optional for backwards compatibility, but Wren-backed retrieval should require
+  it.
+- Add optional `catalog_name` to `AgentQueryRequest` and `ConversationScope`.
+  It may remain null for engines without catalogs, but must be included in
+  semantic project resolution for catalog-aware engines.
+- `superset_ai_agent/conversations/schemas.py::ConversationScope.schema_name`
+  can remain optional for legacy callers, but the conversation graph should
+  require it before resolving a schema project.
+- Extend `superset_ai_agent/integrations/superset/client.py::SupersetClient`
+  context methods to accept `catalog_name` and `schema_name`:
+
+```python
+def list_datasets(
+    *,
+    database_id: int,
+    catalog_name: str | None = None,
+    schema_name: str | None = None,
+    dataset_ids: list[int] | None = None,
+    limit: int = 8,
+) -> list[DatasetMetadata]: ...
+
+def get_agent_context(
+    *,
+    database_id: int,
+    catalog_name: str | None = None,
+    schema_name: str | None = None,
+    dataset_ids: list[int] | None = None,
+) -> AgentContext: ...
+```
+
+- Update `SupersetMetadataContextProvider.get_context` to pass both catalog and
+  schema into the adapter.
+- Update REST/MCP/local adapters so automatic dataset discovery is scoped to
+  the selected schema where the transport supports schema filtering. If an
+  adapter cannot filter by schema, filter normalized `DatasetMetadata` before
+  prompt assembly and record a warning trace.
+- Add a validation helper:
+
+```python
+def require_schema_for_wren(
+    *,
+    schema_name: str | None,
+    wren_enabled: bool,
+    semantic_access_enabled: bool,
+) -> str:
+    """Return schema_name or raise a user-facing validation error."""
+```
+
+- Use this helper in:
+  - `TextToSqlGraph._load_wren_context`
+  - `ConversationGraph._load_wren_context`
+  - semantic project document upload/review/index routes
+  - frontend submit validation
+
+API additions for schema selection:
+
+```text
+GET /agent/databases/{database_id}/schemas
+POST /agent/semantic-layer/projects/resolve
+```
+
+`GET /agent/databases/{database_id}/schemas` should delegate to Superset REST
+or metadata already returned by Superset where possible, using the current
+user's session. It should not enumerate schemas with a service account when the
+agent is running in user-session mode.
+
+API integration:
+
+```text
+POST /agent/semantic-layer/projects/resolve
+GET  /agent/semantic-layer/projects
+POST /agent/semantic-layer/projects
+GET  /agent/semantic-layer/projects/{project_id}
+PATCH /agent/semantic-layer/projects/{project_id}
+DELETE /agent/semantic-layer/projects/{project_id}
+POST /agent/semantic-layer/projects/{project_id}/grants
+DELETE /agent/semantic-layer/projects/{project_id}/grants/{grant_id}
+```
+
+Document upload should move from only scope-based routes to project-aware
+routes:
+
+```text
+POST  /agent/semantic-layer/projects/{project_id}/documents
+GET   /agent/semantic-layer/projects/{project_id}/documents
+PATCH /agent/semantic-layer/projects/{project_id}/documents/{document_id}/review
+POST  /agent/semantic-layer/projects/{project_id}/index/rebuild
+```
+
+Compatibility:
+
+- Keep the existing scope-based document routes as wrappers that resolve or
+  create a project for the scope.
+- Do not break existing frontend calls in Phase 1.
+
+Tests:
+
+```text
+tests/unit_tests/superset_ai_agent/test_semantic_layer_uri_fingerprint.py
+tests/unit_tests/superset_ai_agent/test_semantic_layer_access.py
+tests/unit_tests/superset_ai_agent/test_semantic_layer_projects.py
+tests/unit_tests/superset_ai_agent/test_graph.py
+tests/unit_tests/superset_ai_agent/test_conversation_graph.py
+```
+
+Required coverage:
+
+- two URIs with different credentials but same logical target produce the same
+  fingerprint;
+- two different database targets do not collide in tests;
+- a user with Superset database access can discover all `visibility=db_access`
+  schema projects under the matching DB fingerprint;
+- a user with only schema/dataset access receives filtered context for the
+  selected schema project only;
+- a user with a valid URI proof can discover matching schema projects but must
+  choose one schema for query-time retrieval;
+- write/admin actions require explicit project grant or ownership;
+- raw URI strings are not persisted.
+
+## 17. Identity And Proxying Recommendation
+
+There are three viable identity/deployment patterns. The recommendation is a
+hybrid of Option A and the semantic access resolver above.
+
+| Option | Description | Pros | Cons | Recommendation |
+| --- | --- | --- | --- | --- |
+| A. Same-origin session pass-through | Browser calls `/ai-agent/*` through the Superset origin. Agent validates `/api/v1/me/` and forwards request cookies/CSRF to Superset REST. | Best behavior parity with Superset users. SQL Lab permissions, database permissions, row limits, RLS, and audit identity stay user-scoped. | Requires reverse proxy or same-origin route setup. URI-derived sharing needs an additional access resolver. | Recommended default. |
+| B. Superset signed bridge | A Superset-protected backend route injects short-lived signed identity headers and request-scoped Superset auth material. | Useful when the agent is not directly browser-facing. Avoids trusting browser-provided identity headers. | More moving parts. Must add expiry/nonce and strict header stripping at proxy boundary. | Acceptable enterprise pattern. |
+| C. Agent-issued access-proof token | After Superset DB access or URI validation, the agent issues a short-lived token representing semantic-layer access only. | Supports mixed access: basic DB proof unlocks shared Wren semantics even when the user is not a traditional owner of the semantic layer. | Must never grant SQL execution rights. Must be scoped to semantic project, fingerprint, access level, and TTL. | Recommended for URI-derived semantic-layer collaboration, not for SQL execution. |
+| D. Service-account-only agent | Agent uses a service account for all Superset calls. | Simple operationally. | Poor user parity; risks bypassing per-user SQL Lab/database/RLS behavior. | Avoid for governed analytics. |
+
+Recommended deployment:
+
+```text
+Browser
+  -> Superset same-origin /ai-agent proxy
+  -> FastAPI agent
+      identity: SupersetSessionIdentityProvider
+      Superset execution: SUPERSET_AUTH_MODE=user_session
+      semantic access: Superset DB proof OR validated URI proof
+      Wren execution: disabled
+```
+
+Follow-up identity hardening:
+
+- Add `iat`, `exp`, and optional `jti` to signed identity payloads.
+- Add `AI_AGENT_SIGNED_IDENTITY_MAX_AGE_SECONDS`.
+- Reject role/permission claims in signed identity payloads.
+- Add `SemanticAccessProof` tokens only for semantic-layer access, never for
+  SQL execution.
+- Log semantic access decisions separately from SQL execution audit.
+
+Files:
+
+```text
+superset_ai_agent/auth.py
+superset_ai_agent/config.py
+superset_ai_agent/semantic_layer/access.py
+superset_ai_agent/persistence/models.py
+tests/unit_tests/superset_ai_agent/test_auth.py
+tests/unit_tests/superset_ai_agent/test_semantic_layer_access.py
+```
+
+## 18. SQL Lab Audit Marker: Codebase Analysis And Proposal
+
+Confirmed SQL Lab request schema:
+
+- `superset/sqllab/schemas.py::ExecutePayloadSchema` accepts:
+  - `database_id`
+  - `sql`
+  - `client_id`
+  - `queryLimit`
+  - `sql_editor_id`
+  - `catalog`
+  - `schema`
+  - `tab`
+  - `ctas_method`
+  - `templateParams`
+  - `tmp_table_name`
+  - `select_as_cta`
+  - `runAsync`
+  - `expand_data`
+- It does not accept `extra_json`.
+
+Confirmed persistence path:
+
+- `superset/sqllab/sqllab_execution_context.py::SqlJsonExecutionContext`
+  reads `client_id`, `sql_editor_id`, and `tab`.
+- `SqlJsonExecutionContext.create_query` persists those values on
+  `superset/models/sql_lab.py::Query`.
+- `Query.client_id` is `String(11)`, unique, and appears as `query.id` in
+  `Query.to_dict`.
+- `Query.sql_editor_id` is `String(256)`, indexed, and appears as
+  `query.sqlEditorId`.
+- `Query.tab_name` appears as `query.tab`.
+- `Query.to_dict` returns `extra`, but SQL Lab execute does not accept arbitrary
+  `extra_json` in the execute payload.
+
+Do not use a fixed `client_id="superset_ai_agent"` because `client_id` is
+unique and limited to 11 characters.
+
+Recommended marker strategy:
+
+```python
+client_id = short_ai_query_id()  # e.g. "ai" + 9 chars
+sql_editor_id = "ai_agent:" + source_hash  # <= 256 chars
+tab = "AI Agent"
+```
+
+`source_hash` should be a short hash of non-secret metadata:
+
+```text
+conversation_id
+message_id
+artifact_id
+request_id
+semantic_project_id
+```
+
+Add a typed source context:
+
+```python
+class SqlExecutionSource(BaseModel):
+    source: Literal["superset_ai_agent"] = "superset_ai_agent"
+    request_id: str | None = None
+    conversation_id: str | None = None
+    message_id: str | None = None
+    artifact_id: str | None = None
+    semantic_project_id: str | None = None
+```
+
+Modify `superset_ai_agent/integrations/superset/client.py::SupersetClient`:
+
+```python
+def execute_sql(
+    self,
+    *,
+    database_id: int,
+    sql: str,
+    catalog_name: str | None = None,
+    schema_name: str | None = None,
+    limit: int = 1000,
+    source: SqlExecutionSource | None = None,
+) -> ExecutionResult: ...
+```
+
+Modify `superset_ai_agent/integrations/superset/rest.py::SupersetRestClient.execute_sql_raw`:
+
+```python
+payload = {
+    "database_id": database_id,
+    "sql": sql,
+    "catalog": catalog_name,
+    "schema": schema_name,
+    "queryLimit": limit,
+    "runAsync": False,
+    "expand_data": True,
+    "client_id": short_ai_query_id(source),
+    "sql_editor_id": ai_sql_editor_id(source),
+    "tab": "AI Agent",
+}
+```
+
+Extend `superset_ai_agent/schemas.py::AuditInfo`:
+
+```python
+client_id: str | None = None
+sql_editor_id: str | None = None
+tab: str | None = None
+source_hash: str | None = None
+```
+
+Extend `_normalize_audit_info` in
+`superset_ai_agent/integrations/superset/rest.py` to read:
+
+```python
+client_id = query.get("id")
+sql_editor_id = query.get("sqlEditorId") or query.get("sql_editor_id")
+tab = query.get("tab")
+```
+
+Fallback only if needed:
+
+- If Superset rejects `sql_editor_id` or `tab` in a future version, use a SQL
+  comment marker.
+- Prefer payload fields over SQL comments because comments become part of user
+  SQL and can complicate parser behavior or warehouse query logs.
+
+Tests:
+
+```text
+tests/unit_tests/superset_ai_agent/test_superset_client.py
+tests/unit_tests/superset_ai_agent/test_graph.py
+tests/unit_tests/superset_ai_agent/test_conversation_graph.py
+```
+
+Required coverage:
+
+- REST payload includes `client_id`, `sql_editor_id`, and `tab`.
+- `client_id` is unique and length <= 11.
+- Graph execution passes source metadata for conversation and one-shot calls.
+- `AuditInfo` includes query id, client id, sql editor id, tab, adapter, row
+  limit, and source.
+- Non-read-only SQL still never reaches `SupersetClient.execute_sql`.
+
+## 19. Semantic Layer CRUD Target
+
+The semantic-layer target should not be limited to "publication" from the agent
+DB into Superset. Users should be able to create, read, update, delete, share,
+review, and version semantic layers they have access to, where access can be
+derived from database access.
+
+Current Superset semantic-layer facts:
+
+- `superset/semantic_layers/api.py::SemanticLayerRestApi` exposes create,
+  update, delete, schema, runtime schema, views, and connections routes.
+- `superset/semantic_layers/api.py::SemanticViewRestApi` exposes bulk create,
+  update, delete, bulk delete, and structure routes.
+- `superset/commands/semantic_layer/create.py::CreateSemanticLayerCommand` and
+  `CreateSemanticViewCommand` validate type/uniqueness and create models.
+- `superset/commands/semantic_layer/update.py::UpdateSemanticViewCommand`
+  checks ownership with `security_manager.raise_for_ownership`.
+- `superset/commands/semantic_layer/delete.py::DeleteSemanticViewCommand`
+  checks ownership with `security_manager.raise_for_ownership`.
+- `superset/semantic_layers/models.py::SemanticView.raise_for_access` allows
+  access through all-datasource permission, view `perm`, or layer `perm`.
+- `SemanticLayerRestApi.connections` currently filters semantic layers by
+  `SemanticLayer.perm` unless the user can access all datasources.
+
+Gap:
+
+- Existing Superset semantic-layer access is permission-string oriented. It
+  does not yet encode "user can access a database URI, therefore user can
+  access semantic layers built for the same URI."
+
+Recommended next implementation:
+
+1. Add agent-owned Wren semantic project CRUD now.
+2. Use Superset REST semantic-layer APIs only for Superset-native objects and
+   only through the current user's session.
+3. Add a Superset-side semantic access enhancement later if this model should
+   become first-class in Superset core.
+
+Agent CRUD routes:
+
+```text
+GET    /agent/semantic-layer/projects
+POST   /agent/semantic-layer/projects
+GET    /agent/semantic-layer/projects/{project_id}
+PATCH  /agent/semantic-layer/projects/{project_id}
+DELETE /agent/semantic-layer/projects/{project_id}
+POST   /agent/semantic-layer/projects/{project_id}/share
+DELETE /agent/semantic-layer/projects/{project_id}/share/{grant_id}
+GET    /agent/semantic-layer/projects/{project_id}/versions
+POST   /agent/semantic-layer/projects/{project_id}/versions/{version_id}/activate
+```
+
+Permissions:
+
+| Permission | Allowed actions |
+| --- | --- |
+| `read` | discover, retrieve context, use in text-to-SQL, view documents/versions. |
+| `write` | upload documents, review updates, rebuild index, create versions. |
+| `admin` | rename/delete project, manage sharing, archive, publish to Superset. |
+
+Default policy:
+
+- full database/schema proof may create a new schema project;
+- existing shared projects grant `read` by default through DB-derived access;
+- DB-derived `write` should be opt-in through
+  `AI_AGENT_SEMANTIC_FULL_ACCESS_GRANTS_WRITE=true` and only for full
+  schema/database proof, never for partial dataset proof;
+- `admin`, delete, archive, and sharing changes require ownership or explicit
+  project grant.
+
+Semantic project schema:
+
+```python
+class SemanticProject(BaseModel):
+    id: str
+    name: str
+    description: str | None = None
+    owner_id: str
+    database_uri_fingerprint: str
+    database_backend: str | None = None
+    database_label: str | None = None
+    catalog_name: str | None = None
+    schema_name: str
+    schema_display_name: str | None = None
+    default_database_id: int | None = None
+    visibility: Literal["private", "db_access", "custom"] = "db_access"
+    current_version_id: str | None = None
+    status: Literal["active", "archived"] = "active"
+```
+
+Superset REST bridge methods:
+
+```python
+class SupersetClient(Protocol):
+    def list_semantic_layers(self) -> list[dict[str, Any]]: ...
+    def create_semantic_layer(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+    def update_semantic_layer(self, uuid: str, payload: dict[str, Any]) -> dict[str, Any]: ...
+    def delete_semantic_layer(self, uuid: str) -> None: ...
+    def create_semantic_views(self, views: list[dict[str, Any]]) -> dict[str, Any]: ...
+    def update_semantic_view(self, view_id: int, payload: dict[str, Any]) -> dict[str, Any]: ...
+    def delete_semantic_view(self, view_id: int) -> None: ...
+```
+
+Implement first in:
+
+```text
+superset_ai_agent/integrations/superset/rest.py
+```
+
+Do not implement these methods in the local adapter for production use. The
+local adapter can raise `NotImplementedError` or remain test-only.
+
+Superset core follow-up if URI-derived sharing becomes first-class:
+
+```text
+superset/semantic_layers/models.py
+superset/semantic_layers/api.py
+superset/commands/semantic_layer/create.py
+superset/commands/semantic_layer/update.py
+superset/commands/semantic_layer/delete.py
+superset/daos/semantic_layer.py
+```
+
+Potential Superset model additions:
+
+- `SemanticLayer.database_uri_fingerprint`
+- `SemanticLayer.catalog_name`
+- `SemanticLayer.schema_name`
+- `SemanticLayer.visibility`
+- `SemanticLayerAccessGrant`
+- `SemanticLayerSourceDatabase`
+
+Potential Superset access function:
+
+```python
+def can_access_semantic_layer_via_database(
+    *,
+    user: User,
+    layer: SemanticLayer,
+    database: Database | None,
+    uri_fingerprint: str | None,
+) -> bool:
+    """Grant semantic access when the user can access a matching database."""
+```
+
+Command hardening:
+
+- Add ownership/access checks to `UpdateSemanticLayerCommand.validate`.
+- Add ownership/access checks to `DeleteSemanticLayerCommand.validate`.
+- Add create-view permission checks so a user cannot add views to a layer they
+  cannot write.
+- Keep `SemanticView.raise_for_access` as the read guard for semantic views,
+  extended with DB-derived semantic access if accepted.
+
+Tests:
+
+```text
+tests/unit_tests/superset_ai_agent/test_semantic_layer_projects.py
+tests/unit_tests/superset_ai_agent/test_semantic_layer_access.py
+tests/unit_tests/superset_ai_agent/test_superset_client.py
+tests/integration_tests/semantic_layers/api_tests.py
+tests/integration_tests/semantic_layers/security_tests.py
+```
+
+Required coverage:
+
+- users can discover schema projects for matching DB fingerprints;
+- DB URI proof lists all schema projects associated with that database
+  fingerprint;
+- agent runs resolve exactly one selected schema project;
+- users can CRUD projects they own or administer;
+- users with only read access cannot upload/review/delete;
+- users with DB access but no explicit grant can read `visibility=db_access`
+  schema projects;
+- users with no DB proof cannot read matching project metadata;
+- Superset REST CRUD failures propagate cleanly to the agent UI;
+- Superset semantic-layer update/delete commands enforce ownership or accepted
+  semantic admin access.
+
+## 20. Wren API Adapter And Document Understanding
+
+The current Wren implementation is intentionally file-backed:
+
+- `superset_ai_agent/integrations/wren/client.py::FileWrenClient`
+- `superset_ai_agent/semantic_layer/review.py::propose_updates`
+- `superset_ai_agent/semantic_layer/indexer.py::rebuild_index`
+
+The next Wren-native increment should add an HTTP adapter while preserving the
+no-execution contract.
+
+Config:
+
+```python
+wren_adapter: Literal["file", "http"] = "file"
+wren_base_url: str | None = None
+wren_api_key: str | None = None
+wren_timeout_seconds: float = 30.0
+```
+
+Add:
+
+```text
+superset_ai_agent/integrations/wren/http_client.py
+tests/unit_tests/superset_ai_agent/test_wren_http_client.py
+```
+
+Allowed methods:
+
+```python
+def fetch_context(
+    ...,
+    project: SemanticProject,
+    materialized_project_path: str,
+) -> WrenContextArtifact: ...
+def recall_examples(..., project: SemanticProject, limit: int) -> list[dict[str, Any]]: ...
+def dry_plan(
+    ...,
+    project: SemanticProject,
+    materialized_project_path: str,
+) -> dict[str, Any]: ...
+def preview_document_updates(..., project: SemanticProject, document: SemanticDocument) -> list[SemanticUpdate]: ...
+def build_semantic_overlay(..., project: SemanticProject, approved_updates: list[SemanticUpdate]) -> WrenContextArtifact: ...
+```
+
+`materialized_project_path` must point to the selected schema project's
+validated active MDL directory, not a global Wren project path.
+
+Forbidden methods:
+
+- `execute`
+- `run_sql`
+- `query`
+- `query_preview`
+- any method that returns warehouse rows by bypassing `SupersetClient`.
+
+Tests must assert:
+
+- the public client protocol has no execution method;
+- `WREN_EXECUTION_ENABLED=true` fails startup;
+- Wren document proposals are not indexed until approved;
+- Wren planning failure does not block Superset SQL validation/execution;
+- Wren receives only the selected schema project authorized by
+  `SemanticAccessService`.
+
+## 21. SQL Lab Semantic Layer Editor UI
+
+### Confirmed SQL Lab Frontend Baseline
+
+Confirmed code facts:
+
+- `superset-frontend/src/SqlLab/components/SqlEditorLeftBar/index.tsx`
+  renders the database/catalog/schema selector and then
+  `TableExploreTree`.
+- `superset-frontend/src/SqlLab/components/TableExploreTree/index.tsx`
+  owns the database browser tree state and delegates row rendering to
+  `TreeNodeRenderer`.
+- `superset-frontend/src/SqlLab/components/TableExploreTree/TreeNodeRenderer.tsx`
+  already renders schema row hover actions for refresh and pin/unpin. Schema
+  nodes are identified by `identifier === 'schema'`.
+- `superset-frontend/src/SqlLab/components/TabbedSqlEditors/index.tsx`
+  currently maps `sqlLab.queryEditors` directly to `SqlEditor` tabs. It has no
+  mixed tab type for non-SQL editor panels.
+- `superset-frontend/src/SqlLab/components/EditorWrapper/index.tsx`
+  wraps `EditorHost` but hardcodes `language="sql"`, SQL annotations, SQL
+  keyword completion, and SQL run hotkeys.
+- YAML editor support already exists in the shared editor stack:
+  `superset-frontend/src/core/editors/AceEditorProvider.tsx` maps `yaml` to
+  `ConfigEditor`; `superset-frontend/packages/superset-ui-core/src/components/AsyncAceEditor/index.tsx`
+  registers `brace/mode/yaml`; `TemplateParamsEditor` already uses
+  `EditorHost` with `language="yaml"`.
+
+### Product Decision
+
+Build the semantic-layer editor as a first-class SQL Lab editor tab, opened
+from a schema node in the existing left database browser. Do not put this in
+the existing AI chat panel as the primary UX.
+
+This matches the desired workflow:
+
+```text
+SQL Lab left browser
+  -> user chooses database/catalog/schema
+  -> schema row action opens Semantic Layer tab
+  -> tab edits the schema's MDL directory
+  -> active, validated MDL files are materialized to Wren
+  -> Wren context/planning feeds the AI agent
+  -> SQL execution still goes through SupersetClient
+```
+
+Semantic layer naming:
+
+- canonical name: `<database_label>.<schema_name>` or
+  `<database_label>.<catalog_name>.<schema_name>` for catalog-aware engines;
+- persistent key: `(database_uri_fingerprint, catalog_name, schema_name)`;
+- optional catalog should be included in display labels where the database
+  backend supports catalogs, but the access and materialization boundary
+  remains the selected schema project.
+
+Large database rule:
+
+- the UI must require a selected schema before opening or running a
+  Wren-backed agent workflow;
+- the runtime must load only the selected schema's semantic project, then apply
+  top-k table/metric/example retrieval inside that schema;
+- the agent should not combine multiple schema projects in a single run unless
+  a later cross-schema feature explicitly designs that behavior.
+
+### Entrypoint: Schema Browser Action
+
+Modify:
+
+```text
+superset-frontend/src/SqlLab/components/TableExploreTree/TreeNodeRenderer.tsx
+superset-frontend/src/SqlLab/components/TableExploreTree/index.tsx
+superset-frontend/src/SqlLab/components/SqlEditorLeftBar/index.tsx
+superset-frontend/src/SqlLab/actions/sqlLab.ts
+superset-frontend/src/SqlLab/reducers/sqlLab.ts
+superset-frontend/src/SqlLab/types.ts
+```
+
+Add a schema-level hover action next to refresh/pin:
+
+```tsx
+<ActionButton
+  label={`open-semantic-layer-${schema}`}
+  tooltip={t('Open semantic layer')}
+  icon={<Icons.BookOutlined iconSize="m" />}
+  onClick={() =>
+    openSemanticLayerEditor({
+      databaseId: Number(_dbId),
+      databaseName,
+      catalog,
+      schemaName: schema,
+    })
+  }
+/>
+```
+
+Implementation detail:
+
+- `TreeNodeRenderer` does not currently know the database display name. Pass it
+  from `TableExploreTree` if available from the active query editor/database
+  metadata. If only `dbId` is available, the open action can resolve the
+  display name after project resolution.
+- Keep row click behavior unchanged. The new action must call
+  `e.stopPropagation()` like existing schema actions.
+- If the user has no selected schema, the entrypoint should be hidden or
+  disabled because semantic projects are schema-scoped.
+
+### Mixed SQL Lab Tab Model
+
+The current `tabHistory: string[]` contains query editor IDs only. A semantic
+editor tab should not be represented as a `QueryEditor`, because that would
+inherit SQL execution state, query history state, and run hotkeys.
+
+Add explicit tab typing in `superset-frontend/src/SqlLab/types.ts`:
+
+```ts
+export type SqlLabTabType = 'query' | 'semanticLayer';
+
+export interface SqlLabTabRef {
+  id: string;
+  type: SqlLabTabType;
+}
+
+export interface SemanticLayerEditorTab {
+  id: string;
+  type: 'semanticLayer';
+  projectId?: string;
+  databaseId: number;
+  databaseName?: string;
+  catalog?: string | null;
+  schemaName: string;
+  title: string;
+  activeFileId?: string;
+  dirtyFileIds: string[];
+  updatedAt?: number;
+}
+```
+
+Add state:
+
+```ts
+semanticLayerEditors: SemanticLayerEditorTab[];
+tabHistory: SqlLabTabRef[];
+```
+
+Compatibility migration:
+
+- Redux hydration/local storage may still contain `tabHistory: string[]`.
+  Reducer initialization should normalize strings to
+  `{ type: 'query', id: value }`.
+- Existing query editor actions should keep accepting `QueryEditor`.
+- `setActiveQueryEditor(queryEditor)` should push a query tab ref.
+- New `setActiveSqlLabTab(tab: SqlLabTabRef)` should be used by mixed tabs.
+
+Add actions:
+
+```ts
+export const OPEN_SEMANTIC_LAYER_EDITOR = 'OPEN_SEMANTIC_LAYER_EDITOR';
+export const SET_ACTIVE_SQL_LAB_TAB = 'SET_ACTIVE_SQL_LAB_TAB';
+export const CLOSE_SEMANTIC_LAYER_EDITOR = 'CLOSE_SEMANTIC_LAYER_EDITOR';
+export const UPDATE_SEMANTIC_LAYER_EDITOR = 'UPDATE_SEMANTIC_LAYER_EDITOR';
+
+export function openSemanticLayerEditor(input: {
+  databaseId: number;
+  databaseName?: string;
+  catalog?: string | null;
+  schemaName: string;
+}): SqlLabThunkAction<SqlLabAction> { ... }
+```
+
+`openSemanticLayerEditor` should:
+
+- call `resolveSemanticProject({ databaseId, catalogName: catalog, schemaName })`;
+- create the project if no accessible project exists and the user has write
+  access for that database/schema;
+- open or focus a tab with ID
+  `semantic-layer:${databaseId}:${catalog ?? ''}:${schemaName}`;
+- set `title` to `<database_label>.<schema_name>` or
+  `<database_label>.<catalog_name>.<schema_name>` when catalog is present.
+
+Modify `TabbedSqlEditors`:
+
+- Build `items` from both `queryEditors` and `semanticLayerEditors`.
+- Query tabs continue to render `SqlEditorTabHeader` and `SqlEditor`.
+- Semantic tabs render `SemanticLayerEditorTabHeader` and
+  `SemanticLayerEditor`.
+- `handleSelect` should route by `SqlLabTabRef.type`.
+- `handleEdit(..., 'remove')` should remove query tabs with
+  `removeQueryEditor` and semantic tabs with `closeSemanticLayerEditor`.
+- `handleEdit(..., 'add')` should keep creating SQL query tabs.
+- If all tabs are closed, keep the existing empty SQL tab behavior.
+
+New files:
+
+```text
+superset-frontend/src/SqlLab/components/SemanticLayerEditor/index.tsx
+superset-frontend/src/SqlLab/components/SemanticLayerEditor/SemanticLayerEditorTabHeader.tsx
+superset-frontend/src/SqlLab/components/SemanticLayerEditor/MdlFileBrowser.tsx
+superset-frontend/src/SqlLab/components/SemanticLayerEditor/MdlFileTreeNode.tsx
+superset-frontend/src/SqlLab/components/SemanticLayerEditor/MdlUploadDialog.tsx
+superset-frontend/src/SqlLab/components/SemanticLayerEditor/MdlEditor.tsx
+superset-frontend/src/SqlLab/components/SemanticLayerEditor/MdlValidationPanel.tsx
+superset-frontend/src/SqlLab/components/SemanticLayerEditor/MdlEnrichmentReview.tsx
+superset-frontend/src/SqlLab/components/SemanticLayerEditor/api.ts
+superset-frontend/src/SqlLab/components/SemanticLayerEditor/types.ts
+```
+
+### Semantic Layer Editor Layout
+
+The tab should behave like an editor, not a drawer:
+
+```text
+SemanticLayerEditor
+  left: MDL file browser
+    - project title: database.schema or database.catalog.schema
+    - files as tree/list entries
+    - delete action per file
+    - upload button fixed at bottom
+  center: MDL YAML editor
+  right/bottom: validation, Wren materialization status, and enrichment review
+```
+
+MDL browser rules:
+
+- Treat a semantic layer as a directory of MDL YAML files.
+- Each non-deleted `ai_agent_semantic_mdl_files` row is one browser entry.
+- Default file paths should be stable and readable, for example:
+  `models/<table_or_topic>.yaml`, `metrics/<metric_group>.yaml`, or
+  `docs/<source_name>.generated.yaml`.
+- File delete is soft delete through the backend. The UI should ask for
+  confirmation if the file is active or dirty.
+- Dirty files should show a visual marker in the tab header and browser row.
+
+### Upload And Enrichment Flow
+
+Upload button location:
+
+- bottom of `MdlFileBrowser`;
+- use a modal overlay implemented by `MdlUploadDialog`.
+
+Accepted files:
+
+- valid MDL YAML: `.yaml`, `.yml`, `application/x-yaml`, `text/yaml`;
+- raw text source for enrichment: `.md`, `.markdown`, `text/markdown`.
+
+Rejected for Phase 1:
+
+- PDFs, spreadsheets, Word documents, ZIP archives, images, and arbitrary text
+  files;
+- invalid YAML that is not explicitly uploaded as Markdown.
+
+Two-step behavior:
+
+1. Valid MDL YAML:
+   - upload file;
+   - backend parses YAML and validates MDL structure;
+   - create `ai_agent_semantic_mdl_files` row with
+     `source_type="uploaded_mdl"` and `status="draft"`;
+   - open the file in `MdlEditor` for review;
+   - user must explicitly activate the file before it can be materialized.
+2. Markdown/raw business context:
+   - upload Markdown as a document/source file;
+   - call Wren onboarding/enrichment through the no-execution `WrenClient`;
+   - return a proposed MDL YAML file;
+   - open `MdlEnrichmentReview` with source Markdown side-by-side with the
+     generated YAML;
+   - user must explicitly save/approve before a new
+     `ai_agent_semantic_mdl_files` row becomes active.
+
+Important guardrail:
+
+- Wren enrichment may propose MDL only. It must not automatically mutate active
+  MDL files, materialize a project, or execute SQL.
+
+### MDL Editor
+
+Do not reuse `EditorWrapper` directly because it is SQL-specific. Add
+`MdlEditor` around `EditorHost`:
+
+```tsx
+<EditorHost
+  id={`mdl-editor-${fileId}`}
+  value={content}
+  language="yaml"
+  tabSize={2}
+  lineNumbers
+  annotations={validationAnnotations}
+  hotkeys={saveAndValidateHotkeys}
+  height="100%"
+  width="100%"
+  onChange={handleChange}
+  onBlur={handleBlur}
+/>
+```
+
+Rules:
+
+- YAML syntax highlighting comes from existing `EditorHost` YAML support.
+- YAML linting should be backend-driven initially: convert
+  `MdlValidationResult.errors` and `warnings` into `EditorAnnotation[]`.
+- Do not register SQL Lab run-query hotkeys in `MdlEditor`.
+- Do not use SQL autocomplete keywords. MDL-specific completion can be added
+  later from Wren schema metadata.
+- Save should write a draft; activate should require successful validation or
+  explicit user confirmation if warnings remain.
+
+### Frontend API And Types
+
+Add to:
+
+```text
+superset-frontend/src/SqlLab/components/SemanticLayerEditor/api.ts
+superset-frontend/src/SqlLab/components/SemanticLayerEditor/types.ts
+```
+
+Types:
+
+```ts
+export type MdlFileStatus = 'draft' | 'active' | 'deleted';
+export type MdlFileSourceType = 'uploaded_mdl' | 'manual' | 'enriched_markdown';
+
+export interface SemanticProject {
+  id: string;
+  name: string;
+  databaseId?: number;
+  databaseLabel?: string;
+  catalogName?: string | null;
+  schemaName: string;
+  currentVersionId?: string;
+  access: 'read' | 'write' | 'admin';
+}
+
+export interface MdlValidationMessage {
+  line?: number;
+  column?: number;
+  severity: 'error' | 'warning' | 'info';
+  message: string;
+  code?: string;
+}
+
+export interface MdlValidationResult {
+  valid: boolean;
+  messages: MdlValidationMessage[];
+}
+
+export interface MdlFile {
+  id: string;
+  projectId: string;
+  path: string;
+  filename: string;
+  content: string;
+  contentType: 'application/x-yaml' | 'text/yaml';
+  sourceType: MdlFileSourceType;
+  status: MdlFileStatus;
+  validation?: MdlValidationResult;
+  checksum: string;
+  sourceDocumentId?: string | null;
+  updatedAt: string;
+}
+
+export interface SemanticSourceDocument {
+  id: string;
+  projectId: string;
+  filename: string;
+  contentType: 'text/markdown';
+  extractedTextPreview?: string | null;
+  status: 'uploaded' | 'extracted' | 'needs_review' | 'approved' | 'indexed' | 'error';
+}
+
+export interface MdlEnrichmentProposal {
+  sourceDocumentId: string;
+  proposedPath: string;
+  proposedYaml: string;
+  validation: MdlValidationResult;
+  warnings: string[];
+}
+```
+
+API functions:
+
+```text
+resolveSemanticProject({ databaseId, catalogName, schemaName })
+listMdlFiles(projectId)
+getMdlFile(projectId, fileId)
+createMdlFile(projectId, payload)
+updateMdlFile(projectId, fileId, payload)
+deleteMdlFile(projectId, fileId)
+uploadMdlFile(projectId, file)
+uploadMarkdownForEnrichment(projectId, file)
+enrichMarkdown(projectId, documentId)
+validateMdlFile(projectId, fileId)
+materializeSemanticProject(projectId)
+```
+
+Recommended backend endpoints:
+
+```text
+POST /agent/semantic-layer/projects/resolve
+GET /agent/semantic-layer/projects/{project_id}/mdl-files
+POST /agent/semantic-layer/projects/{project_id}/mdl-files
+GET /agent/semantic-layer/projects/{project_id}/mdl-files/{file_id}
+PATCH /agent/semantic-layer/projects/{project_id}/mdl-files/{file_id}
+DELETE /agent/semantic-layer/projects/{project_id}/mdl-files/{file_id}
+POST /agent/semantic-layer/projects/{project_id}/mdl-files/upload
+POST /agent/semantic-layer/projects/{project_id}/documents/upload-markdown
+POST /agent/semantic-layer/projects/{project_id}/documents/{document_id}/enrich
+POST /agent/semantic-layer/projects/{project_id}/mdl-files/{file_id}/validate
+POST /agent/semantic-layer/projects/{project_id}/materialize
+```
+
+### Runtime Materialization
+
+Add:
+
+```text
+superset_ai_agent/semantic_layer/mdl_files.py
+superset_ai_agent/semantic_layer/mdl_validation.py
+superset_ai_agent/integrations/wren/project_materializer.py
+tests/unit_tests/superset_ai_agent/test_semantic_layer_mdl_files.py
+tests/unit_tests/superset_ai_agent/test_semantic_layer_mdl_api.py
+tests/unit_tests/superset_ai_agent/test_wren_project_materializer.py
+```
+
+`WrenProjectMaterializer` should:
+
+- load only `status="active"` MDL files for the selected schema project;
+- write them to a schema-specific directory such as
+  `{AI_AGENT_STORAGE_DIR}/wren/projects/{database_uri_fingerprint}/{catalog_or_default}/{schema_name}/`;
+- sanitize file paths so MDL rows cannot write outside the project directory;
+- materialize by writing to a temporary directory and atomically renaming it;
+- write a manifest with file checksums and project/version IDs;
+- return the materialized project path to `WrenClient.fetch_context` and
+  `WrenClient.dry_plan`.
+
+Wren runtime behavior:
+
+- Wren receives one materialized project directory for the selected
+  `(database_uri_fingerprint, catalog_name, schema_name)`;
+- Wren may return context, examples, onboarding proposals, and dry plans;
+- Wren must not execute generated SQL;
+- generated SQL is validated and executed only through `SupersetClient`.
+
+### Frontend Tests
+
+Add:
+
+```text
+superset-frontend/src/SqlLab/components/TableExploreTree/TreeNodeRenderer.test.tsx
+superset-frontend/src/SqlLab/components/TabbedSqlEditors/index.test.tsx
+superset-frontend/src/SqlLab/components/SemanticLayerEditor/SemanticLayerEditor.test.tsx
+superset-frontend/src/SqlLab/components/SemanticLayerEditor/MdlFileBrowser.test.tsx
+superset-frontend/src/SqlLab/components/SemanticLayerEditor/MdlUploadDialog.test.tsx
+superset-frontend/src/SqlLab/components/SemanticLayerEditor/MdlEditor.test.tsx
+superset-frontend/src/SqlLab/components/SemanticLayerEditor/MdlEnrichmentReview.test.tsx
+```
+
+Test assertions:
+
+- schema rows expose an "Open semantic layer" action;
+- clicking the action opens a semantic tab scoped to the selected database and
+  schema;
+- SQL tabs still open, close, select, and run as before;
+- semantic tabs do not call SQL run actions or render query result panes;
+- YAML editor uses `language="yaml"`;
+- upload accepts YAML and Markdown and rejects unsupported file types;
+- Markdown enrichment requires explicit review before activation;
+- deleting an MDL file uses the semantic-layer API and does not remove query
+  editor state.
+
+## 22. Revised Follow-Up Milestones
+
+| Milestone | Scope | Highest-risk files |
+| --- | --- | --- |
+| F1. Alembic migrations and semantic project tables | Replace `create_all`, add project/grant/proof tables. | `superset_ai_agent/persistence/database.py`, `models.py`, migrations |
+| F2. URI fingerprint and schema access resolver | Implement DB URI matching, schema project discovery, selected-schema resolution, Superset DB proof, and partial dataset filtering. | `superset_ai_agent/semantic_layer/access.py`, `uri_fingerprint.py`, `graph.py`, `conversation_graph.py` |
+| F3. Agent schema project CRUD | Add project routes and store methods for schema-scoped projects. | `superset_ai_agent/app.py`, `semantic_layer/projects.py`, `semantic_layer/sqlalchemy_store.py` |
+| F4. SQL Lab AI audit marker | Use `client_id`, `sql_editor_id`, and `tab`; extend `AuditInfo`. | `integrations/superset/rest.py`, `schemas.py`, graph execution source plumbing |
+| F5. MDL file persistence and API | Add CRUD, upload, validation, soft delete, checksum, project-id backfill, and active-YAML-only status handling for schema-project MDL files. | `semantic_layer/mdl_files.py`, `semantic_layer/mdl_validation.py`, `app.py`, migrations |
+| F6. SQL Lab semantic editor tab | Add schema browser entrypoint, mixed SQL Lab tab model, MDL browser, YAML editor, and upload dialog. | `TableExploreTree/TreeNodeRenderer.tsx`, `TabbedSqlEditors/index.tsx`, `SqlLab/types.ts`, `SemanticLayerEditor/*` |
+| F7. Markdown enrichment review | Convert Markdown uploads to proposed MDL through Wren onboarding and require explicit user review before activation. | `SemanticLayerEditor/MdlEnrichmentReview.tsx`, `integrations/wren/client.py`, `semantic_layer/documents.py` |
+| F8. Wren HTTP adapter and materializer | Add no-execution HTTP adapter and schema-project directory materialization. | `integrations/wren/http_client.py`, `integrations/wren/project_materializer.py`, `factory.py` |
+| F9. Superset semantic CRUD bridge | Call Superset REST semantic-layer/view APIs through user session for explicit publication. | `integrations/superset/rest.py`, semantic project publish/sync code |
+| F10. Object storage for documents | Add S3/GCS-style storage and app-level storage factory. | `semantic_layer/file_storage.py`, `object_storage.py`, `app.py` |
+| F11. One-shot semantic context parity | Merge the authorized selected schema project into `/agent/query`. | `graph.py`, `app.py`, tests |
+| F12. Docs and adapter warnings | Document REST/MCP/local differences, schema-scoped semantic layers, MDL editor flow, and URI-derived access model. | `README.md`, `ARCHITECTURE.md`, `integrations/superset/README.md` |
+
+## 23. Revised Risk Register
+
+| Risk | Close-out condition |
+| --- | --- |
+| Agent DB has no versioned migration lifecycle | F1 merged with Alembic tests. |
+| Semantic-layer sharing could leak metadata | F2 proves access via Superset DB/schema, filtered dataset context, or validated URI fingerprint; raw URI never stored. |
+| URI matching could be spoofed | URI proof requires successful connection validation, salted fingerprinting, schema discovery, and proof TTL. |
+| Users may expect CRUD on semantic layers they can access | F3/F5/F9 implement project CRUD, MDL file CRUD, and optional Superset REST sync. |
+| SQL Lab audit lacks AI source marker | F4 uses accepted SQL Lab fields and exposes them in `AuditInfo`. |
+| SQL Lab tab state could break existing query-editor behavior | F6 normalizes legacy `tabHistory`, keeps query tabs as `QueryEditor`, and adds tests for SQL tab open/close/run behavior. |
+| MDL editor could inherit SQL run hotkeys | F6 uses a dedicated `MdlEditor` around `EditorHost`, not `EditorWrapper`, and tests that semantic tabs do not dispatch query run actions. |
+| Existing scope-based semantic records could be orphaned | F5 adds nullable `project_id`, compatibility route resolution, and lazy backfill tests for documents, versions, and events. |
+| Catalog-aware databases could collide on schema names | F2/F5 include `catalog_name` in semantic project resolution, uniqueness, materialization paths, and audit metadata where available. |
+| Wren project directory can drift from DB state | F8 materializes active MDL files atomically with a checksum manifest and tests path sanitization. |
+| Markdown source documents could be materialized as MDL | F5/F8 enforce that only validated YAML MDL files with `status="active"` are materialized. |
+| Markdown enrichment could produce incorrect MDL | F7 requires review before activation and records validation warnings next to the proposal. |
+| Unsupported uploads could create unclear user expectations | F5/F6 accept only YAML MDL and Markdown for enrichment, with explicit rejection for other file types. |
+| Large schemas can overwhelm Wren context | F2/F8 require one selected schema project plus top-k retrieval inside that schema. |
+| Object storage is missing | F10 makes raw document storage production-capable. |
+| One-shot and conversation behavior differ | F11 gives both flows the same semantic access resolver. |
+| Superset semantic-layer core access is not DB-derived | F9 works via agent project ACL first; Superset core changes are proposed separately. |
+
+## 24. Avoid For Now
+
+- Wren direct execution.
+- Letting Wren validate or override Superset SQL authorization.
+- Persisting raw database URIs, usernames, passwords, or tokens.
+- Granting SQL execution based on URI proof tokens.
+- Treating URI-derived semantic access as Superset DB permission.
+- Automatic MDL mutation without human review.
+- Treating semantic editor tabs as SQL `QueryEditor` tabs.
+- Registering SQL run-query hotkeys in the MDL YAML editor.
+- Materializing draft, deleted, invalid, or unreviewed MDL files into Wren.
+- Storing Markdown source documents as active MDL files.
+- Accepting unsupported document types before the enrichment pipeline is
+  designed for them.
+- Production persistence with `DEFAULT_OWNER_ID = "local"`.
+- Direct mutation of Superset `semantic_layers` or `semantic_views` outside
+  Superset commands or REST APIs.
+- Global document memory across unrelated database fingerprints.
+- Saved Superset chart creation without explicit user action.
+- Using `client_id="superset_ai_agent"` as a fixed SQL Lab marker.

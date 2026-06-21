@@ -63,6 +63,7 @@ class SqlAlchemyConversationStore:
                 owner_id=owner_id,
                 title=conversation.title,
                 database_id=scope.database_id,
+                catalog_name=scope.catalog_name,
                 schema_name=scope.schema_name,
                 scope=scope.model_dump(mode="json"),
                 created_at=conversation.created_at,
@@ -126,6 +127,7 @@ class SqlAlchemyConversationStore:
                 owner_id=owner_id,
             )
             conversation.database_id = scope.database_id
+            conversation.catalog_name = scope.catalog_name
             conversation.schema_name = scope.schema_name
             conversation.scope = scope.model_dump(mode="json")
             conversation.updated_at = _utc_now()
@@ -294,6 +296,7 @@ def _summarize_model(model: AiAgentConversation) -> ConversationSummary:
         title=model.title,
         owner_id=model.owner_id,
         database_id=model.database_id,
+        catalog_name=model.catalog_name,
         schema_name=model.schema_name,
         updated_at=model.updated_at,
         last_message=last_message,

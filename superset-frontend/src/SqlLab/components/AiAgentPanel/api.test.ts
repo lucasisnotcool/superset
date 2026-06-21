@@ -18,20 +18,30 @@
  */
 import fetchMock from 'fetch-mock';
 import {
+  createMdlFile,
   createConversation,
   createSemanticLayerEventSource,
+  createProjectSemanticLayerEventSource,
+  deleteMdlFile,
+  enrichProjectDocument,
   getSemanticLayerState,
   deleteConversation,
   executeConversationSql,
   getAgentBaseUrl,
   getAgentHealth,
   getConversation,
+  listMdlFiles,
   listConversations,
   listSemanticDocuments,
+  materializeSemanticProject,
   queryAgent,
   rebuildSemanticLayerIndex,
   reviewSemanticDocument,
+  resolveSemanticProject,
   sendConversationMessage,
+  updateMdlFile,
+  uploadMdlFile,
+  uploadProjectSourceDocument,
   uploadSemanticDocument,
   validateSql,
 } from './api';
@@ -87,6 +97,7 @@ test('queryAgent posts typed payload to agent backend', async () => {
   const response = await queryAgent({
     question: 'show one',
     database_id: 1,
+    catalog_name: 'prod',
     schema_name: null,
     dataset_ids: [16],
     execute: false,
@@ -98,6 +109,7 @@ test('queryAgent posts typed payload to agent backend', async () => {
   expect(JSON.parse(String(call.options.body))).toEqual({
     question: 'show one',
     database_id: 1,
+    catalog_name: 'prod',
     schema_name: null,
     dataset_ids: [16],
     execute: false,
@@ -334,6 +346,162 @@ test('semantic-layer API helpers use typed document endpoints', async () => {
   expect(uploadCall.options.credentials).toBe('include');
 });
 
+test('semantic project API helpers use project and MDL endpoints', async () => {
+  const project = {
+    id: 'project-1',
+    name: 'Sales.prod.pipeline',
+    owner_id: 'owner',
+    database_uri_fingerprint: 'fingerprint',
+    database_label: 'Sales',
+    catalog_name: 'prod',
+    schema_name: 'pipeline',
+    default_database_id: 1,
+    visibility: 'db_access',
+    status: 'active',
+    permission: 'admin',
+    created_at: '2026-06-19T00:00:00Z',
+    updated_at: '2026-06-19T00:00:00Z',
+  };
+  const mdlFile = {
+    id: 'file-1',
+    project_id: 'project-1',
+    path: 'models/gross_moves.yaml',
+    filename: 'gross_moves.yaml',
+    content: 'models:\n  - name: gross_moves\n',
+    content_type: 'application/x-yaml',
+    source_type: 'manual',
+    status: 'draft',
+    validation: { valid: true, messages: [] },
+    checksum: 'checksum',
+    created_at: '2026-06-19T00:00:00Z',
+    updated_at: '2026-06-19T00:00:00Z',
+  };
+  const document = {
+    id: 'document-1',
+    project_id: 'project-1',
+    filename: 'notes.md',
+    content_type: 'text/markdown',
+    size_bytes: 12,
+    status: 'extracted',
+    scope: {
+      database_id: 1,
+      catalog_name: 'prod',
+      schema_name: 'pipeline',
+      dataset_ids: [],
+    },
+    checksum: 'abc',
+    storage_uri: 'file:///tmp/notes.md',
+    proposed_updates: [],
+    warnings: [],
+    created_at: '2026-06-19T00:00:00Z',
+    updated_at: '2026-06-19T00:00:00Z',
+  };
+  fetchMock.post(
+    'http://agent.local/agent/semantic-layer/projects/resolve',
+    project,
+  );
+  fetchMock.get(
+    'http://agent.local/agent/semantic-layer/projects/project-1/mdl-files',
+    [mdlFile],
+  );
+  fetchMock.post(
+    'http://agent.local/agent/semantic-layer/projects/project-1/mdl-files',
+    mdlFile,
+  );
+  fetchMock.patch(
+    'http://agent.local/agent/semantic-layer/projects/project-1/mdl-files/file-1',
+    { ...mdlFile, status: 'active' },
+  );
+  fetchMock.delete(
+    'http://agent.local/agent/semantic-layer/projects/project-1/mdl-files/file-1',
+    { deleted: true },
+  );
+  fetchMock.post(
+    'http://agent.local/agent/semantic-layer/projects/project-1/mdl-files/upload',
+    mdlFile,
+  );
+  fetchMock.post(
+    'http://agent.local/agent/semantic-layer/projects/project-1/documents',
+    document,
+  );
+  fetchMock.post(
+    'http://agent.local/agent/semantic-layer/projects/project-1/documents/document-1/enrich',
+    {
+      source_document_id: 'document-1',
+      proposed_path: 'models/gross_moves.yaml',
+      proposed_yaml: 'models:\n  - name: gross_moves\n',
+      validation: { valid: true, messages: [] },
+      warnings: [],
+    },
+  );
+  fetchMock.post(
+    'http://agent.local/agent/semantic-layer/projects/project-1/materialize',
+    {
+      project_id: 'project-1',
+      path: '/tmp/wren/project-1/mdl.json',
+      file_count: 1,
+      checksum: 'checksum',
+    },
+  );
+
+  expect(
+    (
+      await resolveSemanticProject({
+        database_id: 1,
+        catalog_name: 'prod',
+        schema_name: 'pipeline',
+      })
+    ).id,
+  ).toBe('project-1');
+  expect(await listMdlFiles('project-1')).toHaveLength(1);
+  expect(
+    (
+      await createMdlFile('project-1', {
+        path: 'models/gross_moves.yaml',
+        content: 'models:\n  - name: gross_moves\n',
+      })
+    ).id,
+  ).toBe('file-1');
+  expect(
+    (
+      await updateMdlFile('project-1', 'file-1', {
+        status: 'active',
+      })
+    ).status,
+  ).toBe('active');
+  expect((await deleteMdlFile('project-1', 'file-1')).deleted).toBe(true);
+  expect(
+    (
+      await uploadMdlFile(
+        'project-1',
+        new File(['models: []'], 'mdl.yaml', { type: 'text/yaml' }),
+      )
+    ).id,
+  ).toBe('file-1');
+  expect(
+    (
+      await uploadProjectSourceDocument(
+        'project-1',
+        new File(['notes'], 'notes.md', { type: 'text/markdown' }),
+      )
+    ).project_id,
+  ).toBe('project-1');
+  expect(
+    (await enrichProjectDocument('project-1', 'document-1')).proposed_path,
+  ).toBe('models/gross_moves.yaml');
+  expect((await materializeSemanticProject('project-1')).file_count).toBe(1);
+
+  const [resolveCall] = fetchMock.callHistory.calls(
+    'http://agent.local/agent/semantic-layer/projects/resolve',
+  );
+  expect(resolveCall.options.credentials).toBe('include');
+  expect(JSON.parse(String(resolveCall.options.body))).toEqual({
+    database_id: 1,
+    catalog_name: 'prod',
+    schema_name: 'pipeline',
+  });
+});
+
 test('API helpers surface FastAPI detail errors', async () => {
   fetchMock.get('http://agent.local/agent/conversations', {
     status: 401,
@@ -392,9 +560,11 @@ test('semantic-layer event source includes Superset credentials', () => {
   try {
     createSemanticLayerEventSource({
       database_id: 1,
+      catalog_name: 'prod',
       schema_name: null,
       dataset_ids: [16],
     });
+    createProjectSemanticLayerEventSource('project-1');
   } finally {
     Object.defineProperty(globalThis, 'EventSource', {
       configurable: true,
@@ -404,7 +574,11 @@ test('semantic-layer event source includes Superset credentials', () => {
 
   expect(calls).toEqual([
     {
-      url: 'http://agent.local/agent/semantic-layer/events?database_id=1&dataset_ids=16',
+      url: 'http://agent.local/agent/semantic-layer/events?database_id=1&catalog_name=prod&dataset_ids=16',
+      init: { withCredentials: true },
+    },
+    {
+      url: 'http://agent.local/agent/semantic-layer/projects/project-1/events',
       init: { withCredentials: true },
     },
   ]);

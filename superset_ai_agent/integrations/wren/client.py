@@ -41,6 +41,7 @@ class WrenClient(Protocol):
         *,
         question: str,
         superset_context: AgentContext,
+        mdl_path: str | None = None,
     ) -> WrenContextArtifact:
         """Fetch semantic context for an already permission-filtered scope."""
 
@@ -58,6 +59,7 @@ class WrenClient(Protocol):
         question: str,
         sql: str | None,
         context: AgentContext,
+        mdl_path: str | None = None,
     ) -> dict[str, Any]:
         """Return planning metadata without executing SQL."""
 
@@ -76,6 +78,7 @@ class DisabledWrenClient:
         *,
         question: str,
         superset_context: AgentContext,
+        mdl_path: str | None = None,
     ) -> WrenContextArtifact:
         return WrenContextArtifact(
             enabled=False,
@@ -97,6 +100,7 @@ class DisabledWrenClient:
         question: str,
         sql: str | None,
         context: AgentContext,
+        mdl_path: str | None = None,
     ) -> dict[str, Any]:
         return {
             "enabled": False,
@@ -127,15 +131,16 @@ class FileWrenClient:
         *,
         question: str,
         superset_context: AgentContext,
+        mdl_path: str | None = None,
     ) -> WrenContextArtifact:
-        if not self.is_available():
+        if self._mdl_path(mdl_path) is None:
             return WrenContextArtifact(
                 enabled=True,
                 available=False,
                 warnings=["Wren MDL path is not configured or does not exist."],
             )
 
-        mdl = self._load_mdl()
+        mdl = self._load_mdl(mdl_path)
         examples = self.recall_examples(
             question=question,
             limit=self.config.wren_example_limit,
@@ -191,6 +196,7 @@ class FileWrenClient:
         question: str,
         sql: str | None,
         context: AgentContext,
+        mdl_path: str | None = None,
     ) -> dict[str, Any]:
         if not self.config.wren_dry_plan_enabled:
             return {
@@ -198,14 +204,14 @@ class FileWrenClient:
                 "planning_only": True,
                 "dry_plan_enabled": False,
             }
-        if not self.is_available():
+        if self._mdl_path(mdl_path) is None:
             return {
                 "enabled": True,
                 "available": False,
                 "planning_only": True,
                 "warnings": ["Wren MDL path is not configured or does not exist."],
             }
-        mdl = self._load_mdl()
+        mdl = self._load_mdl(mdl_path)
         return {
             "enabled": True,
             "available": True,
@@ -243,11 +249,15 @@ class FileWrenClient:
             if score > 0:
                 matches.append((score, name))
         if not matches:
-            return self.list_models()
+            return [
+                name
+                for name in (_model_name(model) for model in _models_from_mdl(mdl))
+                if name
+            ]
         return [name for _, name in sorted(matches, reverse=True)]
 
-    def _load_mdl(self) -> dict[str, Any]:
-        path = self._mdl_path()
+    def _load_mdl(self, mdl_path: str | None = None) -> dict[str, Any]:
+        path = self._mdl_path(mdl_path)
         if path is None:
             return {}
         try:
@@ -256,7 +266,10 @@ class FileWrenClient:
             return {}
         return payload if isinstance(payload, dict) else {}
 
-    def _mdl_path(self) -> Path | None:
+    def _mdl_path(self, mdl_path: str | None = None) -> Path | None:
+        if mdl_path:
+            path = Path(mdl_path)
+            return path if path.exists() and path.is_file() else None
         candidates = []
         if self.config.wren_mdl_path:
             candidates.append(Path(self.config.wren_mdl_path))

@@ -65,15 +65,24 @@ export interface AuditInfo {
   results_key?: string | null;
   executed_sql?: string | null;
   database_id?: number | null;
+  catalog_name?: string | null;
   schema_name?: string | null;
   row_limit?: number | null;
   timeout_seconds?: number | null;
+  client_id?: string | null;
+  sql_editor_id?: string | null;
+  tab?: string | null;
+  source_hash?: string | null;
   source?: string | null;
 }
 
 export interface WrenContextArtifact {
   enabled: boolean;
   available: boolean;
+  project_id?: string | null;
+  mdl_path?: string | null;
+  materialized_file_count?: number | null;
+  materialized_checksum?: string | null;
   matched_models: string[];
   example_ids: string[];
   document_ids: string[];
@@ -95,6 +104,7 @@ export interface ExecutionResult {
 export interface AgentQueryRequest {
   question: string;
   database_id: number;
+  catalog_name?: string | null;
   schema_name?: string | null;
   dataset_ids: number[];
   execute: boolean;
@@ -119,6 +129,7 @@ export interface AgentQueryResponse {
 
 export interface ConversationScope {
   database_id: number;
+  catalog_name?: string | null;
   schema_name?: string | null;
   dataset_ids: number[];
   query_editor_id?: string | null;
@@ -175,6 +186,7 @@ export interface SemanticUpdate {
 
 export interface SemanticDocument {
   id: string;
+  project_id?: string | null;
   filename: string;
   content_type: string;
   size_bytes: number;
@@ -200,7 +212,9 @@ export interface SemanticLayerReviewRequest {
 }
 
 export interface SemanticLayerState {
+  project_id?: string | null;
   database_id: number;
+  catalog_name?: string | null;
   schema_name?: string | null;
   dataset_ids: number[];
   document_count: number;
@@ -213,6 +227,7 @@ export interface SemanticLayerState {
 
 export interface SemanticLayerVersion {
   id: string;
+  project_id?: string | null;
   scope: ConversationScope;
   scope_hash: string;
   version: string;
@@ -247,6 +262,7 @@ export interface ConversationSummary {
   title: string;
   owner_id: string;
   database_id: number;
+  catalog_name?: string | null;
   schema_name?: string | null;
   updated_at: string;
   last_message?: string | null;
@@ -286,6 +302,102 @@ export interface AgentHealthResponse {
   reachable: boolean;
   ollama_base_url?: string | null;
   ollama_reachable?: boolean | null;
+}
+
+export type SemanticProjectVisibility = 'private' | 'db_access' | 'custom';
+export type SemanticProjectPermission = 'read' | 'write' | 'admin';
+export type MdlFileStatus = 'draft' | 'active' | 'deleted';
+export type MdlFileSourceType = 'uploaded_mdl' | 'manual' | 'enriched_markdown';
+
+export interface SemanticProject {
+  id: string;
+  name: string;
+  description?: string | null;
+  owner_id: string;
+  database_uri_fingerprint: string;
+  database_backend?: string | null;
+  database_label?: string | null;
+  catalog_name?: string | null;
+  schema_name: string;
+  schema_display_name?: string | null;
+  default_database_id?: number | null;
+  visibility: SemanticProjectVisibility;
+  current_version_id?: string | null;
+  status: 'active' | 'archived';
+  permission: SemanticProjectPermission;
+  created_at: string;
+  updated_at: string;
+  deleted_at?: string | null;
+}
+
+export interface SemanticProjectResolveRequest {
+  database_id: number;
+  database_label?: string | null;
+  database_backend?: string | null;
+  catalog_name?: string | null;
+  schema_name: string;
+  supplied_uri?: string | null;
+  create_if_missing?: boolean;
+}
+
+export interface MdlValidationMessage {
+  line?: number | null;
+  column?: number | null;
+  severity: 'error' | 'warning' | 'info';
+  message: string;
+  code?: string | null;
+}
+
+export interface MdlValidationResult {
+  valid: boolean;
+  messages: MdlValidationMessage[];
+}
+
+export interface MdlFile {
+  id: string;
+  project_id: string;
+  path: string;
+  filename: string;
+  content: string;
+  content_type: 'application/x-yaml' | 'text/yaml';
+  source_type: MdlFileSourceType;
+  status: MdlFileStatus;
+  validation?: MdlValidationResult | null;
+  checksum: string;
+  source_document_id?: string | null;
+  created_by?: string | null;
+  updated_by?: string | null;
+  created_at: string;
+  updated_at: string;
+  deleted_at?: string | null;
+}
+
+export interface MdlFileCreateRequest {
+  path: string;
+  content: string;
+  source_type?: MdlFileSourceType;
+  source_document_id?: string | null;
+}
+
+export interface MdlFileUpdateRequest {
+  path?: string | null;
+  content?: string | null;
+  status?: MdlFileStatus | null;
+}
+
+export interface MdlEnrichmentProposal {
+  source_document_id: string;
+  proposed_path: string;
+  proposed_yaml: string;
+  validation: MdlValidationResult;
+  warnings: string[];
+}
+
+export interface WrenMaterializationResult {
+  project_id: string;
+  path: string;
+  file_count: number;
+  checksum: string;
 }
 
 const trimTrailingSlash = (url: string) => url.replace(/\/+$/, '');
@@ -346,6 +458,9 @@ const semanticScopeParams = (scope: ConversationScope) => {
   });
   if (scope.schema_name) {
     params.set('schema_name', scope.schema_name);
+  }
+  if (scope.catalog_name) {
+    params.set('catalog_name', scope.catalog_name);
   }
   if (scope.dataset_ids.length > 0) {
     params.set('dataset_ids', scope.dataset_ids.join(','));
@@ -424,6 +539,118 @@ export const uploadSemanticDocument = (
   );
 };
 
+export const resolveSemanticProject = (
+  payload: SemanticProjectResolveRequest,
+) =>
+  requestJson<SemanticProject>('/agent/semantic-layer/projects/resolve', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+
+export const listSemanticProjects = (
+  databaseId: number,
+  catalogName?: string | null,
+  schemaName?: string | null,
+) => {
+  const params = new URLSearchParams({ database_id: String(databaseId) });
+  if (catalogName) {
+    params.set('catalog_name', catalogName);
+  }
+  if (schemaName) {
+    params.set('schema_name', schemaName);
+  }
+  return requestJson<SemanticProject[]>(
+    `/agent/semantic-layer/projects?${params.toString()}`,
+    { method: 'GET' },
+  );
+};
+
+export const listMdlFiles = (projectId: string) =>
+  requestJson<MdlFile[]>(
+    `/agent/semantic-layer/projects/${projectId}/mdl-files`,
+    { method: 'GET' },
+  );
+
+export const createMdlFile = (
+  projectId: string,
+  payload: MdlFileCreateRequest,
+) =>
+  requestJson<MdlFile>(
+    `/agent/semantic-layer/projects/${projectId}/mdl-files`,
+    {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    },
+  );
+
+export const updateMdlFile = (
+  projectId: string,
+  fileId: string,
+  payload: MdlFileUpdateRequest,
+) =>
+  requestJson<MdlFile>(
+    `/agent/semantic-layer/projects/${projectId}/mdl-files/${fileId}`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    },
+  );
+
+export const deleteMdlFile = (projectId: string, fileId: string) =>
+  requestJson<{ deleted: boolean }>(
+    `/agent/semantic-layer/projects/${projectId}/mdl-files/${fileId}`,
+    { method: 'DELETE' },
+  );
+
+export const validateMdlFile = (projectId: string, fileId: string) =>
+  requestJson<MdlValidationResult>(
+    `/agent/semantic-layer/projects/${projectId}/mdl-files/${fileId}/validate`,
+    { method: 'POST' },
+  );
+
+export const uploadMdlFile = (
+  projectId: string,
+  file: File,
+  path?: string | null,
+) => {
+  const formData = new FormData();
+  if (path) {
+    formData.append('path', path);
+  }
+  formData.append('file', file);
+  return requestForm<MdlFile>(
+    `/agent/semantic-layer/projects/${projectId}/mdl-files/upload`,
+    formData,
+  );
+};
+
+export const uploadProjectSourceDocument = (projectId: string, file: File) => {
+  const formData = new FormData();
+  formData.append('file', file);
+  return requestForm<SemanticDocument>(
+    `/agent/semantic-layer/projects/${projectId}/documents`,
+    formData,
+  );
+};
+
+export const enrichProjectDocument = (projectId: string, documentId: string) =>
+  requestJson<MdlEnrichmentProposal>(
+    `/agent/semantic-layer/projects/${projectId}/documents/${documentId}/enrich`,
+    { method: 'POST' },
+  );
+
+export const materializeSemanticProject = (projectId: string) =>
+  requestJson<WrenMaterializationResult>(
+    `/agent/semantic-layer/projects/${projectId}/materialize`,
+    { method: 'POST' },
+  );
+
+export const getProjectSemanticLayerState = (projectId: string) =>
+  requestJson<SemanticLayerState>(
+    `/agent/semantic-layer/projects/${projectId}/state`,
+    { method: 'GET' },
+  );
+
 export const listSemanticDocuments = (scope: ConversationScope) =>
   requestJson<SemanticDocument[]>(
     `/agent/semantic-layer/documents?${semanticScopeParams(scope)}`,
@@ -465,5 +692,11 @@ export const createSemanticLayerEventSource = (scope: ConversationScope) =>
     `${getAgentBaseUrl()}/agent/semantic-layer/events?${semanticScopeParams(
       scope,
     )}`,
+    { withCredentials: true },
+  );
+
+export const createProjectSemanticLayerEventSource = (projectId: string) =>
+  new EventSource(
+    `${getAgentBaseUrl()}/agent/semantic-layer/projects/${projectId}/events`,
     { withCredentials: true },
   );

@@ -79,6 +79,7 @@ class SqlAlchemySemanticLayerStore:
                     .where(
                         AiAgentSemanticDocument.owner_id == owner_id,
                         AiAgentSemanticDocument.database_id == scope.database_id,
+                        AiAgentSemanticDocument.catalog_name == scope.catalog_name,
                         AiAgentSemanticDocument.schema_name == scope.schema_name,
                     )
                     .order_by(AiAgentSemanticDocument.created_at.desc())
@@ -96,6 +97,32 @@ class SqlAlchemySemanticLayerStore:
                 document
                 for document in documents
                 if scope_matches(document.scope, scope)
+            ]
+
+    def list_project_documents(
+        self,
+        project_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> list[SemanticDocument]:
+        with self.session_factory() as session:
+            models = (
+                session.execute(
+                    select(AiAgentSemanticDocument)
+                    .where(
+                        AiAgentSemanticDocument.owner_id == owner_id,
+                        AiAgentSemanticDocument.project_id == project_id,
+                    )
+                    .order_by(AiAgentSemanticDocument.created_at.desc())
+                )
+                .scalars()
+                .all()
+            )
+            return [
+                _document_from_model(
+                    model, updates=_updates_for_document(session, model.id)
+                )
+                for model in models
             ]
 
     def get_document(
@@ -127,7 +154,9 @@ class SqlAlchemySemanticLayerStore:
                 document.id,
                 owner_id=owner_id,
             )
+            model.project_id = document.project_id
             model.database_id = document.scope.database_id
+            model.catalog_name = document.scope.catalog_name
             model.schema_name = document.scope.schema_name
             model.dataset_ids = document.scope.dataset_ids
             model.filename = document.filename
@@ -153,11 +182,21 @@ class SqlAlchemySemanticLayerStore:
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> list[SemanticUpdate]:
         with self.session_factory() as session:
-            self._get_document_model(session, document_id, owner_id=owner_id)
+            document = self._get_document_model(
+                session,
+                document_id,
+                owner_id=owner_id,
+            )
             for update in updates:
                 existing = session.get(AiAgentSemanticUpdate, update.id)
                 if existing is None:
-                    session.add(_update_to_model(update, owner_id=owner_id))
+                    session.add(
+                        _update_to_model(
+                            update,
+                            owner_id=owner_id,
+                            project_id=document.project_id,
+                        )
+                    )
                 elif (
                     existing.owner_id == owner_id
                     and existing.document_id == document_id
@@ -181,6 +220,21 @@ class SqlAlchemySemanticLayerStore:
             )
         return updates
 
+    def list_project_approved_updates(
+        self,
+        project_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> list[SemanticUpdate]:
+        updates: list[SemanticUpdate] = []
+        for document in self.list_project_documents(project_id, owner_id=owner_id):
+            updates.extend(
+                update
+                for update in document.proposed_updates
+                if update.reviewed and update.approved
+            )
+        return updates
+
     def save_version(
         self,
         version: SemanticLayerVersion,
@@ -191,8 +245,10 @@ class SqlAlchemySemanticLayerStore:
             session.add(
                 AiAgentSemanticLayerVersion(
                     id=version.id,
+                    project_id=version.project_id,
                     owner_id=owner_id,
                     database_id=version.scope.database_id,
+                    catalog_name=version.scope.catalog_name,
                     schema_name=version.scope.schema_name,
                     dataset_ids=version.scope.dataset_ids,
                     scope_hash=version.scope_hash,
@@ -252,7 +308,9 @@ class SqlAlchemySemanticLayerStore:
             None,
         )
         return SemanticLayerState(
+            project_id=documents[0].project_id if documents else None,
             database_id=scope.database_id,
+            catalog_name=scope.catalog_name,
             schema_name=scope.schema_name,
             dataset_ids=scope.dataset_ids,
             document_count=len(documents),
@@ -273,6 +331,44 @@ class SqlAlchemySemanticLayerStore:
             last_error=last_error,
         )
 
+    def get_project_state(
+        self,
+        project_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> SemanticLayerState:
+        documents = self.list_project_documents(project_id, owner_id=owner_id)
+        first_scope = (
+            documents[0].scope
+            if documents
+            else ConversationScope(database_id=0, dataset_ids=[])
+        )
+        last_error = next(
+            (document.error for document in documents if document.status == "error"),
+            None,
+        )
+        return SemanticLayerState(
+            project_id=project_id,
+            database_id=first_scope.database_id,
+            catalog_name=first_scope.catalog_name,
+            schema_name=first_scope.schema_name,
+            dataset_ids=first_scope.dataset_ids,
+            document_count=len(documents),
+            approved_document_count=len(
+                [
+                    document
+                    for document in documents
+                    if document.status in {"approved", "indexed"}
+                ]
+            ),
+            indexed_document_count=len(
+                [document for document in documents if document.status == "indexed"]
+            ),
+            semantic_layer_version=None,
+            indexing_status="idle",
+            last_error=last_error,
+        )
+
     def append_event(
         self,
         event: SemanticLayerEvent,
@@ -283,6 +379,7 @@ class SqlAlchemySemanticLayerStore:
             session.add(
                 AiAgentEvent(
                     id=event.id,
+                    project_id=event.project_id,
                     owner_id=owner_id,
                     scope=event.scope.model_dump(mode="json"),
                     type=event.type,
@@ -313,6 +410,30 @@ class SqlAlchemySemanticLayerStore:
             ]
             return [event for event in events if scope_matches(event.scope, scope)]
 
+    def list_project_events(
+        self,
+        project_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> list[SemanticLayerEvent]:
+        with self.session_factory() as session:
+            models = (
+                session.execute(
+                    select(AiAgentEvent)
+                    .where(
+                        AiAgentEvent.owner_id == owner_id,
+                        AiAgentEvent.project_id == project_id,
+                    )
+                    .order_by(AiAgentEvent.created_at.asc())
+                )
+                .scalars()
+                .all()
+            )
+            return [
+                SemanticLayerEvent.model_validate(model.payload)
+                for model in models
+            ]
+
     @staticmethod
     def _get_document_model(
         session: Session,
@@ -333,8 +454,10 @@ def _document_to_model(
 ) -> AiAgentSemanticDocument:
     return AiAgentSemanticDocument(
         id=document.id,
+        project_id=document.project_id,
         owner_id=owner_id,
         database_id=document.scope.database_id,
+        catalog_name=document.scope.catalog_name,
         schema_name=document.scope.schema_name,
         dataset_ids=document.scope.dataset_ids,
         filename=document.filename,
@@ -360,12 +483,14 @@ def _document_from_model(
 ) -> SemanticDocument:
     return SemanticDocument(
         id=model.id,
+        project_id=model.project_id,
         filename=model.filename,
         content_type=model.content_type,
         size_bytes=model.size_bytes,
         status=cast(SemanticDocumentStatus, model.status),
         scope=ConversationScope(
             database_id=model.database_id,
+            catalog_name=model.catalog_name,
             schema_name=model.schema_name,
             dataset_ids=model.dataset_ids,
         ),
@@ -399,9 +524,11 @@ def _update_to_model(
     update: SemanticUpdate,
     *,
     owner_id: str,
+    project_id: str | None,
 ) -> AiAgentSemanticUpdate:
     return AiAgentSemanticUpdate(
         id=update.id,
+        project_id=project_id,
         document_id=update.source_document_id,
         owner_id=owner_id,
         kind=update.kind,
@@ -455,8 +582,10 @@ def _update_from_model(model: AiAgentSemanticUpdate) -> SemanticUpdate:
 def _version_from_model(model: AiAgentSemanticLayerVersion) -> SemanticLayerVersion:
     return SemanticLayerVersion(
         id=model.id,
+        project_id=model.project_id,
         scope=ConversationScope(
             database_id=model.database_id,
+            catalog_name=model.catalog_name,
             schema_name=model.schema_name,
             dataset_ids=model.dataset_ids,
         ),

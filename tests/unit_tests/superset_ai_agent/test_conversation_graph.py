@@ -107,6 +107,8 @@ class FakeSupersetClient:
         self,
         *,
         database_id: int,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
         dataset_ids: list[int] | None = None,
         limit: int = 8,
     ) -> list[DatasetMetadata]:
@@ -120,12 +122,16 @@ class FakeSupersetClient:
         self,
         *,
         database_id: int,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
         dataset_ids: list[int] | None = None,
     ) -> AgentContext:
         return FakeContextProvider().get_context(
             AgentQueryRequest(
                 question="context",
                 database_id=database_id,
+                catalog_name=catalog_name,
+                schema_name=schema_name,
                 dataset_ids=dataset_ids or [],
             )
         )
@@ -138,6 +144,7 @@ class FakeSupersetClient:
         *,
         database_id: int,
         sql: str,
+        catalog_name: str | None = None,
         schema_name: str | None = None,
         limit: int = 1000,
     ) -> ExecutionResult:

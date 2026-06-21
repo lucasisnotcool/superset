@@ -31,5 +31,7 @@ class SupersetMetadataContextProvider(ContextProvider):
     def get_context(self, request: AgentQueryRequest) -> AgentContext:
         return self.superset_client.get_agent_context(
             database_id=request.database_id,
+            catalog_name=request.catalog_name,
+            schema_name=request.schema_name,
             dataset_ids=request.dataset_ids,
         )

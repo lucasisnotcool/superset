@@ -17,7 +17,10 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
+
+import yaml
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -78,8 +81,28 @@ from superset_ai_agent.semantic_layer.file_storage import (
 )
 from superset_ai_agent.semantic_layer.indexer import rebuild_index
 from superset_ai_agent.semantic_layer.memory import InMemorySemanticLayerStore
+from superset_ai_agent.semantic_layer.mdl_files import (
+    InMemoryMdlFileStore,
+    MdlFileNotFoundError,
+    MdlFileStore,
+    SqlAlchemyMdlFileStore,
+)
+from superset_ai_agent.semantic_layer.mdl_validation import validate_mdl_yaml
+from superset_ai_agent.semantic_layer.projects import (
+    InMemorySemanticProjectStore,
+    SemanticProjectNotFoundError,
+    SemanticProjectStore,
+    SqlAlchemySemanticProjectStore,
+)
 from superset_ai_agent.semantic_layer.review import apply_review
 from superset_ai_agent.semantic_layer.schemas import (
+    MdlEnrichmentProposal,
+    MdlFile,
+    MdlFileCreateRequest,
+    MdlFileUpdateRequest,
+    MdlValidationResult,
+    SemanticProject,
+    SemanticProjectResolveRequest,
     SemanticDocument,
     SemanticLayerEvent,
     SemanticLayerEventType,
@@ -87,6 +110,7 @@ from superset_ai_agent.semantic_layer.schemas import (
     SemanticLayerReviewRequest,
     SemanticLayerState,
     SemanticLayerVersion,
+    WrenMaterializationResult,
 )
 from superset_ai_agent.semantic_layer.sqlalchemy_store import (
     SqlAlchemySemanticLayerStore,
@@ -95,6 +119,7 @@ from superset_ai_agent.semantic_layer.store import (
     SemanticDocumentNotFoundError,
     SemanticLayerStore,
 )
+from superset_ai_agent.semantic_layer.wren_materializer import materialize_wren_project
 from superset_ai_agent.tools.sql import validate_read_only_sql
 
 
@@ -107,6 +132,8 @@ def create_app(  # noqa: C901
     conversation_graph: Any | None = None,
     conversation_store: ConversationStore | None = None,
     semantic_layer_store: SemanticLayerStore | None = None,
+    semantic_project_store: SemanticProjectStore | None = None,
+    mdl_file_store: MdlFileStore | None = None,
     document_storage: DocumentStorage | None = None,
     document_extractor: DocumentExtractor | None = None,
     superset_client: Any | None = None,
@@ -139,6 +166,16 @@ def create_app(  # noqa: C901
     active_semantic_layer_store = semantic_layer_store or _create_semantic_layer_store(
         app_config, session_factory=session_factory
     )
+    active_semantic_project_store = semantic_project_store or (
+        _create_semantic_project_store(
+            app_config,
+            session_factory=session_factory,
+        )
+    )
+    active_mdl_file_store = mdl_file_store or _create_mdl_file_store(
+        app_config,
+        session_factory=session_factory,
+    )
     active_document_storage = document_storage
     active_document_extractor = document_extractor or CompositeDocumentExtractor()
 
@@ -166,6 +203,8 @@ def create_app(  # noqa: C901
             context_provider=app_context_provider,
             superset_client=app_superset_client,
             wren_client=active_wren_client,
+            semantic_project_store=active_semantic_project_store,
+            mdl_file_store=active_mdl_file_store,
         )
         service_conversation_graph = conversation_graph or ConversationGraph(
             config=app_config,
@@ -175,6 +214,8 @@ def create_app(  # noqa: C901
             conversation_store=active_conversation_store,
             wren_client=active_wren_client,
             semantic_layer_store=active_semantic_layer_store,
+            semantic_project_store=active_semantic_project_store,
+            mdl_file_store=active_mdl_file_store,
         )
 
     api = FastAPI(title=app_config.app_name, version="0.1.0")
@@ -182,7 +223,7 @@ def create_app(  # noqa: C901
         CORSMiddleware,
         allow_origins=list(app_config.cors_allowed_origins),
         allow_credentials=True,
-        allow_methods=["DELETE", "GET", "POST", "OPTIONS"],
+        allow_methods=["DELETE", "GET", "PATCH", "POST", "OPTIONS"],
         allow_headers=["*"],
     )
 
@@ -226,6 +267,8 @@ def create_app(  # noqa: C901
             context_provider=request_context_provider,
             superset_client=request_superset_client,
             wren_client=active_wren_client,
+            semantic_project_store=active_semantic_project_store,
+            mdl_file_store=active_mdl_file_store,
         )
 
     def build_conversation_graph(request: Request) -> Any:
@@ -244,6 +287,8 @@ def create_app(  # noqa: C901
             conversation_store=active_conversation_store,
             wren_client=active_wren_client,
             semantic_layer_store=active_semantic_layer_store,
+            semantic_project_store=active_semantic_project_store,
+            mdl_file_store=active_mdl_file_store,
         )
 
     def authorize_semantic_scope(
@@ -256,12 +301,39 @@ def create_app(  # noqa: C901
                 AgentQueryRequest(
                     question="semantic layer scope authorization",
                     database_id=scope.database_id,
+                    catalog_name=scope.catalog_name,
                     schema_name=scope.schema_name,
                     dataset_ids=scope.dataset_ids,
                 )
             )
         except SupersetAuthError as ex:
             raise HTTPException(status_code=ex.status_code, detail=str(ex)) from ex
+
+    def authorize_semantic_project(
+        request: Request,
+        project_id: str,
+        *,
+        owner_id: str,
+        permission: str = "read",
+    ) -> SemanticProject:
+        try:
+            project = active_semantic_project_store.get(
+                project_id,
+                owner_id=owner_id,
+            )
+        except SemanticProjectNotFoundError as ex:
+            raise HTTPException(
+                status_code=404,
+                detail="Semantic project not found.",
+            ) from ex
+        if project.default_database_id is not None:
+            authorize_semantic_scope(request, _scope_from_project(project))
+        if not _has_project_permission(project, permission):
+            raise HTTPException(
+                status_code=403,
+                detail="Insufficient semantic project permission.",
+            )
+        return project
 
     @api.get("/health", response_model=HealthResponse)
     def health() -> HealthResponse:
@@ -298,7 +370,10 @@ def create_app(  # noqa: C901
         """Generate validated SQL from natural language."""
 
         try:
-            return build_text_to_sql_graph(fastapi_request).run(payload)
+            return build_text_to_sql_graph(fastapi_request).run(
+                payload,
+                owner_id=identity.owner_id,
+            )
         except SupersetAuthError as ex:
             raise HTTPException(status_code=ex.status_code, detail=str(ex)) from ex
         except Exception as ex:  # pylint: disable=broad-except
@@ -490,6 +565,437 @@ def create_app(  # noqa: C901
             owner_id=identity.owner_id,
         )
 
+    @api.post(
+        "/agent/semantic-layer/projects/resolve",
+        response_model=SemanticProject,
+    )
+    def resolve_semantic_project(
+        request: SemanticProjectResolveRequest,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> SemanticProject:
+        """Resolve or create a schema-scoped semantic project."""
+
+        if not request.schema_name:
+            raise HTTPException(status_code=400, detail="schema_name is required.")
+        authorize_semantic_scope(
+            fastapi_request,
+            ConversationScope(
+                database_id=request.database_id,
+                catalog_name=request.catalog_name,
+                schema_name=request.schema_name,
+            ),
+        )
+        try:
+            return active_semantic_project_store.resolve(
+                request,
+                owner_id=identity.owner_id,
+            )
+        except ValueError as ex:
+            raise HTTPException(status_code=400, detail=str(ex)) from ex
+
+    @api.get(
+        "/agent/semantic-layer/projects",
+        response_model=list[SemanticProject],
+    )
+    def list_semantic_projects(
+        fastapi_request: Request,
+        database_id: int,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        identity: AgentIdentity = identity_dependency,
+    ) -> list[SemanticProject]:
+        """List semantic projects visible in a governed database scope."""
+
+        authorize_semantic_scope(
+            fastapi_request,
+            ConversationScope(
+                database_id=database_id,
+                catalog_name=catalog_name,
+                schema_name=schema_name,
+            ),
+        )
+        return active_semantic_project_store.list(
+            owner_id=identity.owner_id,
+            database_id=database_id,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+        )
+
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}",
+        response_model=SemanticProject,
+    )
+    def get_semantic_project(
+        project_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> SemanticProject:
+        """Return a governed semantic project."""
+
+        return authorize_semantic_project(
+            fastapi_request,
+            project_id,
+            owner_id=identity.owner_id,
+            permission="read",
+        )
+
+    @api.delete("/agent/semantic-layer/projects/{project_id}")
+    def delete_semantic_project(
+        project_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> dict[str, bool]:
+        """Archive a semantic project."""
+
+        authorize_semantic_project(
+            fastapi_request,
+            project_id,
+            owner_id=identity.owner_id,
+            permission="admin",
+        )
+        active_semantic_project_store.delete(project_id, owner_id=identity.owner_id)
+        return {"deleted": True}
+
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}/mdl-files",
+        response_model=list[MdlFile],
+    )
+    def list_mdl_files(
+        project_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> list[MdlFile]:
+        """List MDL YAML files in a governed semantic project."""
+
+        authorize_semantic_project(
+            fastapi_request,
+            project_id,
+            owner_id=identity.owner_id,
+            permission="read",
+        )
+        return active_mdl_file_store.list(project_id, owner_id=identity.owner_id)
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/mdl-files",
+        response_model=MdlFile,
+    )
+    def create_mdl_file(
+        project_id: str,
+        request: MdlFileCreateRequest,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> MdlFile:
+        """Create an MDL YAML file in a governed semantic project."""
+
+        authorize_semantic_project(
+            fastapi_request,
+            project_id,
+            owner_id=identity.owner_id,
+            permission="write",
+        )
+        try:
+            return active_mdl_file_store.create(
+                project_id,
+                request,
+                owner_id=identity.owner_id,
+            )
+        except ValueError as ex:
+            raise HTTPException(status_code=400, detail=str(ex)) from ex
+
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}/mdl-files/{file_id}",
+        response_model=MdlFile,
+    )
+    def get_mdl_file(
+        project_id: str,
+        file_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> MdlFile:
+        """Return one MDL YAML file from a governed semantic project."""
+
+        authorize_semantic_project(
+            fastapi_request,
+            project_id,
+            owner_id=identity.owner_id,
+            permission="read",
+        )
+        try:
+            file = active_mdl_file_store.get(file_id, owner_id=identity.owner_id)
+        except MdlFileNotFoundError as ex:
+            raise HTTPException(status_code=404, detail="MDL file not found.") from ex
+        if file.project_id != project_id:
+            raise HTTPException(status_code=404, detail="MDL file not found.")
+        return file
+
+    @api.patch(
+        "/agent/semantic-layer/projects/{project_id}/mdl-files/{file_id}",
+        response_model=MdlFile,
+    )
+    def update_mdl_file(
+        project_id: str,
+        file_id: str,
+        request: MdlFileUpdateRequest,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> MdlFile:
+        """Update one MDL YAML file in a governed semantic project."""
+
+        authorize_semantic_project(
+            fastapi_request,
+            project_id,
+            owner_id=identity.owner_id,
+            permission="write",
+        )
+        try:
+            existing = active_mdl_file_store.get(
+                file_id,
+                owner_id=identity.owner_id,
+            )
+            if existing.project_id != project_id:
+                raise MdlFileNotFoundError(file_id)
+            return active_mdl_file_store.update(
+                file_id,
+                request,
+                owner_id=identity.owner_id,
+            )
+        except MdlFileNotFoundError as ex:
+            raise HTTPException(status_code=404, detail="MDL file not found.") from ex
+        except ValueError as ex:
+            raise HTTPException(status_code=400, detail=str(ex)) from ex
+
+    @api.delete(
+        "/agent/semantic-layer/projects/{project_id}/mdl-files/{file_id}",
+    )
+    def delete_mdl_file(
+        project_id: str,
+        file_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> dict[str, bool]:
+        """Delete one MDL YAML file from a governed semantic project."""
+
+        authorize_semantic_project(
+            fastapi_request,
+            project_id,
+            owner_id=identity.owner_id,
+            permission="write",
+        )
+        try:
+            existing = active_mdl_file_store.get(
+                file_id,
+                owner_id=identity.owner_id,
+            )
+            if existing.project_id != project_id:
+                raise MdlFileNotFoundError(file_id)
+            active_mdl_file_store.delete(file_id, owner_id=identity.owner_id)
+        except MdlFileNotFoundError as ex:
+            raise HTTPException(status_code=404, detail="MDL file not found.") from ex
+        return {"deleted": True}
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/mdl-files/{file_id}/validate",
+        response_model=MdlValidationResult,
+    )
+    def validate_mdl_file(
+        project_id: str,
+        file_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> MdlValidationResult:
+        """Validate one MDL YAML file from a governed semantic project."""
+
+        authorize_semantic_project(
+            fastapi_request,
+            project_id,
+            owner_id=identity.owner_id,
+            permission="read",
+        )
+        try:
+            existing = active_mdl_file_store.get(
+                file_id,
+                owner_id=identity.owner_id,
+            )
+            if existing.project_id != project_id:
+                raise MdlFileNotFoundError(file_id)
+            return active_mdl_file_store.validate(
+                file_id,
+                owner_id=identity.owner_id,
+            )
+        except MdlFileNotFoundError as ex:
+            raise HTTPException(status_code=404, detail="MDL file not found.") from ex
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/materialize",
+        response_model=WrenMaterializationResult,
+    )
+    def materialize_semantic_project(
+        project_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> WrenMaterializationResult:
+        """Materialize active MDL YAML files for read-only Wren context use."""
+
+        project = authorize_semantic_project(
+            fastapi_request,
+            project_id,
+            owner_id=identity.owner_id,
+            permission="read",
+        )
+        mdl_files = active_mdl_file_store.list(
+            project_id,
+            owner_id=identity.owner_id,
+        )
+        return materialize_wren_project(
+            project=project,
+            mdl_files=mdl_files,
+            base_path=_wren_materialization_base(app_config),
+        )
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/mdl-files/upload",
+        response_model=MdlFile,
+    )
+    async def upload_mdl_file(
+        project_id: str,
+        fastapi_request: Request,
+        path: str | None = Form(None),
+        file: UploadFile = upload_file,
+        identity: AgentIdentity = identity_dependency,
+    ) -> MdlFile:
+        """Upload a reviewed MDL YAML file to a governed semantic project."""
+
+        authorize_semantic_project(
+            fastapi_request,
+            project_id,
+            owner_id=identity.owner_id,
+            permission="write",
+        )
+        try:
+            content = (await file.read()).decode("utf-8")
+            target_path = path or file.filename or "model.yaml"
+            return active_mdl_file_store.create(
+                project_id,
+                MdlFileCreateRequest(
+                    path=target_path,
+                    content=content,
+                    source_type="uploaded_mdl",
+                ),
+                owner_id=identity.owner_id,
+            )
+        except UnicodeDecodeError as ex:
+            raise HTTPException(
+                status_code=400,
+                detail="MDL YAML upload must be UTF-8 text.",
+            ) from ex
+        except ValueError as ex:
+            raise HTTPException(status_code=400, detail=str(ex)) from ex
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/documents",
+        response_model=SemanticDocument,
+    )
+    async def upload_project_source_document(
+        project_id: str,
+        fastapi_request: Request,
+        file: UploadFile = upload_file,
+        identity: AgentIdentity = identity_dependency,
+    ) -> SemanticDocument:
+        """Upload a source document for Wren-style semantic enrichment."""
+
+        project = authorize_semantic_project(
+            fastapi_request,
+            project_id,
+            owner_id=identity.owner_id,
+            permission="write",
+        )
+        scope = _scope_from_project(project)
+        try:
+            content = await file.read()
+            document = create_document(
+                filename=file.filename or "document",
+                content_type=file.content_type or "application/octet-stream",
+                content=content,
+                scope=scope,
+                project_id=project_id,
+                owner_id=identity.owner_id,
+                config=app_config,
+                store=active_semantic_layer_store,
+                storage=active_document_storage
+                or LocalDocumentStorage(app_config.agent_storage_dir),
+                extractor=active_document_extractor,
+            )
+        except ValueError as ex:
+            raise HTTPException(status_code=400, detail=str(ex)) from ex
+        _append_semantic_event(
+            store=active_semantic_layer_store,
+            owner_id=identity.owner_id,
+            event_type="document_uploaded",
+            scope=scope,
+            project_id=project_id,
+            document_id=document.id,
+            message=f"Uploaded {document.filename}.",
+        )
+        return active_semantic_layer_store.get_document(
+            document.id,
+            owner_id=identity.owner_id,
+        )
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/documents/{document_id}/enrich",
+        response_model=MdlEnrichmentProposal,
+    )
+    def enrich_project_document(
+        project_id: str,
+        document_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> MdlEnrichmentProposal:
+        """Create a reviewable MDL proposal from a source document."""
+
+        project = authorize_semantic_project(
+            fastapi_request,
+            project_id,
+            owner_id=identity.owner_id,
+            permission="write",
+        )
+        try:
+            document = active_semantic_layer_store.get_document(
+                document_id,
+                owner_id=identity.owner_id,
+            )
+        except SemanticDocumentNotFoundError as ex:
+            raise HTTPException(
+                status_code=404,
+                detail="Semantic document not found.",
+            ) from ex
+        if document.project_id != project_id:
+            raise HTTPException(status_code=404, detail="Semantic document not found.")
+        return _enrichment_proposal(project=project, document=document)
+
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}/state",
+        response_model=SemanticLayerState,
+    )
+    def get_project_semantic_layer_state(
+        project_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> SemanticLayerState:
+        """Return document/indexing state for a governed semantic project."""
+
+        authorize_semantic_project(
+            fastapi_request,
+            project_id,
+            owner_id=identity.owner_id,
+            permission="read",
+        )
+        return active_semantic_layer_store.get_project_state(
+            project_id,
+            owner_id=identity.owner_id,
+        )
+
     @api.get(
         "/agent/semantic-layer/documents",
         response_model=list[SemanticDocument],
@@ -497,13 +1003,14 @@ def create_app(  # noqa: C901
     def list_semantic_documents(
         fastapi_request: Request,
         database_id: int,
+        catalog_name: str | None = None,
         schema_name: str | None = None,
         dataset_ids: str | None = None,
         identity: AgentIdentity = identity_dependency,
     ) -> list[SemanticDocument]:
         """List semantic-layer documents for a governed Superset scope."""
 
-        scope = _scope_from_query(database_id, schema_name, dataset_ids)
+        scope = _scope_from_query(database_id, catalog_name, schema_name, dataset_ids)
         authorize_semantic_scope(fastapi_request, scope)
         return active_semantic_layer_store.list_documents(
             scope,
@@ -627,13 +1134,14 @@ def create_app(  # noqa: C901
     def get_semantic_layer_state(
         fastapi_request: Request,
         database_id: int,
+        catalog_name: str | None = None,
         schema_name: str | None = None,
         dataset_ids: str | None = None,
         identity: AgentIdentity = identity_dependency,
     ) -> SemanticLayerState:
         """Return semantic-layer state for a governed Superset scope."""
 
-        scope = _scope_from_query(database_id, schema_name, dataset_ids)
+        scope = _scope_from_query(database_id, catalog_name, schema_name, dataset_ids)
         authorize_semantic_scope(fastapi_request, scope)
         return active_semantic_layer_store.get_state(
             scope,
@@ -644,16 +1152,40 @@ def create_app(  # noqa: C901
     def get_semantic_layer_events(
         fastapi_request: Request,
         database_id: int,
+        catalog_name: str | None = None,
         schema_name: str | None = None,
         dataset_ids: str | None = None,
         identity: AgentIdentity = identity_dependency,
     ) -> StreamingResponse:
         """Stream stored semantic-layer events as server-sent events."""
 
-        scope = _scope_from_query(database_id, schema_name, dataset_ids)
+        scope = _scope_from_query(database_id, catalog_name, schema_name, dataset_ids)
         authorize_semantic_scope(fastapi_request, scope)
         events = active_semantic_layer_store.list_events(
             scope,
+            owner_id=identity.owner_id,
+        )
+        return StreamingResponse(
+            (to_sse(event) for event in events),
+            media_type="text/event-stream",
+        )
+
+    @api.get("/agent/semantic-layer/projects/{project_id}/events")
+    def get_project_semantic_layer_events(
+        project_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> StreamingResponse:
+        """Stream stored semantic-layer events for a governed project."""
+
+        authorize_semantic_project(
+            fastapi_request,
+            project_id,
+            owner_id=identity.owner_id,
+            permission="read",
+        )
+        events = active_semantic_layer_store.list_project_events(
+            project_id,
             owner_id=identity.owner_id,
         )
         return StreamingResponse(
@@ -708,16 +1240,125 @@ def _create_semantic_layer_store(
     )
 
 
+def _create_semantic_project_store(
+    config: AgentConfig,
+    *,
+    session_factory: Any | None = None,
+) -> SemanticProjectStore:
+    if config.semantic_layer_store == "memory":
+        return InMemorySemanticProjectStore()
+    if config.semantic_layer_store == "sqlalchemy":
+        if session_factory is None:
+            raise ValueError("SQLAlchemy semantic project store requires a database.")
+        return SqlAlchemySemanticProjectStore(session_factory)
+    raise ValueError(
+        "Unsupported AI_AGENT_SEMANTIC_LAYER_STORE value "
+        f"{config.semantic_layer_store!r}. Expected one of: memory, sqlalchemy."
+    )
+
+
+def _create_mdl_file_store(
+    config: AgentConfig,
+    *,
+    session_factory: Any | None = None,
+) -> MdlFileStore:
+    if config.semantic_layer_store == "memory":
+        return InMemoryMdlFileStore()
+    if config.semantic_layer_store == "sqlalchemy":
+        if session_factory is None:
+            raise ValueError("SQLAlchemy MDL file store requires a database.")
+        return SqlAlchemyMdlFileStore(session_factory)
+    raise ValueError(
+        "Unsupported AI_AGENT_SEMANTIC_LAYER_STORE value "
+        f"{config.semantic_layer_store!r}. Expected one of: memory, sqlalchemy."
+    )
+
+
 def _scope_from_query(
     database_id: int,
+    catalog_name: str | None,
     schema_name: str | None,
     dataset_ids: str | None,
 ) -> ConversationScope:
     return ConversationScope(
         database_id=database_id,
+        catalog_name=catalog_name,
         schema_name=schema_name,
         dataset_ids=_parse_dataset_ids(dataset_ids),
     )
+
+
+def _scope_from_project(project: SemanticProject) -> ConversationScope:
+    if project.default_database_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Semantic project is not linked to a Superset database.",
+        )
+    return ConversationScope(
+        database_id=project.default_database_id,
+        catalog_name=project.catalog_name,
+        schema_name=project.schema_name,
+    )
+
+
+def _has_project_permission(project: SemanticProject, permission: str) -> bool:
+    ranks = {"read": 1, "write": 2, "admin": 3}
+    return ranks.get(project.permission, 0) >= ranks[permission]
+
+
+def _enrichment_proposal(
+    *,
+    project: SemanticProject,
+    document: SemanticDocument,
+) -> MdlEnrichmentProposal:
+    text = document.extracted_text or document.extracted_text_preview or ""
+    description = document.summary or text.strip()[:500] or document.filename
+    model_name = _safe_mdl_name(project.schema_name)
+    payload = {
+        "models": [
+            {
+                "name": model_name,
+                "description": description,
+                "properties": {
+                    "database_label": project.database_label,
+                    "catalog_name": project.catalog_name,
+                    "schema_name": project.schema_name,
+                    "source_document_id": document.id,
+                    "source_document": document.filename,
+                },
+            }
+        ]
+    }
+    proposed_yaml = yaml.safe_dump(
+        payload,
+        sort_keys=False,
+        allow_unicode=False,
+    )
+    proposed_path = f"{model_name}/{_safe_mdl_name(document.filename)}.yaml"
+    validation = validate_mdl_yaml(proposed_yaml)
+    return MdlEnrichmentProposal(
+        source_document_id=document.id,
+        proposed_path=proposed_path,
+        proposed_yaml=proposed_yaml,
+        validation=validation,
+        warnings=[
+            "Generated MDL is a review draft. Confirm model names, columns, metrics, "
+            "and relationships before activation."
+        ],
+    )
+
+
+def _safe_mdl_name(value: str) -> str:
+    lowered = value.lower()
+    chars = [char if char.isalnum() else "_" for char in lowered]
+    name = "_".join("".join(chars).split("_"))
+    return name or "semantic_model"
+
+
+def _wren_materialization_base(config: AgentConfig) -> Path:
+    if config.wren_project_path:
+        return Path(config.wren_project_path)
+    return Path(config.agent_storage_dir) / "wren"
 
 
 def _parse_dataset_ids(dataset_ids: str | None) -> list[int]:
@@ -734,10 +1375,12 @@ def _append_semantic_event(
     scope: ConversationScope,
     document_id: str | None,
     message: str,
+    project_id: str | None = None,
 ) -> None:
     state = store.get_state(scope, owner_id=owner_id)
     store.append_event(
         SemanticLayerEvent(
+            project_id=project_id,
             type=event_type,
             scope=scope,
             document_id=document_id,

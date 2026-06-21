@@ -28,6 +28,7 @@ from sqlalchemy import (
     JSON,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import declarative_base, relationship
 
@@ -43,6 +44,7 @@ class AiAgentConversation(Base):
     owner_id = Column(String(255), index=True, nullable=False)
     title = Column(String(255), nullable=False)
     database_id = Column(Integer, nullable=False)
+    catalog_name = Column(String(255), nullable=True)
     schema_name = Column(String(255), nullable=True)
     scope = Column(JSON, nullable=False)
     created_at = Column(
@@ -135,8 +137,10 @@ class AiAgentSemanticDocument(Base):
     __tablename__ = "ai_agent_semantic_documents"
 
     id = Column(String(36), primary_key=True)
+    project_id = Column(String(36), index=True, nullable=True)
     owner_id = Column(String(255), index=True, nullable=False)
     database_id = Column(Integer, index=True, nullable=False)
+    catalog_name = Column(String(255), nullable=True)
     schema_name = Column(String(255), nullable=True)
     dataset_ids = Column(JSON, nullable=False)
     filename = Column(String(512), nullable=False)
@@ -164,6 +168,7 @@ class AiAgentSemanticUpdate(Base):
     __tablename__ = "ai_agent_semantic_updates"
 
     id = Column(String(36), primary_key=True)
+    project_id = Column(String(36), index=True, nullable=True)
     document_id = Column(
         String(36),
         ForeignKey("ai_agent_semantic_documents.id", ondelete="CASCADE"),
@@ -197,8 +202,10 @@ class AiAgentSemanticLayerVersion(Base):
     __tablename__ = "ai_agent_semantic_layer_versions"
 
     id = Column(String(36), primary_key=True)
+    project_id = Column(String(36), index=True, nullable=True)
     owner_id = Column(String(255), index=True, nullable=False)
     database_id = Column(Integer, index=True, nullable=False)
+    catalog_name = Column(String(255), nullable=True)
     schema_name = Column(String(255), nullable=True)
     dataset_ids = Column(JSON, nullable=False)
     scope_hash = Column(String(128), index=True, nullable=False)
@@ -222,6 +229,7 @@ class AiAgentWrenContextCache(Base):
     __tablename__ = "ai_agent_wren_context_cache"
 
     id = Column(String(36), primary_key=True)
+    project_id = Column(String(36), index=True, nullable=True)
     owner_id = Column(String(255), index=True, nullable=False)
     scope_hash = Column(String(128), index=True, nullable=False)
     question_hash = Column(String(128), index=True, nullable=False)
@@ -242,6 +250,7 @@ class AiAgentEvent(Base):
     __tablename__ = "ai_agent_events"
 
     id = Column(String(36), primary_key=True)
+    project_id = Column(String(36), index=True, nullable=True)
     owner_id = Column(String(255), index=True, nullable=False)
     scope = Column(JSON, nullable=False)
     type = Column(String(128), index=True, nullable=False)
@@ -251,3 +260,99 @@ class AiAgentEvent(Base):
         index=True,
         nullable=False,
     )
+
+
+class AiAgentSemanticProject(Base):
+    """Schema-scoped Wren semantic project."""
+
+    __tablename__ = "ai_agent_semantic_projects"
+    __table_args__ = (
+        UniqueConstraint(
+            "database_uri_fingerprint",
+            "catalog_name",
+            "schema_name",
+            "deleted_at",
+            name="uq_ai_agent_semantic_project_scope_deleted",
+        ),
+    )
+
+    id = Column(String(36), primary_key=True)
+    name = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    owner_id = Column(String(255), index=True, nullable=False)
+    database_uri_fingerprint = Column(String(128), index=True, nullable=False)
+    database_backend = Column(String(255), nullable=True)
+    database_label = Column(String(255), nullable=True)
+    catalog_name = Column(String(255), nullable=True, default="")
+    schema_name = Column(String(255), index=True, nullable=False)
+    schema_display_name = Column(String(255), nullable=True)
+    default_database_id = Column(Integer, nullable=True)
+    visibility = Column(String(64), nullable=False, default="db_access")
+    status = Column(String(64), nullable=False, default="active")
+    current_version_id = Column(String(36), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class AiAgentSemanticProjectGrant(Base):
+    """Explicit semantic project grant."""
+
+    __tablename__ = "ai_agent_semantic_project_grants"
+
+    id = Column(String(36), primary_key=True)
+    project_id = Column(String(36), index=True, nullable=False)
+    grantee_type = Column(String(64), nullable=False)
+    grantee_id = Column(String(255), nullable=False)
+    permission = Column(String(64), nullable=False)
+    created_by = Column(String(255), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class AiAgentSemanticAccessProof(Base):
+    """Semantic access proof derived from Superset or URI validation."""
+
+    __tablename__ = "ai_agent_semantic_access_proofs"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(String(255), index=True, nullable=False)
+    proof_type = Column(String(64), nullable=False)
+    database_id = Column(Integer, nullable=True)
+    catalog_names = Column(JSON, nullable=False)
+    schema_names = Column(JSON, nullable=False)
+    dataset_ids = Column(JSON, nullable=False)
+    database_uri_fingerprint = Column(String(128), index=True, nullable=False)
+    access_level = Column(String(64), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class AiAgentSemanticMdlFile(Base):
+    """YAML MDL file belonging to a semantic project."""
+
+    __tablename__ = "ai_agent_semantic_mdl_files"
+    __table_args__ = (
+        Index(
+            "ix_ai_agent_semantic_mdl_project_path",
+            "project_id",
+            "path",
+            unique=True,
+        ),
+    )
+
+    id = Column(String(36), primary_key=True)
+    project_id = Column(String(36), index=True, nullable=False)
+    path = Column(String(1024), nullable=False)
+    filename = Column(String(512), nullable=False)
+    content = Column(Text, nullable=False)
+    content_type = Column(String(255), nullable=False)
+    source_type = Column(String(64), nullable=False)
+    status = Column(String(64), index=True, nullable=False)
+    validation = Column(JSON, nullable=True)
+    checksum = Column(String(128), index=True, nullable=False)
+    source_document_id = Column(String(36), nullable=True)
+    created_by = Column(String(255), nullable=True)
+    updated_by = Column(String(255), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)

@@ -171,3 +171,86 @@ def test_semantic_layer_document_review_index_and_events(tmp_path) -> None:
     assert events_response.status_code == 200
     assert "event: document_uploaded" in events_response.text
     assert "event: index_completed" in events_response.text
+
+
+def test_semantic_project_mdl_and_document_flow(tmp_path) -> None:
+    client, context_provider = _client(tmp_path)
+
+    resolve_response = client.post(
+        "/agent/semantic-layer/projects/resolve",
+        json={
+            "database_id": 1,
+            "database_label": "Sales",
+            "catalog_name": "prod",
+            "schema_name": "pipeline",
+            "supplied_uri": "postgresql://user:secret@example.com/sales",
+        },
+    )
+
+    assert resolve_response.status_code == 200
+    project = resolve_response.json()
+    assert project["name"] == "Sales.prod.pipeline"
+    assert context_provider.requests[-1].catalog_name == "prod"
+
+    create_response = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/mdl-files",
+        json={
+            "path": "models/gross_moves.yaml",
+            "content": "models:\n  - name: gross_moves\n",
+        },
+    )
+
+    assert create_response.status_code == 200
+    mdl_file = create_response.json()
+    assert mdl_file["validation"]["valid"] is True
+
+    update_response = client.patch(
+        f"/agent/semantic-layer/projects/{project['id']}/mdl-files/{mdl_file['id']}",
+        json={"status": "active"},
+    )
+
+    assert update_response.status_code == 200
+    assert update_response.json()["status"] == "active"
+
+    validate_response = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/mdl-files/"
+        f"{mdl_file['id']}/validate"
+    )
+    assert validate_response.status_code == 200
+    assert validate_response.json()["valid"] is True
+
+    materialize_response = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/materialize"
+    )
+    assert materialize_response.status_code == 200
+    materialized = materialize_response.json()
+    assert materialized["project_id"] == project["id"]
+    assert materialized["file_count"] == 1
+    assert materialized["path"].endswith("mdl.json")
+
+    document_response = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/documents",
+        files={
+            "file": (
+                "gross_moves.md",
+                b"Gross moves count opportunities by stage.",
+                "text/markdown",
+            )
+        },
+    )
+
+    assert document_response.status_code == 200
+    document = document_response.json()
+    assert document["project_id"] == project["id"]
+    assert document["scope"]["catalog_name"] == "prod"
+
+    enrichment_response = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/documents/"
+        f"{document['id']}/enrich"
+    )
+
+    assert enrichment_response.status_code == 200
+    proposal = enrichment_response.json()
+    assert proposal["source_document_id"] == document["id"]
+    assert proposal["validation"]["valid"] is True
+    assert "models:" in proposal["proposed_yaml"]

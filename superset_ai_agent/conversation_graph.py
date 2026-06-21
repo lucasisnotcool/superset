@@ -59,7 +59,13 @@ from superset_ai_agent.schemas import (
     TraceEvent,
     WrenContextArtifact,
 )
+from superset_ai_agent.semantic_layer.mdl_files import MdlFileStore
+from superset_ai_agent.semantic_layer.projects import SemanticProjectStore
+from superset_ai_agent.semantic_layer.schemas import WrenMaterializationResult
 from superset_ai_agent.semantic_layer.store import SemanticLayerStore
+from superset_ai_agent.semantic_layer.wren_runtime import (
+    materialize_request_semantic_project,
+)
 from superset_ai_agent.tools.sql import validate_read_only_sql
 
 
@@ -113,6 +119,8 @@ class ConversationState(TypedDict, total=False):
     audit: AuditInfo | None
     recommended_followups: list[str]
     wren_context: WrenContextArtifact | None
+    wren_materialization: WrenMaterializationResult | None
+    wren_mdl_path: str | None
     sql_iterations: int
     sql_observations: list[dict[str, Any]]
     attempted_sql: list[str]
@@ -136,6 +144,8 @@ class ConversationGraph:
         conversation_store: ConversationStore,
         wren_client: WrenClient | None = None,
         semantic_layer_store: SemanticLayerStore | None = None,
+        semantic_project_store: SemanticProjectStore | None = None,
+        mdl_file_store: MdlFileStore | None = None,
     ):
         self.config = config
         self.model_client = model_client
@@ -144,6 +154,8 @@ class ConversationGraph:
         self.conversation_store = conversation_store
         self.wren_client = wren_client or DisabledWrenClient()
         self.semantic_layer_store = semantic_layer_store
+        self.semantic_project_store = semantic_project_store
+        self.mdl_file_store = mdl_file_store
         self.graph = self._compile_graph()
 
     def run(
@@ -293,6 +305,8 @@ class ConversationGraph:
             "audit": None,
             "recommended_followups": [],
             "wren_context": None,
+            "wren_materialization": None,
+            "wren_mdl_path": None,
             "artifacts": [],
             "pending_artifact": None,
             "sql_iterations": 0,
@@ -399,6 +413,7 @@ class ConversationGraph:
         agent_request = AgentQueryRequest(
             question=request.message,
             database_id=request.scope.database_id,
+            catalog_name=request.scope.catalog_name,
             schema_name=request.scope.schema_name,
             dataset_ids=request.scope.dataset_ids,
             execute=request.resolved_execution_mode() != "manual",
@@ -424,10 +439,27 @@ class ConversationGraph:
     def _load_wren_context(self, state: ConversationState) -> ConversationState:
         request = state["request"]
         context = state["context"]
+        materialization = None
+        project_id = None
+        mdl_path = None
         try:
+            materialized = materialize_request_semantic_project(
+                config=self.config,
+                semantic_project_store=self.semantic_project_store,
+                mdl_file_store=self.mdl_file_store,
+                owner_id=state["owner_id"],
+                database_id=request.scope.database_id,
+                catalog_name=request.scope.catalog_name,
+                schema_name=request.scope.schema_name,
+            )
+            if materialized is not None:
+                project, materialization = materialized
+                project_id = project.id
+                mdl_path = materialization.path
             wren_context = self.wren_client.fetch_context(
                 question=request.message,
                 superset_context=context,
+                mdl_path=mdl_path,
             )
         except Exception as ex:  # pylint: disable=broad-except
             wren_context = WrenContextArtifact(
@@ -442,10 +474,25 @@ class ConversationGraph:
             state,
             wren_context,
         )
+        if materialization is not None:
+            warnings = list(wren_context.warnings)
+            if materialization.file_count == 0:
+                warnings.append("Semantic project has no active MDL files.")
+            wren_context = wren_context.model_copy(
+                update={
+                    "project_id": project_id,
+                    "mdl_path": materialization.path,
+                    "materialized_file_count": materialization.file_count,
+                    "materialized_checksum": materialization.checksum,
+                    "warnings": warnings,
+                }
+            )
         status = "ok" if wren_context.available else status
         return {
             **state,
             "wren_context": wren_context,
+            "wren_materialization": materialization,
+            "wren_mdl_path": mdl_path,
             "trace": [
                 *state.get("trace", []),
                 TraceEvent(
@@ -560,6 +607,7 @@ class ConversationGraph:
                 question=request.message,
                 sql=draft.sql,
                 context=state["context"],
+                mdl_path=state.get("wren_mdl_path"),
             )
         except Exception as ex:  # pylint: disable=broad-except
             dry_plan = {"error": str(ex), "planning_only": True}
@@ -747,6 +795,7 @@ class ConversationGraph:
             result = self.superset_client.execute_sql(
                 database_id=request.scope.database_id,
                 sql=sql,
+                catalog_name=request.scope.catalog_name,
                 schema_name=request.scope.schema_name,
                 limit=self.config.default_sql_limit,
             )

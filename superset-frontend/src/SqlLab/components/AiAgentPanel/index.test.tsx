@@ -271,43 +271,96 @@ test('sends a conversation message and renders SQL artifact', async () => {
 });
 
 test('opens semantic-layer drawer and uploads a document', async () => {
-  fetchMock.get('http://agent.local/agent/semantic-layer/state?database_id=1', {
-    database_id: 1,
-    schema_name: null,
-    dataset_ids: [],
-    document_count: 0,
-    approved_document_count: 0,
-    indexed_document_count: 0,
-    semantic_layer_version: null,
-    indexing_status: 'idle',
-    last_error: null,
-  });
-  fetchMock.get(
-    'http://agent.local/agent/semantic-layer/documents?database_id=1',
-    [],
-  );
-  fetchMock.post('http://agent.local/agent/semantic-layer/documents', {
-    id: 'document-1',
-    filename: 'notes.md',
-    content_type: 'text/markdown',
-    size_bytes: 12,
-    status: 'needs_review',
-    scope: {
-      database_id: 1,
-      schema_name: null,
-      dataset_ids: [],
+  const scopedState = {
+    ...initialState,
+    sqlLab: {
+      ...initialState.sqlLab,
+      queryEditors: initialState.sqlLab.queryEditors.map(queryEditor => ({
+        ...queryEditor,
+        catalog: 'prod',
+        schema: 'main',
+      })),
     },
-    checksum: 'abc',
-    storage_uri: 'file:///tmp/notes.md',
-    proposed_updates: [],
-    warnings: [],
+  };
+  const project = {
+    id: 'project-1',
+    name: 'Database 1.prod.main',
+    owner_id: 'local',
+    database_uri_fingerprint: 'fingerprint',
+    catalog_name: 'prod',
+    schema_name: 'main',
+    default_database_id: 1,
+    visibility: 'db_access',
+    status: 'active',
+    permission: 'admin',
     created_at: '2026-06-19T00:00:00Z',
     updated_at: '2026-06-19T00:00:00Z',
-  });
+  };
+  fetchMock.post(
+    'http://agent.local/agent/semantic-layer/projects/resolve',
+    project,
+  );
+  fetchMock.get(
+    'http://agent.local/agent/semantic-layer/projects/project-1/mdl-files',
+    [],
+  );
+  fetchMock.get(
+    'http://agent.local/agent/semantic-layer/documents?database_id=1&schema_name=main&catalog_name=prod',
+    [],
+  );
+  fetchMock.get(
+    'http://agent.local/agent/semantic-layer/projects/project-1/state',
+    {
+      project_id: 'project-1',
+      database_id: 1,
+      catalog_name: 'prod',
+      schema_name: 'main',
+      dataset_ids: [],
+      document_count: 0,
+      approved_document_count: 0,
+      indexed_document_count: 0,
+      semantic_layer_version: null,
+      indexing_status: 'idle',
+      last_error: null,
+    },
+  );
+  fetchMock.post(
+    'http://agent.local/agent/semantic-layer/projects/project-1/documents',
+    {
+      id: 'document-1',
+      project_id: 'project-1',
+      filename: 'notes.md',
+      content_type: 'text/markdown',
+      size_bytes: 12,
+      status: 'needs_review',
+      scope: {
+        database_id: 1,
+        catalog_name: 'prod',
+        schema_name: 'main',
+        dataset_ids: [],
+      },
+      checksum: 'abc',
+      storage_uri: 'file:///tmp/notes.md',
+      proposed_updates: [],
+      warnings: [],
+      created_at: '2026-06-19T00:00:00Z',
+      updated_at: '2026-06-19T00:00:00Z',
+    },
+  );
+  fetchMock.post(
+    'http://agent.local/agent/semantic-layer/projects/project-1/documents/document-1/enrich',
+    {
+      source_document_id: 'document-1',
+      proposed_path: 'models/notes.yaml',
+      proposed_yaml: 'models:\n  - name: notes\n',
+      validation: { valid: true, messages: [] },
+      warnings: [],
+    },
+  );
 
   const { container } = render(<AiAgentPanel />, {
     useRedux: true,
-    initialState,
+    initialState: scopedState,
   });
 
   await userEvent.click(screen.getByRole('button', { name: 'Semantic layer' }));
@@ -317,10 +370,11 @@ test('opens semantic-layer drawer and uploads a document', async () => {
     ).toBeInTheDocument();
   });
 
-  const input = container.querySelector<HTMLInputElement>('input[type="file"]');
-  expect(input).not.toBeNull();
+  const inputs =
+    container.querySelectorAll<HTMLInputElement>('input[type="file"]');
+  expect(inputs).toHaveLength(2);
   await userEvent.upload(
-    input as HTMLInputElement,
+    inputs[1],
     new File(['Metric gross_moves = count moves'], 'notes.md', {
       type: 'text/markdown',
     }),
@@ -329,7 +383,7 @@ test('opens semantic-layer drawer and uploads a document', async () => {
   await waitFor(() => {
     expect(
       fetchMock.callHistory.calls(
-        'http://agent.local/agent/semantic-layer/documents',
+        'http://agent.local/agent/semantic-layer/projects/project-1/documents',
       ),
     ).toHaveLength(1);
   });

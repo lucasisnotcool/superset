@@ -27,6 +27,7 @@ from superset_ai_agent.artifacts.charts import infer_chart_spec
 from superset_ai_agent.artifacts.insights import build_artifact_bundle, profile_result
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.context.base import ContextProvider
+from superset_ai_agent.conversations.store import DEFAULT_OWNER_ID
 from superset_ai_agent.integrations.superset.client import AgentContext, SupersetClient
 from superset_ai_agent.integrations.wren.client import DisabledWrenClient, WrenClient
 from superset_ai_agent.llm.base import ChatMessage, ModelClient
@@ -42,6 +43,12 @@ from superset_ai_agent.schemas import (
     TraceEvent,
     WrenContextArtifact,
 )
+from superset_ai_agent.semantic_layer.mdl_files import MdlFileStore
+from superset_ai_agent.semantic_layer.projects import SemanticProjectStore
+from superset_ai_agent.semantic_layer.schemas import WrenMaterializationResult
+from superset_ai_agent.semantic_layer.wren_runtime import (
+    materialize_request_semantic_project,
+)
 from superset_ai_agent.tools.sql import validate_read_only_sql
 
 
@@ -53,6 +60,7 @@ class SqlDraft(BaseModel):
 
 
 class AgentState(TypedDict, total=False):
+    owner_id: str
     request: AgentQueryRequest
     context: AgentContext
     sql: str | None
@@ -66,6 +74,8 @@ class AgentState(TypedDict, total=False):
     audit: AuditInfo | None
     recommended_followups: list[str]
     wren_context: WrenContextArtifact | None
+    wren_materialization: WrenMaterializationResult | None
+    wren_mdl_path: str | None
     trace: list[TraceEvent]
     repair_attempts: int
     error: str | None
@@ -82,16 +92,26 @@ class TextToSqlGraph:
         context_provider: ContextProvider,
         superset_client: SupersetClient,
         wren_client: WrenClient | None = None,
+        semantic_project_store: SemanticProjectStore | None = None,
+        mdl_file_store: MdlFileStore | None = None,
     ):
         self.config = config
         self.model_client = model_client
         self.context_provider = context_provider
         self.superset_client = superset_client
         self.wren_client = wren_client or DisabledWrenClient()
+        self.semantic_project_store = semantic_project_store
+        self.mdl_file_store = mdl_file_store
         self.graph = self._compile_graph()
 
-    def run(self, request: AgentQueryRequest) -> AgentQueryResponse:
+    def run(
+        self,
+        request: AgentQueryRequest,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> AgentQueryResponse:
         initial_state: AgentState = {
+            "owner_id": owner_id,
             "request": request,
             "trace": [],
             "repair_attempts": 0,
@@ -103,6 +123,8 @@ class TextToSqlGraph:
             "audit": None,
             "recommended_followups": [],
             "wren_context": None,
+            "wren_materialization": None,
+            "wren_mdl_path": None,
             "error": None,
         }
         state = self.graph.invoke(initial_state)
@@ -191,10 +213,27 @@ class TextToSqlGraph:
     def _load_wren_context(self, state: AgentState) -> AgentState:
         request = state["request"]
         context = state["context"]
+        materialization = None
+        project_id = None
+        mdl_path = None
         try:
+            materialized = materialize_request_semantic_project(
+                config=self.config,
+                semantic_project_store=self.semantic_project_store,
+                mdl_file_store=self.mdl_file_store,
+                owner_id=state.get("owner_id", DEFAULT_OWNER_ID),
+                database_id=request.database_id,
+                catalog_name=request.catalog_name,
+                schema_name=request.schema_name,
+            )
+            if materialized is not None:
+                project, materialization = materialized
+                project_id = project.id
+                mdl_path = materialization.path
             wren_context = self.wren_client.fetch_context(
                 question=request.question,
                 superset_context=context,
+                mdl_path=mdl_path,
             )
         except Exception as ex:  # pylint: disable=broad-except
             wren_context = WrenContextArtifact(
@@ -205,9 +244,24 @@ class TextToSqlGraph:
             status: Literal["ok", "warning", "error"] = "warning"
         else:
             status = "ok" if wren_context.available else "warning"
+        if materialization is not None:
+            warnings = list(wren_context.warnings)
+            if materialization.file_count == 0:
+                warnings.append("Semantic project has no active MDL files.")
+            wren_context = wren_context.model_copy(
+                update={
+                    "project_id": project_id,
+                    "mdl_path": materialization.path,
+                    "materialized_file_count": materialization.file_count,
+                    "materialized_checksum": materialization.checksum,
+                    "warnings": warnings,
+                }
+            )
         return {
             **state,
             "wren_context": wren_context,
+            "wren_materialization": materialization,
+            "wren_mdl_path": mdl_path,
             "trace": [
                 *state.get("trace", []),
                 TraceEvent(
@@ -255,6 +309,7 @@ class TextToSqlGraph:
                 question=request.question,
                 sql=state.get("sql"),
                 context=state["context"],
+                mdl_path=state.get("wren_mdl_path"),
             )
         except Exception as ex:  # pylint: disable=broad-except
             dry_plan = {"error": str(ex), "planning_only": True}
@@ -346,6 +401,7 @@ class TextToSqlGraph:
             result = self.superset_client.execute_sql(
                 database_id=request.database_id,
                 sql=validation.normalized_sql,
+                catalog_name=request.catalog_name,
                 schema_name=request.schema_name,
                 limit=self.config.default_sql_limit,
             )

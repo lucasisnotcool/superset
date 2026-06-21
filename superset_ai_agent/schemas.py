@@ -36,6 +36,7 @@ class AgentQueryRequest(BaseModel):
 
     question: str = Field(min_length=1)
     database_id: int
+    catalog_name: str | None = None
     schema_name: str | None = None
     dataset_ids: list[int] = Field(default_factory=list)
     execute: bool = False
@@ -91,9 +92,14 @@ class AuditInfo(BaseModel):
     results_key: str | None = None
     executed_sql: str | None = None
     database_id: int | None = None
+    catalog_name: str | None = None
     schema_name: str | None = None
     row_limit: int | None = None
     timeout_seconds: int | None = None
+    client_id: str | None = None
+    sql_editor_id: str | None = None
+    tab: str | None = None
+    source_hash: str | None = None
     source: str | None = None
 
 
@@ -102,6 +108,10 @@ class WrenContextArtifact(BaseModel):
 
     enabled: bool = False
     available: bool = False
+    project_id: str | None = None
+    mdl_path: str | None = None
+    materialized_file_count: int | None = None
+    materialized_checksum: str | None = None
     matched_models: list[str] = Field(default_factory=list)
     example_ids: list[str] = Field(default_factory=list)
     document_ids: list[str] = Field(default_factory=list)
