@@ -93,8 +93,12 @@ class FakeContextProvider(ContextProvider):
 
 
 class FakeSupersetClient:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        results: list[ExecutionResult | Exception] | None = None,
+    ) -> None:
         self.executed_sql: list[str] = []
+        self.results = results or []
 
     def list_databases(self) -> list[DatabaseSummary]:
         return [DatabaseSummary(id=1, name="examples", backend="sqlite")]
@@ -138,6 +142,13 @@ class FakeSupersetClient:
         limit: int = 1000,
     ) -> ExecutionResult:
         self.executed_sql.append(sql)
+        if self.results:
+            result = self.results[
+                min(len(self.executed_sql) - 1, len(self.results) - 1)
+            ]
+            if isinstance(result, Exception):
+                raise result
+            return result
         return ExecutionResult(
             columns=["name", "total_births"],
             rows=[{"name": "Michael", "total_births": 2467129}],
@@ -240,10 +251,9 @@ def test_conversation_graph_executes_valid_sql_when_requested() -> None:
                     "explanation": "Groups names and sums births.",
                 },
                 {
-                    "response_type": "answer",
+                    "outcome": "answer",
                     "message": "Michael has the highest total in the sample.",
-                    "sql": "",
-                    "explanation": None,
+                    "retry_feedback": None,
                 },
             ]
         ),
@@ -274,7 +284,7 @@ def test_conversation_graph_executes_valid_sql_when_requested() -> None:
         "draft_response",
         "validate_sql",
         "execute_sql",
-        "draft_response",
+        "reflect_sql_outcome",
     ]
 
 
@@ -301,10 +311,9 @@ def test_conversation_graph_updates_approved_sql_artifact_in_manual_mode() -> No
     superset_client = FakeSupersetClient()
     model_client = FakeModelClient(
         {
-            "response_type": "answer",
+            "outcome": "answer",
             "message": "The approved query returned Michael.",
-            "sql": "",
-            "explanation": None,
+            "retry_feedback": None,
         }
     )
     graph = ConversationGraph(
@@ -349,7 +358,7 @@ def test_conversation_graph_updates_approved_sql_artifact_in_manual_mode() -> No
         "approved_sql",
         "validate_sql",
         "execute_sql",
-        "draft_response",
+        "reflect_sql_outcome",
     ]
 
 
@@ -431,6 +440,14 @@ def test_conversation_graph_can_take_multiple_sql_steps() -> None:
                 "explanation": "Gets candidate top names.",
             },
             {
+                "outcome": "retry",
+                "message": "The first result needs detail for the top candidate.",
+                "retry_feedback": (
+                    "Inspect detail rows for the top candidate using a different "
+                    "query."
+                ),
+            },
+            {
                 "response_type": "sql",
                 "message": "I will check one candidate.",
                 "sql": (
@@ -439,10 +456,9 @@ def test_conversation_graph_can_take_multiple_sql_steps() -> None:
                 "explanation": "Checks detail rows for Michael.",
             },
             {
-                "response_type": "answer",
+                "outcome": "answer",
                 "message": "The executed queries returned enough context.",
-                "sql": "",
-                "explanation": None,
+                "retry_feedback": None,
             },
         ]
     )
@@ -466,10 +482,225 @@ def test_conversation_graph_can_take_multiple_sql_steps() -> None:
     assert response.status == "ok"
     assert len(response.artifacts) == 2
     assert len(superset_client.executed_sql) == 2
-    model_payload = json.loads(
-        model_client.messages[-1][1].content.split("provided context.\n", 1)[1]
+    second_draft_payload = json.loads(
+        model_client.messages[2][1].content.split("\n", 1)[1]
     )
-    assert len(model_payload["sql_observations"]) == 2
+    assert len(second_draft_payload["sql_observations"]) == 1
+    assert second_draft_payload["reflection_feedback"] == (
+        "Inspect detail rows for the top candidate using a different query."
+    )
+    final_reflection_payload = json.loads(
+        model_client.messages[3][1].content.split("\n", 1)[1]
+    )
+    assert len(final_reflection_payload["sql_observations"]) == 2
+
+
+def test_conversation_graph_skips_duplicate_sql_retry() -> None:
+    store = InMemoryConversationStore()
+    scope = ConversationScope(database_id=1, dataset_ids=[16])
+    conversation = store.create(scope)
+    superset_client = FakeSupersetClient()
+    repeated_sql = (
+        "SELECT name, SUM(num) AS total_births "
+        "FROM birth_names GROUP BY name LIMIT 5"
+    )
+    model_client = FakeModelClient(
+        [
+            {
+                "response_type": "sql",
+                "message": "I will inspect top names.",
+                "sql": repeated_sql,
+                "explanation": "Gets candidate top names.",
+            },
+            {
+                "outcome": "retry",
+                "message": "The query needs a different attempt.",
+                "retry_feedback": "Use a materially different query.",
+            },
+            {
+                "response_type": "sql",
+                "message": "I will retry.",
+                "sql": repeated_sql,
+                "explanation": "Repeats the same query.",
+            },
+            {
+                "outcome": "clarify",
+                "message": "I could not find a different useful query.",
+                "retry_feedback": None,
+            },
+        ]
+    )
+    graph = ConversationGraph(
+        config=AgentConfig(max_agent_sql_iterations=2),
+        model_client=model_client,
+        context_provider=FakeContextProvider(),
+        superset_client=superset_client,
+        conversation_store=store,
+    )
+
+    response = graph.run(
+        conversation_id=conversation.id,
+        request=ConversationTurnRequest(
+            message="Find top names and try again if needed",
+            scope=scope,
+            execution_mode="auto",
+        ),
+    )
+
+    assert response.status == "ok"
+    assert response.message.content == "I could not find a different useful query."
+    assert superset_client.executed_sql == [
+        "SELECT name, SUM(num) AS total_births FROM birth_names GROUP BY name LIMIT 5"
+    ]
+    assert len(response.artifacts) == 1
+    assert [event.step for event in response.trace].count("duplicate_sql") == 1
+    duplicate_reflection_payload = json.loads(
+        model_client.messages[3][1].content.split("\n", 1)[1]
+    )
+    assert duplicate_reflection_payload["sql_observations"][-1]["is_duplicate"] is True
+
+
+def test_conversation_graph_retries_empty_result_with_different_sql() -> None:
+    store = InMemoryConversationStore()
+    scope = ConversationScope(database_id=1, dataset_ids=[16])
+    conversation = store.create(scope)
+    superset_client = FakeSupersetClient(
+        results=[
+            ExecutionResult(columns=["name"], rows=[], row_count=0),
+            ExecutionResult(
+                columns=["name", "total_births"],
+                rows=[{"name": "Michael", "total_births": 2467129}],
+                row_count=1,
+            ),
+        ]
+    )
+    graph = ConversationGraph(
+        config=AgentConfig(max_agent_sql_iterations=2),
+        model_client=FakeModelClient(
+            [
+                {
+                    "response_type": "sql",
+                    "message": "I will check an exact match.",
+                    "sql": "SELECT name FROM birth_names WHERE name = 'Nope' LIMIT 5",
+                    "explanation": "Looks for the requested name.",
+                },
+                {
+                    "outcome": "retry",
+                    "message": "The first query returned no rows.",
+                    "retry_feedback": (
+                        "Use a broader aggregate query against birth_names."
+                    ),
+                },
+                {
+                    "response_type": "sql",
+                    "message": "I will broaden the search.",
+                    "sql": (
+                        "SELECT name, SUM(num) AS total_births "
+                        "FROM birth_names GROUP BY name LIMIT 5"
+                    ),
+                    "explanation": "Uses an aggregate query.",
+                },
+                {
+                    "outcome": "answer",
+                    "message": "The broader query returned Michael.",
+                    "retry_feedback": None,
+                },
+            ]
+        ),
+        context_provider=FakeContextProvider(),
+        superset_client=superset_client,
+        conversation_store=store,
+    )
+
+    response = graph.run(
+        conversation_id=conversation.id,
+        request=ConversationTurnRequest(
+            message="Find a useful name result",
+            scope=scope,
+            execution_mode="auto",
+        ),
+    )
+
+    assert response.status == "ok"
+    assert response.message.content == "The broader query returned Michael."
+    assert superset_client.executed_sql == [
+        "SELECT name FROM birth_names WHERE name = 'Nope' LIMIT 5",
+        "SELECT name, SUM(num) AS total_births FROM birth_names GROUP BY name LIMIT 5",
+    ]
+    assert len(response.artifacts) == 2
+    assert response.artifacts[0].execution_result is not None
+    assert response.artifacts[0].execution_result.row_count == 0
+    assert response.artifacts[1].execution_result is not None
+    assert response.artifacts[1].execution_result.row_count == 1
+
+
+def test_approved_sql_can_return_retry_artifact_in_manual_mode() -> None:
+    store = InMemoryConversationStore()
+    scope = ConversationScope(database_id=1, dataset_ids=[16])
+    conversation = store.create(scope)
+    artifact = ConversationArtifact(
+        sql="SELECT name FROM birth_names WHERE name = 'Nope'",
+        explanation="Looks for a specific name.",
+    )
+    store.append(
+        conversation.id,
+        ConversationMessage(role="user", content="Find this name"),
+    )
+    store.append(
+        conversation.id,
+        ConversationMessage(
+            role="assistant",
+            content="I drafted SQL.",
+            artifacts=[artifact],
+        ),
+    )
+    superset_client = FakeSupersetClient(
+        results=[ExecutionResult(columns=["name"], rows=[], row_count=0)]
+    )
+    model_client = FakeModelClient(
+        [
+            {
+                "outcome": "retry",
+                "message": "The approved query returned no rows.",
+                "retry_feedback": "Try a broader query for nearby names.",
+            },
+            {
+                "response_type": "sql",
+                "message": "I drafted a broader query for review.",
+                "sql": "SELECT name FROM birth_names LIMIT 5",
+                "explanation": "Broadens the search.",
+            },
+        ]
+    )
+    graph = ConversationGraph(
+        config=AgentConfig(default_sql_limit=25),
+        model_client=model_client,
+        context_provider=FakeContextProvider(),
+        superset_client=superset_client,
+        conversation_store=store,
+    )
+
+    response = graph.execute_approved_sql(
+        conversation_id=conversation.id,
+        request=ConversationSqlExecutionRequest(
+            scope=scope,
+            execution_mode="manual",
+            sql="SELECT name FROM birth_names WHERE name = 'Nope'",
+            artifact_id=artifact.id,
+        ),
+    )
+
+    assert response.status == "needs_review"
+    assert response.message.content == "I drafted a broader query for review."
+    assert len(response.message.artifacts) == 1
+    assert response.message.artifacts[0].sql == "SELECT name FROM birth_names LIMIT 5"
+    assert response.message.artifacts[0].execution_result is None
+    assert response.artifacts[0].id == artifact.id
+    assert response.artifacts[0].execution_result is not None
+    assert response.artifacts[0].execution_result.row_count == 0
+    assert superset_client.executed_sql == [
+        "SELECT name FROM birth_names WHERE name = 'Nope'\nLIMIT 25"
+    ]
 
 
 def test_conversation_graph_does_not_execute_invalid_sql() -> None:

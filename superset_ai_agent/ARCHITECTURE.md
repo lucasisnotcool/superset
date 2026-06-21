@@ -206,7 +206,7 @@ Status behavior:
 | --- | --- |
 | Valid SQL and no execution requested | `needs_review` |
 | Valid SQL and execution result returned | `ok` |
-| Validation failed after repair attempts or execution raised | `error` |
+| Validation failed after repair attempts | `error` |
 
 ### Conversational Agent
 
@@ -216,7 +216,9 @@ Status behavior:
 artifact as `approved_sql`, skips the initial model draft, validates the SQL,
 executes only that approved statement in `manual` mode, replaces the original
 artifact with validation and result state, and then appends only the final
-assistant answer after redrafting from the execution observation.
+assistant answer after reflecting on the execution observation. If reflection
+asks for another query in manual mode, the assistant appends a new SQL artifact
+for user approval instead of executing it automatically.
 
 ```mermaid
 graph TD
@@ -232,8 +234,8 @@ graph TD
   repair[Repair SQL]
   can_execute{Auto execution allowed}
   execute[Execute SQL]
-  observe[Add SQL observations]
-  redraft[Draft from observations]
+  reflect[Reflect on SQL outcome]
+  retry{Retry with different SQL}
   save_assistant[Append assistant message]
 
   start --> save_user
@@ -251,9 +253,10 @@ graph TD
   valid -->|Yes| can_execute
   can_execute -->|No| save_assistant
   can_execute -->|Yes| execute
-  execute --> observe
-  observe --> redraft
-  redraft --> needs_sql
+  execute --> reflect
+  reflect --> retry
+  retry -->|Yes| draft
+  retry -->|No| save_assistant
 ```
 
 Execution modes are defined in `conversations/schemas.py`:
@@ -264,8 +267,11 @@ Execution modes are defined in `conversations/schemas.py`:
 | `read_only` | Execute only if `tools/sql.py` validates the query as read-only. |
 | `auto` | Same backend safety gate as `read_only`; intended for a more permissive UI policy. |
 
-`AI_AGENT_MAX_SQL_ITERATIONS` caps automatic SQL/observation loops. The prompt
-only sees `AI_AGENT_MAX_PROMPT_RESULT_ROWS` rows per execution observation.
+`AI_AGENT_MAX_SQL_ITERATIONS` caps automatic SQL execution and reflection
+cycles. The reflection prompt chooses whether to answer, retry with feedback for
+the SQL drafting prompt, or explain missing requirements. The graph skips
+duplicate SQL attempts within a turn before calling Superset. Prompts only see
+`AI_AGENT_MAX_PROMPT_RESULT_ROWS` rows per execution observation.
 
 ## Standalone Agent API
 
@@ -491,7 +497,7 @@ syntax, or comments, improve this with AST-aware limit detection.
 | `AI_AGENT_CONVERSATION_STORE` | `memory` | Conversation store backend. |
 | `AI_AGENT_MAX_HISTORY_MESSAGES` | `12` | Conversation messages included in prompt history. |
 | `AI_AGENT_MAX_PROMPT_RESULT_ROWS` | `5` | Execution rows included in follow-up prompt observations. |
-| `AI_AGENT_MAX_SQL_ITERATIONS` | `3` | Max automatic execute/observe/redraft cycles per turn. |
+| `AI_AGENT_MAX_SQL_ITERATIONS` | `3` | Max automatic execute/reflect/retry cycles per turn. |
 | `SUPERSET_AGENT_ADAPTER` | `rest` | One of `local`, `rest`, `mcp`. |
 | `SUPERSET_BASE_URL` | `http://localhost:8091` | Superset REST base URL for native development. Docker uses the internal service URL `http://superset:8088`. |
 | `SUPERSET_MCP_URL` | `http://localhost:8098/mcp` | Superset MCP JSON-RPC URL. |

@@ -10,6 +10,10 @@ Rules:
 - If sql_observations are present, use them to answer the user or decide on the
   next read-only SQL query. Stop producing SQL once the observations are enough
   to answer.
+- If reflection_feedback is present, use it to draft a materially different
+  read-only SQL query or explain why no better query is possible.
+- Never repeat SQL that appears in attempted_sql unless the user explicitly asks
+  to re-run that exact query.
 - Respect execution_mode. In manual mode, the user must approve SQL. In
   read_only and auto modes, automatic execution is still limited to validated
   read-only SQL.

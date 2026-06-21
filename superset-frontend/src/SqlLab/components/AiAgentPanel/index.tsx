@@ -428,6 +428,19 @@ const formatResultValue = (value: unknown) => {
   return String(value);
 };
 
+const getExecutionError = (artifact: ConversationArtifact) => {
+  const executionEvent = artifact.trace.find(
+    event => event.step === 'execute_sql' && event.status === 'error',
+  );
+  if (!executionEvent) {
+    return null;
+  }
+  const detailError = executionEvent.details.error;
+  return typeof detailError === 'string'
+    ? detailError
+    : executionEvent.summary;
+};
+
 const AiAgentPanel = () => {
   const dispatch = useAppDispatch();
   const queryEditor = useSelector(getActiveQueryEditor);
@@ -749,10 +762,12 @@ const AiAgentPanel = () => {
             const resultColumns = getResultColumns(artifact);
             const resultRows =
               artifact.execution_result?.rows.slice(0, 10) || [];
+            const executionError = getExecutionError(artifact);
             const isExecuted = Boolean(artifact.execution_result);
             const canExecuteArtifact =
               Boolean(artifact.sql) &&
               Boolean(conversation) &&
+              !executionError &&
               !isExecuted &&
               artifact.validation?.is_valid === true &&
               artifact.validation?.is_read_only === true;
@@ -781,6 +796,9 @@ const AiAgentPanel = () => {
                     type="warning"
                     message={artifact.validation.errors.join('\n')}
                   />
+                ) : null}
+                {executionError ? (
+                  <Alert type="warning" message={executionError} />
                 ) : null}
                 {artifact.execution_result && (
                   <>

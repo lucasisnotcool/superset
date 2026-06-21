@@ -298,17 +298,21 @@ Every conversation SQL draft is parsed with `sqlglot`, limited to a single
 SELECT/CTE-style statement, checked for destructive keywords and expressions,
 and normalized with a conservative `LIMIT` before execution. The LangGraph
 conversation workflow can take multiple SQL tool turns in one run: draft SQL,
-validate it, execute it when the selected mode permits, feed the rows back to
-the model, and stop when it can answer. The loop is capped by
-`AI_AGENT_MAX_SQL_ITERATIONS`.
+validate it, execute it when the selected mode permits, reflect on the returned
+rows or execution error, and then answer, retry with a different query, or
+explain what requirements are missing. The loop is capped by
+`AI_AGENT_MAX_SQL_ITERATIONS`, and duplicate SQL attempts in the same turn are
+skipped before calling Superset.
 
 In `manual` mode, pressing Execute on a valid SQL artifact executes only that
 approved statement, updates that SQL artifact with the returned rows, changes
 the button state to Executed, and then sends the result observation back to the
 model for a follow-up answer. The approval is not recorded as a separate user
 message. In `auto` mode, valid read-only SQL drafts follow the same
-validate/execute/observe loop without a button press; executed SQL artifacts are
-rendered before the answer that used their rows.
+validate/execute/reflect loop without a button press; executed SQL artifacts
+are rendered before the answer that used their rows. If the reflection step asks
+for a retry, auto mode can execute the next different validated query while
+manual mode returns the next SQL artifact for user approval.
 
 Conversation state is process-local by default. These values can be edited in
 `superset_ai_agent/.env`:

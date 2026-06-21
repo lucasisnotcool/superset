@@ -62,6 +62,27 @@ class ConversationDraft(BaseModel):
     explanation: str | None = Field(default=None, description="Short SQL explanation.")
 
 
+class SqlReflection(BaseModel):
+    """Structured model output for a SQL execution observation."""
+
+    outcome: Literal["answer", "retry", "clarify"] = Field(
+        description=(
+            "Whether the observations are enough to answer, need a different "
+            "SQL retry, or require clarification from the user."
+        )
+    )
+    message: str = Field(
+        description=(
+            "User-facing answer or explanation. For retry, summarize why a "
+            "different query is needed."
+        )
+    )
+    retry_feedback: str | None = Field(
+        default=None,
+        description="Feedback for the SQL drafting model when outcome is retry.",
+    )
+
+
 class ConversationState(TypedDict, total=False):
     conversation_id: str
     owner_id: str
@@ -75,6 +96,9 @@ class ConversationState(TypedDict, total=False):
     execution_result: ExecutionResult | None
     sql_iterations: int
     sql_observations: list[dict[str, Any]]
+    attempted_sql: list[str]
+    sql_reflection: SqlReflection | None
+    reflection_feedback: str | None
     trace: list[TraceEvent]
     repair_attempts: int
     error: str | None
@@ -196,10 +220,18 @@ class ConversationGraph:
             response_artifacts = [updated_artifact]
 
         assistant_message = self._assistant_message_from_state(state)
+        assistant_artifacts = assistant_message.artifacts
+        if updated_artifact:
+            updated_artifact_key = _sql_match_key(updated_artifact.sql)
+            assistant_artifacts = [
+                artifact
+                for artifact in assistant_artifacts
+                if _sql_match_key(artifact.sql) != updated_artifact_key
+            ]
         assistant_message = assistant_message.model_copy(
             update={
                 "content": _approved_sql_response_content(state, assistant_message),
-                "artifacts": [],
+                "artifacts": assistant_artifacts,
             }
         )
         conversation = self.conversation_store.append(
@@ -235,6 +267,9 @@ class ConversationGraph:
             "pending_artifact": None,
             "sql_iterations": 0,
             "sql_observations": [],
+            "attempted_sql": [],
+            "sql_reflection": None,
+            "reflection_feedback": None,
             "error": None,
         }
         try:
@@ -260,6 +295,7 @@ class ConversationGraph:
         graph.add_node("validate_sql", self._validate_sql)
         graph.add_node("repair_sql", self._repair_sql)
         graph.add_node("execute_sql", self._execute_sql)
+        graph.add_node("reflect_sql_outcome", self._reflect_sql_outcome)
 
         graph.set_entry_point("load_conversation")
         graph.add_edge("load_conversation", "load_context")
@@ -285,6 +321,14 @@ class ConversationGraph:
         graph.add_conditional_edges(
             "execute_sql",
             self._route_after_execution,
+            {
+                "reflect": "reflect_sql_outcome",
+                "end": END,
+            },
+        )
+        graph.add_conditional_edges(
+            "reflect_sql_outcome",
+            self._route_after_reflection,
             {
                 "draft": "draft_response",
                 "end": END,
@@ -454,32 +498,82 @@ class ConversationGraph:
         if validation is None or not validation.normalized_sql:
             return {**state, "error": "No validated SQL is available to execute."}
 
+        sql = validation.normalized_sql
+        sql_key = _sql_match_key(sql)
+        attempted_sql = state.get("attempted_sql", [])
+        if sql_key in attempted_sql:
+            trace = [
+                *state.get("trace", []),
+                TraceEvent(
+                    step="duplicate_sql",
+                    status="warning",
+                    summary="Skipped a duplicate SQL attempt.",
+                    details={"sql": sql},
+                ),
+            ]
+            return {
+                **state,
+                "execution_result": None,
+                "pending_artifact": None,
+                "sql_iterations": state.get("sql_iterations", 0) + 1,
+                "sql_observations": [
+                    *state.get("sql_observations", []),
+                    _execution_observation(
+                        sql=sql,
+                        result=None,
+                        max_prompt_result_rows=self.config.max_prompt_result_rows,
+                        error=(
+                            "The same SQL was already attempted in this turn. "
+                            "A retry must use a materially different query."
+                        ),
+                        is_duplicate=True,
+                    ),
+                ],
+                "trace": trace,
+            }
+
         try:
             result = self.superset_client.execute_sql(
                 database_id=request.scope.database_id,
-                sql=validation.normalized_sql,
+                sql=sql,
                 schema_name=request.scope.schema_name,
                 limit=self.config.default_sql_limit,
             )
         except Exception as ex:  # pylint: disable=broad-except
+            error = str(ex)
             trace = [
                 *state.get("trace", []),
                 TraceEvent(
                     step="execute_sql",
                     status="error",
                     summary="SQL execution failed.",
-                    details={"error": str(ex)},
+                    details={"error": error},
                 ),
             ]
             pending_artifact = state.get("pending_artifact")
+            artifact = None
+            if pending_artifact:
+                artifact = pending_artifact.model_copy(update={"trace": trace})
             return {
                 **state,
-                "error": str(ex),
-                "pending_artifact": (
-                    pending_artifact.model_copy(update={"trace": trace})
-                    if pending_artifact
-                    else None
+                "execution_result": None,
+                "artifacts": (
+                    [*state.get("artifacts", []), artifact]
+                    if artifact
+                    else state.get("artifacts", [])
                 ),
+                "pending_artifact": None,
+                "attempted_sql": [*attempted_sql, sql_key],
+                "sql_iterations": state.get("sql_iterations", 0) + 1,
+                "sql_observations": [
+                    *state.get("sql_observations", []),
+                    _execution_observation(
+                        sql=sql,
+                        result=None,
+                        max_prompt_result_rows=self.config.max_prompt_result_rows,
+                        error=error,
+                    ),
+                ],
                 "trace": trace,
             }
 
@@ -492,7 +586,7 @@ class ConversationGraph:
         ]
         pending_artifact = state.get("pending_artifact")
         artifact = ConversationArtifact(
-            sql=validation.normalized_sql,
+            sql=sql,
             explanation=state["draft"].explanation,
             validation=validation,
             execution_result=result,
@@ -508,11 +602,12 @@ class ConversationGraph:
             "execution_result": result,
             "artifacts": [*state.get("artifacts", []), artifact],
             "pending_artifact": None,
+            "attempted_sql": [*attempted_sql, sql_key],
             "sql_iterations": state.get("sql_iterations", 0) + 1,
             "sql_observations": [
                 *state.get("sql_observations", []),
                 _execution_observation(
-                    sql=validation.normalized_sql,
+                    sql=sql,
                     result=result,
                     max_prompt_result_rows=self.config.max_prompt_result_rows,
                 ),
@@ -537,11 +632,67 @@ class ConversationGraph:
             return "repair"
         return "end"
 
+    def _reflect_sql_outcome(self, state: ConversationState) -> ConversationState:
+        reflection = self._call_sql_reflection_model(state=state)
+        remaining_iterations = max(
+            self.config.max_agent_sql_iterations - state.get("sql_iterations", 0),
+            0,
+        )
+        if reflection.outcome == "retry" and remaining_iterations <= 0:
+            reflection = reflection.model_copy(
+                update={
+                    "outcome": "clarify",
+                    "message": (
+                        reflection.message
+                        or "The SQL attempts did not produce enough usable data."
+                    ),
+                }
+            )
+
+        draft = state.get("draft")
+        if reflection.outcome in {"answer", "clarify"}:
+            draft = ConversationDraft(
+                response_type="answer",
+                message=reflection.message,
+                sql="",
+                explanation=None,
+            )
+
+        return {
+            **state,
+            "draft": draft,
+            "sql_reflection": reflection,
+            "reflection_feedback": reflection.retry_feedback,
+            "trace": [
+                *state.get("trace", []),
+                TraceEvent(
+                    step="reflect_sql_outcome",
+                    status="warning" if reflection.outcome == "retry" else "ok",
+                    summary=f"SQL reflection selected {reflection.outcome}.",
+                    details={
+                        "outcome": reflection.outcome,
+                        "remaining_sql_iterations": remaining_iterations,
+                        "retry_feedback": reflection.retry_feedback,
+                    },
+                ),
+            ],
+        }
+
     @staticmethod
     def _route_after_execution(state: ConversationState) -> str:
         if state.get("error"):
             return "end"
-        return "draft"
+        return "reflect"
+
+    def _route_after_reflection(self, state: ConversationState) -> str:
+        reflection = state.get("sql_reflection")
+        if (
+            reflection
+            and reflection.outcome == "retry"
+            and state.get("sql_iterations", 0) < self.config.max_agent_sql_iterations
+        ):
+            return "draft"
+        return "end"
 
     def _can_execute_sql(self, state: ConversationState) -> bool:
         validation = state.get("validation")
@@ -574,6 +725,8 @@ class ConversationGraph:
                 0,
             ),
             "sql_observations": state.get("sql_observations", []),
+            "attempted_sql": state.get("attempted_sql", []),
+            "reflection_feedback": state.get("reflection_feedback"),
             "database": context.database.model_dump(),
             "datasets": [dataset.model_dump() for dataset in context.datasets],
             "conversation": _conversation_payload(
@@ -612,6 +765,69 @@ class ConversationGraph:
         if validation_errors and draft.response_type != "sql":
             return draft.model_copy(update={"response_type": "sql"})
         return draft
+
+    def _call_sql_reflection_model(
+        self,
+        *,
+        state: ConversationState,
+    ) -> SqlReflection:
+        request = state["request"]
+        context = state["context"]
+        conversation = state["conversation"]
+        prompt = get_prompt("sql_reflection")
+        execution_mode: ExecutionMode = request.resolved_execution_mode()
+        remaining_iterations = max(
+            self.config.max_agent_sql_iterations - state.get("sql_iterations", 0),
+            0,
+        )
+        validation = state.get("validation")
+        draft = state.get("draft")
+        latest_sql = (
+            validation.normalized_sql if validation else draft.sql if draft else ""
+        )
+        payload = {
+            "user_message": request.message,
+            "execution_mode": execution_mode,
+            "remaining_sql_iterations": remaining_iterations,
+            "sql_observations": state.get("sql_observations", []),
+            "attempted_sql": state.get("attempted_sql", []),
+            "latest_sql": latest_sql,
+            "database": context.database.model_dump(),
+            "datasets": [dataset.model_dump() for dataset in context.datasets],
+            "conversation": _conversation_payload(
+                conversation,
+                max_history_messages=self.config.max_history_messages,
+                max_prompt_result_rows=self.config.max_prompt_result_rows,
+            ),
+            "scope": request.scope.model_dump(),
+        }
+        schema = SqlReflection.model_json_schema()
+        result = self.model_client.chat(
+            [
+                ChatMessage(role="system", content=prompt),
+                ChatMessage(
+                    role="user",
+                    content=(
+                        "Review the latest SQL execution outcome and decide "
+                        "whether to answer, retry with a different query, or "
+                        "ask for missing requirements.\n"
+                        f"{json.dumps(payload, default=str)}"
+                    ),
+                ),
+            ],
+            model=request.model,
+            format_schema=schema,
+        )
+        try:
+            data = json.loads(result.content)
+            reflection = SqlReflection.model_validate(data)
+        except Exception as ex:  # pylint: disable=broad-except
+            return _fallback_sql_reflection(state=state, error=str(ex))
+        if reflection.outcome == "retry" and not reflection.retry_feedback:
+            return reflection.model_copy(
+                update={"retry_feedback": reflection.message}
+            )
+        return reflection
 
     def _assistant_message_from_state(
         self,
@@ -721,15 +937,52 @@ def _artifact_payload(
 def _execution_observation(
     *,
     sql: str,
-    result: ExecutionResult,
+    result: ExecutionResult | None,
     max_prompt_result_rows: int,
+    error: str | None = None,
+    is_duplicate: bool = False,
 ) -> dict[str, Any]:
+    if result is None:
+        return {
+            "sql": sql,
+            "columns": [],
+            "rows": [],
+            "row_count": 0,
+            "error": error,
+            "is_duplicate": is_duplicate,
+        }
     return {
         "sql": sql,
         "columns": result.columns,
         "rows": result.rows[:max_prompt_result_rows],
         "row_count": result.row_count,
+        "is_empty": result.row_count == 0,
     }
+
+
+def _fallback_sql_reflection(
+    *,
+    state: ConversationState,
+    error: str,
+) -> SqlReflection:
+    observations = state.get("sql_observations", [])
+    latest_observation = observations[-1] if observations else {}
+    if latest_observation.get("error") or latest_observation.get("row_count") == 0:
+        return SqlReflection(
+            outcome="retry",
+            message="The latest SQL attempt did not produce usable results.",
+            retry_feedback=(
+                "The latest SQL attempt failed, returned no rows, or repeated an "
+                "earlier query. Produce a materially different read-only SQL query."
+            ),
+        )
+    return SqlReflection(
+        outcome="answer",
+        message=(
+            "I could not parse the SQL reflection output, but the latest SQL "
+            f"observation is available. Reflection error: {error}"
+        ),
+    )
 
 
 def _find_artifact(
