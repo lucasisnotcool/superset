@@ -53,12 +53,73 @@ class SqlValidation(BaseModel):
     errors: list[str] = Field(default_factory=list)
 
 
+class InsightCard(BaseModel):
+    """Small insight shown next to an executed analytics result."""
+
+    title: str
+    value: str | int | float | None = None
+    metric: str | None = None
+    category: str | None = None
+    description: str | None = None
+    severity: Literal["info", "success", "warning"] = "info"
+
+
+class ChartEncoding(BaseModel):
+    """Minimal frontend chart encoding."""
+
+    x: str | None = None
+    y: str | list[str] | None = None
+    series: str | None = None
+    time: str | None = None
+    label: str | None = None
+
+
+class ChartSpec(BaseModel):
+    """Lightweight chart preview contract for returned rows."""
+
+    type: Literal["bar", "line", "table"]
+    title: str | None = None
+    encoding: ChartEncoding = Field(default_factory=ChartEncoding)
+    options: dict[str, Any] = Field(default_factory=dict)
+
+
+class AuditInfo(BaseModel):
+    """Audit metadata propagated from the governed Superset execution path."""
+
+    adapter: Literal["rest", "mcp", "local"] | None = None
+    query_id: int | str | None = None
+    results_key: str | None = None
+    executed_sql: str | None = None
+    database_id: int | None = None
+    schema_name: str | None = None
+    row_limit: int | None = None
+    timeout_seconds: int | None = None
+    source: str | None = None
+
+
+class WrenContextArtifact(BaseModel):
+    """Wren context, examples, planning, and semantic-layer metadata."""
+
+    enabled: bool = False
+    available: bool = False
+    matched_models: list[str] = Field(default_factory=list)
+    example_ids: list[str] = Field(default_factory=list)
+    document_ids: list[str] = Field(default_factory=list)
+    semantic_layer_version: str | None = None
+    indexing_status: str | None = None
+    context_items: list[dict[str, Any]] = Field(default_factory=list)
+    dry_plan: dict[str, Any] | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
 class ExecutionResult(BaseModel):
     """Small, model-safe SQL execution result."""
 
     columns: list[str]
     rows: list[dict[str, Any]]
     row_count: int
+    audit: AuditInfo | None = None
+    is_truncated: bool = False
 
 
 class AgentQueryResponse(BaseModel):
@@ -70,6 +131,13 @@ class AgentQueryResponse(BaseModel):
     validation: SqlValidation
     execution_result: ExecutionResult | None = None
     trace: list[TraceEvent] = Field(default_factory=list)
+    answer_summary: str | None = None
+    insight_cards: list[InsightCard] = Field(default_factory=list)
+    chart_spec: ChartSpec | None = None
+    data_preview: ExecutionResult | None = None
+    audit: AuditInfo | None = None
+    recommended_followups: list[str] = Field(default_factory=list)
+    wren_context: WrenContextArtifact | None = None
 
 
 class ValidateSqlRequest(BaseModel):

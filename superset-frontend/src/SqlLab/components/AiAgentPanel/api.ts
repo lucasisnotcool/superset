@@ -35,6 +35,63 @@ export interface SqlValidationResult {
   errors: string[];
 }
 
+export interface InsightCard {
+  title: string;
+  value?: string | number | null;
+  metric?: string | null;
+  category?: string | null;
+  description?: string | null;
+  severity: 'info' | 'success' | 'warning';
+}
+
+export interface ChartEncoding {
+  x?: string | null;
+  y?: string | string[] | null;
+  series?: string | null;
+  time?: string | null;
+  label?: string | null;
+}
+
+export interface ChartSpec {
+  type: 'bar' | 'line' | 'table';
+  title?: string | null;
+  encoding: ChartEncoding;
+  options: Record<string, unknown>;
+}
+
+export interface AuditInfo {
+  adapter?: 'rest' | 'mcp' | 'local' | null;
+  query_id?: number | string | null;
+  results_key?: string | null;
+  executed_sql?: string | null;
+  database_id?: number | null;
+  schema_name?: string | null;
+  row_limit?: number | null;
+  timeout_seconds?: number | null;
+  source?: string | null;
+}
+
+export interface WrenContextArtifact {
+  enabled: boolean;
+  available: boolean;
+  matched_models: string[];
+  example_ids: string[];
+  document_ids: string[];
+  semantic_layer_version?: string | null;
+  indexing_status?: string | null;
+  context_items: Record<string, unknown>[];
+  dry_plan?: Record<string, unknown> | null;
+  warnings: string[];
+}
+
+export interface ExecutionResult {
+  columns: string[];
+  rows: Record<string, unknown>[];
+  row_count: number;
+  audit?: AuditInfo | null;
+  is_truncated?: boolean;
+}
+
 export interface AgentQueryRequest {
   question: string;
   database_id: number;
@@ -49,12 +106,15 @@ export interface AgentQueryResponse {
   sql?: string | null;
   explanation?: string | null;
   validation: SqlValidationResult;
-  execution_result?: {
-    columns: string[];
-    rows: Record<string, unknown>[];
-    row_count: number;
-  } | null;
+  execution_result?: ExecutionResult | null;
   trace: AgentTraceEvent[];
+  answer_summary?: string | null;
+  insight_cards?: InsightCard[];
+  chart_spec?: ChartSpec | null;
+  data_preview?: ExecutionResult | null;
+  audit?: AuditInfo | null;
+  recommended_followups?: string[];
+  wren_context?: WrenContextArtifact | null;
 }
 
 export interface ConversationScope {
@@ -72,12 +132,96 @@ export interface ConversationArtifact {
   sql: string;
   explanation?: string | null;
   validation?: SqlValidationResult | null;
-  execution_result?: {
-    columns: string[];
-    rows: Record<string, unknown>[];
-    row_count: number;
-  } | null;
+  execution_result?: ExecutionResult | null;
   trace: AgentTraceEvent[];
+  answer_summary?: string | null;
+  insight_cards?: InsightCard[];
+  chart_spec?: ChartSpec | null;
+  data_preview?: ExecutionResult | null;
+  audit?: AuditInfo | null;
+  recommended_followups?: string[];
+  wren_context?: WrenContextArtifact | null;
+}
+
+export type SemanticDocumentStatus =
+  | 'uploaded'
+  | 'extracted'
+  | 'needs_review'
+  | 'approved'
+  | 'indexed'
+  | 'error';
+
+export interface SemanticUpdate {
+  id: string;
+  kind:
+    | 'model_description'
+    | 'field_description'
+    | 'metric'
+    | 'synonym'
+    | 'example'
+    | 'relationship';
+  target: Record<string, unknown>;
+  value: Record<string, unknown>;
+  confidence?: number | null;
+  source_document_id: string;
+  reviewed: boolean;
+  approved: boolean;
+  reviewer_id?: string | null;
+  review_notes?: string | null;
+  created_at: string;
+  updated_at: string;
+  reviewed_at?: string | null;
+}
+
+export interface SemanticDocument {
+  id: string;
+  filename: string;
+  content_type: string;
+  size_bytes: number;
+  status: SemanticDocumentStatus;
+  scope: ConversationScope;
+  checksum: string;
+  storage_uri: string;
+  summary?: string | null;
+  extracted_text?: string | null;
+  extracted_text_preview?: string | null;
+  proposed_updates: SemanticUpdate[];
+  warnings: string[];
+  error?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SemanticLayerReviewRequest {
+  approved_update_ids: string[];
+  rejected_update_ids: string[];
+  edited_updates: SemanticUpdate[];
+  notes?: string | null;
+}
+
+export interface SemanticLayerState {
+  database_id: number;
+  schema_name?: string | null;
+  dataset_ids: number[];
+  document_count: number;
+  approved_document_count: number;
+  indexed_document_count: number;
+  semantic_layer_version?: string | null;
+  indexing_status: 'idle' | 'running' | 'error';
+  last_error?: string | null;
+}
+
+export interface SemanticLayerVersion {
+  id: string;
+  scope: ConversationScope;
+  scope_hash: string;
+  version: string;
+  status: 'idle' | 'running' | 'error';
+  mdl?: Record<string, unknown> | null;
+  wren_context?: WrenContextArtifact | null;
+  source_update_ids: string[];
+  published_semantic_layer_uuid?: string | null;
+  created_at: string;
 }
 
 export interface ConversationMessage {
@@ -152,6 +296,7 @@ export const getAgentBaseUrl = () =>
 const requestJson = async <T>(path: string, init?: RequestInit): Promise<T> => {
   const response = await fetch(`${getAgentBaseUrl()}${path}`, {
     ...init,
+    credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
       ...(init?.headers || {}),
@@ -159,11 +304,53 @@ const requestJson = async <T>(path: string, init?: RequestInit): Promise<T> => {
   });
 
   if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(detail || `Agent API request failed: ${response.status}`);
+    throw new Error(await getAgentErrorMessage(response));
   }
 
   return response.json() as Promise<T>;
+};
+
+const requestForm = async <T>(path: string, body: FormData): Promise<T> => {
+  const response = await fetch(`${getAgentBaseUrl()}${path}`, {
+    method: 'POST',
+    credentials: 'include',
+    body,
+  });
+
+  if (!response.ok) {
+    throw new Error(await getAgentErrorMessage(response));
+  }
+
+  return response.json() as Promise<T>;
+};
+
+const getAgentErrorMessage = async (response: Response) => {
+  const detail = await response.text();
+  if (!detail) {
+    return `Agent API request failed: ${response.status}`;
+  }
+  try {
+    const parsed = JSON.parse(detail) as { detail?: unknown };
+    if (typeof parsed.detail === 'string' && parsed.detail.trim()) {
+      return parsed.detail;
+    }
+  } catch {
+    return detail;
+  }
+  return detail;
+};
+
+const semanticScopeParams = (scope: ConversationScope) => {
+  const params = new URLSearchParams({
+    database_id: String(scope.database_id),
+  });
+  if (scope.schema_name) {
+    params.set('schema_name', scope.schema_name);
+  }
+  if (scope.dataset_ids.length > 0) {
+    params.set('dataset_ids', scope.dataset_ids.join(','));
+  }
+  return params.toString();
 };
 
 export const getAgentHealth = () =>
@@ -223,3 +410,60 @@ export const deleteConversation = (conversationId: string) =>
   requestJson<{ deleted: boolean }>(`/agent/conversations/${conversationId}`, {
     method: 'DELETE',
   });
+
+export const uploadSemanticDocument = (
+  scope: ConversationScope,
+  file: File,
+) => {
+  const formData = new FormData();
+  formData.append('scope', JSON.stringify(scope));
+  formData.append('file', file);
+  return requestForm<SemanticDocument>(
+    '/agent/semantic-layer/documents',
+    formData,
+  );
+};
+
+export const listSemanticDocuments = (scope: ConversationScope) =>
+  requestJson<SemanticDocument[]>(
+    `/agent/semantic-layer/documents?${semanticScopeParams(scope)}`,
+    { method: 'GET' },
+  );
+
+export const getSemanticDocument = (documentId: string) =>
+  requestJson<SemanticDocument>(
+    `/agent/semantic-layer/documents/${documentId}`,
+    { method: 'GET' },
+  );
+
+export const reviewSemanticDocument = (
+  documentId: string,
+  payload: SemanticLayerReviewRequest,
+) =>
+  requestJson<SemanticDocument>(
+    `/agent/semantic-layer/documents/${documentId}/review`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    },
+  );
+
+export const rebuildSemanticLayerIndex = (scope: ConversationScope) =>
+  requestJson<SemanticLayerVersion>('/agent/semantic-layer/index/rebuild', {
+    method: 'POST',
+    body: JSON.stringify({ scope }),
+  });
+
+export const getSemanticLayerState = (scope: ConversationScope) =>
+  requestJson<SemanticLayerState>(
+    `/agent/semantic-layer/state?${semanticScopeParams(scope)}`,
+    { method: 'GET' },
+  );
+
+export const createSemanticLayerEventSource = (scope: ConversationScope) =>
+  new EventSource(
+    `${getAgentBaseUrl()}/agent/semantic-layer/events?${semanticScopeParams(
+      scope,
+    )}`,
+    { withCredentials: true },
+  );

@@ -66,6 +66,20 @@ Copy-Item superset_ai_agent/.env.example superset_ai_agent/.env
 notepad superset_ai_agent/.env
 ```
 
+The example env uses the Superset browser session by default:
+
+```env
+AI_AGENT_IDENTITY_PROVIDER=superset_session
+SUPERSET_AUTH_MODE=user_session
+SUPERSET_AGENT_ADAPTER=rest
+```
+
+In this mode, do not copy a CSRF token from the browser. The SQL Lab panel calls
+`/ai-agent` with browser credentials, nginx forwards the Superset cookies and
+CSRF headers to the agent, and the agent validates the session with
+`/api/v1/me/` before using the same request-scoped credentials for Superset REST
+or MCP calls. This keeps the agent scoped to the logged-in Superset user.
+
 For an OpenAI-compatible gateway, set these values in
 `superset_ai_agent/.env`:
 
@@ -196,16 +210,29 @@ notepad superset_ai_agent/.env
 ```
 
 Native dev uses local process ports and is separate from Docker's single
-published port. The shared env file defaults to the REST adapter so native and
-Docker exercise the same Superset boundary:
+published port. The shared env file defaults to the REST adapter and Superset
+session auth so native and Docker exercise the same Superset boundary through
+the browser/dev-server proxy:
 
 ```env
 SUPERSET_AGENT_ADAPTER=rest
+SUPERSET_AUTH_MODE=user_session
+AI_AGENT_IDENTITY_PROVIDER=superset_session
 SUPERSET_BASE_URL=http://localhost:8091
-SUPERSET_USERNAME=admin
-SUPERSET_PASSWORD=admin
 AI_AGENT_CORS_ALLOWED_ORIGINS=http://localhost:8090,http://127.0.0.1:8090,http://localhost:8092,http://127.0.0.1:8092
 ```
+
+For direct native API tests against `http://localhost:8097` without a proxied
+Superset browser session, edit the same env file to use service-account mode:
+
+```env
+SUPERSET_AUTH_MODE=service_account
+AI_AGENT_IDENTITY_PROVIDER=static
+SUPERSET_USERNAME=admin
+SUPERSET_PASSWORD=admin
+```
+
+Use that fallback only when user-scoped Superset auth is not part of the test.
 
 If you are running the Superset backend natively too:
 

@@ -23,6 +23,8 @@ from typing import Any, Literal, TypedDict
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
+from superset_ai_agent.artifacts.charts import infer_chart_spec
+from superset_ai_agent.artifacts.insights import build_artifact_bundle, profile_result
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.context.base import ContextProvider
 from superset_ai_agent.conversations.schemas import (
@@ -39,15 +41,25 @@ from superset_ai_agent.conversations.store import (
     ConversationStore,
     DEFAULT_OWNER_ID,
 )
-from superset_ai_agent.integrations.superset.client import AgentContext, SupersetClient
+from superset_ai_agent.integrations.superset.client import (
+    AgentContext,
+    SupersetAuthError,
+    SupersetClient,
+)
+from superset_ai_agent.integrations.wren.client import DisabledWrenClient, WrenClient
 from superset_ai_agent.llm.base import ChatMessage, ModelClient
 from superset_ai_agent.prompts.registry import get_prompt
 from superset_ai_agent.schemas import (
     AgentQueryRequest,
+    AuditInfo,
+    ChartSpec,
     ExecutionResult,
+    InsightCard,
     SqlValidation,
     TraceEvent,
+    WrenContextArtifact,
 )
+from superset_ai_agent.semantic_layer.store import SemanticLayerStore
 from superset_ai_agent.tools.sql import validate_read_only_sql
 
 
@@ -94,6 +106,13 @@ class ConversationState(TypedDict, total=False):
     pending_artifact: ConversationArtifact | None
     validation: SqlValidation | None
     execution_result: ExecutionResult | None
+    answer_summary: str | None
+    insight_cards: list[InsightCard]
+    chart_spec: ChartSpec | None
+    data_preview: ExecutionResult | None
+    audit: AuditInfo | None
+    recommended_followups: list[str]
+    wren_context: WrenContextArtifact | None
     sql_iterations: int
     sql_observations: list[dict[str, Any]]
     attempted_sql: list[str]
@@ -115,12 +134,16 @@ class ConversationGraph:
         context_provider: ContextProvider,
         superset_client: SupersetClient,
         conversation_store: ConversationStore,
+        wren_client: WrenClient | None = None,
+        semantic_layer_store: SemanticLayerStore | None = None,
     ):
         self.config = config
         self.model_client = model_client
         self.context_provider = context_provider
         self.superset_client = superset_client
         self.conversation_store = conversation_store
+        self.wren_client = wren_client or DisabledWrenClient()
+        self.semantic_layer_store = semantic_layer_store
         self.graph = self._compile_graph()
 
     def run(
@@ -263,6 +286,13 @@ class ConversationGraph:
             "trace": [],
             "repair_attempts": 0,
             "execution_result": None,
+            "answer_summary": None,
+            "insight_cards": [],
+            "chart_spec": None,
+            "data_preview": None,
+            "audit": None,
+            "recommended_followups": [],
+            "wren_context": None,
             "artifacts": [],
             "pending_artifact": None,
             "sql_iterations": 0,
@@ -274,6 +304,8 @@ class ConversationGraph:
         }
         try:
             return self.graph.invoke(initial_state)
+        except SupersetAuthError:
+            raise
         except Exception as ex:  # pylint: disable=broad-except
             return {
                 **initial_state,
@@ -291,23 +323,28 @@ class ConversationGraph:
         graph = StateGraph(ConversationState)
         graph.add_node("load_conversation", self._load_conversation)
         graph.add_node("load_context", self._load_context)
+        graph.add_node("load_wren_context", self._load_wren_context)
         graph.add_node("draft_response", self._draft_response)
+        graph.add_node("dry_plan_with_wren", self._dry_plan_with_wren)
         graph.add_node("validate_sql", self._validate_sql)
         graph.add_node("repair_sql", self._repair_sql)
         graph.add_node("execute_sql", self._execute_sql)
+        graph.add_node("build_artifacts", self._build_artifacts)
         graph.add_node("reflect_sql_outcome", self._reflect_sql_outcome)
 
         graph.set_entry_point("load_conversation")
         graph.add_edge("load_conversation", "load_context")
-        graph.add_edge("load_context", "draft_response")
+        graph.add_edge("load_context", "load_wren_context")
+        graph.add_edge("load_wren_context", "draft_response")
         graph.add_conditional_edges(
             "draft_response",
             self._route_after_draft,
             {
-                "validate": "validate_sql",
+                "validate": "dry_plan_with_wren",
                 "end": END,
             },
         )
+        graph.add_edge("dry_plan_with_wren", "validate_sql")
         graph.add_conditional_edges(
             "validate_sql",
             self._route_after_validation,
@@ -322,10 +359,12 @@ class ConversationGraph:
             "execute_sql",
             self._route_after_execution,
             {
+                "build": "build_artifacts",
                 "reflect": "reflect_sql_outcome",
                 "end": END,
             },
         )
+        graph.add_edge("build_artifacts", "reflect_sql_outcome")
         graph.add_conditional_edges(
             "reflect_sql_outcome",
             self._route_after_reflection,
@@ -382,6 +421,83 @@ class ConversationGraph:
             ],
         }
 
+    def _load_wren_context(self, state: ConversationState) -> ConversationState:
+        request = state["request"]
+        context = state["context"]
+        try:
+            wren_context = self.wren_client.fetch_context(
+                question=request.message,
+                superset_context=context,
+            )
+        except Exception as ex:  # pylint: disable=broad-except
+            wren_context = WrenContextArtifact(
+                enabled=self.config.wren_enabled,
+                available=False,
+                warnings=[str(ex)],
+            )
+            status: Literal["ok", "warning", "error"] = "warning"
+        else:
+            status = "ok" if wren_context.available else "warning"
+        wren_context = self._merge_indexed_semantic_context(
+            state,
+            wren_context,
+        )
+        status = "ok" if wren_context.available else status
+        return {
+            **state,
+            "wren_context": wren_context,
+            "trace": [
+                *state.get("trace", []),
+                TraceEvent(
+                    step="load_wren_context",
+                    status=status,
+                    summary=(
+                        "Loaded Wren semantic context."
+                        if wren_context.available
+                        else "Wren semantic context is unavailable."
+                    ),
+                    details=wren_context.model_dump(),
+                ),
+            ],
+        }
+
+    def _merge_indexed_semantic_context(
+        self,
+        state: ConversationState,
+        wren_context: WrenContextArtifact,
+    ) -> WrenContextArtifact:
+        if self.semantic_layer_store is None:
+            return wren_context
+        latest_version = self.semantic_layer_store.get_latest_version(
+            state["request"].scope,
+            owner_id=state["owner_id"],
+        )
+        if latest_version is None or latest_version.wren_context is None:
+            return wren_context
+        indexed_context = latest_version.wren_context
+        return wren_context.model_copy(
+            update={
+                "enabled": wren_context.enabled or indexed_context.enabled,
+                "available": wren_context.available or indexed_context.available,
+                "document_ids": sorted(
+                    {
+                        *wren_context.document_ids,
+                        *indexed_context.document_ids,
+                    }
+                ),
+                "semantic_layer_version": indexed_context.semantic_layer_version,
+                "indexing_status": indexed_context.indexing_status,
+                "context_items": [
+                    *wren_context.context_items,
+                    *indexed_context.context_items,
+                ],
+                "warnings": [
+                    *wren_context.warnings,
+                    *indexed_context.warnings,
+                ],
+            }
+        )
+
     def _draft_response(self, state: ConversationState) -> ConversationState:
         request = state["request"]
         approved_sql = request.approved_sql
@@ -431,6 +547,43 @@ class ConversationGraph:
             ],
         }
 
+    def _dry_plan_with_wren(
+        self,
+        state: ConversationState,
+    ) -> ConversationState:
+        if not self.config.wren_dry_plan_enabled:
+            return state
+        draft = state["draft"]
+        request = state["request"]
+        try:
+            dry_plan = self.wren_client.dry_plan(
+                question=request.message,
+                sql=draft.sql,
+                context=state["context"],
+            )
+        except Exception as ex:  # pylint: disable=broad-except
+            dry_plan = {"error": str(ex), "planning_only": True}
+            status: Literal["ok", "warning", "error"] = "warning"
+        else:
+            status = "ok" if dry_plan.get("available", True) else "warning"
+
+        wren_context = (
+            state.get("wren_context") or WrenContextArtifact(enabled=True)
+        ).model_copy(update={"dry_plan": dry_plan})
+        return {
+            **state,
+            "wren_context": wren_context,
+            "trace": [
+                *state.get("trace", []),
+                TraceEvent(
+                    step="dry_plan_with_wren",
+                    status=status,
+                    summary="Collected Wren dry-plan metadata.",
+                    details=dry_plan,
+                ),
+            ],
+        }
+
     def _validate_sql(self, state: ConversationState) -> ConversationState:
         request = state["request"]
         draft = state["draft"]
@@ -468,6 +621,64 @@ class ConversationGraph:
                 validation=validation,
                 trace=trace,
             ),
+            "trace": trace,
+        }
+
+    def _build_artifacts(self, state: ConversationState) -> ConversationState:
+        result = state.get("execution_result")
+        if result is None:
+            return state
+
+        request = state["request"]
+        bundle = build_artifact_bundle(
+            question=request.message,
+            result=result,
+            row_limit=self.config.default_sql_limit,
+        )
+        analysis = profile_result(
+            result,
+            question=request.message,
+            row_limit=self.config.default_sql_limit,
+        )
+        chart_spec = infer_chart_spec(
+            question=request.message,
+            result=result,
+            analysis=analysis,
+        )
+        trace = [
+            *state.get("trace", []),
+            TraceEvent(
+                step="build_artifacts",
+                summary="Built conversational analytics artifacts.",
+                details={
+                    "insight_card_count": len(bundle.insight_cards),
+                    "chart_type": chart_spec.type if chart_spec else None,
+                },
+            ),
+        ]
+        artifacts = list(state.get("artifacts", []))
+        if artifacts:
+            artifacts[-1] = artifacts[-1].model_copy(
+                update={
+                    "answer_summary": bundle.answer_summary,
+                    "insight_cards": bundle.insight_cards,
+                    "chart_spec": chart_spec,
+                    "data_preview": bundle.data_preview,
+                    "audit": result.audit,
+                    "recommended_followups": bundle.recommended_followups,
+                    "wren_context": state.get("wren_context"),
+                    "trace": trace,
+                }
+            )
+        return {
+            **state,
+            "answer_summary": bundle.answer_summary,
+            "insight_cards": bundle.insight_cards,
+            "chart_spec": chart_spec,
+            "data_preview": bundle.data_preview,
+            "audit": result.audit,
+            "recommended_followups": bundle.recommended_followups,
+            "artifacts": artifacts,
             "trace": trace,
         }
 
@@ -649,7 +860,12 @@ class ConversationGraph:
                 }
             )
 
-        draft = state.get("draft")
+        draft = state.get("draft") or ConversationDraft(
+            response_type="answer",
+            message=reflection.message,
+            sql="",
+            explanation=None,
+        )
         if reflection.outcome in {"answer", "clarify"}:
             draft = ConversationDraft(
                 response_type="answer",
@@ -682,6 +898,8 @@ class ConversationGraph:
     def _route_after_execution(state: ConversationState) -> str:
         if state.get("error"):
             return "end"
+        if state.get("execution_result") is not None:
+            return "build"
         return "reflect"
 
     def _route_after_reflection(self, state: ConversationState) -> str:
@@ -715,6 +933,7 @@ class ConversationGraph:
         conversation = state["conversation"]
         prompt = get_prompt("conversation")
         execution_mode: ExecutionMode = request.resolved_execution_mode()
+        wren_context = state.get("wren_context")
         payload = {
             "user_message": request.message,
             "execution_mode": execution_mode,
@@ -729,6 +948,7 @@ class ConversationGraph:
             "reflection_feedback": state.get("reflection_feedback"),
             "database": context.database.model_dump(),
             "datasets": [dataset.model_dump() for dataset in context.datasets],
+            "wren_context": wren_context.model_dump() if wren_context else None,
             "conversation": _conversation_payload(
                 conversation,
                 max_history_messages=self.config.max_history_messages,
@@ -782,6 +1002,7 @@ class ConversationGraph:
         )
         validation = state.get("validation")
         draft = state.get("draft")
+        wren_context = state.get("wren_context")
         latest_sql = (
             validation.normalized_sql if validation else draft.sql if draft else ""
         )
@@ -794,6 +1015,7 @@ class ConversationGraph:
             "latest_sql": latest_sql,
             "database": context.database.model_dump(),
             "datasets": [dataset.model_dump() for dataset in context.datasets],
+            "wren_context": wren_context.model_dump() if wren_context else None,
             "conversation": _conversation_payload(
                 conversation,
                 max_history_messages=self.config.max_history_messages,
@@ -824,9 +1046,7 @@ class ConversationGraph:
         except Exception as ex:  # pylint: disable=broad-except
             return _fallback_sql_reflection(state=state, error=str(ex))
         if reflection.outcome == "retry" and not reflection.retry_feedback:
-            return reflection.model_copy(
-                update={"retry_feedback": reflection.message}
-            )
+            return reflection.model_copy(update={"retry_feedback": reflection.message})
         return reflection
 
     def _assistant_message_from_state(
@@ -1024,6 +1244,13 @@ def _artifact_with_execution_state(
             "sql": state_artifact.sql,
             "validation": state_artifact.validation,
             "execution_result": state_artifact.execution_result,
+            "answer_summary": state_artifact.answer_summary,
+            "insight_cards": state_artifact.insight_cards,
+            "chart_spec": state_artifact.chart_spec,
+            "data_preview": state_artifact.data_preview,
+            "audit": state_artifact.audit,
+            "recommended_followups": state_artifact.recommended_followups,
+            "wren_context": state_artifact.wren_context,
             "trace": state_artifact.trace,
         }
     )

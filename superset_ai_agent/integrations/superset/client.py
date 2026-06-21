@@ -25,7 +25,7 @@ from typing import Any, Protocol
 from pydantic import BaseModel
 
 from superset_ai_agent.config import AgentConfig
-from superset_ai_agent.schemas import ExecutionResult
+from superset_ai_agent.schemas import AuditInfo, ExecutionResult
 
 
 class DatabaseSummary(BaseModel):
@@ -71,6 +71,14 @@ class SupersetAdapterNotImplementedError(NotImplementedError):
 
 class SupersetAdapterError(RuntimeError):
     """Raised when a Superset adapter cannot complete a request."""
+
+
+class SupersetAuthError(SupersetAdapterError):
+    """Raised when Superset rejects request-scoped or service auth."""
+
+    def __init__(self, message: str, *, status_code: int = 401):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class SupersetClient(Protocol):
@@ -207,6 +215,14 @@ class LocalSupersetClient:
                 columns=list(dataframe.columns),
                 rows=dataframe.to_dict(orient="records"),
                 row_count=len(dataframe),
+                audit=AuditInfo(
+                    adapter="local",
+                    executed_sql=sql,
+                    database_id=database_id,
+                    schema_name=schema_name,
+                    row_limit=limit,
+                    source="local_superset_client",
+                ),
             )
 
     def get_database_dialect(self, database_id: int) -> str | None:

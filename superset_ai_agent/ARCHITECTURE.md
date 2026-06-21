@@ -65,6 +65,32 @@ The standalone agent exposes a FastAPI API. SQL Lab uses it through
 `/ai-agent/*` to the agent service; nginx also has a `/ai-agent/` location that
 forwards to the same service.
 
+## Auth And Request Scope
+
+The normal SQL Lab integration uses the logged-in Superset browser session for
+agent identity and Superset API calls:
+
+1. The frontend client calls `/ai-agent` with `credentials: "include"`.
+2. Nginx or the webpack dev proxy forwards the browser `Cookie`,
+   `Authorization`, and CSRF headers to the standalone agent.
+3. `SupersetSessionIdentityProvider` validates the request with Superset
+   `GET /api/v1/me/` and scopes persisted agent state by the Superset user id.
+4. `SupersetRestClient` and `SupersetMcpClient` receive a
+   `SupersetRequestAuth` object and forward only that request's browser
+   credentials to Superset.
+
+This is configured with:
+
+```env
+AI_AGENT_IDENTITY_PROVIDER=superset_session
+SUPERSET_AUTH_MODE=user_session
+```
+
+Service-account mode still exists for direct native API tests and explicitly
+non-user-scoped deployments. It should be treated as a separate product mode:
+the agent can then see whatever the configured service account can see, not
+what the current browser user can see.
+
 ## Startup Assembly
 
 `superset_ai_agent/app.py` is the composition root:
@@ -105,6 +131,7 @@ store, so tests can replace external services without changing route code.
 | File | Component | Responsibility |
 | --- | --- | --- |
 | `superset_ai_agent/app.py` | FastAPI app factory and routes | Wires config, model client, Superset adapter, context provider, graphs, conversation store, CORS, and HTTP error handling. |
+| `superset_ai_agent/auth.py` | Identity providers and request auth | Resolves static, signed-header, or Superset-session identities and captures per-request browser credentials for Superset REST/MCP calls. |
 | `superset_ai_agent/config.py` | `AgentConfig` | Reads all runtime env vars for model provider, Superset adapter, SQL limits, conversation behavior, CORS, and logging. |
 | `superset_ai_agent/graph.py` | `TextToSqlGraph`, `SqlDraft` | One-shot natural language to SQL workflow used by `POST /agent/query`. |
 | `superset_ai_agent/conversation_graph.py` | `ConversationGraph`, `ConversationDraft` | Multi-turn assistant workflow with chat history, execution modes, SQL observations, repair loop, and artifacts. |
@@ -313,8 +340,8 @@ Adapter selection:
 | `SUPERSET_AGENT_ADAPTER` | Class | Transport | Best use |
 | --- | --- | --- | --- |
 | `local` | `LocalSupersetClient` | In-process Superset imports and ORM calls | Fast local development. It bypasses REST/MCP transport behavior and should not be the production security model. |
-| `rest` | `SupersetRestClient` | Superset REST API | Production-shaped service-account integration. |
-| `mcp` | `SupersetMcpClient` | Superset MCP JSON-RPC tools | Agent-native integration with tool discovery and MCP RBAC middleware. |
+| `rest` | `SupersetRestClient` | Superset REST API | Production-shaped user-session or service-account integration. |
+| `mcp` | `SupersetMcpClient` | Superset MCP JSON-RPC tools | Agent-native integration with request-scoped auth, tool discovery, and MCP RBAC middleware. |
 
 ## Superset REST Surface Used By The Agent
 
@@ -336,10 +363,11 @@ REST authentication modes:
 
 | Env vars | Behavior |
 | --- | --- |
-| `SUPERSET_AUTH_TOKEN` | Sends `Authorization: Bearer <token>`. |
-| `SUPERSET_USERNAME`, `SUPERSET_PASSWORD`, `SUPERSET_AUTH_PROVIDER` | Logs in through `/api/v1/security/login` and stores the returned access token in memory. |
-| `SUPERSET_CSRF_TOKEN` | Uses a pre-issued CSRF token for non-GET calls. Leave empty for normal REST use so the adapter fetches CSRF and keeps the matching session cookie in its HTTP client. |
-| No auth env vars | Sends no auth header, for deployments where identity is injected upstream. |
+| `SUPERSET_AUTH_MODE=user_session` | Forwards the current inbound browser `Cookie`, `Authorization`, and CSRF headers to Superset. No service token, username/password, or copied CSRF token is required. |
+| `SUPERSET_AUTH_MODE=service_account`, `SUPERSET_AUTH_TOKEN` | Sends `Authorization: Bearer <token>`. |
+| `SUPERSET_AUTH_MODE=service_account`, `SUPERSET_USERNAME`, `SUPERSET_PASSWORD`, `SUPERSET_AUTH_PROVIDER` | Logs in through `/api/v1/security/login` and stores the returned access token in memory. |
+| `SUPERSET_CSRF_TOKEN` | Service-account override for a pre-issued CSRF token. Leave empty for normal REST use so the adapter fetches CSRF and keeps the matching session cookie in its HTTP client. |
+| No service-account auth env vars | Sends no auth header in service-account mode, for deployments where identity is injected upstream. |
 
 ## Superset MCP Surface Used By The Agent
 
@@ -369,9 +397,10 @@ MCP auth:
 
 | Env vars | Behavior |
 | --- | --- |
+| `SUPERSET_AUTH_MODE=user_session` | Forwards the current inbound browser `Cookie` and `Authorization` headers to the MCP endpoint. |
 | `SUPERSET_MCP_AUTH_TOKEN` | Sends `Authorization: Bearer <token>` to the MCP endpoint. |
 | `SUPERSET_AUTH_TOKEN` | Fallback token when `SUPERSET_MCP_AUTH_TOKEN` is unset. |
-| Neither set | Sends no auth header, for upstream identity injection. |
+| Neither set in service-account mode | Sends no auth header, for upstream identity injection. |
 
 The Superset MCP service tool implementations live under
 `superset/mcp_service/*/tool/*.py`. Useful tools for future agent work include:
@@ -498,10 +527,12 @@ syntax, or comments, improve this with AST-aware limit detection.
 | `AI_AGENT_MAX_HISTORY_MESSAGES` | `12` | Conversation messages included in prompt history. |
 | `AI_AGENT_MAX_PROMPT_RESULT_ROWS` | `5` | Execution rows included in follow-up prompt observations. |
 | `AI_AGENT_MAX_SQL_ITERATIONS` | `3` | Max automatic execute/reflect/retry cycles per turn. |
+| `AI_AGENT_IDENTITY_PROVIDER` | `superset_session` in `.env.example` | Owner identity for persisted state: `superset_session`, `signed_header`, or `static`. |
 | `SUPERSET_AGENT_ADAPTER` | `rest` | One of `local`, `rest`, `mcp`. |
+| `SUPERSET_AUTH_MODE` | `user_session` in `.env.example` | `user_session` forwards the logged-in browser user's Superset credentials. `service_account` uses token or username/password credentials. |
 | `SUPERSET_BASE_URL` | `http://localhost:8091` | Superset REST base URL for native development. Docker uses the internal service URL `http://superset:8088`. |
 | `SUPERSET_MCP_URL` | `http://localhost:8098/mcp` | Superset MCP JSON-RPC URL. |
-| `SUPERSET_AUTH_TOKEN`, `SUPERSET_USERNAME`, `SUPERSET_PASSWORD` | token unset, username/password `admin` | REST authentication options. |
+| `SUPERSET_AUTH_TOKEN`, `SUPERSET_USERNAME`, `SUPERSET_PASSWORD` | unset in `.env.example` | Service-account REST authentication options. Ignored when `SUPERSET_AUTH_MODE=user_session`. |
 | `SUPERSET_MCP_AUTH_TOKEN` | falls back to `SUPERSET_AUTH_TOKEN` | MCP bearer token. |
 | `SUPERSET_SQL_POLL_ATTEMPTS` | `10` | REST SQL Lab results polling attempts. |
 | `SUPERSET_SQL_POLL_INTERVAL_SECONDS` | `0.5` | Delay between REST SQL Lab result polls. |

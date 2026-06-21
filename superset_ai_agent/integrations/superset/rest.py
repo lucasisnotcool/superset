@@ -18,10 +18,11 @@
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
+from superset_ai_agent.auth import SupersetRequestAuth
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.integrations.superset.client import (
     AgentContext,
@@ -30,8 +31,9 @@ from superset_ai_agent.integrations.superset.client import (
     DatasetMetadata,
     MetricSummary,
     SupersetAdapterError,
+    SupersetAuthError,
 )
-from superset_ai_agent.schemas import ExecutionResult
+from superset_ai_agent.schemas import AuditInfo, ExecutionResult
 
 
 class SupersetRestClient:
@@ -41,13 +43,21 @@ class SupersetRestClient:
         self,
         config: AgentConfig,
         transport: httpx.BaseTransport | None = None,
+        request_auth: SupersetRequestAuth | None = None,
     ):
         self.config = config
         self.base_url = config.superset_base_url.rstrip("/")
         self.transport = transport
         self.timeout = httpx.Timeout(60.0)
-        self._access_token = config.superset_auth_token
-        self._csrf_token = config.superset_csrf_token
+        self.request_auth = request_auth
+        self._access_token = (
+            None if self._uses_user_session_auth else config.superset_auth_token
+        )
+        self._csrf_token = (
+            request_auth.csrf_token
+            if self._uses_user_session_auth and request_auth
+            else config.superset_csrf_token
+        )
         self._http_client: httpx.Client | None = None
 
     def request(
@@ -61,6 +71,18 @@ class SupersetRestClient:
     ) -> dict[str, Any]:
         """Perform a low-level authenticated REST request."""
 
+        return self._request(method, path, params=params, json=json, headers=headers)
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        allow_auth_retry: bool = True,
+    ) -> dict[str, Any]:
         self._ensure_authenticated()
         request_headers = self._headers()
         if headers:
@@ -75,7 +97,20 @@ class SupersetRestClient:
             json=json,
             headers=request_headers,
         )
-        self._raise_for_status(response)
+        try:
+            self._raise_for_status(response)
+        except SupersetAuthError:
+            if allow_auth_retry and self._can_retry_service_auth():
+                self._reset_service_auth()
+                return self._request(
+                    method,
+                    path,
+                    params=params,
+                    json=json,
+                    headers=headers,
+                    allow_auth_retry=False,
+                )
+            raise
         data = response.json()
         if not isinstance(data, dict):
             raise SupersetAdapterError(
@@ -239,7 +274,8 @@ class SupersetRestClient:
                 sql=sql,
                 schema_name=schema_name,
                 limit=limit,
-            )
+            ),
+            adapter="rest",
         )
 
     def get_database_dialect(self, database_id: int) -> str | None:
@@ -249,9 +285,17 @@ class SupersetRestClient:
 
     def _client(self) -> httpx.Client:
         if self._http_client is None:
+            client_headers: dict[str, str] = {}
+            client_cookies: dict[str, str] = {}
+            if self._uses_user_session_auth:
+                auth = self._required_request_auth()
+                client_headers.update(auth.headers())
+                client_cookies.update(auth.cookies())
             self._http_client = httpx.Client(
                 timeout=self.timeout,
                 transport=self.transport,
+                headers=client_headers,
+                cookies=client_cookies,
             )
         return self._http_client
 
@@ -263,6 +307,9 @@ class SupersetRestClient:
             self._http_client = None
 
     def _ensure_authenticated(self) -> None:
+        if self._uses_user_session_auth:
+            self._required_request_auth()
+            return
         if self._access_token or not self.config.superset_username:
             return
         if not self.config.superset_password:
@@ -297,9 +344,33 @@ class SupersetRestClient:
 
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json"}
-        if self._access_token:
+        if not self._uses_user_session_auth and self._access_token:
             headers["Authorization"] = f"Bearer {self._access_token}"
         return headers
+
+    @property
+    def _uses_user_session_auth(self) -> bool:
+        return self.config.superset_auth_mode == "user_session"
+
+    def _required_request_auth(self) -> SupersetRequestAuth:
+        if self.request_auth and self.request_auth.has_credentials():
+            return self.request_auth
+        raise SupersetAuthError(
+            "Superset user-session auth requires request cookies or Authorization.",
+            status_code=401,
+        )
+
+    def _can_retry_service_auth(self) -> bool:
+        return (
+            not self._uses_user_session_auth
+            and not self.config.superset_auth_token
+            and bool(self.config.superset_username)
+        )
+
+    def _reset_service_auth(self) -> None:
+        self._access_token = None
+        self._csrf_token = None
+        self.close()
 
     def _url(self, path: str) -> str:
         if path.startswith("http://") or path.startswith("https://"):
@@ -312,6 +383,12 @@ class SupersetRestClient:
             response.raise_for_status()
         except httpx.HTTPStatusError as ex:
             body = ex.response.text[:500]
+            if ex.response.status_code in {401, 403}:
+                raise SupersetAuthError(
+                    f"Superset REST auth failed with HTTP "
+                    f"{ex.response.status_code}: {body}",
+                    status_code=ex.response.status_code,
+                ) from ex
             raise SupersetAdapterError(
                 f"Superset REST request failed with HTTP "
                 f"{ex.response.status_code}: {body}"
@@ -396,7 +473,11 @@ def _normalize_metric(data: dict[str, Any]) -> MetricSummary:
     )
 
 
-def _normalize_execution_result(payload: dict[str, Any]) -> ExecutionResult:
+def _normalize_execution_result(
+    payload: dict[str, Any],
+    *,
+    adapter: Literal["rest", "mcp"] = "rest",
+) -> ExecutionResult:
     result = _result(payload)
     rows = result.get("data") or result.get("rows") or []
     if not isinstance(rows, list):
@@ -410,7 +491,81 @@ def _normalize_execution_result(payload: dict[str, Any]) -> ExecutionResult:
         columns=_normalize_column_names(columns, rows),
         rows=[row for row in rows if isinstance(row, dict)],
         row_count=int(row_count),
+        audit=_normalize_audit_info(payload, adapter=adapter),
+        is_truncated=int(row_count) > len(rows),
     )
+
+
+def _normalize_audit_info(
+    payload: dict[str, Any],
+    *,
+    adapter: Literal["rest", "mcp"],
+) -> AuditInfo:
+    result = _result(payload)
+    query = result.get("query")
+    if not isinstance(query, dict):
+        query = payload.get("query")
+    if not isinstance(query, dict):
+        query = {}
+
+    query_id = (
+        result.get("query_id")
+        or result.get("queryId")
+        or query.get("id")
+        or query.get("query_id")
+        or query.get("queryId")
+    )
+    results_key = (
+        result.get("resultsKey")
+        or result.get("results_key")
+        or query.get("resultsKey")
+        or query.get("results_key")
+    )
+    executed_sql = (
+        result.get("executed_sql")
+        or result.get("executedSql")
+        or query.get("executed_sql")
+        or query.get("executedSql")
+        or query.get("sql")
+    )
+    database_id = _optional_int(
+        result.get("database_id")
+        or result.get("databaseId")
+        or query.get("database_id")
+        or query.get("databaseId")
+    )
+    row_limit = _optional_int(
+        result.get("queryLimit")
+        or result.get("limit")
+        or query.get("queryLimit")
+        or query.get("limit")
+    )
+    timeout_seconds = _optional_int(
+        result.get("timeout")
+        or result.get("timeout_seconds")
+        or query.get("timeout")
+        or query.get("timeout_seconds")
+    )
+    return AuditInfo(
+        adapter=adapter,
+        query_id=query_id,
+        results_key=str(results_key) if results_key is not None else None,
+        executed_sql=str(executed_sql) if executed_sql is not None else None,
+        database_id=database_id,
+        schema_name=result.get("schema") or query.get("schema"),
+        row_limit=row_limit,
+        timeout_seconds=timeout_seconds,
+        source="sqllab_rest" if adapter == "rest" else "superset_mcp",
+    )
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _normalize_column_names(

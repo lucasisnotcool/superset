@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+from superset_ai_agent.auth import SupersetRequestAuth
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.integrations.superset.client import (
     LocalSupersetClient,
@@ -26,16 +27,20 @@ from superset_ai_agent.integrations.superset.mcp import SupersetMcpClient
 from superset_ai_agent.integrations.superset.rest import SupersetRestClient
 
 
-def create_superset_client(config: AgentConfig) -> SupersetClient:
+def create_superset_client(
+    config: AgentConfig,
+    *,
+    request_auth: SupersetRequestAuth | None = None,
+) -> SupersetClient:
     """Create the configured Superset adapter without changing the graph."""
 
     adapter = config.superset_agent_adapter
     if adapter == "local":
         return LocalSupersetClient(config)
     if adapter == "rest":
-        return SupersetRestClient(config)
+        return SupersetRestClient(config, request_auth=request_auth)
     if adapter == "mcp":
-        return SupersetMcpClient(config)
+        return SupersetMcpClient(config, request_auth=request_auth)
     raise ValueError(
         "Unsupported SUPERSET_AGENT_ADAPTER value "
         f"{adapter!r}. Expected one of: local, rest, mcp."

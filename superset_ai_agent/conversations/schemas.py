@@ -23,7 +23,15 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
-from superset_ai_agent.schemas import ExecutionResult, SqlValidation, TraceEvent
+from superset_ai_agent.schemas import (
+    AuditInfo,
+    ChartSpec,
+    ExecutionResult,
+    InsightCard,
+    SqlValidation,
+    TraceEvent,
+    WrenContextArtifact,
+)
 
 ConversationRole = Literal["user", "assistant"]
 ConversationStatus = Literal["ok", "needs_review", "error"]
@@ -59,6 +67,13 @@ class ConversationArtifact(BaseModel):
     validation: SqlValidation | None = None
     execution_result: ExecutionResult | None = None
     trace: list[TraceEvent] = Field(default_factory=list)
+    answer_summary: str | None = None
+    insight_cards: list[InsightCard] = Field(default_factory=list)
+    chart_spec: ChartSpec | None = None
+    data_preview: ExecutionResult | None = None
+    audit: AuditInfo | None = None
+    recommended_followups: list[str] = Field(default_factory=list)
+    wren_context: WrenContextArtifact | None = None
 
 
 class ConversationMessage(BaseModel):

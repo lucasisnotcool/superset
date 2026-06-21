@@ -62,11 +62,20 @@ import {
   listConversations,
   sendConversationMessage,
   type ExecutionMode,
+  type SemanticLayerState,
 } from './api';
+import AiChartPreview from './AiChartPreview';
+import AuditInfoPanel from './AuditInfoPanel';
+import DataPreviewToggle from './DataPreviewToggle';
+import FollowupQuestions from './FollowupQuestions';
+import InsightCards from './InsightCards';
+import SemanticLayerDrawer from './SemanticLayerDrawer';
+import SemanticLayerStateBadge from './SemanticLayerStateBadge';
 
 const Panel = styled.div`
   ${({ theme }) => css`
     display: flex;
+    position: relative;
     flex-direction: column;
     height: 100%;
     min-height: 0;
@@ -255,42 +264,6 @@ const ValidationStatus = styled.span<{
   `}
 `;
 
-const ResultScroller = styled.div`
-  ${({ theme }) => css`
-    max-height: 220px;
-    overflow: auto;
-    border: 1px solid ${theme.colorBorderSecondary};
-    border-radius: ${theme.borderRadius}px;
-  `}
-`;
-
-const ResultTable = styled.table`
-  ${({ theme }) => css`
-    width: 100%;
-    border-collapse: collapse;
-    font-size: ${theme.fontSizeSM}px;
-
-    th,
-    td {
-      padding: ${theme.sizeUnit}px ${theme.sizeUnit * 2}px;
-      border-bottom: 1px solid ${theme.colorBorderSecondary};
-      text-align: left;
-      vertical-align: top;
-      white-space: nowrap;
-    }
-
-    th {
-      background: ${theme.colorBgElevated};
-      color: ${theme.colorTextSecondary};
-      font-weight: ${theme.fontWeightStrong};
-    }
-
-    tr:last-of-type td {
-      border-bottom: 0;
-    }
-  `}
-`;
-
 const Composer = styled.div`
   ${({ theme }) => css`
     display: flex;
@@ -406,28 +379,6 @@ const getValidationTooltip = (artifact: ConversationArtifact) => {
     : t('SQL is invalid.');
 };
 
-const getResultColumns = (artifact: ConversationArtifact) => {
-  const result = artifact.execution_result;
-  if (!result) {
-    return [];
-  }
-  if (result.columns.length > 0) {
-    return result.columns;
-  }
-  const firstRow = result.rows[0];
-  return firstRow ? Object.keys(firstRow) : [];
-};
-
-const formatResultValue = (value: unknown) => {
-  if (value === null || value === undefined) {
-    return 'NULL';
-  }
-  if (typeof value === 'object') {
-    return JSON.stringify(value);
-  }
-  return String(value);
-};
-
 const getExecutionError = (artifact: ConversationArtifact) => {
   const executionEvent = artifact.trace.find(
     event => event.step === 'execute_sql' && event.status === 'error',
@@ -436,9 +387,7 @@ const getExecutionError = (artifact: ConversationArtifact) => {
     return null;
   }
   const detailError = executionEvent.details.error;
-  return typeof detailError === 'string'
-    ? detailError
-    : executionEvent.summary;
+  return typeof detailError === 'string' ? detailError : executionEvent.summary;
 };
 
 const AiAgentPanel = () => {
@@ -457,12 +406,22 @@ const AiAgentPanel = () => {
   const [health, setHealth] = useState<AgentHealthResponse | null>(null);
   const [isHealthError, setIsHealthError] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [isSemanticLayerOpen, setIsSemanticLayerOpen] = useState(false);
+  const [semanticLayerState, setSemanticLayerState] =
+    useState<SemanticLayerState | null>(null);
 
   const parsedDatasetIds = useMemo(
     () => parseDatasetIds(datasetIds),
     [datasetIds],
   );
   const databaseId = queryEditor?.dbId;
+  const currentScope = useMemo(
+    () =>
+      typeof databaseId === 'number'
+        ? buildConversationScope(queryEditor, databaseId, parsedDatasetIds)
+        : null,
+    [databaseId, parsedDatasetIds, queryEditor],
+  );
   const canSend =
     Boolean(composerValue.trim()) && typeof databaseId === 'number';
   const healthLabel = isHealthError
@@ -533,24 +492,21 @@ const AiAgentPanel = () => {
     return createdConversation;
   };
 
-  const onSend = async () => {
-    if (!canSend || typeof databaseId !== 'number') {
+  const onSend = async (messageOverride?: string) => {
+    const message = (messageOverride || composerValue).trim();
+    if (!message || typeof databaseId !== 'number' || !currentScope) {
       return;
     }
     setIsLoading(true);
     setError(null);
-    const message = composerValue.trim();
-    const scope = buildConversationScope(
-      queryEditor,
-      databaseId,
-      parsedDatasetIds,
-    );
     try {
-      const activeConversation = await ensureConversation(scope);
-      setComposerValue('');
+      const activeConversation = await ensureConversation(currentScope);
+      if (!messageOverride) {
+        setComposerValue('');
+      }
       const result = await sendConversationMessage(activeConversation.id, {
         message,
-        scope,
+        scope: currentScope,
         execution_mode: executionMode,
       });
       setConversation(result.conversation);
@@ -633,7 +589,12 @@ const AiAgentPanel = () => {
   };
 
   const onExecuteArtifact = async (artifact: ConversationArtifact) => {
-    if (!conversation || !artifact.sql || typeof databaseId !== 'number') {
+    if (
+      !conversation ||
+      !artifact.sql ||
+      typeof databaseId !== 'number' ||
+      !currentScope
+    ) {
       return;
     }
     if (!artifact.validation?.is_valid || !artifact.validation.is_read_only) {
@@ -642,15 +603,10 @@ const AiAgentPanel = () => {
     }
     setIsLoading(true);
     setError(null);
-    const scope = buildConversationScope(
-      queryEditor,
-      databaseId,
-      parsedDatasetIds,
-    );
     try {
       const result = await executeConversationSql(conversation.id, {
         sql: artifact.validation.normalized_sql || artifact.sql,
-        scope,
+        scope: currentScope,
         execution_mode: executionMode,
         artifact_id: artifact.id,
       });
@@ -698,6 +654,15 @@ const AiAgentPanel = () => {
             icon={<Icons.HistoryOutlined iconSize="m" />}
           />
           <Button
+            aria-label={t('Semantic layer')}
+            tooltip={t('Semantic layer')}
+            buttonSize="small"
+            buttonStyle="tertiary"
+            disabled={!currentScope}
+            onClick={() => setIsSemanticLayerOpen(true)}
+            icon={<Icons.DatabaseOutlined iconSize="m" />}
+          />
+          <Button
             aria-label={t('Delete conversation')}
             tooltip={t('Delete conversation')}
             buttonSize="small"
@@ -721,6 +686,7 @@ const AiAgentPanel = () => {
             <Chip key={datasetId}>{t('Dataset %s', datasetId)}</Chip>
           ))}
           {queryEditor?.selectedText && <Chip>{t('Selection')}</Chip>}
+          <SemanticLayerStateBadge state={semanticLayerState} />
         </ContextChips>
         <Flex gap="small" align="center">
           <Input
@@ -759,9 +725,6 @@ const AiAgentPanel = () => {
             );
           const artifactBlocks = message.artifacts.map((artifact, index) => {
             const validationStatus = getValidationStatus(artifact);
-            const resultColumns = getResultColumns(artifact);
-            const resultRows =
-              artifact.execution_result?.rows.slice(0, 10) || [];
             const executionError = getExecutionError(artifact);
             const isExecuted = Boolean(artifact.execution_result);
             const canExecuteArtifact =
@@ -774,9 +737,19 @@ const AiAgentPanel = () => {
 
             return (
               <ArtifactBlock key={`${message.id}-${artifact.type}-${index}`}>
+                {artifact.answer_summary && (
+                  <Typography.Text strong>
+                    {artifact.answer_summary}
+                  </Typography.Text>
+                )}
+                <InsightCards cards={artifact.insight_cards} />
                 {artifact.explanation && (
                   <MetaText>{artifact.explanation}</MetaText>
                 )}
+                <AiChartPreview
+                  chartSpec={artifact.chart_spec}
+                  result={artifact.execution_result || artifact.data_preview}
+                />
                 <SqlBlockRow>
                   <SqlBlock>{artifact.sql}</SqlBlock>
                   <Tooltip title={getValidationTooltip(artifact)}>
@@ -800,40 +773,12 @@ const AiAgentPanel = () => {
                 {executionError ? (
                   <Alert type="warning" message={executionError} />
                 ) : null}
-                {artifact.execution_result && (
-                  <>
-                    <MetaText>
-                      {t(
-                        '%s row(s) returned',
-                        artifact.execution_result.row_count,
-                      )}
-                    </MetaText>
-                    {resultColumns.length > 0 && resultRows.length > 0 && (
-                      <ResultScroller>
-                        <ResultTable>
-                          <thead>
-                            <tr>
-                              {resultColumns.map(column => (
-                                <th key={column}>{column}</th>
-                              ))}
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {resultRows.map((row, rowIndex) => (
-                              <tr key={rowIndex}>
-                                {resultColumns.map(column => (
-                                  <td key={column}>
-                                    {formatResultValue(row[column])}
-                                  </td>
-                                ))}
-                              </tr>
-                            ))}
-                          </tbody>
-                        </ResultTable>
-                      </ResultScroller>
-                    )}
-                  </>
-                )}
+                <DataPreviewToggle
+                  result={artifact.execution_result || artifact.data_preview}
+                />
+                <AuditInfoPanel
+                  audit={artifact.audit || artifact.execution_result?.audit}
+                />
                 <Flex gap="small" wrap="wrap">
                   <Button
                     aria-label={t('Insert')}
@@ -869,6 +814,19 @@ const AiAgentPanel = () => {
                     {isExecuted ? t('Executed') : t('Execute')}
                   </Button>
                 </Flex>
+                <FollowupQuestions
+                  questions={artifact.recommended_followups}
+                  disabled={isLoading}
+                  onSelect={question => onSend(question)}
+                />
+                {artifact.wren_context && (
+                  <TraceDetails>
+                    <summary>{t('Wren context')}</summary>
+                    <SqlBlock>
+                      {JSON.stringify(artifact.wren_context, null, 2)}
+                    </SqlBlock>
+                  </TraceDetails>
+                )}
                 {artifact.trace.length > 0 && (
                   <TraceDetails>
                     <summary>{t('Trace')}</summary>
@@ -905,6 +863,13 @@ const AiAgentPanel = () => {
         {error && <Alert type="error" message={error} />}
       </Transcript>
 
+      <SemanticLayerDrawer
+        open={isSemanticLayerOpen}
+        scope={currentScope}
+        onClose={() => setIsSemanticLayerOpen(false)}
+        onStateChange={setSemanticLayerState}
+      />
+
       <Composer>
         <Input.TextArea
           rows={3}
@@ -937,7 +902,7 @@ const AiAgentPanel = () => {
           <Button
             aria-label={t('Send')}
             buttonStyle="primary"
-            onClick={onSend}
+            onClick={() => onSend()}
             disabled={!canSend || isLoading}
             loading={isLoading}
             icon={<Icons.ArrowRightOutlined iconSize="m" />}

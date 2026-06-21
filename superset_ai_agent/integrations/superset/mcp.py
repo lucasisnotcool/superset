@@ -23,12 +23,14 @@ from typing import Any
 
 import httpx
 
+from superset_ai_agent.auth import SupersetRequestAuth
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.integrations.superset.client import (
     AgentContext,
     DatabaseSummary,
     DatasetMetadata,
     SupersetAdapterError,
+    SupersetAuthError,
 )
 from superset_ai_agent.integrations.superset.rest import (
     _items,
@@ -46,11 +48,13 @@ class SupersetMcpClient:
         self,
         config: AgentConfig,
         transport: httpx.BaseTransport | None = None,
+        request_auth: SupersetRequestAuth | None = None,
     ):
         self.config = config
         self.mcp_url = config.superset_mcp_url
         self.transport = transport
         self.timeout = httpx.Timeout(60.0)
+        self.request_auth = request_auth
         self._request_ids = itertools.count(1)
 
     def call_json_rpc(
@@ -297,7 +301,7 @@ class SupersetMcpClient:
             raise SupersetAdapterError(
                 f"Superset MCP execute_sql failed: {payload.get('error')}"
             )
-        return _normalize_execution_result(payload)
+        return _normalize_execution_result(payload, adapter="mcp")
 
     def get_database_dialect(self, database_id: int) -> str | None:
         """Return database backend from MCP metadata."""
@@ -309,6 +313,17 @@ class SupersetMcpClient:
             "Accept": "application/json, text/event-stream",
             "Content-Type": "application/json",
         }
+        if self.config.superset_auth_mode == "user_session":
+            if not self.request_auth or not self.request_auth.has_credentials():
+                raise SupersetAuthError(
+                    "Superset MCP user-session auth requires request cookies or "
+                    "Authorization.",
+                    status_code=401,
+                )
+            headers.update(self.request_auth.headers())
+            if self.request_auth.cookie_header:
+                headers["Cookie"] = self.request_auth.cookie_header
+            return headers
         token = self.config.superset_mcp_auth_token
         if token:
             headers["Authorization"] = f"Bearer {token}"
@@ -320,6 +335,12 @@ class SupersetMcpClient:
             response.raise_for_status()
         except httpx.HTTPStatusError as ex:
             body = ex.response.text[:500]
+            if ex.response.status_code in {401, 403}:
+                raise SupersetAuthError(
+                    f"Superset MCP auth failed with HTTP "
+                    f"{ex.response.status_code}: {body}",
+                    status_code=ex.response.status_code,
+                ) from ex
             raise SupersetAdapterError(
                 f"Superset MCP request failed with HTTP "
                 f"{ex.response.status_code}: {body}"

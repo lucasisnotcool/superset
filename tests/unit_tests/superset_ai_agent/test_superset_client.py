@@ -24,9 +24,11 @@ from typing import cast
 import httpx
 import pytest
 
+from superset_ai_agent.auth import SupersetRequestAuth
 from superset_ai_agent.config import AgentConfig, SupersetAdapterMode
 from superset_ai_agent.integrations.superset.client import (
     LocalSupersetClient,
+    SupersetAuthError,
 )
 from superset_ai_agent.integrations.superset.factory import create_superset_client
 from superset_ai_agent.integrations.superset.mcp import SupersetMcpClient
@@ -200,6 +202,14 @@ def test_rest_adapter_is_wired_as_skeleton() -> None:
                         {"name": "name"},
                         {"name": "total_births"},
                     ],
+                    "query": {
+                        "id": 123,
+                        "resultsKey": "result-key",
+                        "executedSql": "select 1",
+                        "databaseId": 1,
+                        "schema": None,
+                        "queryLimit": 1000,
+                    },
                 },
             )
         return httpx.Response(404, text=request.url.path)
@@ -207,6 +217,7 @@ def test_rest_adapter_is_wired_as_skeleton() -> None:
     client = SupersetRestClient(
         AgentConfig(
             superset_agent_adapter="rest",
+            superset_auth_mode="service_account",
             superset_base_url="http://localhost:8091/",
             superset_username="admin",
             superset_password="admin",  # noqa: S106
@@ -226,7 +237,148 @@ def test_rest_adapter_is_wired_as_skeleton() -> None:
     result = client.execute_sql(database_id=1, sql="select 1")
     assert result.columns == ["name", "total_births"]
     assert result.row_count == 1
+    assert result.audit is not None
+    assert result.audit.adapter == "rest"
+    assert result.audit.query_id == 123
+    assert result.audit.results_key == "result-key"
+    assert result.audit.executed_sql == "select 1"
+    assert result.audit.database_id == 1
     assert requests[0].url.path == "/api/v1/security/login"
+
+
+def test_rest_adapter_forwards_user_session_without_service_login() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.url.path != "/api/v1/security/login"
+        assert request.headers["cookie"] == "session=user-session"
+        return httpx.Response(
+            200,
+            json={
+                "result": {
+                    "id": 1,
+                    "database_name": "examples",
+                    "backend": "sqlite",
+                }
+            },
+        )
+
+    client = SupersetRestClient(
+        AgentConfig(
+            superset_auth_mode="user_session",
+            superset_base_url="http://localhost:8091",
+        ),
+        transport=httpx.MockTransport(handler),
+        request_auth=SupersetRequestAuth(cookie_header="session=user-session"),
+    )
+
+    assert client.get_database_dialect(1) == "sqlite"
+    assert [request.url.path for request in requests] == ["/api/v1/database/1"]
+
+
+def test_rest_adapter_fetches_csrf_with_user_session_for_post() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.headers["cookie"] == "session=user-session"
+        if request.url.path == "/api/v1/security/csrf_token/":
+            return httpx.Response(200, json={"result": "user-csrf"})
+        if request.url.path == "/api/v1/sqllab/execute/":
+            assert request.headers["x-csrftoken"] == "user-csrf"
+            return httpx.Response(
+                200,
+                json={
+                    "status": "success",
+                    "data": [{"value": 1}],
+                    "columns": [{"name": "value"}],
+                },
+            )
+        return httpx.Response(404, text=request.url.path)
+
+    client = SupersetRestClient(
+        AgentConfig(
+            superset_auth_mode="user_session",
+            superset_base_url="http://localhost:8091",
+        ),
+        transport=httpx.MockTransport(handler),
+        request_auth=SupersetRequestAuth(cookie_header="session=user-session"),
+    )
+
+    result = client.execute_sql(database_id=1, sql="select 1")
+
+    assert result.row_count == 1
+    assert [request.url.path for request in requests] == [
+        "/api/v1/security/csrf_token/",
+        "/api/v1/sqllab/execute/",
+    ]
+
+
+def test_rest_adapter_reauthenticates_service_account_once_after_401() -> None:
+    requests: list[httpx.Request] = []
+    login_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal login_count
+        requests.append(request)
+        if request.url.path == "/api/v1/security/login":
+            login_count += 1
+            return httpx.Response(200, json={"access_token": f"token-{login_count}"})
+        if request.url.path == "/api/v1/database/1":
+            if request.headers["authorization"] == "Bearer token-1":
+                return httpx.Response(401, text="expired")
+            return httpx.Response(
+                200,
+                json={
+                    "result": {
+                        "id": 1,
+                        "database_name": "examples",
+                        "backend": "sqlite",
+                    }
+                },
+            )
+        return httpx.Response(404, text=request.url.path)
+
+    client = SupersetRestClient(
+        AgentConfig(
+            superset_auth_mode="service_account",
+            superset_base_url="http://localhost:8091",
+            superset_username="admin",
+            superset_password="admin",  # noqa: S106
+        ),
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert client.get_database_dialect(1) == "sqlite"
+    assert [request.url.path for request in requests] == [
+        "/api/v1/security/login",
+        "/api/v1/database/1",
+        "/api/v1/security/login",
+        "/api/v1/database/1",
+    ]
+
+
+def test_rest_adapter_static_token_401_does_not_retry() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(401, text="expired")
+
+    client = SupersetRestClient(
+        AgentConfig(
+            superset_auth_mode="service_account",
+            superset_base_url="http://localhost:8091",
+            superset_auth_token="static-token",
+        ),
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(SupersetAuthError):
+        client.get_database_dialect(1)
+
+    assert [request.url.path for request in requests] == ["/api/v1/database/1"]
 
 
 def test_mcp_adapter_calls_tools_and_normalizes_results() -> None:
@@ -322,6 +474,9 @@ def test_mcp_adapter_calls_tools_and_normalizes_results() -> None:
                             {"name": "total_births", "type": "BIGINT"},
                         ],
                         "row_count": 1,
+                        "query_id": "mcp-query-1",
+                        "database_id": 1,
+                        "limit": 1000,
                     }
                 },
             )
@@ -330,6 +485,7 @@ def test_mcp_adapter_calls_tools_and_normalizes_results() -> None:
     client = SupersetMcpClient(
         AgentConfig(
             superset_agent_adapter="mcp",
+            superset_auth_mode="service_account",
             superset_mcp_url="http://localhost:8098/mcp",
             superset_mcp_auth_token="mcp-token",  # noqa: S106
         ),
@@ -348,6 +504,38 @@ def test_mcp_adapter_calls_tools_and_normalizes_results() -> None:
     result = client.execute_sql(database_id=1, sql="select 1")
     assert result.columns == ["name", "total_births"]
     assert result.row_count == 1
+    assert result.audit is not None
+    assert result.audit.adapter == "mcp"
+    assert result.audit.query_id == "mcp-query-1"
+    assert result.audit.database_id == 1
+
+
+def test_mcp_adapter_forwards_user_session_headers() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["cookie"] == "session=user-session"
+        payload = json.loads(request.content)
+        return _json_rpc_result(
+            payload["id"],
+            {
+                "structuredContent": {
+                    "id": 1,
+                    "database_name": "examples",
+                    "backend": "sqlite",
+                }
+            },
+        )
+
+    client = SupersetMcpClient(
+        AgentConfig(
+            superset_agent_adapter="mcp",
+            superset_auth_mode="user_session",
+            superset_mcp_url="http://localhost:8098/mcp",
+        ),
+        transport=httpx.MockTransport(handler),
+        request_auth=SupersetRequestAuth(cookie_header="session=user-session"),
+    )
+
+    assert client.get_database_dialect(1) == "sqlite"
 
 
 def test_mcp_adapter_raises_on_tool_error() -> None:
@@ -358,6 +546,7 @@ def test_mcp_adapter_raises_on_tool_error() -> None:
     client = SupersetMcpClient(
         AgentConfig(
             superset_agent_adapter="mcp",
+            superset_auth_mode="service_account",
             superset_mcp_url="http://localhost:8098/mcp",
         ),
         transport=httpx.MockTransport(handler),

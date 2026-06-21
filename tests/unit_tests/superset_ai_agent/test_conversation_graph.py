@@ -275,15 +275,22 @@ def test_conversation_graph_executes_valid_sql_when_requested() -> None:
     assert response.message.content == "Michael has the highest total in the sample."
     assert response.artifacts[0].execution_result is not None
     assert response.artifacts[0].execution_result.row_count == 1
+    assert response.artifacts[0].answer_summary is not None
+    assert response.artifacts[0].insight_cards
+    assert response.artifacts[0].chart_spec is not None
+    assert response.artifacts[0].data_preview is not None
+    assert response.artifacts[0].recommended_followups
     assert superset_client.executed_sql == [
         "SELECT name, SUM(num) AS total_births FROM birth_names GROUP BY name LIMIT 10"
     ]
     assert [event.step for event in response.trace] == [
         "load_conversation",
         "load_context",
+        "load_wren_context",
         "draft_response",
         "validate_sql",
         "execute_sql",
+        "build_artifacts",
         "reflect_sql_outcome",
     ]
 
@@ -347,6 +354,10 @@ def test_conversation_graph_updates_approved_sql_artifact_in_manual_mode() -> No
     updated_artifact = response.conversation.messages[1].artifacts[0]
     assert updated_artifact.id == artifact.id
     assert updated_artifact.execution_result is not None
+    assert updated_artifact.answer_summary is not None
+    assert updated_artifact.insight_cards
+    assert updated_artifact.chart_spec is not None
+    assert updated_artifact.data_preview is not None
     assert response.conversation.messages[-1].content == (
         "The approved query returned Michael."
     )
@@ -355,9 +366,11 @@ def test_conversation_graph_updates_approved_sql_artifact_in_manual_mode() -> No
     assert [event.step for event in response.trace] == [
         "load_conversation",
         "load_context",
+        "load_wren_context",
         "approved_sql",
         "validate_sql",
         "execute_sql",
+        "build_artifacts",
         "reflect_sql_outcome",
     ]
 

@@ -29,6 +29,8 @@ services:
     depends_on:
       superset:
         condition: service_started
+    volumes:
+      - superset_ai_agent_data:/app/.data
     restart: unless-stopped
 
   superset-node:
@@ -42,3 +44,6 @@ services:
     depends_on:
       superset-ai-agent:
         condition: service_started
+
+volumes:
+  superset_ai_agent_data:

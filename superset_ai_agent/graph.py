@@ -23,17 +23,24 @@ from typing import Any, Literal, TypedDict
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
+from superset_ai_agent.artifacts.charts import infer_chart_spec
+from superset_ai_agent.artifacts.insights import build_artifact_bundle, profile_result
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.context.base import ContextProvider
 from superset_ai_agent.integrations.superset.client import AgentContext, SupersetClient
+from superset_ai_agent.integrations.wren.client import DisabledWrenClient, WrenClient
 from superset_ai_agent.llm.base import ChatMessage, ModelClient
 from superset_ai_agent.prompts.registry import get_prompt
 from superset_ai_agent.schemas import (
     AgentQueryRequest,
     AgentQueryResponse,
+    AuditInfo,
+    ChartSpec,
     ExecutionResult,
+    InsightCard,
     SqlValidation,
     TraceEvent,
+    WrenContextArtifact,
 )
 from superset_ai_agent.tools.sql import validate_read_only_sql
 
@@ -52,6 +59,13 @@ class AgentState(TypedDict, total=False):
     explanation: str | None
     validation: SqlValidation
     execution_result: ExecutionResult | None
+    answer_summary: str | None
+    insight_cards: list[InsightCard]
+    chart_spec: ChartSpec | None
+    data_preview: ExecutionResult | None
+    audit: AuditInfo | None
+    recommended_followups: list[str]
+    wren_context: WrenContextArtifact | None
     trace: list[TraceEvent]
     repair_attempts: int
     error: str | None
@@ -67,11 +81,13 @@ class TextToSqlGraph:
         model_client: ModelClient,
         context_provider: ContextProvider,
         superset_client: SupersetClient,
+        wren_client: WrenClient | None = None,
     ):
         self.config = config
         self.model_client = model_client
         self.context_provider = context_provider
         self.superset_client = superset_client
+        self.wren_client = wren_client or DisabledWrenClient()
         self.graph = self._compile_graph()
 
     def run(self, request: AgentQueryRequest) -> AgentQueryResponse:
@@ -80,6 +96,13 @@ class TextToSqlGraph:
             "trace": [],
             "repair_attempts": 0,
             "execution_result": None,
+            "answer_summary": None,
+            "insight_cards": [],
+            "chart_spec": None,
+            "data_preview": None,
+            "audit": None,
+            "recommended_followups": [],
+            "wren_context": None,
             "error": None,
         }
         state = self.graph.invoke(initial_state)
@@ -108,19 +131,31 @@ class TextToSqlGraph:
             validation=validation,
             execution_result=state.get("execution_result"),
             trace=state.get("trace", []),
+            answer_summary=state.get("answer_summary"),
+            insight_cards=state.get("insight_cards", []),
+            chart_spec=state.get("chart_spec"),
+            data_preview=state.get("data_preview"),
+            audit=state.get("audit"),
+            recommended_followups=state.get("recommended_followups", []),
+            wren_context=state.get("wren_context"),
         )
 
     def _compile_graph(self) -> Any:
         graph = StateGraph(AgentState)
         graph.add_node("load_context", self._load_context)
+        graph.add_node("load_wren_context", self._load_wren_context)
         graph.add_node("draft_sql", self._draft_sql)
+        graph.add_node("dry_plan_with_wren", self._dry_plan_with_wren)
         graph.add_node("validate_sql", self._validate_sql)
         graph.add_node("repair_sql", self._repair_sql)
         graph.add_node("execute_sql", self._execute_sql)
+        graph.add_node("build_artifacts", self._build_artifacts)
 
         graph.set_entry_point("load_context")
-        graph.add_edge("load_context", "draft_sql")
-        graph.add_edge("draft_sql", "validate_sql")
+        graph.add_edge("load_context", "load_wren_context")
+        graph.add_edge("load_wren_context", "draft_sql")
+        graph.add_edge("draft_sql", "dry_plan_with_wren")
+        graph.add_edge("dry_plan_with_wren", "validate_sql")
         graph.add_conditional_edges(
             "validate_sql",
             self._route_after_validation,
@@ -131,7 +166,8 @@ class TextToSqlGraph:
             },
         )
         graph.add_edge("repair_sql", "validate_sql")
-        graph.add_edge("execute_sql", END)
+        graph.add_edge("execute_sql", "build_artifacts")
+        graph.add_edge("build_artifacts", END)
         return graph.compile()
 
     def _load_context(self, state: AgentState) -> AgentState:
@@ -152,12 +188,48 @@ class TextToSqlGraph:
             ],
         }
 
+    def _load_wren_context(self, state: AgentState) -> AgentState:
+        request = state["request"]
+        context = state["context"]
+        try:
+            wren_context = self.wren_client.fetch_context(
+                question=request.question,
+                superset_context=context,
+            )
+        except Exception as ex:  # pylint: disable=broad-except
+            wren_context = WrenContextArtifact(
+                enabled=self.config.wren_enabled,
+                available=False,
+                warnings=[str(ex)],
+            )
+            status: Literal["ok", "warning", "error"] = "warning"
+        else:
+            status = "ok" if wren_context.available else "warning"
+        return {
+            **state,
+            "wren_context": wren_context,
+            "trace": [
+                *state.get("trace", []),
+                TraceEvent(
+                    step="load_wren_context",
+                    status=status,
+                    summary=(
+                        "Loaded Wren semantic context."
+                        if wren_context.available
+                        else "Wren semantic context is unavailable."
+                    ),
+                    details=wren_context.model_dump(),
+                ),
+            ],
+        }
+
     def _draft_sql(self, state: AgentState) -> AgentState:
         request = state["request"]
         context = state["context"]
         draft = self._call_sql_model(
             request=request,
             context=context,
+            wren_context=state.get("wren_context"),
             validation_errors=[],
         )
         return {
@@ -170,6 +242,39 @@ class TextToSqlGraph:
                     step="draft_sql",
                     summary="Generated an initial SQL draft.",
                     details={"model": request.model or self.config.default_model()},
+                ),
+            ],
+        }
+
+    def _dry_plan_with_wren(self, state: AgentState) -> AgentState:
+        if not self.config.wren_dry_plan_enabled:
+            return state
+        request = state["request"]
+        try:
+            dry_plan = self.wren_client.dry_plan(
+                question=request.question,
+                sql=state.get("sql"),
+                context=state["context"],
+            )
+        except Exception as ex:  # pylint: disable=broad-except
+            dry_plan = {"error": str(ex), "planning_only": True}
+            status: Literal["ok", "warning", "error"] = "warning"
+        else:
+            status = "ok" if dry_plan.get("available", True) else "warning"
+
+        wren_context = (
+            state.get("wren_context") or WrenContextArtifact(enabled=True)
+        ).model_copy(update={"dry_plan": dry_plan})
+        return {
+            **state,
+            "wren_context": wren_context,
+            "trace": [
+                *state.get("trace", []),
+                TraceEvent(
+                    step="dry_plan_with_wren",
+                    status=status,
+                    summary="Collected Wren dry-plan metadata.",
+                    details=dry_plan,
                 ),
             ],
         }
@@ -213,6 +318,7 @@ class TextToSqlGraph:
         draft = self._call_sql_model(
             request=request,
             context=context,
+            wren_context=state.get("wren_context"),
             validation_errors=validation.errors,
         )
         return {
@@ -270,6 +376,48 @@ class TextToSqlGraph:
             ],
         }
 
+    def _build_artifacts(self, state: AgentState) -> AgentState:
+        result = state.get("execution_result")
+        if result is None:
+            return state
+
+        request = state["request"]
+        bundle = build_artifact_bundle(
+            question=request.question,
+            result=result,
+            row_limit=self.config.default_sql_limit,
+        )
+        analysis = profile_result(
+            result,
+            question=request.question,
+            row_limit=self.config.default_sql_limit,
+        )
+        chart_spec = infer_chart_spec(
+            question=request.question,
+            result=result,
+            analysis=analysis,
+        )
+        return {
+            **state,
+            "answer_summary": bundle.answer_summary,
+            "insight_cards": bundle.insight_cards,
+            "chart_spec": chart_spec,
+            "data_preview": bundle.data_preview,
+            "audit": result.audit,
+            "recommended_followups": bundle.recommended_followups,
+            "trace": [
+                *state.get("trace", []),
+                TraceEvent(
+                    step="build_artifacts",
+                    summary="Built conversational analytics artifacts.",
+                    details={
+                        "insight_card_count": len(bundle.insight_cards),
+                        "chart_type": chart_spec.type if chart_spec else None,
+                    },
+                ),
+            ],
+        }
+
     def _route_after_validation(self, state: AgentState) -> str:
         request = state["request"]
         validation = state["validation"]
@@ -284,6 +432,7 @@ class TextToSqlGraph:
         *,
         request: AgentQueryRequest,
         context: AgentContext,
+        wren_context: WrenContextArtifact | None,
         validation_errors: list[str],
     ) -> SqlDraft:
         prompt = get_prompt("text_to_sql")
@@ -291,6 +440,9 @@ class TextToSqlGraph:
             "question": request.question,
             "database": context.database.model_dump(),
             "datasets": [dataset.model_dump() for dataset in context.datasets],
+            "wren_context": (
+                wren_context.model_dump() if wren_context is not None else None
+            ),
             "validation_errors_to_fix": validation_errors,
         }
         schema = SqlDraft.model_json_schema()

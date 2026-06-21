@@ -109,9 +109,53 @@ test('sends a conversation message and renders SQL artifact', async () => {
           {
             ...completedConversation.messages[1].artifacts[0],
             execution_result: {
-              columns: ['name'],
-              rows: [{ name: 'Michael' }],
+              columns: ['name', 'total_births'],
+              rows: [{ name: 'Michael', total_births: 10 }],
               row_count: 1,
+              audit: {
+                adapter: 'rest',
+                query_id: 123,
+                results_key: 'result-key',
+                executed_sql: 'SELECT name FROM birth_names LIMIT 10',
+                database_id: 1,
+                schema_name: null,
+                row_limit: 1000,
+                timeout_seconds: null,
+                source: 'sqllab_rest',
+              },
+              is_truncated: false,
+            },
+            answer_summary: 'Michael is the top returned name.',
+            insight_cards: [
+              {
+                title: 'Top name',
+                value: 'Michael',
+                metric: 'total_births',
+                category: 'Michael',
+                description: 'Michael leads the returned rows.',
+                severity: 'success',
+              },
+            ],
+            chart_spec: {
+              type: 'bar',
+              title: 'Births by name',
+              encoding: { x: 'name', y: 'total_births' },
+              options: {},
+            },
+            data_preview: null,
+            audit: null,
+            recommended_followups: ['Show by year'],
+            wren_context: {
+              enabled: true,
+              available: true,
+              matched_models: ['birth_names'],
+              example_ids: [],
+              document_ids: [],
+              semantic_layer_version: null,
+              indexing_status: null,
+              context_items: [],
+              dry_plan: null,
+              warnings: [],
             },
             trace: [
               {
@@ -191,7 +235,13 @@ test('sends a conversation message and renders SQL artifact', async () => {
   await waitFor(() => {
     expect(screen.getByText('The query returned one row.')).toBeInTheDocument();
   });
-  expect(screen.getByText('Michael')).toBeInTheDocument();
+  expect(
+    screen.getByText('Michael is the top returned name.'),
+  ).toBeInTheDocument();
+  expect(screen.getByText('Top name')).toBeInTheDocument();
+  expect(screen.getByText('Births by name')).toBeInTheDocument();
+  expect(screen.getByText('Data - 1 rows')).toBeInTheDocument();
+  expect(screen.getAllByText('Michael').length).toBeGreaterThan(0);
   expect(screen.queryByText('Execute selected SQL.')).not.toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'Executed' })).toBeInTheDocument();
   const [executeCall] = fetchMock.callHistory.calls(
@@ -201,5 +251,86 @@ test('sends a conversation message and renders SQL artifact', async () => {
     sql: 'SELECT name FROM birth_names LIMIT 10',
     execution_mode: 'manual',
     artifact_id: 'artifact-1',
+  });
+
+  await userEvent.click(screen.getByRole('button', { name: 'Show by year' }));
+  await waitFor(() => {
+    expect(
+      fetchMock.callHistory.calls(
+        'http://agent.local/agent/conversations/conversation-1/messages',
+      ),
+    ).toHaveLength(2);
+  });
+  const [, followupCall] = fetchMock.callHistory.calls(
+    'http://agent.local/agent/conversations/conversation-1/messages',
+  );
+  expect(JSON.parse(String(followupCall.options.body))).toMatchObject({
+    message: 'Show by year',
+    execution_mode: 'manual',
+  });
+});
+
+test('opens semantic-layer drawer and uploads a document', async () => {
+  fetchMock.get('http://agent.local/agent/semantic-layer/state?database_id=1', {
+    database_id: 1,
+    schema_name: null,
+    dataset_ids: [],
+    document_count: 0,
+    approved_document_count: 0,
+    indexed_document_count: 0,
+    semantic_layer_version: null,
+    indexing_status: 'idle',
+    last_error: null,
+  });
+  fetchMock.get(
+    'http://agent.local/agent/semantic-layer/documents?database_id=1',
+    [],
+  );
+  fetchMock.post('http://agent.local/agent/semantic-layer/documents', {
+    id: 'document-1',
+    filename: 'notes.md',
+    content_type: 'text/markdown',
+    size_bytes: 12,
+    status: 'needs_review',
+    scope: {
+      database_id: 1,
+      schema_name: null,
+      dataset_ids: [],
+    },
+    checksum: 'abc',
+    storage_uri: 'file:///tmp/notes.md',
+    proposed_updates: [],
+    warnings: [],
+    created_at: '2026-06-19T00:00:00Z',
+    updated_at: '2026-06-19T00:00:00Z',
+  });
+
+  const { container } = render(<AiAgentPanel />, {
+    useRedux: true,
+    initialState,
+  });
+
+  await userEvent.click(screen.getByRole('button', { name: 'Semantic layer' }));
+  await waitFor(() => {
+    expect(
+      screen.getByRole('dialog', { name: 'Semantic layer' }),
+    ).toBeInTheDocument();
+  });
+
+  const input = container.querySelector<HTMLInputElement>('input[type="file"]');
+  expect(input).not.toBeNull();
+  await userEvent.upload(
+    input as HTMLInputElement,
+    new File(['Metric gross_moves = count moves'], 'notes.md', {
+      type: 'text/markdown',
+    }),
+  );
+
+  await waitFor(() => {
+    expect(
+      fetchMock.callHistory.calls(
+        'http://agent.local/agent/semantic-layer/documents',
+      ),
+    ).toHaveLength(1);
   });
 });

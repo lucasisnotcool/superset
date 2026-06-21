@@ -11,6 +11,7 @@ MCP transport details directly.
 
 ```bash
 SUPERSET_AGENT_ADAPTER=local|rest|mcp
+SUPERSET_AUTH_MODE=user_session|service_account
 SUPERSET_BASE_URL=http://localhost:8091
 SUPERSET_MCP_URL=http://localhost:8098/mcp
 ```
@@ -66,11 +67,27 @@ Adapters also expose raw controls for engineers building custom agents.
 
 ## REST Auth
 
-The REST adapter supports three deploy patterns:
+The REST adapter supports request-scoped user auth and service-account auth.
+The normal SQL Lab integration uses user-session mode:
+
+```bash
+AI_AGENT_IDENTITY_PROVIDER=superset_session
+SUPERSET_AUTH_MODE=user_session
+SUPERSET_AGENT_ADAPTER=rest
+```
+
+In this mode, `app.py` builds the REST client with a `SupersetRequestAuth`
+captured from the inbound FastAPI request. The adapter forwards that request's
+browser `Cookie`, `Authorization`, and CSRF headers to Superset and does not log
+in with a shared service account. The agent validates the same browser session
+through `/api/v1/me/` before handling user-scoped routes.
+
+Service-account mode supports three deploy patterns:
 
 1. Pre-issued bearer token:
 
 ```bash
+SUPERSET_AUTH_MODE=service_account
 SUPERSET_AGENT_ADAPTER=rest
 SUPERSET_BASE_URL=http://superset:8088
 SUPERSET_AUTH_TOKEN=...
@@ -79,6 +96,7 @@ SUPERSET_AUTH_TOKEN=...
 2. Username/password login through Superset security API:
 
 ```bash
+SUPERSET_AUTH_MODE=service_account
 SUPERSET_AGENT_ADAPTER=rest
 SUPERSET_BASE_URL=http://superset:8088
 SUPERSET_USERNAME=agent-service-account
@@ -98,9 +116,9 @@ same HTTP client cookie jar for the subsequent mutating request. A copied CSRF
 token without the matching session cookie can still fail with a missing CSRF
 session token.
 
-If no token or username is configured, `request()` sends no `Authorization`
-header. That supports deployments where an upstream sidecar or service mesh
-injects identity.
+If no token or username is configured in service-account mode, `request()`
+sends no `Authorization` header. That supports deployments where an upstream
+sidecar or service mesh injects identity.
 
 ## REST Endpoint Payloads
 
@@ -222,15 +240,28 @@ If SQL Lab returns a results key, the REST adapter polls
 
 ## MCP Auth
 
+User-session mode forwards the current inbound browser `Cookie` and
+`Authorization` headers to `SUPERSET_MCP_URL`:
+
 ```bash
+AI_AGENT_IDENTITY_PROVIDER=superset_session
+SUPERSET_AUTH_MODE=user_session
+SUPERSET_AGENT_ADAPTER=mcp
+SUPERSET_MCP_URL=http://superset-mcp:8098/mcp
+```
+
+Service-account mode sends a bearer token:
+
+```bash
+SUPERSET_AUTH_MODE=service_account
 SUPERSET_AGENT_ADAPTER=mcp
 SUPERSET_MCP_URL=http://superset-mcp:8098/mcp
 SUPERSET_MCP_AUTH_TOKEN=...
 ```
 
 If `SUPERSET_MCP_AUTH_TOKEN` is not set, the adapter falls back to
-`SUPERSET_AUTH_TOKEN`. If neither is set, requests are sent without
-authorization for environments that inject identity upstream.
+`SUPERSET_AUTH_TOKEN`. If neither is set in service-account mode, requests are
+sent without authorization for environments that inject identity upstream.
 
 ## MCP Tool Payloads
 

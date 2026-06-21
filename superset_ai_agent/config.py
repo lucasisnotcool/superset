@@ -22,7 +22,10 @@ from dataclasses import dataclass
 from typing import cast, Literal
 
 SupersetAdapterMode = Literal["local", "rest", "mcp"]
-ConversationStoreMode = Literal["memory"]
+ConversationStoreMode = Literal["memory", "sqlalchemy"]
+SemanticLayerStoreMode = Literal["memory", "sqlalchemy"]
+IdentityProviderMode = Literal["static", "signed_header", "superset_session"]
+SupersetAuthMode = Literal["service_account", "user_session"]
 ModelProviderMode = Literal[
     "ollama",
     "openai",
@@ -72,15 +75,40 @@ class AgentConfig:
     max_context_datasets: int = 8
     max_sample_rows: int = 5
     conversation_store: ConversationStoreMode = "memory"
+    semantic_layer_store: SemanticLayerStoreMode = "memory"
+    identity_provider: IdentityProviderMode = "superset_session"
+    allow_static_identity_with_persistence: bool = False
+    signed_identity_header: str = "X-Superset-Ai-Agent-Identity"
+    signed_identity_secret: str | None = None
+    agent_database_url: str = "sqlite:///./.data/ai_agent.db"
+    agent_database_echo: bool = False
+    agent_run_migrations: bool = True
+    agent_storage_dir: str = "./.data"
     max_history_messages: int = 12
     max_prompt_result_rows: int = 5
     max_agent_sql_iterations: int = 3
+    wren_enabled: bool = True
+    wren_project_path: str | None = None
+    wren_mdl_path: str | None = None
+    wren_memory_path: str | None = None
+    wren_dry_plan_enabled: bool = False
+    wren_execution_enabled: bool = False
+    wren_context_limit: int = 8
+    wren_example_limit: int = 5
+    wren_max_document_bytes: int = 2_000_000
+    wren_allowed_document_types: tuple[str, ...] = (
+        "text/plain",
+        "text/markdown",
+        "text/csv",
+        "application/json",
+    )
     superset_agent_adapter: SupersetAdapterMode = "rest"
+    superset_auth_mode: SupersetAuthMode = "user_session"
     superset_base_url: str = "http://localhost:8091"
     superset_mcp_url: str = "http://localhost:8098/mcp"
     superset_auth_token: str | None = None
-    superset_username: str | None = "admin"
-    superset_password: str | None = "admin"  # noqa: S105
+    superset_username: str | None = None
+    superset_password: str | None = None
     superset_auth_provider: str = "db"
     superset_csrf_token: str | None = None
     superset_sql_poll_attempts: int = 10
@@ -95,7 +123,9 @@ class AgentConfig:
     )
     log_level: str = "INFO"
     suppress_superset_logs: bool = True
-    local_superset_secret_key: str = "ai-agent-local-dev-secret-key-not-for-production"  # noqa: S105
+    local_superset_secret_key: str = (
+        "ai-agent-local-dev-secret-key-not-for-production"  # noqa: S105
+    )
 
     @classmethod
     def from_env(cls) -> "AgentConfig":
@@ -177,6 +207,46 @@ class AgentConfig:
                 .strip()
                 .lower(),
             ),
+            semantic_layer_store=cast(
+                SemanticLayerStoreMode,
+                os.getenv(
+                    "AI_AGENT_SEMANTIC_LAYER_STORE",
+                    cls.semantic_layer_store,
+                )
+                .strip()
+                .lower(),
+            ),
+            identity_provider=cast(
+                IdentityProviderMode,
+                os.getenv("AI_AGENT_IDENTITY_PROVIDER", cls.identity_provider)
+                .strip()
+                .lower(),
+            ),
+            allow_static_identity_with_persistence=_env_bool(
+                "AI_AGENT_ALLOW_STATIC_IDENTITY_WITH_PERSISTENCE",
+                cls.allow_static_identity_with_persistence,
+            ),
+            signed_identity_header=os.getenv(
+                "AI_AGENT_SIGNED_IDENTITY_HEADER",
+                cls.signed_identity_header,
+            ),
+            signed_identity_secret=(
+                os.getenv("AI_AGENT_SIGNED_IDENTITY_SECRET")
+                or cls.signed_identity_secret
+            ),
+            agent_database_url=os.getenv(
+                "AI_AGENT_DATABASE_URL",
+                cls.agent_database_url,
+            ),
+            agent_database_echo=_env_bool(
+                "AI_AGENT_DATABASE_ECHO",
+                cls.agent_database_echo,
+            ),
+            agent_run_migrations=_env_bool(
+                "AI_AGENT_RUN_MIGRATIONS",
+                cls.agent_run_migrations,
+            ),
+            agent_storage_dir=os.getenv("AI_AGENT_STORAGE_DIR", cls.agent_storage_dir),
             max_history_messages=int(
                 os.getenv(
                     "AI_AGENT_MAX_HISTORY_MESSAGES",
@@ -195,9 +265,43 @@ class AgentConfig:
                     str(cls.max_agent_sql_iterations),
                 )
             ),
+            wren_enabled=_env_bool("WREN_ENABLED", cls.wren_enabled),
+            wren_project_path=os.getenv("WREN_PROJECT_PATH") or cls.wren_project_path,
+            wren_mdl_path=os.getenv("WREN_MDL_PATH") or cls.wren_mdl_path,
+            wren_memory_path=os.getenv("WREN_MEMORY_PATH") or cls.wren_memory_path,
+            wren_dry_plan_enabled=_env_bool(
+                "WREN_DRY_PLAN_ENABLED",
+                cls.wren_dry_plan_enabled,
+            ),
+            wren_execution_enabled=_env_bool(
+                "WREN_EXECUTION_ENABLED",
+                cls.wren_execution_enabled,
+            ),
+            wren_context_limit=int(
+                os.getenv("WREN_CONTEXT_LIMIT", str(cls.wren_context_limit))
+            ),
+            wren_example_limit=int(
+                os.getenv("WREN_EXAMPLE_LIMIT", str(cls.wren_example_limit))
+            ),
+            wren_max_document_bytes=int(
+                os.getenv(
+                    "WREN_MAX_DOCUMENT_BYTES",
+                    str(cls.wren_max_document_bytes),
+                )
+            ),
+            wren_allowed_document_types=_env_list(
+                "WREN_ALLOWED_DOCUMENT_TYPES",
+                cls.wren_allowed_document_types,
+            ),
             superset_agent_adapter=cast(
                 SupersetAdapterMode,
                 os.getenv("SUPERSET_AGENT_ADAPTER", cls.superset_agent_adapter)
+                .strip()
+                .lower(),
+            ),
+            superset_auth_mode=cast(
+                SupersetAuthMode,
+                os.getenv("SUPERSET_AUTH_MODE", cls.superset_auth_mode)
                 .strip()
                 .lower(),
             ),

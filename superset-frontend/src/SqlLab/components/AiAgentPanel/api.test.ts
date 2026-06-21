@@ -19,14 +19,20 @@
 import fetchMock from 'fetch-mock';
 import {
   createConversation,
+  createSemanticLayerEventSource,
+  getSemanticLayerState,
   deleteConversation,
   executeConversationSql,
   getAgentBaseUrl,
   getAgentHealth,
   getConversation,
   listConversations,
+  listSemanticDocuments,
   queryAgent,
+  rebuildSemanticLayerIndex,
+  reviewSemanticDocument,
   sendConversationMessage,
+  uploadSemanticDocument,
   validateSql,
 } from './api';
 
@@ -88,6 +94,7 @@ test('queryAgent posts typed payload to agent backend', async () => {
 
   const [call] = fetchMock.callHistory.calls('http://agent.local/agent/query');
   expect(response.sql).toBe('select 1');
+  expect(call.options.credentials).toBe('include');
   expect(JSON.parse(String(call.options.body))).toEqual({
     question: 'show one',
     database_id: 1,
@@ -112,6 +119,7 @@ test('validateSql posts SQL validation payload', async () => {
     'http://agent.local/agent/validate-sql',
   );
   expect(response.is_valid).toBe(true);
+  expect(call.options.credentials).toBe('include');
   expect(JSON.parse(String(call.options.body))).toEqual({
     sql: 'select 1',
     dialect: 'sqlite',
@@ -227,6 +235,7 @@ test('conversation API helpers use typed conversation endpoints', async () => {
   const [messageCall] = fetchMock.callHistory.calls(
     'http://agent.local/agent/conversations/conversation-1/messages',
   );
+  expect(messageCall.options.credentials).toBe('include');
   expect(JSON.parse(String(messageCall.options.body))).toEqual({
     message: 'What columns?',
     scope,
@@ -235,10 +244,168 @@ test('conversation API helpers use typed conversation endpoints', async () => {
   const [executeCall] = fetchMock.callHistory.calls(
     'http://agent.local/agent/conversations/conversation-1/execute-sql',
   );
+  expect(executeCall.options.credentials).toBe('include');
   expect(JSON.parse(String(executeCall.options.body))).toEqual({
     sql: 'select 1',
     scope,
     execution_mode: 'manual',
     artifact_id: 'artifact-1',
   });
+});
+
+test('semantic-layer API helpers use typed document endpoints', async () => {
+  const scope = {
+    database_id: 1,
+    schema_name: null,
+    dataset_ids: [16],
+  };
+  const document = {
+    id: 'document-1',
+    filename: 'notes.md',
+    content_type: 'text/markdown',
+    size_bytes: 12,
+    status: 'needs_review',
+    scope,
+    checksum: 'abc',
+    storage_uri: 'file:///tmp/notes.md',
+    proposed_updates: [],
+    warnings: [],
+    created_at: '2026-06-19T00:00:00Z',
+    updated_at: '2026-06-19T00:00:00Z',
+  };
+  fetchMock.post('http://agent.local/agent/semantic-layer/documents', document);
+  fetchMock.get(
+    'http://agent.local/agent/semantic-layer/documents?database_id=1&dataset_ids=16',
+    [document],
+  );
+  fetchMock.patch(
+    'http://agent.local/agent/semantic-layer/documents/document-1/review',
+    { ...document, status: 'approved' },
+  );
+  fetchMock.post('http://agent.local/agent/semantic-layer/index/rebuild', {
+    id: 'version-1',
+    scope,
+    scope_hash: 'hash',
+    version: 'v1',
+    status: 'idle',
+    mdl: null,
+    wren_context: null,
+    source_update_ids: [],
+    created_at: '2026-06-19T00:00:00Z',
+  });
+  fetchMock.get(
+    'http://agent.local/agent/semantic-layer/state?database_id=1&dataset_ids=16',
+    {
+      database_id: 1,
+      schema_name: null,
+      dataset_ids: [16],
+      document_count: 1,
+      approved_document_count: 1,
+      indexed_document_count: 0,
+      semantic_layer_version: 'v1',
+      indexing_status: 'idle',
+      last_error: null,
+    },
+  );
+
+  expect(
+    (
+      await uploadSemanticDocument(
+        scope,
+        new File(['notes'], 'notes.md', { type: 'text/markdown' }),
+      )
+    ).id,
+  ).toBe('document-1');
+  expect(await listSemanticDocuments(scope)).toHaveLength(1);
+  expect(
+    (
+      await reviewSemanticDocument('document-1', {
+        approved_update_ids: ['update-1'],
+        rejected_update_ids: [],
+        edited_updates: [],
+      })
+    ).status,
+  ).toBe('approved');
+  expect((await rebuildSemanticLayerIndex(scope)).version).toBe('v1');
+  expect((await getSemanticLayerState(scope)).document_count).toBe(1);
+  const [uploadCall] = fetchMock.callHistory.calls(
+    'http://agent.local/agent/semantic-layer/documents',
+  );
+  expect(uploadCall.options.credentials).toBe('include');
+});
+
+test('API helpers surface FastAPI detail errors', async () => {
+  fetchMock.get('http://agent.local/agent/conversations', {
+    status: 401,
+    body: { detail: 'Superset session expired.' },
+  });
+
+  await expect(listConversations()).rejects.toThrow(
+    'Superset session expired.',
+  );
+});
+
+test('semantic-layer event source includes Superset credentials', () => {
+  const calls: Array<{ url: string; init?: EventSourceInit }> = [];
+  const OriginalEventSource = globalThis.EventSource;
+
+  class MockEventSource {
+    static CONNECTING = 0;
+
+    static OPEN = 1;
+
+    static CLOSED = 2;
+
+    onerror: ((this: EventSource, ev: Event) => unknown) | null = null;
+
+    onmessage: ((this: EventSource, ev: MessageEvent) => unknown) | null = null;
+
+    onopen: ((this: EventSource, ev: Event) => unknown) | null = null;
+
+    readyState = MockEventSource.CONNECTING;
+
+    url: string;
+
+    withCredentials: boolean;
+
+    constructor(url: string | URL, init?: EventSourceInit) {
+      this.url = String(url);
+      this.withCredentials = init?.withCredentials ?? false;
+      calls.push({ url: this.url, init });
+    }
+
+    addEventListener() {}
+
+    close() {}
+
+    dispatchEvent() {
+      return true;
+    }
+
+    removeEventListener() {}
+  }
+
+  Object.defineProperty(globalThis, 'EventSource', {
+    configurable: true,
+    value: MockEventSource as unknown as typeof EventSource,
+  });
+  try {
+    createSemanticLayerEventSource({
+      database_id: 1,
+      schema_name: null,
+      dataset_ids: [16],
+    });
+  } finally {
+    Object.defineProperty(globalThis, 'EventSource', {
+      configurable: true,
+      value: OriginalEventSource,
+    });
+  }
+
+  expect(calls).toEqual([
+    {
+      url: 'http://agent.local/agent/semantic-layer/events?database_id=1&dataset_ids=16',
+      init: { withCredentials: true },
+    },
+  ]);
 });

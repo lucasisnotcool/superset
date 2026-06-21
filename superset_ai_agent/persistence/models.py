@@ -1,0 +1,253 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+from __future__ import annotations
+
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    String,
+    Text,
+)
+from sqlalchemy.orm import declarative_base, relationship
+
+Base = declarative_base()
+
+
+class AiAgentConversation(Base):
+    """Persisted conversation header."""
+
+    __tablename__ = "ai_agent_conversations"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(String(255), index=True, nullable=False)
+    title = Column(String(255), nullable=False)
+    database_id = Column(Integer, nullable=False)
+    schema_name = Column(String(255), nullable=True)
+    scope = Column(JSON, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        index=True,
+        nullable=False,
+    )
+    deleted_at = Column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    messages = relationship(
+        "AiAgentMessage",
+        back_populates="conversation",
+        cascade="all, delete-orphan",
+        order_by="AiAgentMessage.sequence",
+    )
+
+
+class AiAgentMessage(Base):
+    """Persisted conversation message."""
+
+    __tablename__ = "ai_agent_messages"
+    __table_args__ = (
+        Index("ix_ai_agent_message_conversation_seq", "conversation_id", "sequence"),
+    )
+
+    id = Column(String(36), primary_key=True)
+    conversation_id = Column(
+        String(36),
+        ForeignKey("ai_agent_conversations.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    owner_id = Column(String(255), index=True, nullable=False)
+    role = Column(String(32), nullable=False)
+    content = Column(Text, nullable=False)
+    sequence = Column(Integer, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False
+    )
+
+    conversation = relationship(
+        "AiAgentConversation",
+        back_populates="messages",
+    )
+    artifacts = relationship(
+        "AiAgentArtifact",
+        back_populates="message",
+        cascade="all, delete-orphan",
+    )
+
+
+class AiAgentArtifact(Base):
+    """Persisted assistant artifact."""
+
+    __tablename__ = "ai_agent_artifacts"
+
+    id = Column(String(36), primary_key=True)
+    message_id = Column(
+        String(36),
+        ForeignKey("ai_agent_messages.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    owner_id = Column(String(255), index=True, nullable=False)
+    type = Column(String(64), nullable=False)
+    sql = Column(Text, nullable=True)
+    payload = Column(JSON, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False
+    )
+
+    message = relationship(
+        "AiAgentMessage",
+        back_populates="artifacts",
+    )
+
+
+class AiAgentSemanticDocument(Base):
+    """Persisted semantic-layer source document."""
+
+    __tablename__ = "ai_agent_semantic_documents"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(String(255), index=True, nullable=False)
+    database_id = Column(Integer, index=True, nullable=False)
+    schema_name = Column(String(255), nullable=True)
+    dataset_ids = Column(JSON, nullable=False)
+    filename = Column(String(512), nullable=False)
+    content_type = Column(String(255), nullable=False)
+    size_bytes = Column(Integer, nullable=False)
+    checksum = Column(String(128), index=True, nullable=False)
+    storage_uri = Column(String(1024), nullable=False)
+    status = Column(String(64), index=True, nullable=False)
+    summary = Column(Text, nullable=True)
+    extracted_text = Column(Text, nullable=True)
+    extracted_text_preview = Column(Text, nullable=True)
+    warnings = Column(JSON, nullable=False)
+    error = Column(Text, nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class AiAgentSemanticUpdate(Base):
+    """Persisted proposed or reviewed semantic-layer update."""
+
+    __tablename__ = "ai_agent_semantic_updates"
+
+    id = Column(String(36), primary_key=True)
+    document_id = Column(
+        String(36),
+        ForeignKey("ai_agent_semantic_documents.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    owner_id = Column(String(255), index=True, nullable=False)
+    kind = Column(String(64), nullable=False)
+    target = Column(JSON, nullable=False)
+    value = Column(JSON, nullable=False)
+    confidence = Column(Float, nullable=True)
+    reviewed = Column(Boolean, nullable=False, default=False)
+    approved = Column(Boolean, nullable=False, default=False)
+    reviewer_id = Column(String(255), nullable=True)
+    review_notes = Column(Text, nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False
+    )
+    reviewed_at = Column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+
+class AiAgentSemanticLayerVersion(Base):
+    """Versioned semantic overlay generated from reviewed updates."""
+
+    __tablename__ = "ai_agent_semantic_layer_versions"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(String(255), index=True, nullable=False)
+    database_id = Column(Integer, index=True, nullable=False)
+    schema_name = Column(String(255), nullable=True)
+    dataset_ids = Column(JSON, nullable=False)
+    scope_hash = Column(String(128), index=True, nullable=False)
+    version = Column(String(64), nullable=False)
+    status = Column(String(64), nullable=False)
+    mdl = Column(JSON, nullable=True)
+    wren_context = Column(JSON, nullable=True)
+    source_update_ids = Column(JSON, nullable=False)
+    published_semantic_layer_uuid = Column(
+        String(36),
+        nullable=True,
+    )
+    created_at = Column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class AiAgentWrenContextCache(Base):
+    """Cached Wren context for a scope/question pair."""
+
+    __tablename__ = "ai_agent_wren_context_cache"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(String(255), index=True, nullable=False)
+    scope_hash = Column(String(128), index=True, nullable=False)
+    question_hash = Column(String(128), index=True, nullable=False)
+    context = Column(JSON, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False
+    )
+    expires_at = Column(
+        DateTime(timezone=True),
+        index=True,
+        nullable=True,
+    )
+
+
+class AiAgentEvent(Base):
+    """Persisted semantic-layer and workflow event."""
+
+    __tablename__ = "ai_agent_events"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(String(255), index=True, nullable=False)
+    scope = Column(JSON, nullable=False)
+    type = Column(String(128), index=True, nullable=False)
+    payload = Column(JSON, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        index=True,
+        nullable=False,
+    )

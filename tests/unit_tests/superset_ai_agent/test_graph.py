@@ -29,7 +29,11 @@ from superset_ai_agent.integrations.superset.client import (
     MetricSummary,
 )
 from superset_ai_agent.llm.base import ChatMessage, ModelResult
-from superset_ai_agent.schemas import AgentQueryRequest, ExecutionResult
+from superset_ai_agent.schemas import (
+    AgentQueryRequest,
+    ExecutionResult,
+    WrenContextArtifact,
+)
 
 
 class FakeModelClient:
@@ -99,6 +103,44 @@ class FakeSupersetClient:
         )
 
 
+class FakeWrenClient:
+    def fetch_context(
+        self,
+        *,
+        question: str,
+        superset_context: AgentContext,
+    ) -> WrenContextArtifact:
+        return WrenContextArtifact(
+            enabled=True,
+            available=True,
+            matched_models=["birth_names"],
+            example_ids=["example-1"],
+        )
+
+    def dry_plan(
+        self,
+        *,
+        question: str,
+        sql: str | None,
+        context: AgentContext,
+    ) -> dict:
+        return {
+            "available": True,
+            "planning_only": True,
+            "matched_models": ["birth_names"],
+            "sql_hash": "test",
+        }
+
+    def is_available(self) -> bool:
+        return True
+
+    def list_models(self) -> list[str]:
+        return ["birth_names"]
+
+    def recall_examples(self, *, question: str, limit: int) -> list[dict]:
+        return [{"id": "example-1"}]
+
+
 def test_graph_generates_valid_sql_without_execution() -> None:
     graph = TextToSqlGraph(
         config=AgentConfig(),
@@ -125,6 +167,43 @@ def test_graph_generates_valid_sql_without_execution() -> None:
     assert response.sql.endswith("LIMIT 1000")
 
 
+def test_graph_records_wren_context_and_dry_plan() -> None:
+    graph = TextToSqlGraph(
+        config=AgentConfig(wren_dry_plan_enabled=True),
+        model_client=FakeModelClient(
+            "SELECT name, SUM(num) AS total_births FROM birth_names GROUP BY name"
+        ),
+        context_provider=FakeContextProvider(),
+        superset_client=FakeSupersetClient(),
+        wren_client=FakeWrenClient(),
+    )
+
+    response = graph.run(
+        AgentQueryRequest(
+            question="top names",
+            database_id=1,
+            dataset_ids=[16],
+            execute=False,
+        )
+    )
+
+    assert response.wren_context is not None
+    assert response.wren_context.available is True
+    assert response.wren_context.dry_plan == {
+        "available": True,
+        "planning_only": True,
+        "matched_models": ["birth_names"],
+        "sql_hash": "test",
+    }
+    assert [event.step for event in response.trace] == [
+        "load_context",
+        "load_wren_context",
+        "draft_sql",
+        "dry_plan_with_wren",
+        "validate_sql",
+    ]
+
+
 def test_graph_executes_valid_sql_when_requested() -> None:
     graph = TextToSqlGraph(
         config=AgentConfig(),
@@ -148,9 +227,17 @@ def test_graph_executes_valid_sql_when_requested() -> None:
     assert response.status == "ok"
     assert response.execution_result is not None
     assert response.execution_result.row_count == 1
+    assert response.answer_summary is not None
+    assert response.insight_cards
+    assert response.chart_spec is not None
+    assert response.chart_spec.type == "bar"
+    assert response.data_preview is not None
+    assert response.recommended_followups
     assert [event.step for event in response.trace] == [
         "load_context",
+        "load_wren_context",
         "draft_sql",
         "validate_sql",
         "execute_sql",
+        "build_artifacts",
     ]

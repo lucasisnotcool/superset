@@ -19,8 +19,10 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 from superset_ai_agent.app import create_app
+from superset_ai_agent.auth import AgentIdentity, sign_identity_payload
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.conversations.memory import InMemoryConversationStore
 from superset_ai_agent.conversations.schemas import (
@@ -29,6 +31,7 @@ from superset_ai_agent.conversations.schemas import (
     ConversationTurnRequest,
     ConversationTurnResponse,
 )
+from superset_ai_agent.integrations.superset.client import SupersetAuthError
 from superset_ai_agent.schemas import (
     AgentQueryRequest,
     AgentQueryResponse,
@@ -48,6 +51,11 @@ class FakeOllamaClient:
 class RaisingGraph:
     def run(self, request: AgentQueryRequest) -> AgentQueryResponse:
         raise RuntimeError("ollama unavailable")
+
+
+class AuthRaisingGraph:
+    def run(self, request: AgentQueryRequest) -> AgentQueryResponse:
+        raise SupersetAuthError("Superset session expired.", status_code=401)
 
 
 class StaticGraph:
@@ -124,15 +132,62 @@ class StaticConversationGraph:
         )
 
 
+class AuthRaisingConversationGraph:
+    def run(
+        self,
+        *,
+        conversation_id: str,
+        request: ConversationTurnRequest,
+        owner_id: str = "local",
+    ) -> ConversationTurnResponse:
+        raise SupersetAuthError("Superset session expired.", status_code=401)
+
+    def execute_approved_sql(
+        self,
+        *,
+        conversation_id: str,
+        request: ConversationSqlExecutionRequest,
+        owner_id: str = "local",
+    ) -> ConversationTurnResponse:
+        raise SupersetAuthError("Superset session expired.", status_code=401)
+
+
+class HeaderIdentityProvider:
+    def get_identity(self, request: Request) -> AgentIdentity:
+        owner_id = request.headers.get("x-test-superset-user", "1")
+        return AgentIdentity(
+            owner_id=f"superset:{owner_id}",
+            username=owner_id,
+            source="superset_session",
+        )
+
+
+def _local_config(**overrides) -> AgentConfig:
+    return AgentConfig(
+        identity_provider="static",
+        superset_auth_mode="service_account",
+        **overrides,
+    )
+
+
 def _create_test_app(store: InMemoryConversationStore | None = None) -> FastAPI:
     active_store = store or InMemoryConversationStore()
     return create_app(
-        config=AgentConfig(),
+        config=_local_config(),
         ollama_client=FakeOllamaClient(),
         text_to_sql_graph=StaticGraph(),
         conversation_graph=StaticConversationGraph(active_store),
         conversation_store=active_store,
     )
+
+
+def _signed_identity_header(owner_id: str) -> dict[str, str]:
+    return {
+        "x-agent-identity": sign_identity_payload(
+            {"owner_id": owner_id, "username": owner_id},
+            secret="secret",
+        )
+    }
 
 
 def test_health_and_models_use_injected_ollama_client() -> None:
@@ -149,7 +204,7 @@ def test_health_and_models_use_injected_ollama_client() -> None:
 def test_agent_query_returns_error_payload_when_graph_fails() -> None:
     store = InMemoryConversationStore()
     app = create_app(
-        config=AgentConfig(),
+        config=_local_config(),
         ollama_client=FakeOllamaClient(),
         text_to_sql_graph=RaisingGraph(),
         conversation_graph=StaticConversationGraph(store),
@@ -172,10 +227,33 @@ def test_agent_query_returns_error_payload_when_graph_fails() -> None:
     assert "ollama unavailable" in body["trace"][0]["summary"]
 
 
+def test_agent_query_returns_auth_status_when_superset_session_fails() -> None:
+    store = InMemoryConversationStore()
+    app = create_app(
+        config=_local_config(),
+        ollama_client=FakeOllamaClient(),
+        text_to_sql_graph=AuthRaisingGraph(),
+        conversation_graph=StaticConversationGraph(store),
+        conversation_store=store,
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/agent/query",
+        json={
+            "question": "show sales",
+            "database_id": 1,
+        },
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Superset session expired."
+
+
 def test_validate_sql_endpoint_adds_limit() -> None:
     store = InMemoryConversationStore()
     app = create_app(
-        config=AgentConfig(default_sql_limit=25),
+        config=_local_config(default_sql_limit=25),
         ollama_client=FakeOllamaClient(),
         text_to_sql_graph=StaticGraph(),
         conversation_graph=StaticConversationGraph(store),
@@ -244,7 +322,7 @@ def test_execute_conversation_sql_endpoint_passes_approved_sql_to_graph() -> Non
     store = InMemoryConversationStore()
     graph = StaticConversationGraph(store)
     app = create_app(
-        config=AgentConfig(),
+        config=_local_config(),
         ollama_client=FakeOllamaClient(),
         text_to_sql_graph=StaticGraph(),
         conversation_graph=graph,
@@ -283,3 +361,156 @@ def test_execute_conversation_sql_endpoint_passes_approved_sql_to_graph() -> Non
     assert graph.sql_execution_requests[-1].sql == "select 1"
     assert graph.sql_execution_requests[-1].artifact_id == "artifact-1"
     assert graph.sql_execution_requests[-1].execution_mode == "manual"
+
+
+def test_conversation_message_returns_auth_status_when_superset_session_fails() -> None:
+    store = InMemoryConversationStore()
+    app = create_app(
+        config=_local_config(),
+        ollama_client=FakeOllamaClient(),
+        text_to_sql_graph=StaticGraph(),
+        conversation_graph=AuthRaisingConversationGraph(),
+        conversation_store=store,
+    )
+    client = TestClient(app)
+
+    create_response = client.post(
+        "/agent/conversations",
+        json={
+            "scope": {
+                "database_id": 1,
+                "schema_name": None,
+                "dataset_ids": [16],
+            },
+        },
+    )
+    conversation_id = create_response.json()["id"]
+
+    response = client.post(
+        f"/agent/conversations/{conversation_id}/messages",
+        json={
+            "message": "What columns are available?",
+            "scope": {
+                "database_id": 1,
+                "schema_name": None,
+                "dataset_ids": [16],
+            },
+            "execution_mode": "manual",
+        },
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Superset session expired."
+
+
+def test_conversation_endpoints_scope_history_by_signed_identity() -> None:
+    store = InMemoryConversationStore()
+    app = create_app(
+        config=AgentConfig(
+            identity_provider="signed_header",
+            signed_identity_header="x-agent-identity",
+            signed_identity_secret="secret",
+        ),
+        ollama_client=FakeOllamaClient(),
+        text_to_sql_graph=StaticGraph(),
+        conversation_graph=StaticConversationGraph(store),
+        conversation_store=store,
+    )
+    client = TestClient(app)
+
+    create_response = client.post(
+        "/agent/conversations",
+        headers=_signed_identity_header("user-1"),
+        json={
+            "scope": {
+                "database_id": 1,
+                "schema_name": None,
+                "dataset_ids": [16],
+            },
+        },
+    )
+
+    assert create_response.status_code == 200
+    conversation_id = create_response.json()["id"]
+    assert (
+        client.get(
+            "/agent/conversations",
+            headers=_signed_identity_header("user-1"),
+        ).json()[0]["id"]
+        == conversation_id
+    )
+    assert (
+        client.get(
+            "/agent/conversations",
+            headers=_signed_identity_header("user-2"),
+        ).json()
+        == []
+    )
+    assert (
+        client.get(
+            f"/agent/conversations/{conversation_id}",
+            headers=_signed_identity_header("user-2"),
+        ).status_code
+        == 404
+    )
+
+
+def test_conversation_endpoints_scope_history_by_superset_session_identity() -> None:
+    store = InMemoryConversationStore()
+    app = create_app(
+        config=_local_config(),
+        ollama_client=FakeOllamaClient(),
+        text_to_sql_graph=StaticGraph(),
+        conversation_graph=StaticConversationGraph(store),
+        conversation_store=store,
+        identity_provider=HeaderIdentityProvider(),
+    )
+    client = TestClient(app)
+
+    create_response = client.post(
+        "/agent/conversations",
+        headers={"x-test-superset-user": "42"},
+        json={
+            "scope": {
+                "database_id": 1,
+                "schema_name": None,
+                "dataset_ids": [16],
+            },
+        },
+    )
+
+    assert create_response.status_code == 200
+    conversation_id = create_response.json()["id"]
+    assert (
+        client.get(
+            "/agent/conversations",
+            headers={"x-test-superset-user": "42"},
+        ).json()[0]["id"]
+        == conversation_id
+    )
+    assert (
+        client.get(
+            "/agent/conversations",
+            headers={"x-test-superset-user": "7"},
+        ).json()
+        == []
+    )
+
+
+def test_persistent_stores_reject_static_identity_without_local_override() -> None:
+    try:
+        create_app(
+            config=AgentConfig(
+                identity_provider="static",
+                superset_auth_mode="service_account",
+                conversation_store="sqlalchemy",
+                agent_database_url="sqlite+pysqlite:///:memory:",
+            ),
+            ollama_client=FakeOllamaClient(),
+            text_to_sql_graph=StaticGraph(),
+            conversation_graph=StaticConversationGraph(InMemoryConversationStore()),
+        )
+    except ValueError as ex:
+        assert "require non-static identity" in str(ex)
+    else:
+        raise AssertionError("Expected static identity persistence guard.")
