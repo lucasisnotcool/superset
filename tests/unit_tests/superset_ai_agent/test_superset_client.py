@@ -121,7 +121,11 @@ def test_rest_adapter_is_wired_as_skeleton() -> None:
             return httpx.Response(200, json={"access_token": "rest-token"})
         if request.url.path == "/api/v1/security/csrf_token/":
             assert request.headers["authorization"] == "Bearer rest-token"
-            return httpx.Response(200, json={"result": "csrf-token"})
+            return httpx.Response(
+                200,
+                headers={"set-cookie": "session=csrf-session; Path=/"},
+                json={"result": "csrf-token"},
+            )
         if request.url.path == "/api/v1/database/":
             return httpx.Response(
                 200,
@@ -183,6 +187,7 @@ def test_rest_adapter_is_wired_as_skeleton() -> None:
             )
         if request.url.path == "/api/v1/sqllab/execute/":
             assert request.headers["x-csrftoken"] == "csrf-token"
+            assert "session=csrf-session" in request.headers["cookie"]
             body = json.loads(request.content)
             assert body["database_id"] == 1
             assert body["runAsync"] is False

@@ -246,6 +246,30 @@ class ConversationGraph:
         }
 
     def _draft_response(self, state: ConversationState) -> ConversationState:
+        request = state["request"]
+        approved_sql = request.approved_sql
+        if approved_sql and state.get("sql_iterations", 0) == 0:
+            draft = ConversationDraft(
+                response_type="sql",
+                message="Executing approved SQL.",
+                sql=approved_sql,
+                explanation="Approved SQL from the chat artifact.",
+            )
+            return {
+                **state,
+                "draft": draft,
+                "validation": None,
+                "execution_result": None,
+                "pending_artifact": None,
+                "trace": [
+                    *state.get("trace", []),
+                    TraceEvent(
+                        step="approved_sql",
+                        summary="Using approved SQL artifact for execution.",
+                    ),
+                ],
+            }
+
         draft = self._call_conversation_model(state=state, validation_errors=[])
         return {
             **state,
@@ -414,6 +438,8 @@ class ConversationGraph:
         validation = state["validation"]
         if validation and validation.is_valid:
             return "execute" if self._can_execute_sql(state) else "end"
+        if state["request"].approved_sql:
+            return "end"
         if state.get("repair_attempts", 0) < self.config.max_repair_attempts:
             return "repair"
         return "end"
@@ -430,6 +456,8 @@ class ConversationGraph:
             return False
         if state.get("sql_iterations", 0) >= self.config.max_agent_sql_iterations:
             return False
+        if state["request"].approved_sql and state.get("sql_iterations", 0) == 0:
+            return True
         return state["request"].resolved_execution_mode() in {"read_only", "auto"}
 
     def _call_conversation_model(

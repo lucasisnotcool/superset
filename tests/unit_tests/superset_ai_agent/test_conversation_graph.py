@@ -275,6 +275,90 @@ def test_conversation_graph_executes_valid_sql_when_requested() -> None:
     ]
 
 
+def test_conversation_graph_executes_approved_sql_once_in_manual_mode() -> None:
+    store = InMemoryConversationStore()
+    scope = ConversationScope(database_id=1, dataset_ids=[16])
+    conversation = store.create(scope)
+    superset_client = FakeSupersetClient()
+    model_client = FakeModelClient(
+        {
+            "response_type": "answer",
+            "message": "The approved query returned Michael.",
+            "sql": "",
+            "explanation": None,
+        }
+    )
+    graph = ConversationGraph(
+        config=AgentConfig(default_sql_limit=25),
+        model_client=model_client,
+        context_provider=FakeContextProvider(),
+        superset_client=superset_client,
+        conversation_store=store,
+    )
+
+    response = graph.run(
+        conversation_id=conversation.id,
+        request=ConversationTurnRequest(
+            message="Execute selected SQL.",
+            scope=scope,
+            execution_mode="manual",
+            approved_sql="SELECT name FROM birth_names",
+        ),
+    )
+
+    assert response.status == "ok"
+    assert response.message.content == "The approved query returned Michael."
+    assert response.artifacts[0].execution_result is not None
+    assert superset_client.executed_sql == ["SELECT name FROM birth_names\nLIMIT 25"]
+    assert len(model_client.messages) == 1
+    assert [event.step for event in response.trace] == [
+        "load_conversation",
+        "load_context",
+        "approved_sql",
+        "validate_sql",
+        "execute_sql",
+        "draft_response",
+    ]
+
+
+def test_conversation_graph_does_not_repair_or_execute_invalid_approved_sql() -> None:
+    store = InMemoryConversationStore()
+    scope = ConversationScope(database_id=1, dataset_ids=[16])
+    conversation = store.create(scope)
+    superset_client = FakeSupersetClient()
+    model_client = FakeModelClient(
+        {
+            "response_type": "answer",
+            "message": "This should not be used.",
+            "sql": "",
+            "explanation": None,
+        }
+    )
+    graph = ConversationGraph(
+        config=AgentConfig(),
+        model_client=model_client,
+        context_provider=FakeContextProvider(),
+        superset_client=superset_client,
+        conversation_store=store,
+    )
+
+    response = graph.run(
+        conversation_id=conversation.id,
+        request=ConversationTurnRequest(
+            message="Execute selected SQL.",
+            scope=scope,
+            execution_mode="manual",
+            approved_sql="DROP TABLE birth_names",
+        ),
+    )
+
+    assert response.status == "error"
+    assert response.artifacts[0].validation is not None
+    assert response.artifacts[0].validation.is_valid is False
+    assert superset_client.executed_sql == []
+    assert model_client.messages == []
+
+
 def test_conversation_graph_can_take_multiple_sql_steps() -> None:
     store = InMemoryConversationStore()
     scope = ConversationScope(database_id=1, dataset_ids=[16])

@@ -283,8 +283,9 @@ proxies `/ai-agent` to the native AI agent by default.
 
 The panel keeps a conversation transcript, tracks the active SQL Lab database
 and schema as context, and treats generated SQL as an artifact. SQL artifacts
-can be inserted into the active editor, copied, validated, or executed through
-an explicit follow-up turn.
+are validated automatically by the backend and show a valid/invalid icon with
+details on hover. They can be inserted into the active editor, copied, or
+executed as an approved SQL artifact.
 
 The composer exposes an execution-mode selector:
 
@@ -300,6 +301,12 @@ conversation workflow can take multiple SQL tool turns in one run: draft SQL,
 validate it, execute it when the selected mode permits, feed the rows back to
 the model, and stop when it can answer. The loop is capped by
 `AI_AGENT_MAX_SQL_ITERATIONS`.
+
+In `manual` mode, pressing Execute on a valid SQL artifact executes only that
+approved statement, renders the returned rows in chat, and then sends the result
+observation back to the model for a follow-up answer. In `auto` mode, valid
+read-only SQL drafts follow the same validate/execute/observe loop without a
+button press.
 
 Conversation state is process-local by default. These values can be edited in
 `superset_ai_agent/.env`:
@@ -371,6 +378,22 @@ curl -s http://localhost:8097/agent/conversations/<conversation-id>/messages \
   -H 'content-type: application/json' \
   -d '{
     "message": "Show the top 10 names by total births",
+    "scope": {
+      "database_id": 1,
+      "schema_name": null,
+      "dataset_ids": [16]
+    },
+    "execution_mode": "manual"
+  }'
+```
+
+Execute a reviewed SQL artifact:
+
+```bash
+curl -s http://localhost:8097/agent/conversations/<conversation-id>/execute-sql \
+  -H 'content-type: application/json' \
+  -d '{
+    "sql": "select * from birth_names limit 10",
     "scope": {
       "database_id": 1,
       "schema_name": null,

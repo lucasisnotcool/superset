@@ -107,6 +107,7 @@ class ConversationTurnRequest(BaseModel):
     scope: ConversationScope
     execution_mode: ExecutionMode = "manual"
     execute: bool | None = None
+    approved_sql: str | None = Field(default=None, min_length=1)
     model: str | None = None
     max_steps: int = Field(default=8, ge=2, le=16)
 
@@ -116,6 +117,16 @@ class ConversationTurnRequest(BaseModel):
         if self.execution_mode != "manual" or self.execute is None:
             return self.execution_mode
         return "read_only" if self.execute else "manual"
+
+
+class ConversationSqlExecutionRequest(BaseModel):
+    """Request to execute a SQL artifact that the user approved in chat."""
+
+    sql: str = Field(min_length=1)
+    scope: ConversationScope
+    execution_mode: ExecutionMode = "manual"
+    model: str | None = None
+    max_steps: int = Field(default=8, ge=2, le=16)
 
 
 class ConversationTurnResponse(BaseModel):

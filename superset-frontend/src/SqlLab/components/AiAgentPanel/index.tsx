@@ -55,12 +55,12 @@ import {
   ConversationSummary,
   createConversation,
   deleteConversation,
+  executeConversationSql,
   getAgentBaseUrl,
   getAgentHealth,
   getConversation,
   listConversations,
   sendConversationMessage,
-  validateSql,
   type ExecutionMode,
 } from './api';
 
@@ -209,8 +209,19 @@ const ArtifactBlock = styled.div`
   `}
 `;
 
+const SqlBlockRow = styled.div`
+  ${({ theme }) => css`
+    display: flex;
+    align-items: flex-start;
+    gap: ${theme.sizeUnit * 2}px;
+    min-width: 0;
+  `}
+`;
+
 const SqlBlock = styled.pre`
   ${({ theme }) => css`
+    flex: 1;
+    min-width: 0;
     margin: 0;
     padding: ${theme.sizeUnit * 2}px;
     max-height: 240px;
@@ -222,6 +233,61 @@ const SqlBlock = styled.pre`
     border-radius: ${theme.borderRadius}px;
     font-size: ${theme.fontSizeSM}px;
     line-height: 1.5;
+  `}
+`;
+
+const ValidationStatus = styled.span<{
+  'data-validation-status': 'valid' | 'invalid' | 'unknown';
+}>`
+  ${({ theme, 'data-validation-status': validationStatus }) => css`
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    width: ${theme.sizeUnit * 6}px;
+    height: ${theme.sizeUnit * 6}px;
+    margin-top: ${theme.sizeUnit}px;
+    color: ${validationStatus === 'valid'
+      ? theme.colorSuccess
+      : validationStatus === 'invalid'
+        ? theme.colorError
+        : theme.colorTextSecondary};
+  `}
+`;
+
+const ResultScroller = styled.div`
+  ${({ theme }) => css`
+    max-height: 220px;
+    overflow: auto;
+    border: 1px solid ${theme.colorBorderSecondary};
+    border-radius: ${theme.borderRadius}px;
+  `}
+`;
+
+const ResultTable = styled.table`
+  ${({ theme }) => css`
+    width: 100%;
+    border-collapse: collapse;
+    font-size: ${theme.fontSizeSM}px;
+
+    th,
+    td {
+      padding: ${theme.sizeUnit}px ${theme.sizeUnit * 2}px;
+      border-bottom: 1px solid ${theme.colorBorderSecondary};
+      text-align: left;
+      vertical-align: top;
+      white-space: nowrap;
+    }
+
+    th {
+      background: ${theme.colorBgElevated};
+      color: ${theme.colorTextSecondary};
+      font-weight: ${theme.fontWeightStrong};
+    }
+
+    tr:last-of-type td {
+      border-bottom: 0;
+    }
   `}
 `;
 
@@ -318,6 +384,49 @@ const executionModes: ExecutionMode[] = ['manual', 'read_only', 'auto'];
 
 const isExecutionMode = (value: SelectValue): value is ExecutionMode =>
   typeof value === 'string' && executionModes.includes(value as ExecutionMode);
+
+const getValidationStatus = (artifact: ConversationArtifact) => {
+  if (!artifact.validation) {
+    return 'unknown' as const;
+  }
+  return artifact.validation.is_valid
+    ? ('valid' as const)
+    : ('invalid' as const);
+};
+
+const getValidationTooltip = (artifact: ConversationArtifact) => {
+  if (!artifact.validation) {
+    return t('SQL validation status is unavailable.');
+  }
+  if (artifact.validation.is_valid) {
+    return t('SQL is valid.');
+  }
+  return artifact.validation.errors.length
+    ? artifact.validation.errors.join('\n')
+    : t('SQL is invalid.');
+};
+
+const getResultColumns = (artifact: ConversationArtifact) => {
+  const result = artifact.execution_result;
+  if (!result) {
+    return [];
+  }
+  if (result.columns.length > 0) {
+    return result.columns;
+  }
+  const firstRow = result.rows[0];
+  return firstRow ? Object.keys(firstRow) : [];
+};
+
+const formatResultValue = (value: unknown) => {
+  if (value === null || value === undefined) {
+    return 'NULL';
+  }
+  if (typeof value === 'object') {
+    return JSON.stringify(value);
+  }
+  return String(value);
+};
 
 const AiAgentPanel = () => {
   const dispatch = useAppDispatch();
@@ -510,29 +619,12 @@ const AiAgentPanel = () => {
       .catch(() => dispatch(addInfoToast(t('Copy failed.'))));
   };
 
-  const onValidateSql = async (artifact: ConversationArtifact) => {
-    if (!artifact.sql) {
-      return;
-    }
-    try {
-      const result = await validateSql(
-        artifact.sql,
-        artifact.validation?.dialect || null,
-      );
-      dispatch(
-        result.is_valid
-          ? addSuccessToast(t('SQL is valid.'))
-          : addDangerToast(result.errors.join('\n')),
-      );
-    } catch (ex) {
-      const messageText =
-        ex instanceof Error ? ex.message : t('SQL validation failed');
-      dispatch(addDangerToast(messageText));
-    }
-  };
-
   const onExecuteArtifact = async (artifact: ConversationArtifact) => {
     if (!conversation || !artifact.sql || typeof databaseId !== 'number') {
+      return;
+    }
+    if (!artifact.validation?.is_valid || !artifact.validation.is_read_only) {
+      dispatch(addDangerToast(getValidationTooltip(artifact)));
       return;
     }
     setIsLoading(true);
@@ -542,13 +634,11 @@ const AiAgentPanel = () => {
       databaseId,
       parsedDatasetIds,
     );
-    const artifactExecutionMode =
-      executionMode === 'manual' ? 'read_only' : executionMode;
     try {
-      const result = await sendConversationMessage(conversation.id, {
-        message: `${t('Execute this SQL and summarize the result')}:\n${artifact.sql}`,
+      const result = await executeConversationSql(conversation.id, {
+        sql: artifact.validation.normalized_sql || artifact.sql,
         scope,
-        execution_mode: artifactExecutionMode,
+        execution_mode: executionMode,
       });
       setConversation(result.conversation);
       await refreshConversationSummaries();
@@ -651,78 +741,123 @@ const AiAgentPanel = () => {
             <MessageBubble data-message-role={message.role}>
               {message.content}
             </MessageBubble>
-            {message.artifacts.map((artifact, index) => (
-              <ArtifactBlock key={`${message.id}-${artifact.type}-${index}`}>
-                {artifact.explanation && (
-                  <MetaText>{artifact.explanation}</MetaText>
-                )}
-                <SqlBlock>{artifact.sql}</SqlBlock>
-                {artifact.validation?.errors.length ? (
-                  <Alert
-                    type="warning"
-                    message={artifact.validation.errors.join('\n')}
-                  />
-                ) : null}
-                {artifact.execution_result && (
-                  <MetaText>
-                    {t(
-                      '%s row(s) returned',
-                      artifact.execution_result.row_count,
-                    )}
-                  </MetaText>
-                )}
-                <Flex gap="small" wrap="wrap">
-                  <Button
-                    aria-label={t('Insert')}
-                    buttonStyle="tertiary"
-                    onClick={() => onInsertSql(artifact.sql)}
-                    disabled={!artifact.sql || !queryEditor?.id}
-                    icon={<Icons.EditOutlined iconSize="m" />}
-                  >
-                    {t('Insert')}
-                  </Button>
-                  <Button
-                    aria-label={t('Copy')}
-                    buttonStyle="tertiary"
-                    onClick={() => onCopySql(artifact.sql)}
-                    disabled={!artifact.sql}
-                    icon={<Icons.CopyOutlined iconSize="m" />}
-                  >
-                    {t('Copy')}
-                  </Button>
-                  <Button
-                    aria-label={t('Validate')}
-                    buttonStyle="tertiary"
-                    onClick={() => onValidateSql(artifact)}
-                    disabled={!artifact.sql}
-                    icon={<Icons.CheckCircleOutlined iconSize="m" />}
-                  >
-                    {t('Validate')}
-                  </Button>
-                  <Button
-                    aria-label={t('Execute')}
-                    buttonStyle="tertiary"
-                    onClick={() => onExecuteArtifact(artifact)}
-                    disabled={!artifact.sql || !conversation || isLoading}
-                    icon={<Icons.PlayCircleOutlined iconSize="m" />}
-                  >
-                    {t('Execute')}
-                  </Button>
-                </Flex>
-                {artifact.trace.length > 0 && (
-                  <TraceDetails>
-                    <summary>{t('Trace')}</summary>
-                    <TraceList>
-                      {artifact.trace.map((event, index) => (
-                        <li key={`${event.step}-${index}`}>
-                          {event.step}: {event.summary}
-                        </li>
-                      ))}
-                    </TraceList>
-                  </TraceDetails>
-                )}
-              </ArtifactBlock>
-            ))}
+            {message.artifacts.map((artifact, index) => {
+              const validationStatus = getValidationStatus(artifact);
+              const resultColumns = getResultColumns(artifact);
+              const resultRows =
+                artifact.execution_result?.rows.slice(0, 10) || [];
+              const canExecuteArtifact =
+                Boolean(artifact.sql) &&
+                Boolean(conversation) &&
+                !artifact.execution_result &&
+                artifact.validation?.is_valid === true &&
+                artifact.validation?.is_read_only === true;
+
+              return (
+                <ArtifactBlock key={`${message.id}-${artifact.type}-${index}`}>
+                  {artifact.explanation && (
+                    <MetaText>{artifact.explanation}</MetaText>
+                  )}
+                  <SqlBlockRow>
+                    <SqlBlock>{artifact.sql}</SqlBlock>
+                    <Tooltip title={getValidationTooltip(artifact)}>
+                      <ValidationStatus
+                        data-validation-status={validationStatus}
+                      >
+                        {validationStatus === 'valid' ? (
+                          <Icons.CheckCircleOutlined iconSize="m" />
+                        ) : validationStatus === 'invalid' ? (
+                          <Icons.CloseCircleOutlined iconSize="m" />
+                        ) : (
+                          <Icons.InfoCircleOutlined iconSize="m" />
+                        )}
+                      </ValidationStatus>
+                    </Tooltip>
+                  </SqlBlockRow>
+                  {artifact.validation?.errors.length ? (
+                    <Alert
+                      type="warning"
+                      message={artifact.validation.errors.join('\n')}
+                    />
+                  ) : null}
+                  {artifact.execution_result && (
+                    <>
+                      <MetaText>
+                        {t(
+                          '%s row(s) returned',
+                          artifact.execution_result.row_count,
+                        )}
+                      </MetaText>
+                      {resultColumns.length > 0 && resultRows.length > 0 && (
+                        <ResultScroller>
+                          <ResultTable>
+                            <thead>
+                              <tr>
+                                {resultColumns.map(column => (
+                                  <th key={column}>{column}</th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {resultRows.map((row, rowIndex) => (
+                                <tr key={rowIndex}>
+                                  {resultColumns.map(column => (
+                                    <td key={column}>
+                                      {formatResultValue(row[column])}
+                                    </td>
+                                  ))}
+                                </tr>
+                              ))}
+                            </tbody>
+                          </ResultTable>
+                        </ResultScroller>
+                      )}
+                    </>
+                  )}
+                  <Flex gap="small" wrap="wrap">
+                    <Button
+                      aria-label={t('Insert')}
+                      buttonStyle="tertiary"
+                      onClick={() => onInsertSql(artifact.sql)}
+                      disabled={!artifact.sql || !queryEditor?.id}
+                      icon={<Icons.EditOutlined iconSize="m" />}
+                    >
+                      {t('Insert')}
+                    </Button>
+                    <Button
+                      aria-label={t('Copy')}
+                      buttonStyle="tertiary"
+                      onClick={() => onCopySql(artifact.sql)}
+                      disabled={!artifact.sql}
+                      icon={<Icons.CopyOutlined iconSize="m" />}
+                    >
+                      {t('Copy')}
+                    </Button>
+                    <Button
+                      aria-label={t('Execute')}
+                      buttonStyle="tertiary"
+                      onClick={() => onExecuteArtifact(artifact)}
+                      disabled={!canExecuteArtifact || isLoading}
+                      icon={<Icons.PlayCircleOutlined iconSize="m" />}
+                    >
+                      {t('Execute')}
+                    </Button>
+                  </Flex>
+                  {artifact.trace.length > 0 && (
+                    <TraceDetails>
+                      <summary>{t('Trace')}</summary>
+                      <TraceList>
+                        {artifact.trace.map((event, index) => (
+                          <li key={`${event.step}-${index}`}>
+                            {event.step}: {event.summary}
+                          </li>
+                        ))}
+                      </TraceList>
+                    </TraceDetails>
+                  )}
+                </ArtifactBlock>
+              );
+            })}
           </MessageBlock>
         ))}
         {isLoading && (

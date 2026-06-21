@@ -112,6 +112,14 @@ export interface ConversationTurnRequest {
   scope: ConversationScope;
   execution_mode: ExecutionMode;
   execute?: boolean;
+  approved_sql?: string | null;
+  model?: string | null;
+}
+
+export interface ConversationSqlExecutionRequest {
+  sql: string;
+  scope: ConversationScope;
+  execution_mode: ExecutionMode;
   model?: string | null;
 }
 
@@ -191,6 +199,18 @@ export const sendConversationMessage = (
 ) =>
   requestJson<ConversationTurnResponse>(
     `/agent/conversations/${conversationId}/messages`,
+    {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    },
+  );
+
+export const executeConversationSql = (
+  conversationId: string,
+  payload: ConversationSqlExecutionRequest,
+) =>
+  requestJson<ConversationTurnResponse>(
+    `/agent/conversations/${conversationId}/execute-sql`,
     {
       method: 'POST',
       body: JSON.stringify(payload),

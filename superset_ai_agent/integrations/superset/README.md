@@ -46,7 +46,7 @@ Adapters also expose raw controls for engineers building custom agents.
 
 | Method | Description |
 | --- | --- |
-| `request(method, path, params=None, json=None, headers=None)` | Authenticated REST request. Adds bearer and CSRF headers when needed. |
+| `request(method, path, params=None, json=None, headers=None)` | Authenticated REST request. Adds bearer and CSRF headers when needed and keeps Superset session cookies in the adapter HTTP client. |
 | `list_databases_raw(page_size=100)` | Raw `GET /api/v1/database/`. |
 | `get_database_raw(database_id)` | Raw `GET /api/v1/database/{id}`. |
 | `list_datasets_raw(database_id, limit)` | Raw `GET /api/v1/dataset/`. |
@@ -91,6 +91,12 @@ SUPERSET_AUTH_PROVIDER=db
 ```bash
 SUPERSET_CSRF_TOKEN=...
 ```
+
+For normal REST use, leave `SUPERSET_CSRF_TOKEN` empty. Superset binds CSRF to
+the Flask session, so the adapter fetches a CSRF token itself and reuses the
+same HTTP client cookie jar for the subsequent mutating request. A copied CSRF
+token without the matching session cookie can still fail with a missing CSRF
+session token.
 
 If no token or username is configured, `request()` sends no `Authorization`
 header. That supports deployments where an upstream sidecar or service mesh

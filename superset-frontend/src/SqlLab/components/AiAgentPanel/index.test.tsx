@@ -96,6 +96,35 @@ test('sends a conversation message and renders SQL artifact', async () => {
       },
     ],
   };
+  const executedConversation = {
+    ...conversation,
+    messages: [
+      ...completedConversation.messages,
+      {
+        id: 'message-3',
+        role: 'user',
+        content: 'Execute selected SQL.',
+        created_at: '2026-06-19T00:00:00Z',
+        artifacts: [],
+      },
+      {
+        id: 'message-4',
+        role: 'assistant',
+        content: 'The query returned one row.',
+        created_at: '2026-06-19T00:00:00Z',
+        artifacts: [
+          {
+            ...completedConversation.messages[1].artifacts[0],
+            execution_result: {
+              columns: ['name'],
+              rows: [{ name: 'Michael' }],
+              row_count: 1,
+            },
+          },
+        ],
+      },
+    ],
+  };
   fetchMock.post('http://agent.local/agent/conversations', conversation);
   fetchMock.post(
     'http://agent.local/agent/conversations/conversation-1/messages',
@@ -106,6 +135,17 @@ test('sends a conversation message and renders SQL artifact', async () => {
       artifacts: completedConversation.messages[1].artifacts,
       trace: [],
       conversation: completedConversation,
+    },
+  );
+  fetchMock.post(
+    'http://agent.local/agent/conversations/conversation-1/execute-sql',
+    {
+      status: 'ok',
+      conversation_id: 'conversation-1',
+      message: executedConversation.messages[3],
+      artifacts: executedConversation.messages[3].artifacts,
+      trace: [],
+      conversation: executedConversation,
     },
   );
 
@@ -127,11 +167,28 @@ test('sends a conversation message and renders SQL artifact', async () => {
     screen.getByText('SELECT name FROM birth_names LIMIT 10'),
   ).toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'Insert' })).toBeInTheDocument();
+  expect(
+    screen.queryByRole('button', { name: 'Validate' }),
+  ).not.toBeInTheDocument();
   const [messageCall] = fetchMock.callHistory.calls(
     'http://agent.local/agent/conversations/conversation-1/messages',
   );
   expect(JSON.parse(String(messageCall.options.body))).toMatchObject({
     message: 'Show top names',
+    execution_mode: 'manual',
+  });
+
+  await userEvent.click(screen.getByRole('button', { name: 'Execute' }));
+
+  await waitFor(() => {
+    expect(screen.getByText('The query returned one row.')).toBeInTheDocument();
+  });
+  expect(screen.getByText('Michael')).toBeInTheDocument();
+  const [executeCall] = fetchMock.callHistory.calls(
+    'http://agent.local/agent/conversations/conversation-1/execute-sql',
+  );
+  expect(JSON.parse(String(executeCall.options.body))).toMatchObject({
+    sql: 'SELECT name FROM birth_names LIMIT 10',
     execution_mode: 'manual',
   });
 });

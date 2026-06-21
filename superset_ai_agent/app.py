@@ -29,6 +29,7 @@ from superset_ai_agent.conversations.memory import InMemoryConversationStore
 from superset_ai_agent.conversations.schemas import (
     Conversation,
     ConversationCreateRequest,
+    ConversationSqlExecutionRequest,
     ConversationSummary,
     ConversationTurnRequest,
     ConversationTurnResponse,
@@ -183,6 +184,37 @@ def create_app(  # noqa: C901
             return active_conversation_graph.run(
                 conversation_id=conversation_id,
                 request=request,
+                owner_id=DEFAULT_OWNER_ID,
+            )
+        except ConversationNotFoundError as ex:
+            raise HTTPException(
+                status_code=404,
+                detail="Conversation not found.",
+            ) from ex
+        except Exception as ex:  # pylint: disable=broad-except
+            raise HTTPException(status_code=502, detail=str(ex)) from ex
+
+    @api.post(
+        "/agent/conversations/{conversation_id}/execute-sql",
+        response_model=ConversationTurnResponse,
+    )
+    def execute_conversation_sql(
+        conversation_id: str,
+        request: ConversationSqlExecutionRequest,
+    ) -> ConversationTurnResponse:
+        """Execute an approved SQL artifact and continue the conversation."""
+
+        try:
+            return active_conversation_graph.run(
+                conversation_id=conversation_id,
+                request=ConversationTurnRequest(
+                    message="Execute selected SQL.",
+                    scope=request.scope,
+                    execution_mode=request.execution_mode,
+                    approved_sql=request.sql,
+                    model=request.model,
+                    max_steps=request.max_steps,
+                ),
                 owner_id=DEFAULT_OWNER_ID,
             )
         except ConversationNotFoundError as ex:

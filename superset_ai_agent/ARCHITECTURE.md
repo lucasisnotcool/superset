@@ -211,7 +211,11 @@ Status behavior:
 ### Conversational Agent
 
 `POST /agent/conversations/{conversation_id}/messages` calls
-`ConversationGraph.run()`.
+`ConversationGraph.run()`. `POST
+/agent/conversations/{conversation_id}/execute-sql` wraps a reviewed SQL
+artifact as `approved_sql`, skips the initial model draft, validates the SQL,
+executes only that approved statement in `manual` mode, and then redrafts from
+the execution observation.
 
 ```mermaid
 graph TD
@@ -278,6 +282,7 @@ These routes are served by `superset_ai_agent/app.py`, typically on host port
 | `GET` | `/agent/conversations` | none | `list[ConversationSummary]` | List conversation history for the current owner. |
 | `GET` | `/agent/conversations/{conversation_id}` | none | `Conversation` | Fetch a full transcript. |
 | `POST` | `/agent/conversations/{conversation_id}/messages` | `ConversationTurnRequest` | `ConversationTurnResponse` | Append a user message and run one agent turn. |
+| `POST` | `/agent/conversations/{conversation_id}/execute-sql` | `ConversationSqlExecutionRequest` | `ConversationTurnResponse` | Execute a reviewed SQL artifact and continue the conversation from the returned rows. |
 | `DELETE` | `/agent/conversations/{conversation_id}` | none | `{ "deleted": true }` | Delete a conversation. |
 
 The frontend typed client for all of these routes is
@@ -326,7 +331,7 @@ REST authentication modes:
 | --- | --- |
 | `SUPERSET_AUTH_TOKEN` | Sends `Authorization: Bearer <token>`. |
 | `SUPERSET_USERNAME`, `SUPERSET_PASSWORD`, `SUPERSET_AUTH_PROVIDER` | Logs in through `/api/v1/security/login` and stores the returned access token in memory. |
-| `SUPERSET_CSRF_TOKEN` | Uses a pre-issued CSRF token for non-GET calls. |
+| `SUPERSET_CSRF_TOKEN` | Uses a pre-issued CSRF token for non-GET calls. Leave empty for normal REST use so the adapter fetches CSRF and keeps the matching session cookie in its HTTP client. |
 | No auth env vars | Sends no auth header, for deployments where identity is injected upstream. |
 
 ## Superset MCP Surface Used By The Agent

@@ -48,6 +48,7 @@ class SupersetRestClient:
         self.timeout = httpx.Timeout(60.0)
         self._access_token = config.superset_auth_token
         self._csrf_token = config.superset_csrf_token
+        self._http_client: httpx.Client | None = None
 
     def request(
         self,
@@ -67,14 +68,13 @@ class SupersetRestClient:
         if method.upper() not in {"GET", "HEAD", "OPTIONS"}:
             request_headers["X-CSRFToken"] = self._ensure_csrf_token()
 
-        with self._client() as client:
-            response = client.request(
-                method,
-                self._url(path),
-                params=params,
-                json=json,
-                headers=request_headers,
-            )
+        response = self._client().request(
+            method,
+            self._url(path),
+            params=params,
+            json=json,
+            headers=request_headers,
+        )
         self._raise_for_status(response)
         data = response.json()
         if not isinstance(data, dict):
@@ -248,7 +248,19 @@ class SupersetRestClient:
         return _normalize_database(self.get_database_raw(database_id)).backend
 
     def _client(self) -> httpx.Client:
-        return httpx.Client(timeout=self.timeout, transport=self.transport)
+        if self._http_client is None:
+            self._http_client = httpx.Client(
+                timeout=self.timeout,
+                transport=self.transport,
+            )
+        return self._http_client
+
+    def close(self) -> None:
+        """Close the underlying HTTP client when the adapter is disposed."""
+
+        if self._http_client is not None:
+            self._http_client.close()
+            self._http_client = None
 
     def _ensure_authenticated(self) -> None:
         if self._access_token or not self.config.superset_username:
@@ -257,16 +269,15 @@ class SupersetRestClient:
             raise SupersetAdapterError(
                 "SUPERSET_PASSWORD is required when SUPERSET_USERNAME is set."
             )
-        with self._client() as client:
-            response = client.post(
-                self._url("/api/v1/security/login"),
-                json={
-                    "username": self.config.superset_username,
-                    "password": self.config.superset_password,
-                    "provider": self.config.superset_auth_provider,
-                    "refresh": True,
-                },
-            )
+        response = self._client().post(
+            self._url("/api/v1/security/login"),
+            json={
+                "username": self.config.superset_username,
+                "password": self.config.superset_password,
+                "provider": self.config.superset_auth_provider,
+                "refresh": True,
+            },
+        )
         self._raise_for_status(response)
         payload = response.json()
         access_token = payload.get("access_token")

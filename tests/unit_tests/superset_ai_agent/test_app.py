@@ -66,6 +66,7 @@ class StaticGraph:
 class StaticConversationGraph:
     def __init__(self, store: InMemoryConversationStore):
         self.store = store
+        self.requests: list[ConversationTurnRequest] = []
 
     def run(
         self,
@@ -74,6 +75,7 @@ class StaticConversationGraph:
         request: ConversationTurnRequest,
         owner_id: str = "local",
     ) -> ConversationTurnResponse:
+        self.requests.append(request)
         message = ConversationMessage(
             role="assistant",
             content=f"Answered: {request.message}",
@@ -210,3 +212,46 @@ def test_conversation_endpoints_create_list_message_and_delete() -> None:
     assert delete_response.status_code == 200
     assert delete_response.json() == {"deleted": True}
     assert client.get(f"/agent/conversations/{conversation_id}").status_code == 404
+
+
+def test_execute_conversation_sql_endpoint_passes_approved_sql_to_graph() -> None:
+    store = InMemoryConversationStore()
+    graph = StaticConversationGraph(store)
+    app = create_app(
+        config=AgentConfig(),
+        ollama_client=FakeOllamaClient(),
+        text_to_sql_graph=StaticGraph(),
+        conversation_graph=graph,
+        conversation_store=store,
+    )
+    client = TestClient(app)
+
+    create_response = client.post(
+        "/agent/conversations",
+        json={
+            "scope": {
+                "database_id": 1,
+                "schema_name": None,
+                "dataset_ids": [16],
+            },
+        },
+    )
+    conversation_id = create_response.json()["id"]
+
+    response = client.post(
+        f"/agent/conversations/{conversation_id}/execute-sql",
+        json={
+            "sql": "select 1",
+            "scope": {
+                "database_id": 1,
+                "schema_name": None,
+                "dataset_ids": [16],
+            },
+            "execution_mode": "manual",
+        },
+    )
+
+    assert response.status_code == 200
+    assert graph.requests[-1].message == "Execute selected SQL."
+    assert graph.requests[-1].approved_sql == "select 1"
+    assert graph.requests[-1].execution_mode == "manual"

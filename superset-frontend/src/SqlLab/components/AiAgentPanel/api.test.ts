@@ -20,6 +20,7 @@ import fetchMock from 'fetch-mock';
 import {
   createConversation,
   deleteConversation,
+  executeConversationSql,
   getAgentBaseUrl,
   getAgentHealth,
   getConversation,
@@ -170,6 +171,23 @@ test('conversation API helpers use typed conversation endpoints', async () => {
   fetchMock.delete('http://agent.local/agent/conversations/conversation-1', {
     deleted: true,
   });
+  fetchMock.post(
+    'http://agent.local/agent/conversations/conversation-1/execute-sql',
+    {
+      status: 'ok',
+      conversation_id: 'conversation-1',
+      message: {
+        id: 'message-3',
+        role: 'assistant',
+        content: 'Executed',
+        created_at: '2026-06-19T00:00:00Z',
+        artifacts: [],
+      },
+      artifacts: [],
+      trace: [],
+      conversation,
+    },
+  );
 
   const scope = {
     database_id: 1,
@@ -194,6 +212,15 @@ test('conversation API helpers use typed conversation endpoints', async () => {
       })
     ).message.content,
   ).toBe('Answer');
+  expect(
+    (
+      await executeConversationSql('conversation-1', {
+        sql: 'select 1',
+        scope,
+        execution_mode: 'manual',
+      })
+    ).message.content,
+  ).toBe('Executed');
   expect((await deleteConversation('conversation-1')).deleted).toBe(true);
 
   const [messageCall] = fetchMock.callHistory.calls(
@@ -201,6 +228,14 @@ test('conversation API helpers use typed conversation endpoints', async () => {
   );
   expect(JSON.parse(String(messageCall.options.body))).toEqual({
     message: 'What columns?',
+    scope,
+    execution_mode: 'manual',
+  });
+  const [executeCall] = fetchMock.callHistory.calls(
+    'http://agent.local/agent/conversations/conversation-1/execute-sql',
+  );
+  expect(JSON.parse(String(executeCall.options.body))).toEqual({
+    sql: 'select 1',
     scope,
     execution_mode: 'manual',
   });
