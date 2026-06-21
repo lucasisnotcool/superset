@@ -15,24 +15,28 @@
 # specific language governing permissions and limitations
 # under the License.
 
+"""${message}
+
+Revision ID: ${up_revision}
+Revises: ${down_revision | comma,n}
+Create Date: ${create_date}
+"""
+
 from __future__ import annotations
 
-from superset_ai_agent.config import AgentConfig
-from superset_ai_agent.integrations.wren.client import (
-    DisabledWrenClient,
-    FileWrenClient,
-    WrenClient,
-)
-from superset_ai_agent.integrations.wren.http_client import WrenHttpClient
+import sqlalchemy as sa
+from alembic import op
+${imports if imports else ""}
+
+revision = ${repr(up_revision)}
+down_revision = ${repr(down_revision)}
+branch_labels = ${repr(branch_labels)}
+depends_on = ${repr(depends_on)}
 
 
-def create_wren_client(config: AgentConfig) -> WrenClient:
-    """Create the configured read-only Wren client."""
+def upgrade() -> None:
+    ${upgrades if upgrades else "pass"}
 
-    if config.wren_execution_enabled:
-        raise ValueError("Wren execution is not supported by the Superset AI agent.")
-    if not config.wren_enabled:
-        return DisabledWrenClient()
-    if config.wren_adapter == "http":
-        return WrenHttpClient(config)
-    return FileWrenClient(config)
+
+def downgrade() -> None:
+    ${downgrades if downgrades else "pass"}

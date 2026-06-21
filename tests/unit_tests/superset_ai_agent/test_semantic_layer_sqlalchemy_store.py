@@ -21,8 +21,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.pool import StaticPool
 
 from superset_ai_agent.conversations.schemas import ConversationScope
-from superset_ai_agent.persistence.database import create_session_factory
-from superset_ai_agent.persistence.models import Base
+from superset_ai_agent.persistence.database import (
+    create_all_for_tests,
+    create_session_factory,
+)
 from superset_ai_agent.semantic_layer.schemas import (
     SemanticDocument,
     SemanticLayerEvent,
@@ -42,7 +44,7 @@ def _store() -> SqlAlchemySemanticLayerStore:
         future=True,
         poolclass=StaticPool,
     )
-    Base.metadata.create_all(engine)
+    create_all_for_tests(engine)
     return SqlAlchemySemanticLayerStore(create_session_factory(engine))
 
 

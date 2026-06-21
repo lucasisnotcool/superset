@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json  # noqa: TID251 - keep the standalone agent independent of Superset
 from typing import Any, Literal, TypedDict
+from uuid import uuid4
 
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
@@ -55,12 +56,15 @@ from superset_ai_agent.schemas import (
     ChartSpec,
     ExecutionResult,
     InsightCard,
+    SqlExecutionSource,
     SqlValidation,
     TraceEvent,
     WrenContextArtifact,
+    WrenRetrievalArtifact,
 )
 from superset_ai_agent.semantic_layer.mdl_files import MdlFileStore
 from superset_ai_agent.semantic_layer.projects import SemanticProjectStore
+from superset_ai_agent.semantic_layer.runtime import merge_indexed_semantic_context
 from superset_ai_agent.semantic_layer.schemas import WrenMaterializationResult
 from superset_ai_agent.semantic_layer.store import SemanticLayerStore
 from superset_ai_agent.semantic_layer.wren_runtime import (
@@ -119,6 +123,7 @@ class ConversationState(TypedDict, total=False):
     audit: AuditInfo | None
     recommended_followups: list[str]
     wren_context: WrenContextArtifact | None
+    wren_retrieval: WrenRetrievalArtifact | None
     wren_materialization: WrenMaterializationResult | None
     wren_mdl_path: str | None
     sql_iterations: int
@@ -217,6 +222,7 @@ class ConversationGraph:
             scope=request.scope,
             execution_mode=request.execution_mode,
             approved_sql=request.sql,
+            approved_artifact_id=request.artifact_id,
             model=request.model,
             max_steps=request.max_steps,
         )
@@ -305,6 +311,7 @@ class ConversationGraph:
             "audit": None,
             "recommended_followups": [],
             "wren_context": None,
+            "wren_retrieval": None,
             "wren_materialization": None,
             "wren_mdl_path": None,
             "artifacts": [],
@@ -421,9 +428,19 @@ class ConversationGraph:
             max_steps=min(request.max_steps, 12),
         )
         context = self.context_provider.get_context(agent_request)
+        retrieval = getattr(self.context_provider, "last_retrieval", None)
+        retrieval_artifact = (
+            retrieval.retrieval if retrieval is not None else None
+        )
+        details = (
+            retrieval_artifact.model_dump()
+            if retrieval_artifact is not None
+            else {}
+        )
         return {
             **state,
             "context": context,
+            "wren_retrieval": retrieval_artifact,
             "trace": [
                 *state.get("trace", []),
                 TraceEvent(
@@ -432,6 +449,7 @@ class ConversationGraph:
                         f"Loaded {len(context.datasets)} dataset(s) from "
                         f"database {context.database.name}."
                     ),
+                    details=details,
                 ),
             ],
         }
@@ -439,6 +457,25 @@ class ConversationGraph:
     def _load_wren_context(self, state: ConversationState) -> ConversationState:
         request = state["request"]
         context = state["context"]
+        if self.config.wren_require_schema_scope and not request.scope.schema_name:
+            wren_context = WrenContextArtifact(
+                enabled=self.config.wren_enabled,
+                available=False,
+                warnings=["Select a database schema before loading Wren context."],
+            )
+            return {
+                **state,
+                "wren_context": wren_context,
+                "trace": [
+                    *state.get("trace", []),
+                    TraceEvent(
+                        step="load_wren_context",
+                        status="warning",
+                        summary="Wren context requires a selected schema.",
+                        details=wren_context.model_dump(),
+                    ),
+                ],
+            }
         materialization = None
         project_id = None
         mdl_path = None
@@ -470,9 +507,11 @@ class ConversationGraph:
             status: Literal["ok", "warning", "error"] = "warning"
         else:
             status = "ok" if wren_context.available else "warning"
-        wren_context = self._merge_indexed_semantic_context(
-            state,
-            wren_context,
+        wren_context = merge_indexed_semantic_context(
+            semantic_layer_store=self.semantic_layer_store,
+            scope=request.scope,
+            owner_id=state["owner_id"],
+            wren_context=wren_context,
         )
         if materialization is not None:
             warnings = list(wren_context.warnings)
@@ -487,10 +526,23 @@ class ConversationGraph:
                     "warnings": warnings,
                 }
             )
+        retrieval_artifact = state.get("wren_retrieval")
+        if retrieval_artifact is not None and project_id is not None:
+            retrieval_artifact = retrieval_artifact.model_copy(
+                update={"project_id": project_id}
+            )
+            wren_context = wren_context.model_copy(
+                update={"retrieval": retrieval_artifact}
+            )
+        elif retrieval_artifact is not None:
+            wren_context = wren_context.model_copy(
+                update={"retrieval": retrieval_artifact}
+            )
         status = "ok" if wren_context.available else status
         return {
             **state,
             "wren_context": wren_context,
+            "wren_retrieval": retrieval_artifact,
             "wren_materialization": materialization,
             "wren_mdl_path": mdl_path,
             "trace": [
@@ -507,43 +559,6 @@ class ConversationGraph:
                 ),
             ],
         }
-
-    def _merge_indexed_semantic_context(
-        self,
-        state: ConversationState,
-        wren_context: WrenContextArtifact,
-    ) -> WrenContextArtifact:
-        if self.semantic_layer_store is None:
-            return wren_context
-        latest_version = self.semantic_layer_store.get_latest_version(
-            state["request"].scope,
-            owner_id=state["owner_id"],
-        )
-        if latest_version is None or latest_version.wren_context is None:
-            return wren_context
-        indexed_context = latest_version.wren_context
-        return wren_context.model_copy(
-            update={
-                "enabled": wren_context.enabled or indexed_context.enabled,
-                "available": wren_context.available or indexed_context.available,
-                "document_ids": sorted(
-                    {
-                        *wren_context.document_ids,
-                        *indexed_context.document_ids,
-                    }
-                ),
-                "semantic_layer_version": indexed_context.semantic_layer_version,
-                "indexing_status": indexed_context.indexing_status,
-                "context_items": [
-                    *wren_context.context_items,
-                    *indexed_context.context_items,
-                ],
-                "warnings": [
-                    *wren_context.warnings,
-                    *indexed_context.warnings,
-                ],
-            }
-        )
 
     def _draft_response(self, state: ConversationState) -> ConversationState:
         request = state["request"]
@@ -602,6 +617,8 @@ class ConversationGraph:
             return state
         draft = state["draft"]
         request = state["request"]
+        if self.config.wren_require_schema_scope and not request.scope.schema_name:
+            return state
         try:
             dry_plan = self.wren_client.dry_plan(
                 question=request.message,
@@ -798,6 +815,24 @@ class ConversationGraph:
                 catalog_name=request.scope.catalog_name,
                 schema_name=request.scope.schema_name,
                 limit=self.config.default_sql_limit,
+                source=SqlExecutionSource(
+                    source=(
+                        "ai_agent_manual"
+                        if request.approved_sql
+                        else "ai_agent_conversation"
+                    ),
+                    request_id=uuid4().hex,
+                    conversation_id=state.get("conversation_id"),
+                    artifact_id=(
+                        request.approved_artifact_id
+                        or (
+                            state["pending_artifact"].id
+                            if state.get("pending_artifact")
+                            else None
+                        )
+                    ),
+                    sql_editor_id=request.scope.query_editor_id,
+                ),
             )
         except Exception as ex:  # pylint: disable=broad-except
             error = str(ex)

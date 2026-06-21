@@ -103,6 +103,38 @@ class AuditInfo(BaseModel):
     source: str | None = None
 
 
+class SqlExecutionSource(BaseModel):
+    """Source marker for governed SQL Lab executions started by the agent."""
+
+    source: Literal[
+        "ai_agent",
+        "ai_agent_conversation",
+        "ai_agent_manual",
+    ] = "ai_agent"
+    request_id: str | None = None
+    conversation_id: str | None = None
+    artifact_id: str | None = None
+    tab: str = "AI Agent"
+    client_id: str | None = Field(default=None, max_length=11)
+    sql_editor_id: str | None = None
+
+
+class WrenRetrievalArtifact(BaseModel):
+    """Bounded schema retrieval metadata for large semantic projects."""
+
+    project_id: str | None = None
+    database_id: int | None = None
+    catalog_name: str | None = None
+    schema_name: str | None = None
+    candidate_table_names: list[str] = Field(default_factory=list)
+    candidate_metric_names: list[str] = Field(default_factory=list)
+    candidate_example_ids: list[str] = Field(default_factory=list)
+    candidate_document_ids: list[str] = Field(default_factory=list)
+    scanned_table_count: int = 0
+    omitted_table_count: int = 0
+    context_truncated: bool = False
+
+
 class WrenContextArtifact(BaseModel):
     """Wren context, examples, planning, and semantic-layer metadata."""
 
@@ -118,6 +150,7 @@ class WrenContextArtifact(BaseModel):
     semantic_layer_version: str | None = None
     indexing_status: str | None = None
     context_items: list[dict[str, Any]] = Field(default_factory=list)
+    retrieval: WrenRetrievalArtifact | None = None
     dry_plan: dict[str, Any] | None = None
     warnings: list[str] = Field(default_factory=list)
 

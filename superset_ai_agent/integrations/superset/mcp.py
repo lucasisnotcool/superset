@@ -27,9 +27,11 @@ from superset_ai_agent.auth import SupersetRequestAuth
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.integrations.superset.client import (
     AgentContext,
+    DatabaseIdentity,
     DatabaseSummary,
     DatasetMetadata,
     SupersetAdapterError,
+    SupersetAdapterNotImplementedError,
     SupersetAuthError,
 )
 from superset_ai_agent.integrations.superset.rest import (
@@ -38,7 +40,8 @@ from superset_ai_agent.integrations.superset.rest import (
     _normalize_dataset,
     _normalize_execution_result,
 )
-from superset_ai_agent.schemas import ExecutionResult
+from superset_ai_agent.semantic_layer.uri_fingerprint import fingerprint_database_identity
+from superset_ai_agent.schemas import ExecutionResult, SqlExecutionSource
 
 
 class SupersetMcpClient:
@@ -246,6 +249,48 @@ class SupersetMcpClient:
         payload = _as_dict(self.list_databases_raw())
         return [_normalize_database(item) for item in _items(payload, "databases")]
 
+    def get_database_identity(
+        self,
+        *,
+        database_id: int,
+        catalog_name: str | None = None,
+    ) -> DatabaseIdentity:
+        """Return non-secret database identity from MCP metadata."""
+
+        database = _normalize_database(_as_dict(self.get_database_raw(database_id)))
+        return DatabaseIdentity(
+            database_id=database.id,
+            database_name=database.name,
+            backend=database.backend,
+            uri_fingerprint=fingerprint_database_identity(database_id=database.id),
+            catalog_name=catalog_name,
+            schema_names=self.list_database_schemas(
+                database_id=database_id,
+                catalog_name=catalog_name,
+            ),
+        )
+
+    def list_database_schemas(
+        self,
+        *,
+        database_id: int,
+        catalog_name: str | None = None,
+    ) -> list[str]:
+        """List schemas visible through dataset metadata when MCP lacks schema tool."""
+
+        datasets = self.list_datasets(
+            database_id=database_id,
+            catalog_name=catalog_name,
+            limit=self.config.max_context_datasets,
+        )
+        return sorted(
+            {
+                dataset.schema_name
+                for dataset in datasets
+                if dataset.schema_name is not None
+            }
+        )
+
     def list_datasets(
         self,
         *,
@@ -310,9 +355,11 @@ class SupersetMcpClient:
         catalog_name: str | None = None,
         schema_name: str | None = None,
         limit: int = 1000,
+        source: SqlExecutionSource | None = None,
     ) -> ExecutionResult:
         """Execute SQL through MCP and normalize the result."""
 
+        _ = source
         payload = _as_dict(
             self.execute_sql_raw(
                 database_id=database_id,
@@ -347,6 +394,38 @@ class SupersetMcpClient:
         """Return database backend from MCP metadata."""
 
         return _normalize_database(_as_dict(self.get_database_raw(database_id))).backend
+
+    def list_semantic_layers(self) -> list[dict[str, Any]]:
+        raise SupersetAdapterNotImplementedError(
+            "The MCP adapter does not publish semantic layers."
+        )
+
+    def create_semantic_layer(self, payload: dict[str, Any]) -> dict[str, Any]:
+        raise SupersetAdapterNotImplementedError(
+            "The MCP adapter does not publish semantic layers."
+        )
+
+    def update_semantic_layer(
+        self,
+        uuid: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        raise SupersetAdapterNotImplementedError(
+            "The MCP adapter does not publish semantic layers."
+        )
+
+    def delete_semantic_layer(self, uuid: str) -> None:
+        raise SupersetAdapterNotImplementedError(
+            "The MCP adapter does not publish semantic layers."
+        )
+
+    def create_semantic_views(
+        self,
+        views: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        raise SupersetAdapterNotImplementedError(
+            "The MCP adapter does not publish semantic layers."
+        )
 
     def _headers(self) -> dict[str, str]:
         headers = {

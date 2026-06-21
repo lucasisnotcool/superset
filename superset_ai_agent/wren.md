@@ -65,6 +65,44 @@ The current agent service is implemented in these files:
 | SQL Lab AI frontend API | `superset-frontend/src/SqlLab/components/AiAgentPanel/api.ts` |
 | SQL Lab AI frontend panel | `superset-frontend/src/SqlLab/components/AiAgentPanel/index.tsx` |
 
+## Codebase Source Map And Completion Status
+
+Use this section as the implementation-session refresher. It records what is
+already present in the repository and what still needs to be closed before the
+Wren semantic-layer increment should be considered production-ready.
+
+Legend:
+
+- `[COMPLETE]` means the repository has an implemented baseline and tests or
+  source coverage matching the plan's intent.
+- `[PARTIAL]` means the repository has useful code, but the risk is not fully
+  closed or the product behavior still differs from the finalized direction.
+- `[TODO]` means the item remains implementation work.
+
+| Status | Capability | Codebase source |
+| --- | --- | --- |
+| [COMPLETE] | Optional conversational artifact response fields: summary, insight cards, chart spec, data preview, audit, follow-ups, Wren context. | `superset_ai_agent/schemas.py::AgentQueryResponse`, `ExecutionResult`, `InsightCard`, `ChartSpec`, `AuditInfo`, `WrenContextArtifact`; `superset_ai_agent/conversations/schemas.py::ConversationArtifact`. |
+| [COMPLETE] | Deterministic result analysis and chart inference. | `superset_ai_agent/artifacts/insights.py`; `superset_ai_agent/artifacts/charts.py`; `tests/unit_tests/superset_ai_agent/test_artifact_insights.py`; `tests/unit_tests/superset_ai_agent/test_artifact_charts.py`. |
+| [COMPLETE] | One-shot graph and conversation graph attach post-execution artifacts. | `superset_ai_agent/graph.py::TextToSqlGraph`; `superset_ai_agent/conversation_graph.py::ConversationGraph`; `tests/unit_tests/superset_ai_agent/test_graph.py`; `tests/unit_tests/superset_ai_agent/test_conversation_graph.py`. |
+| [COMPLETE] | Wren is read/planning-only at the public agent boundary and fails closed when execution is enabled. | `superset_ai_agent/integrations/wren/client.py::WrenClient`, `DisabledWrenClient`, `FileWrenClient`; `superset_ai_agent/integrations/wren/http_client.py::WrenHttpClient`; `superset_ai_agent/integrations/wren/factory.py::create_wren_client`; `tests/unit_tests/superset_ai_agent/test_wren_client.py`; `tests/unit_tests/superset_ai_agent/test_wren_http_client.py`. |
+| [COMPLETE] | REST SQL Lab adapter is the default governed execution adapter and carries catalog/schema. | `superset_ai_agent/config.py::AgentConfig.superset_agent_adapter`; `superset_ai_agent/integrations/superset/factory.py::create_superset_client`; `superset_ai_agent/integrations/superset/rest.py::SupersetRestClient.execute_sql_raw`. |
+| [COMPLETE] | Agent request and conversation scopes carry `catalog_name` and `schema_name`. | `superset_ai_agent/schemas.py::AgentQueryRequest`; `superset_ai_agent/conversations/schemas.py::ConversationScope`; `superset_ai_agent/context/superset_metadata.py::SupersetMetadataContextProvider`. |
+| [COMPLETE] | Agent-owned SQLAlchemy stores exist for conversations and semantic-layer workflow state. | `superset_ai_agent/conversations/sqlalchemy_store.py::SqlAlchemyConversationStore`; `superset_ai_agent/semantic_layer/sqlalchemy_store.py::SqlAlchemySemanticLayerStore`; `superset_ai_agent/persistence/models.py`. |
+| [COMPLETE] | Identity can be resolved from Superset session, signed header, or static development mode; persistence rejects unsafe static identity unless explicitly allowed. | `superset_ai_agent/auth.py`; `superset_ai_agent/app.py::_validate_identity_persistence_config`; `tests/unit_tests/superset_ai_agent/test_auth.py`; `tests/unit_tests/superset_ai_agent/test_config.py`. |
+| [COMPLETE] | Schema-scoped semantic project and MDL file persistence models exist. | `superset_ai_agent/persistence/models.py::AiAgentSemanticProject`; `AiAgentSemanticMdlFile`; `superset_ai_agent/semantic_layer/projects.py`; `superset_ai_agent/semantic_layer/mdl_files.py`. |
+| [COMPLETE] | Project-aware semantic routes and MDL CRUD/upload/materialization endpoints exist. | `superset_ai_agent/app.py::create_app`; routes under `/agent/semantic-layer/projects`; `tests/unit_tests/superset_ai_agent/test_semantic_layer_api.py`; `tests/unit_tests/superset_ai_agent/test_semantic_layer_projects.py`; `tests/unit_tests/superset_ai_agent/test_semantic_layer_mdl_files.py`. |
+| [COMPLETE] | Project materialization writes only active MDL files into project-scoped Wren runtime state. | `superset_ai_agent/semantic_layer/wren_materializer.py::materialize_wren_project`; `superset_ai_agent/semantic_layer/wren_runtime.py`; `tests/unit_tests/superset_ai_agent/test_wren_materializer.py`. |
+| [COMPLETE] | URI fingerprint utilities strip secret material and provide fallback Superset database fingerprints. | `superset_ai_agent/semantic_layer/uri_fingerprint.py`; `tests/unit_tests/superset_ai_agent/test_semantic_layer_projects.py`. |
+| [COMPLETE] | Semantic project authorization is centralized behind a Superset-proven access service. | `superset_ai_agent/semantic_layer/access.py::SemanticAccessService`; `superset_ai_agent/app.py::authorize_semantic_scope`; `authorize_semantic_project`; `tests/unit_tests/superset_ai_agent/test_semantic_layer_access.py`. |
+| [COMPLETE] | Agent DB persistence uses versioned Alembic migrations with an explicit bootstrap mode for legacy unversioned tables. | `superset_ai_agent/persistence/database.py::run_migrations`; `superset_ai_agent/persistence/migrations/versions/0001_initial_agent_tables.py`; `tests/unit_tests/superset_ai_agent/test_persistence_database.py`. |
+| [PARTIAL] | UI exposes semantic-layer editing, but as a left-bar button plus `SemanticLayerDrawer`, not a first-class mixed SQL Lab tab opened from a schema row. | `superset-frontend/src/SqlLab/components/SqlEditorLeftBar/index.tsx`; `superset-frontend/src/SqlLab/components/AiAgentPanel/SemanticLayerDrawer.tsx`; `superset-frontend/src/SqlLab/components/TabbedSqlEditors/index.tsx`. |
+| [COMPLETE] | Markdown upload/enrichment can call a read-only Wren HTTP onboarding adapter and falls back to deterministic review drafts. | `superset_ai_agent/integrations/wren/http_client.py::WrenHttpClient.propose_mdl_from_document`; `superset_ai_agent/app.py` route `/documents/{document_id}/enrich`; `tests/unit_tests/superset_ai_agent/test_wren_http_client.py`; `tests/unit_tests/superset_ai_agent/test_semantic_layer_api.py`. |
+| [COMPLETE] | AI source audit metadata is modeled as a typed execution source and carried through accepted SQL Lab fields. | `superset_ai_agent/schemas.py::SqlExecutionSource`; `AuditInfo`; `superset_ai_agent/integrations/superset/rest.py::SupersetRestClient.execute_sql_raw`; `TextToSqlGraph._execute_sql`; `ConversationGraph._execute_sql`; `tests/unit_tests/superset_ai_agent/test_superset_client.py`; `tests/unit_tests/superset_ai_agent/test_graph.py`; `tests/unit_tests/superset_ai_agent/test_conversation_graph.py`. |
+| [COMPLETE] | Superset-proven DB/schema identity endpoint and semantic access proofs. | `superset/ai_agent/api.py::AiAgentRestApi.database_identity`; `superset_ai_agent/integrations/superset/client.py::DatabaseIdentity`; `superset_ai_agent/semantic_layer/access.py::SemanticAccessService`; `tests/unit_tests/superset_ai_agent/test_superset_client.py`; `tests/unit_tests/superset_ai_agent/test_semantic_layer_access.py`. |
+| [COMPLETE] | Top-k schema retrieval service for very large schema projects with schema-required Wren runtime behavior. | `superset_ai_agent/semantic_layer/retrieval.py`; `superset_ai_agent/context/superset_metadata.py::SupersetMetadataContextProvider`; `superset_ai_agent/graph.py::TextToSqlGraph._load_wren_context`; `superset_ai_agent/conversation_graph.py::ConversationGraph._load_wren_context`; `tests/unit_tests/superset_ai_agent/test_semantic_layer_retrieval.py`; `tests/unit_tests/superset_ai_agent/test_context_provider.py`; `tests/unit_tests/superset_ai_agent/test_graph.py`. |
+| [COMPLETE] | Object storage implementation for uploaded source documents. | `superset_ai_agent/semantic_layer/file_storage.py::LocalDocumentStorage`; `S3DocumentStorage`; `superset_ai_agent/app.py::_create_document_storage`; `tests/unit_tests/superset_ai_agent/test_semantic_layer_file_storage.py`. |
+| [PARTIAL] | Superset semantic-layer/view REST bridge primitives exist, but the explicit publish route and Wren-MDL-to-Superset configuration mapper remain open. | `superset_ai_agent/integrations/superset/client.py::SupersetClient`; `superset_ai_agent/integrations/superset/rest.py::SupersetRestClient.list_semantic_layers`; `create_semantic_layer`; `update_semantic_layer`; `delete_semantic_layer`; `create_semantic_views`; `tests/unit_tests/superset_ai_agent/test_superset_client.py`. |
+
 The conversation graph already supports SQL execution and reflection:
 
 ```text
@@ -2177,8 +2215,9 @@ Implemented baseline:
   review decisions.
 - `superset_ai_agent/semantic_layer/indexer.py::rebuild_index` creates a
   reviewed semantic overlay and `WrenContextArtifact.context_items`.
-- `ConversationGraph._merge_indexed_semantic_context` merges the latest
-  reviewed semantic overlay into conversation-time Wren context.
+- `superset_ai_agent/semantic_layer/runtime.py::merge_indexed_semantic_context`
+  merges the latest reviewed semantic overlay into one-shot and conversation
+  Wren context.
 - `superset-frontend/src/SqlLab/components/AiAgentPanel/SemanticLayerDrawer.tsx`
   supports upload, approve-all review, rebuild, and state refresh.
 
@@ -2188,8 +2227,10 @@ Remaining follow-up:
   section 21;
 - add granular frontend review/edit/reject controls for MDL files and
   Markdown-enriched proposals;
-- add object-storage-backed document storage for multi-replica deployments;
-- add a real Wren document-ingestion adapter if Wren exposes a stable API;
+- continue hardening object-storage-backed document retrieval and checksum
+  verification for any future raw-download route;
+- validate the Wren HTTP document-ingestion adapter against the deployed Wren
+  API contract;
 - merge reviewed semantic context into one-shot `/agent/query` without losing
   per-user scoping.
 
@@ -3698,46 +3739,717 @@ Test assertions:
 - deleting an MDL file uses the semantic-layer API and does not remove query
   editor state.
 
-## 22. Revised Follow-Up Milestones
+## 22. Remaining Risk Closure Checklist
 
-| Milestone | Scope | Highest-risk files |
+This section is the authoritative implementation checklist for the next
+session. Complete the items in order unless a lower item is needed to unblock a
+test. Each item names the risk, the confirmed source state, implementation
+steps, required tests, and acceptance criteria.
+
+### R1. Agent-Owned DB Migration Lifecycle
+
+Status: `[COMPLETE]`
+
+Confirmed source state:
+
+- `superset_ai_agent/persistence/database.py::run_migrations` runs Alembic
+  `upgrade head` through an agent-local Alembic configuration.
+- `superset_ai_agent/persistence/models.py` already contains the conversation,
+  artifact, semantic document, semantic project, access proof, and MDL file
+  model definitions.
+- Store implementations already rely on those models:
+  `SqlAlchemyConversationStore`, `SqlAlchemySemanticLayerStore`,
+  `SqlAlchemySemanticProjectStore`, and `SqlAlchemyMdlFileStore`.
+- `superset_ai_agent/persistence/database.py::create_all_for_tests` is the only
+  helper that calls SQLAlchemy `create_all`.
+- `AgentConfig.agent_migration_bootstrap` and
+  `AI_AGENT_MIGRATION_BOOTSTRAP=error|stamp_existing` cover legacy development
+  DB bootstrap behavior.
+
+Implementation steps:
+
+1. `[COMPLETE]` Add Alembic files:
+
+   ```text
+   superset_ai_agent/persistence/alembic.ini
+   superset_ai_agent/persistence/migrations/env.py
+   superset_ai_agent/persistence/migrations/script.py.mako
+   superset_ai_agent/persistence/migrations/versions/0001_initial_agent_tables.py
+   ```
+
+2. `[COMPLETE]` Replace `run_migrations(config)` with Alembic
+   `command.upgrade(..., "head")`.
+3. `[COMPLETE]` Keep `_ensure_sqlite_parent` for SQLite path creation.
+4. `[COMPLETE]` Add a test-only helper, not production startup behavior:
+
+   ```python
+   def create_all_for_tests(engine: Engine) -> None:
+       Base.metadata.create_all(engine)
+   ```
+
+5. `[COMPLETE]` Add bootstrap handling for existing development DBs:
+
+   ```python
+   agent_migration_bootstrap: Literal["error", "stamp_existing"] = "error"
+   ```
+
+6. `[COMPLETE]` Add `AI_AGENT_MIGRATION_BOOTSTRAP=error` to `.env.example`;
+   `stamp_existing` is documented as the development-only escape hatch.
+
+Tests:
+
+```text
+tests/unit_tests/superset_ai_agent/test_persistence_migrations.py
+tests/unit_tests/superset_ai_agent/test_persistence_database.py
+tests/unit_tests/superset_ai_agent/test_conversation_sqlalchemy_store.py
+tests/unit_tests/superset_ai_agent/test_semantic_layer_sqlalchemy_store.py
+```
+
+Acceptance criteria:
+
+- `[COMPLETE]` app startup no longer uses `Base.metadata.create_all`;
+- `[COMPLETE]` migrations create all tables required by current SQLAlchemy
+  stores;
+- `[COMPLETE]` an empty SQLite DB upgrades to head;
+- `[COMPLETE]` repeated upgrade is idempotent;
+- `[COMPLETE]` existing tests no longer depend on production `create_all`
+  behavior.
+
+### R2. Central Semantic Access Service
+
+Status: `[COMPLETE]`
+
+Confirmed source state:
+
+- Route-level helpers exist in `superset_ai_agent/app.py`:
+  `authorize_semantic_scope` and `authorize_semantic_project`.
+- Central access decisions live in
+  `superset_ai_agent/semantic_layer/access.py::SemanticAccessService`.
+- `SemanticAccessService` resolves Superset-proven database identity when
+  available and records `SemanticAccessProof` details in access decisions.
+- Store-level visibility in
+  `superset_ai_agent/semantic_layer/projects.py::_with_permission` no longer
+  silently grants write access for DB-derived visibility; `db_access` grants
+  read permission unless
+  `AI_AGENT_SEMANTIC_FULL_ACCESS_GRANTS_WRITE=true` and access proof is full.
+
+Implementation steps:
+
+1. `[COMPLETE]` Add `superset_ai_agent/semantic_layer/access.py`.
+2. `[COMPLETE]` Add:
+
+   ```python
+   class SemanticPermission(str, Enum): ...
+   class SemanticAccessLevel(str, Enum): ...
+   class SemanticAccessProof(BaseModel): ...
+   class SemanticAccessDecision(BaseModel): ...
+   class SemanticAccessService: ...
+   ```
+
+3. `[COMPLETE]` Move project permission decisions into
+   `SemanticAccessService`.
+4. `[COMPLETE]` Replace direct route helper logic in `app.py` with centralized
+   service calls:
+
+   ```python
+   access_service.require_project_permission(...)
+   access_service.require_scope_permission(...)
+   access_service.resolve_project_for_run(...)
+   ```
+
+5. `[COMPLETE]` Update `SemanticProjectStore` so `_with_permission` treats
+   DB-derived access as read by default.
+6. `[COMPLETE]` Make write/admin decisions explicit:
+   - owner: admin;
+   - explicit grant: granted permission;
+   - DB-derived access: read by default;
+   - DB-derived write only when
+     `AI_AGENT_SEMANTIC_FULL_ACCESS_GRANTS_WRITE=true` and access proof is full.
+
+Tests:
+
+```text
+tests/unit_tests/superset_ai_agent/test_semantic_layer_access.py
+tests/unit_tests/superset_ai_agent/test_semantic_layer_api.py
+tests/unit_tests/superset_ai_agent/test_semantic_layer_projects.py
+tests/unit_tests/superset_ai_agent/test_semantic_layer_mdl_files.py
+```
+
+Acceptance criteria:
+
+- `[COMPLETE]` every semantic project/document/MDL/materialization route calls
+  `SemanticAccessService`;
+- `[COMPLETE]` read, write, and admin decisions are tested independently;
+- `[COMPLETE]` DB-derived access does not silently grant write unless
+  configured;
+- `[COMPLETE]` direct project ID access is checked through the central service.
+
+### R3. Superset-Proven Database And Schema Access
+
+Status: `[COMPLETE]`
+
+Confirmed source state:
+
+- `superset_ai_agent/semantic_layer/uri_fingerprint.py` fingerprints supplied
+  URIs and fallback Superset database IDs.
+- `SemanticProjectResolveRequest.supplied_uri` exists in
+  `superset_ai_agent/semantic_layer/schemas.py`.
+- `superset/ai_agent/api.py::AiAgentRestApi.database_identity` returns
+  server-side database identity and a salted URI fingerprint without returning
+  raw SQLAlchemy URIs or credentials.
+- `SupersetRestClient.get_database_identity` and
+  `SupersetClient.list_database_schemas` expose the identity path to the agent.
+- `SemanticAccessService` prefers Superset-proven identity and supports
+  `AI_AGENT_SEMANTIC_ACCESS_MODE=superset_only|db_uri_match|superset_or_uri`.
+
+Implementation steps:
+
+1. `[COMPLETE]` Add a Superset-side protected identity endpoint:
+
+   ```text
+   superset/ai_agent/api.py
+   GET /api/v1/ai-agent/database/<database_id>/identity
+   ```
+
+2. `[COMPLETE]` The endpoint:
+   - use `@protect()`;
+   - validate database access through Superset security manager;
+   - compute a salted URI fingerprint server-side;
+   - return `database_id`, label, backend, fingerprint, and available schemas;
+   - never return username, password, token, or raw SQLAlchemy URI.
+
+3. `[COMPLETE]` Extend
+   `superset_ai_agent/integrations/superset/client.py`:
+
+   ```python
+   class DatabaseIdentity(BaseModel): ...
+   def get_database_identity(self, database_id: int) -> DatabaseIdentity: ...
+   def list_database_schemas(
+       self,
+       *,
+       database_id: int,
+       catalog_name: str | None = None,
+   ) -> list[str]: ...
+   ```
+
+4. `[COMPLETE]` Implement the methods in `SupersetRestClient`.
+5. `[COMPLETE]` Let `SemanticAccessService` create access proofs from Superset
+   identity when available.
+6. `[COMPLETE]` Keep `supplied_uri` as a development or explicit validation
+   path only:
+
+   ```python
+   semantic_access_mode: Literal[
+       "superset_only",
+       "db_uri_match",
+       "superset_or_uri",
+   ] = "superset_or_uri"
+   ```
+
+Tests:
+
+```text
+tests/unit_tests/superset_ai_agent/test_semantic_layer_uri_fingerprint.py
+tests/unit_tests/superset_ai_agent/test_semantic_layer_access.py
+tests/unit_tests/superset_ai_agent/test_superset_client.py
+tests/integration_tests/views/api/test_ai_agent_database_identity.py
+```
+
+Acceptance criteria:
+
+- `[COMPLETE]` raw URIs are never returned by the Superset identity endpoint;
+- `[COMPLETE]` different credentials for the same logical DB produce the same
+  fingerprint;
+- `[COMPLETE]` schema project discovery uses Superset-proven
+  database/schema access when available;
+- `[COMPLETE]` URI-derived semantic-layer access cannot grant SQL execution
+  permission.
+
+### R4. Schema-Scoped Runtime Retrieval For Large Databases
+
+Status: `[COMPLETE]`
+
+Confirmed source state:
+
+- Requests and scopes include `schema_name`.
+- `superset_ai_agent/semantic_layer/retrieval.py::retrieve_schema_context`
+  ranks permission-filtered Superset datasets and emits
+  `WrenRetrievalArtifact`.
+- `superset_ai_agent/context/superset_metadata.py::SupersetMetadataContextProvider`
+  scans up to `AgentConfig.wren_schema_table_scan_limit` tables and narrows
+  the prompt context to `wren_schema_table_candidate_limit`.
+- `TextToSqlGraph._load_wren_context` and
+  `ConversationGraph._load_wren_context` skip Wren context when
+  `WREN_REQUIRE_SCHEMA_SCOPE=true` and no schema is selected.
+- `WrenRetrievalArtifact` is exposed in `superset_ai_agent/schemas.py` and
+  `superset-frontend/src/SqlLab/components/AiAgentPanel/api.ts`.
+
+Implementation steps:
+
+1. `[COMPLETE]` Add `superset_ai_agent/semantic_layer/retrieval.py`.
+2. `[COMPLETE]` Add retrieval config in `AgentConfig`:
+
+   ```python
+   wren_schema_table_scan_limit: int = 100
+   wren_schema_table_candidate_limit: int = 12
+   wren_schema_metric_candidate_limit: int = 20
+   wren_schema_example_candidate_limit: int = 5
+   wren_schema_document_candidate_limit: int = 5
+   wren_schema_context_token_budget: int = 6000
+   wren_require_schema_scope: bool = True
+   ```
+
+3. `[COMPLETE]` Add `WrenRetrievalArtifact` to
+   `superset_ai_agent/schemas.py`.
+4. `[COMPLETE]` Update both graphs:
+   - require `schema_name` before Wren retrieval when
+     `wren_require_schema_scope=true`;
+   - resolve exactly one semantic project through the project materialization
+     runtime;
+   - retrieve/rank only top-k models, metrics, examples, and document snippets;
+   - record omitted counts and truncation in trace.
+
+5. `[COMPLETE]` Do not load multiple schema projects into one prompt.
+
+Tests:
+
+```text
+tests/unit_tests/superset_ai_agent/test_semantic_layer_retrieval.py
+tests/unit_tests/superset_ai_agent/test_context_provider.py
+tests/unit_tests/superset_ai_agent/test_graph.py
+tests/unit_tests/superset_ai_agent/test_conversation_graph.py
+```
+
+Acceptance criteria:
+
+- `[COMPLETE]` Wren context for a run is bound to one
+  database/catalog/schema project.
+- `[COMPLETE]` Large schema projects are truncated by configured top-k limits.
+- `[COMPLETE]` Missing schema produces a user-facing Wren-scope warning and
+  skips Wren context/dry-plan.
+- `[COMPLETE]` Follow-up suggestions remain generated from the narrowed
+  execution/result context.
+
+### R5. True SQL Lab Semantic Editor Tab
+
+Status: `[PARTIAL]`
+
+Confirmed source state:
+
+- `superset-frontend/src/SqlLab/components/SqlEditorLeftBar/index.tsx`
+  contains a `Semantic layer` button and opens `SemanticLayerDrawer`.
+- `superset-frontend/src/SqlLab/components/AiAgentPanel/SemanticLayerDrawer.tsx`
+  implements project resolve, MDL CRUD, upload, YAML editing, Markdown
+  enrichment, and materialization in an overlay.
+- `superset-frontend/src/SqlLab/components/TabbedSqlEditors/index.tsx` still
+  maps SQL Lab query editors directly to SQL editor tabs.
+- There is no `superset-frontend/src/SqlLab/components/SemanticLayerEditor/`
+  tab implementation.
+
+Implementation steps:
+
+1. Add mixed SQL Lab tab types in `superset-frontend/src/SqlLab/types.ts`:
+
+   ```ts
+   export type SqlLabTabType = 'query' | 'semanticLayer';
+   export interface SqlLabTabRef { id: string; type: SqlLabTabType; }
+   export interface SemanticLayerEditorTab { ... }
+   ```
+
+2. Add Redux actions in `superset-frontend/src/SqlLab/actions/sqlLab.ts`:
+
+   ```ts
+   OPEN_SEMANTIC_LAYER_EDITOR
+   SET_ACTIVE_SQL_LAB_TAB
+   CLOSE_SEMANTIC_LAYER_EDITOR
+   UPDATE_SEMANTIC_LAYER_EDITOR
+   ```
+
+3. Update `superset-frontend/src/SqlLab/reducers/sqlLab.ts` to normalize legacy
+   `tabHistory: string[]` into query tab refs.
+4. Modify `TabbedSqlEditors/index.tsx` to render both SQL tabs and semantic
+   tabs.
+5. Add schema-row entrypoint to:
+
+   ```text
+   superset-frontend/src/SqlLab/components/TableExploreTree/TreeNodeRenderer.tsx
+   superset-frontend/src/SqlLab/components/TableExploreTree/index.tsx
+   ```
+
+6. Add new components:
+
+   ```text
+   superset-frontend/src/SqlLab/components/SemanticLayerEditor/index.tsx
+   SemanticLayerEditorTabHeader.tsx
+   MdlFileBrowser.tsx
+   MdlFileTreeNode.tsx
+   MdlUploadDialog.tsx
+   MdlEditor.tsx
+   MdlValidationPanel.tsx
+   MdlEnrichmentReview.tsx
+   api.ts
+   types.ts
+   ```
+
+7. Move reusable behavior out of `SemanticLayerDrawer` into the new tab
+   components. Keep the drawer only as a temporary wrapper, or remove it once
+   the tab flow has parity.
+8. Use `EditorHost` with `language="yaml"`; do not use SQL `EditorWrapper` or
+   SQL run hotkeys.
+
+Tests:
+
+```text
+superset-frontend/src/SqlLab/components/TableExploreTree/TreeNodeRenderer.test.tsx
+superset-frontend/src/SqlLab/components/TabbedSqlEditors/index.test.tsx
+superset-frontend/src/SqlLab/components/SemanticLayerEditor/index.test.tsx
+superset-frontend/src/SqlLab/components/SemanticLayerEditor/MdlFileBrowser.test.tsx
+superset-frontend/src/SqlLab/components/SemanticLayerEditor/MdlUploadDialog.test.tsx
+superset-frontend/src/SqlLab/components/SemanticLayerEditor/MdlEditor.test.tsx
+superset-frontend/src/SqlLab/components/SemanticLayerEditor/MdlEnrichmentReview.test.tsx
+```
+
+Acceptance criteria:
+
+- semantic layers open as first-class SQL Lab tabs;
+- SQL tabs still open, close, select, and run unchanged;
+- semantic tabs do not render SQL result panes or dispatch run-query actions;
+- the visible scope is always database plus schema, with catalog where present.
+
+### R6. Wren-Native Document Understanding
+
+Status: `[COMPLETE]`
+
+Confirmed source state:
+
+- `superset_ai_agent/semantic_layer/review.py::propose_updates` still produces
+  deterministic semantic updates for upload-time review candidates.
+- `superset_ai_agent/app.py` exposes project document upload and enrichment
+  routes.
+- `superset_ai_agent/integrations/wren/client.py::WrenClient` exposes
+  proposal-only methods: `preview_document_updates`,
+  `propose_mdl_from_document`, and `validate_mdl_project`.
+- `superset_ai_agent/integrations/wren/http_client.py::WrenHttpClient` can call
+  Wren context, examples, dry-plan, document update preview, MDL proposal, and
+  MDL validation endpoints without any SQL execution method.
+- `superset_ai_agent/app.py::enrich_project_document` calls
+  `WrenClient.propose_mdl_from_document`; file/disabled clients fall back to a
+  deterministic review draft.
+
+Implementation steps:
+
+1. `[COMPLETE]` Extend `superset_ai_agent/integrations/wren/client.py::WrenClient` with
+   proposal-only methods:
+
+   ```python
+   def preview_document_updates(...): ...
+   def propose_mdl_from_document(...): ...
+   def validate_mdl_project(...): ...
+   ```
+
+2. `[COMPLETE]` Add `superset_ai_agent/integrations/wren/http_client.py`.
+3. `[COMPLETE]` Add config:
+
+   ```python
+   wren_adapter: Literal["file", "http"] = "file"
+   wren_base_url: str | None = None
+   wren_api_key: str | None = None
+   wren_timeout_seconds: float = 30.0
+   wren_onboarding_enabled: bool = False
+   ```
+
+4. `[COMPLETE]` Update the document enrichment route to:
+   - call the HTTP adapter when available;
+   - return proposed MDL as a draft proposal;
+   - require explicit user save/activation;
+   - fall back to deterministic scaffold with clear warnings.
+
+5. `[COMPLETE]` Ensure only validated YAML MDL files with `status="active"` are materialized.
+
+Tests:
+
+```text
+tests/unit_tests/superset_ai_agent/test_wren_http_client.py
+tests/unit_tests/superset_ai_agent/test_semantic_layer_review.py
+tests/unit_tests/superset_ai_agent/test_semantic_layer_api.py
+```
+
+Acceptance criteria:
+
+- `[COMPLETE]` Wren enrichment never mutates active MDL automatically.
+- `[COMPLETE]` Wren HTTP dry-plan and validation payloads set
+  `execution="disabled"`.
+- `[COMPLETE]` HTTP onboarding failures return deterministic review drafts with
+  warnings instead of activating content.
+- `[PARTIAL]` Frontend review remains implemented inside
+  `SemanticLayerDrawer`; a first-class `SemanticLayerEditor` tab test is still
+  part of R5.
+- Wren enrichment never executes SQL;
+- failed Wren enrichment returns a reviewable error or fallback proposal;
+- proposal source, warnings, and validation state are visible to the user.
+
+### R7. SQL Lab AI Audit Source Marker
+
+Status: `[COMPLETE]`
+
+Confirmed source state:
+
+- `superset_ai_agent/schemas.py::AuditInfo` already has `client_id`,
+  `sql_editor_id`, `tab`, and `source_hash`.
+- `superset_ai_agent/integrations/superset/rest.py::SupersetRestClient`
+  normalizes audit payloads.
+- `superset_ai_agent/schemas.py::SqlExecutionSource` is the typed cross-graph
+  execution argument.
+- `TextToSqlGraph._execute_sql` and `ConversationGraph._execute_sql` pass
+  source metadata only after SQL validation succeeds.
+- `SupersetRestClient.execute_sql_raw` sends accepted SQL Lab fields:
+  `client_id`, `sql_editor_id`, and `tab`.
+
+Implementation steps:
+
+1. `[COMPLETE]` Add `SqlExecutionSource` to `superset_ai_agent/schemas.py`.
+2. `[COMPLETE]` Extend `SupersetClient.execute_sql` in
+   `superset_ai_agent/integrations/superset/client.py`:
+
+   ```python
+   source: SqlExecutionSource | None = None
+   ```
+
+3. `[COMPLETE]` Update REST payload in
+   `SupersetRestClient.execute_sql_raw`:
+
+   ```python
+   "client_id": short_ai_query_id(source),
+   "sql_editor_id": ai_sql_editor_id(source),
+   "tab": "AI Agent",
+   ```
+
+4. `[COMPLETE]` Thread source metadata from:
+   - `TextToSqlGraph._execute_sql`;
+   - `ConversationGraph._execute_sql`;
+   - conversation manual execution route.
+
+5. `[COMPLETE]` Keep `client_id` unique and <= 11 characters. Do not use a
+   fixed `client_id`.
+
+Tests:
+
+```text
+tests/unit_tests/superset_ai_agent/test_superset_client.py
+tests/unit_tests/superset_ai_agent/test_graph.py
+tests/unit_tests/superset_ai_agent/test_conversation_graph.py
+```
+
+Acceptance criteria:
+
+- `[COMPLETE]` REST execute payload contains accepted SQL Lab marker fields;
+- `[COMPLETE]` `AuditInfo` returns marker values when Superset returns query
+  metadata;
+- `[COMPLETE]` invalid or non-read-only SQL still never reaches `execute_sql`.
+
+### R8. Object Storage For Uploaded Documents
+
+Status: `[COMPLETE]`
+
+Confirmed source state:
+
+- `superset_ai_agent/semantic_layer/file_storage.py::LocalDocumentStorage`
+  stores files under `AI_AGENT_STORAGE_DIR`.
+- `superset_ai_agent/semantic_layer/file_storage.py::S3DocumentStorage`
+  stores files in an S3-compatible object store and returns `s3://` URIs.
+- `superset_ai_agent/app.py::_create_document_storage` wires
+  `AI_AGENT_DOCUMENT_STORAGE=local|s3`.
+- `SemanticDocument.storage_uri` records the durable pointer.
+- Raw bytes remain outside SQLAlchemy stores; the DB stores checksum, metadata,
+  extracted text, review state, and `storage_uri`.
+
+Implementation steps:
+
+1. `[COMPLETE]` Extend the existing
+   `superset_ai_agent/semantic_layer/file_storage.py::DocumentStorage`
+   protocol with local and S3 implementations.
+2. `[COMPLETE]` Add app-level storage factory in
+   `superset_ai_agent/app.py::_create_document_storage`.
+3. `[COMPLETE]` Add config:
+
+   ```python
+   document_storage: Literal["local", "s3"] = "local"
+   document_s3_bucket: str | None = None
+   document_s3_prefix: str = "superset-ai-agent/documents"
+   document_s3_endpoint_url: str | None = None
+   document_s3_region_name: str | None = None
+   ```
+
+4. `[COMPLETE]` Keep raw bytes outside the SQLAlchemy DB.
+5. `[COMPLETE]` Keep extracted text, checksum, metadata, and review state in
+   the DB.
+
+Tests:
+
+```text
+tests/unit_tests/superset_ai_agent/test_semantic_layer_file_storage.py
+tests/unit_tests/superset_ai_agent/test_semantic_layer_documents.py
+```
+
+Acceptance criteria:
+
+- `[COMPLETE]` Local storage remains default and tested.
+- `[COMPLETE]` S3 storage writes, reads, and deletes by `storage_uri`.
+- `[COMPLETE]` DB rows never contain raw file bytes.
+- `[PARTIAL]` Document checksum is computed at upload time; read-time checksum
+  verification can be added before serving downloaded raw bytes.
+
+### R9. Superset Semantic-Layer Publication Bridge
+
+Status: `[PARTIAL]`
+
+Confirmed source state:
+
+- Superset has semantic-layer APIs and models:
+  `superset/semantic_layers/api.py::SemanticLayerRestApi`,
+  `SemanticViewRestApi`, and
+  `superset/semantic_layers/models.py::SemanticLayer`, `SemanticView`.
+- The agent has REST bridge primitives in
+  `superset_ai_agent/integrations/superset/rest.py::SupersetRestClient`:
+  `list_semantic_layers`, `create_semantic_layer`,
+  `update_semantic_layer`, `delete_semantic_layer`, and
+  `create_semantic_views`.
+- Local and MCP adapters raise `SupersetAdapterNotImplementedError` for
+  publication methods; publication remains REST-only to preserve Superset
+  route-level authorization.
+- The agent still does not have an explicit project `publish` route or a
+  validated Wren-MDL-to-Superset semantic-layer configuration mapper.
+
+Implementation steps:
+
+1. `[COMPLETE]` Extend `SupersetClient` with semantic-layer methods:
+
+   ```python
+   def list_semantic_layers(self) -> list[dict[str, Any]]: ...
+   def create_semantic_layer(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+   def update_semantic_layer(self, uuid: str, payload: dict[str, Any]) -> dict[str, Any]: ...
+   def delete_semantic_layer(self, uuid: str) -> None: ...
+   def create_semantic_views(self, views: list[dict[str, Any]]) -> dict[str, Any]: ...
+   ```
+
+2. `[COMPLETE]` Implement only in
+   `superset_ai_agent/integrations/superset/rest.py` first.
+3. `[COMPLETE]` Call Superset REST with the current user's session when the
+   adapter is configured for `user_session`.
+4. `[TODO]` Add explicit publication route under project admin permission:
+
+   ```text
+   POST /agent/semantic-layer/projects/{project_id}/publish
+   ```
+
+5. `[TODO]` Store returned Superset UUIDs on `SemanticLayerVersion`.
+6. `[TODO]` Define and test the Wren MDL publication mapper. Do not infer a
+   lossy mapper without product review of Superset semantic-layer type,
+   configuration schema, runtime data, and semantic-view payload shape.
+
+Tests:
+
+```text
+tests/unit_tests/superset_ai_agent/test_superset_client.py
+tests/unit_tests/superset_ai_agent/test_semantic_layer_api.py
+tests/integration_tests/semantic_layers/api_tests.py
+```
+
+Acceptance criteria:
+
+- `[PARTIAL]` publication primitives use Superset REST/commands, not direct DB
+  mutation;
+- `[TODO]` publication is exposed as an explicit user action;
+- `[TODO]` Superset REST permission failures propagate through the project
+  publish route to the agent UI;
+- `[TODO]` agent semantic project remains useful even when publication fails.
+
+### R10. One-Shot And Conversation Semantic Parity
+
+Status: `[COMPLETE]`
+
+Confirmed source state:
+
+- Both graphs have Wren hooks.
+- Both graphs use
+  `superset_ai_agent/semantic_layer/runtime.py::merge_indexed_semantic_context`
+  to merge the latest indexed semantic-layer version into the runtime Wren
+  artifact.
+- `TextToSqlGraph` receives `semantic_layer_store` from `app.py` and now
+  matches `ConversationGraph` behavior for indexed document context.
+
+Implementation steps:
+
+1. `[COMPLETE]` Share a helper used by both graphs:
+
+   ```text
+   superset_ai_agent/semantic_layer/runtime.py
+   ```
+
+2. `[COMPLETE]` Runtime helper:
+   - require or validate schema scope;
+   - preserves schema-scoped Wren artifacts from R4;
+   - merges latest indexed document context from `SemanticLayerStore`;
+   - returns the same `WrenContextArtifact` shape.
+
+3. `[COMPLETE]` Use this helper in:
+   - `TextToSqlGraph._load_wren_context`;
+   - `ConversationGraph._load_wren_context`.
+
+Tests:
+
+```text
+tests/unit_tests/superset_ai_agent/test_graph.py
+tests/unit_tests/superset_ai_agent/test_conversation_graph.py
+tests/unit_tests/superset_ai_agent/test_semantic_layer_runtime.py
+```
+
+Acceptance criteria:
+
+- `[COMPLETE]` one-shot and conversation requests resolve the same semantic
+  project for the same database/catalog/schema/user;
+- `[COMPLETE]` both flows refuse or warn on missing schema consistently;
+- `[COMPLETE]` both flows include the same Wren artifact shape, including
+  indexed document context.
+
+## 23. Final Follow-Up Milestone Order
+
+| Order | Milestone | Status | Primary output |
+| --- | --- | --- | --- |
+| 1 | R1 migrations | [COMPLETE] | Alembic-managed agent DB. |
+| 2 | R2 access service | [COMPLETE] | Single audited semantic authorization boundary. |
+| 3 | R3 Superset DB/schema proof | [COMPLETE] | User/session-proven URI fingerprint and schema access. |
+| 4 | R4 schema retrieval | [COMPLETE] | Bounded top-k context for large schemas. |
+| 5 | R5 SQL Lab tab UI | [PARTIAL] | First-class semantic editor tab replacing drawer as target UX. |
+| 6 | R7 audit source marker | [COMPLETE] | Traceable AI-origin SQL Lab queries. |
+| 7 | R6 Wren document adapter | [COMPLETE] | Real Wren proposal flow, still no execution. |
+| 8 | R8 object storage | [COMPLETE] | Multi-replica-safe document bytes. |
+| 9 | R10 graph parity | [COMPLETE] | Same semantic runtime in one-shot and conversation flows. |
+| 10 | R9 Superset publication bridge | [PARTIAL] | REST bridge primitives exist; explicit publish route and mapper remain. |
+
+## 24. Remaining Risk Register
+
+| Risk | Status | Close-out condition |
 | --- | --- | --- |
-| F1. Alembic migrations and semantic project tables | Replace `create_all`, add project/grant/proof tables. | `superset_ai_agent/persistence/database.py`, `models.py`, migrations |
-| F2. URI fingerprint and schema access resolver | Implement DB URI matching, schema project discovery, selected-schema resolution, Superset DB proof, and partial dataset filtering. | `superset_ai_agent/semantic_layer/access.py`, `uri_fingerprint.py`, `graph.py`, `conversation_graph.py` |
-| F3. Agent schema project CRUD | Add project routes and store methods for schema-scoped projects. | `superset_ai_agent/app.py`, `semantic_layer/projects.py`, `semantic_layer/sqlalchemy_store.py` |
-| F4. SQL Lab AI audit marker | Use `client_id`, `sql_editor_id`, and `tab`; extend `AuditInfo`. | `integrations/superset/rest.py`, `schemas.py`, graph execution source plumbing |
-| F5. MDL file persistence and API | Add CRUD, upload, validation, soft delete, checksum, project-id backfill, and active-YAML-only status handling for schema-project MDL files. | `semantic_layer/mdl_files.py`, `semantic_layer/mdl_validation.py`, `app.py`, migrations |
-| F6. SQL Lab semantic editor tab | Add schema browser entrypoint, mixed SQL Lab tab model, MDL browser, YAML editor, and upload dialog. | `TableExploreTree/TreeNodeRenderer.tsx`, `TabbedSqlEditors/index.tsx`, `SqlLab/types.ts`, `SemanticLayerEditor/*` |
-| F7. Markdown enrichment review | Convert Markdown uploads to proposed MDL through Wren onboarding and require explicit user review before activation. | `SemanticLayerEditor/MdlEnrichmentReview.tsx`, `integrations/wren/client.py`, `semantic_layer/documents.py` |
-| F8. Wren HTTP adapter and materializer | Add no-execution HTTP adapter and schema-project directory materialization. | `integrations/wren/http_client.py`, `integrations/wren/project_materializer.py`, `factory.py` |
-| F9. Superset semantic CRUD bridge | Call Superset REST semantic-layer/view APIs through user session for explicit publication. | `integrations/superset/rest.py`, semantic project publish/sync code |
-| F10. Object storage for documents | Add S3/GCS-style storage and app-level storage factory. | `semantic_layer/file_storage.py`, `object_storage.py`, `app.py` |
-| F11. One-shot semantic context parity | Merge the authorized selected schema project into `/agent/query`. | `graph.py`, `app.py`, tests |
-| F12. Docs and adapter warnings | Document REST/MCP/local differences, schema-scoped semantic layers, MDL editor flow, and URI-derived access model. | `README.md`, `ARCHITECTURE.md`, `integrations/superset/README.md` |
+| Agent DB has no versioned migration lifecycle | [COMPLETE] | Alembic migration lifecycle merged; tests prove migrations create all agent tables and startup does not call production `create_all`. |
+| Semantic-layer sharing could leak metadata | [COMPLETE] baseline, [PARTIAL] route context | Every route uses `SemanticAccessService`; project-ID-only routes still rely on the project's stored default Superset DB ID unless the UI first resolves by the user's current DB/schema. |
+| URI matching could be spoofed | [COMPLETE] baseline | Superset-side fingerprinting is available through `AiAgentRestApi.database_identity`; raw URI fallback remains configurable and should be disabled with `AI_AGENT_SEMANTIC_ACCESS_MODE=superset_only` in hardened deployments. |
+| Users expect CRUD on semantic layers they can access | [COMPLETE] baseline, [PARTIAL] policy | Existing project/MDL CRUD remains; R2 tightens read/write/admin policy; R5 moves CRUD to target tab UI. |
+| SQL Lab audit lacks AI source marker | [COMPLETE] | `SqlExecutionSource` is threaded through graph execution and REST SQL Lab payload fields. |
+| SQL Lab tab state could break existing query behavior | [TODO] | R5 mixed tab model has reducer migration and tests for legacy SQL tabs. |
+| MDL editor could inherit SQL run hotkeys | [PARTIAL] | R5 target implementation must use a dedicated YAML `MdlEditor` and tests proving no run-query dispatch occurs. |
+| Existing scope-based semantic records could be orphaned | [PARTIAL] | R2/R10 keep compatibility routes and graph merge behavior; a dedicated migration/backfill for old records remains optional deployment work. |
+| Catalog-aware databases could collide on schema names | [COMPLETE] baseline, [PARTIAL] tests | Existing schemas carry `catalog_name`; R2/R3 add access proofs and tests around catalog-qualified project keys. |
+| Wren project directory can drift from DB state | [COMPLETE] baseline | Existing materializer writes active files; R4/R10 add selected-project runtime checks and trace metadata. |
+| Markdown source documents could be materialized as MDL | [COMPLETE] baseline | Existing materialization reads MDL files, not source documents; keep regression tests in R6/R10. |
+| Markdown enrichment could produce incorrect MDL | [PARTIAL] | R6 makes Wren proposals review-only, visible, validated, and explicitly activated. |
+| Unsupported uploads could create unclear user expectations | [PARTIAL] | R5 upload dialog accepts only YAML MDL and Markdown for enrichment in the target UI. |
+| Large schemas can overwhelm Wren context | [COMPLETE] baseline | R4 top-k retrieval and schema scope requirement merged; deeper Wren-native ranking quality depends on the deployed Wren API. |
+| Object storage is missing | [COMPLETE] | R8 adds local and S3 document storage and verifies raw bytes stay outside DB. |
+| One-shot and conversation behavior differ | [COMPLETE] | Both graphs share schema-scoped Wren materialization/retrieval and indexed semantic-layer context merge behavior. |
+| Superset semantic-layer core access is not DB-derived | [PARTIAL] | R9 REST bridge primitives are implemented; explicit project publication and any Superset core DB-derived semantic access remain separate design work. |
 
-## 23. Revised Risk Register
-
-| Risk | Close-out condition |
-| --- | --- |
-| Agent DB has no versioned migration lifecycle | F1 merged with Alembic tests. |
-| Semantic-layer sharing could leak metadata | F2 proves access via Superset DB/schema, filtered dataset context, or validated URI fingerprint; raw URI never stored. |
-| URI matching could be spoofed | URI proof requires successful connection validation, salted fingerprinting, schema discovery, and proof TTL. |
-| Users may expect CRUD on semantic layers they can access | F3/F5/F9 implement project CRUD, MDL file CRUD, and optional Superset REST sync. |
-| SQL Lab audit lacks AI source marker | F4 uses accepted SQL Lab fields and exposes them in `AuditInfo`. |
-| SQL Lab tab state could break existing query-editor behavior | F6 normalizes legacy `tabHistory`, keeps query tabs as `QueryEditor`, and adds tests for SQL tab open/close/run behavior. |
-| MDL editor could inherit SQL run hotkeys | F6 uses a dedicated `MdlEditor` around `EditorHost`, not `EditorWrapper`, and tests that semantic tabs do not dispatch query run actions. |
-| Existing scope-based semantic records could be orphaned | F5 adds nullable `project_id`, compatibility route resolution, and lazy backfill tests for documents, versions, and events. |
-| Catalog-aware databases could collide on schema names | F2/F5 include `catalog_name` in semantic project resolution, uniqueness, materialization paths, and audit metadata where available. |
-| Wren project directory can drift from DB state | F8 materializes active MDL files atomically with a checksum manifest and tests path sanitization. |
-| Markdown source documents could be materialized as MDL | F5/F8 enforce that only validated YAML MDL files with `status="active"` are materialized. |
-| Markdown enrichment could produce incorrect MDL | F7 requires review before activation and records validation warnings next to the proposal. |
-| Unsupported uploads could create unclear user expectations | F5/F6 accept only YAML MDL and Markdown for enrichment, with explicit rejection for other file types. |
-| Large schemas can overwhelm Wren context | F2/F8 require one selected schema project plus top-k retrieval inside that schema. |
-| Object storage is missing | F10 makes raw document storage production-capable. |
-| One-shot and conversation behavior differ | F11 gives both flows the same semantic access resolver. |
-| Superset semantic-layer core access is not DB-derived | F9 works via agent project ACL first; Superset core changes are proposed separately. |
-
-## 24. Avoid For Now
+## 25. Avoid For Now
 
 - Wren direct execution.
 - Letting Wren validate or override Superset SQL authorization.

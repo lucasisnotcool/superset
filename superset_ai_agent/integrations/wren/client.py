@@ -22,9 +22,18 @@ import json
 from pathlib import Path
 from typing import Any, Protocol
 
+import yaml
+
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.integrations.superset.client import AgentContext
 from superset_ai_agent.schemas import WrenContextArtifact
+from superset_ai_agent.semantic_layer.mdl_validation import validate_mdl_yaml
+from superset_ai_agent.semantic_layer.schemas import (
+    MdlEnrichmentProposal,
+    SemanticDocument,
+    SemanticProject,
+    SemanticUpdate,
+)
 
 
 class WrenClient(Protocol):
@@ -62,6 +71,25 @@ class WrenClient(Protocol):
         mdl_path: str | None = None,
     ) -> dict[str, Any]:
         """Return planning metadata without executing SQL."""
+
+    def preview_document_updates(
+        self,
+        *,
+        project: SemanticProject,
+        document: SemanticDocument,
+    ) -> list[SemanticUpdate]:
+        """Return reviewable semantic updates without activating MDL."""
+
+    def propose_mdl_from_document(
+        self,
+        *,
+        project: SemanticProject,
+        document: SemanticDocument,
+    ) -> MdlEnrichmentProposal:
+        """Return reviewable MDL YAML without activating it."""
+
+    def validate_mdl_project(self, *, mdl_path: str) -> dict[str, Any]:
+        """Validate a materialized MDL project without executing queries."""
 
 
 class DisabledWrenClient:
@@ -104,6 +132,30 @@ class DisabledWrenClient:
     ) -> dict[str, Any]:
         return {
             "enabled": False,
+            "planning_only": True,
+            "warnings": ["Wren integration is disabled."],
+        }
+
+    def preview_document_updates(
+        self,
+        *,
+        project: SemanticProject,
+        document: SemanticDocument,
+    ) -> list[SemanticUpdate]:
+        return []
+
+    def propose_mdl_from_document(
+        self,
+        *,
+        project: SemanticProject,
+        document: SemanticDocument,
+    ) -> MdlEnrichmentProposal:
+        return deterministic_mdl_proposal(project=project, document=document)
+
+    def validate_mdl_project(self, *, mdl_path: str) -> dict[str, Any]:
+        return {
+            "enabled": False,
+            "available": False,
             "planning_only": True,
             "warnings": ["Wren integration is disabled."],
         }
@@ -225,6 +277,31 @@ class FileWrenClient:
             "sql_hash": _hash_text(sql or ""),
         }
 
+    def preview_document_updates(
+        self,
+        *,
+        project: SemanticProject,
+        document: SemanticDocument,
+    ) -> list[SemanticUpdate]:
+        return []
+
+    def propose_mdl_from_document(
+        self,
+        *,
+        project: SemanticProject,
+        document: SemanticDocument,
+    ) -> MdlEnrichmentProposal:
+        return deterministic_mdl_proposal(project=project, document=document)
+
+    def validate_mdl_project(self, *, mdl_path: str) -> dict[str, Any]:
+        path = Path(mdl_path)
+        return {
+            "enabled": True,
+            "available": path.exists(),
+            "planning_only": True,
+            "path": str(path),
+        }
+
     def _matched_models(
         self,
         *,
@@ -314,3 +391,52 @@ def _hash_text(text: str) -> str:
 
 def _example_id(example: dict[str, Any]) -> str:
     return _hash_text(json.dumps(example, sort_keys=True, default=str))[:12]
+
+
+def deterministic_mdl_proposal(
+    *,
+    project: SemanticProject,
+    document: SemanticDocument,
+) -> MdlEnrichmentProposal:
+    """Create a local review draft when Wren onboarding is unavailable."""
+
+    text = document.extracted_text or document.extracted_text_preview or ""
+    description = document.summary or text.strip()[:500] or document.filename
+    model_name = _safe_mdl_name(project.schema_name)
+    payload = {
+        "models": [
+            {
+                "name": model_name,
+                "description": description,
+                "properties": {
+                    "database_label": project.database_label,
+                    "catalog_name": project.catalog_name,
+                    "schema_name": project.schema_name,
+                    "source_document_id": document.id,
+                    "source_document": document.filename,
+                },
+            }
+        ]
+    }
+    proposed_yaml = yaml.safe_dump(
+        payload,
+        sort_keys=False,
+        allow_unicode=False,
+    )
+    return MdlEnrichmentProposal(
+        source_document_id=document.id,
+        proposed_path=f"{model_name}/{_safe_mdl_name(document.filename)}.yaml",
+        proposed_yaml=proposed_yaml,
+        validation=validate_mdl_yaml(proposed_yaml),
+        warnings=[
+            "Generated MDL is a review draft. Confirm model names, columns, "
+            "metrics, and relationships before activation."
+        ],
+    )
+
+
+def _safe_mdl_name(value: str) -> str:
+    lowered = value.lower()
+    chars = [char if char.isalnum() else "_" for char in lowered]
+    name = "_".join("".join(chars).split("_"))
+    return name or "semantic_model"

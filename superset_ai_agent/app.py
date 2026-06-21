@@ -20,8 +20,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -53,6 +51,7 @@ from superset_ai_agent.conversations.store import (
 from superset_ai_agent.graph import TextToSqlGraph
 from superset_ai_agent.integrations.superset.client import SupersetAuthError
 from superset_ai_agent.integrations.superset.factory import create_superset_client
+from superset_ai_agent.integrations.wren.client import WrenClient
 from superset_ai_agent.integrations.wren.factory import create_wren_client
 from superset_ai_agent.llm.factory import create_model_client
 from superset_ai_agent.persistence.database import (
@@ -70,6 +69,10 @@ from superset_ai_agent.schemas import (
     ValidateSqlRequest,
 )
 from superset_ai_agent.semantic_layer.documents import create_document
+from superset_ai_agent.semantic_layer.access import (
+    SemanticAccessService,
+    SemanticPermission,
+)
 from superset_ai_agent.semantic_layer.events import to_sse
 from superset_ai_agent.semantic_layer.extractors import (
     CompositeDocumentExtractor,
@@ -78,6 +81,7 @@ from superset_ai_agent.semantic_layer.extractors import (
 from superset_ai_agent.semantic_layer.file_storage import (
     DocumentStorage,
     LocalDocumentStorage,
+    S3DocumentStorage,
 )
 from superset_ai_agent.semantic_layer.indexer import rebuild_index
 from superset_ai_agent.semantic_layer.memory import InMemorySemanticLayerStore
@@ -176,7 +180,7 @@ def create_app(  # noqa: C901
         app_config,
         session_factory=session_factory,
     )
-    active_document_storage = document_storage
+    active_document_storage = document_storage or _create_document_storage(app_config)
     active_document_extractor = document_extractor or CompositeDocumentExtractor()
 
     app_superset_client = (
@@ -189,7 +193,7 @@ def create_app(  # noqa: C901
     )
     active_wren_client = wren_client or create_wren_client(app_config)
     app_context_provider = context_provider or (
-        SupersetMetadataContextProvider(app_superset_client)
+        SupersetMetadataContextProvider(app_superset_client, config=app_config)
         if app_superset_client is not None
         else None
     )
@@ -203,6 +207,7 @@ def create_app(  # noqa: C901
             context_provider=app_context_provider,
             superset_client=app_superset_client,
             wren_client=active_wren_client,
+            semantic_layer_store=active_semantic_layer_store,
             semantic_project_store=active_semantic_project_store,
             mdl_file_store=active_mdl_file_store,
         )
@@ -249,7 +254,8 @@ def create_app(  # noqa: C901
             request_auth=request_auth,
         )
         request_context_provider = context_provider or SupersetMetadataContextProvider(
-            request_superset_client
+            request_superset_client,
+            config=app_config,
         )
         return request_context_provider, request_superset_client
 
@@ -267,6 +273,7 @@ def create_app(  # noqa: C901
             context_provider=request_context_provider,
             superset_client=request_superset_client,
             wren_client=active_wren_client,
+            semantic_layer_store=active_semantic_layer_store,
             semantic_project_store=active_semantic_project_store,
             mdl_file_store=active_mdl_file_store,
         )
@@ -291,13 +298,12 @@ def create_app(  # noqa: C901
             mdl_file_store=active_mdl_file_store,
         )
 
-    def authorize_semantic_scope(
+    def build_semantic_access_service(
         request: Request,
-        scope: ConversationScope,
-    ) -> None:
-        try:
+    ) -> SemanticAccessService:
+        def load_context(scope: ConversationScope) -> Any:
             request_context_provider, _ = build_superset_runtime(request)
-            request_context_provider.get_context(
+            return request_context_provider.get_context(
                 AgentQueryRequest(
                     question="semantic layer scope authorization",
                     database_id=scope.database_id,
@@ -305,6 +311,40 @@ def create_app(  # noqa: C901
                     schema_name=scope.schema_name,
                     dataset_ids=scope.dataset_ids,
                 )
+            )
+
+        def get_database_identity(
+            database_id: int,
+            catalog_name: str | None,
+        ) -> Any:
+            _, request_superset_client = build_superset_runtime(request)
+            return request_superset_client.get_database_identity(
+                database_id=database_id,
+                catalog_name=catalog_name,
+            )
+
+        return SemanticAccessService(
+            project_store=active_semantic_project_store,
+            load_context=load_context,
+            get_database_identity=get_database_identity,
+            semantic_access_mode=app_config.semantic_access_mode,
+            semantic_full_access_grants_write=(
+                app_config.semantic_full_access_grants_write
+            ),
+        )
+
+    def authorize_semantic_scope(
+        request: Request,
+        scope: ConversationScope,
+        *,
+        identity: AgentIdentity,
+        permission: SemanticPermission = SemanticPermission.READ,
+    ) -> None:
+        try:
+            build_semantic_access_service(request).require_scope_permission(
+                identity=identity,
+                scope=scope,
+                permission=permission,
             )
         except SupersetAuthError as ex:
             raise HTTPException(status_code=ex.status_code, detail=str(ex)) from ex
@@ -317,23 +357,25 @@ def create_app(  # noqa: C901
         permission: str = "read",
     ) -> SemanticProject:
         try:
-            project = active_semantic_project_store.get(
-                project_id,
-                owner_id=owner_id,
+            return build_semantic_access_service(
+                request
+            ).require_project_permission(
+                identity=AgentIdentity(owner_id=owner_id),
+                project_id=project_id,
+                permission=SemanticPermission(permission),
             )
         except SemanticProjectNotFoundError as ex:
             raise HTTPException(
                 status_code=404,
                 detail="Semantic project not found.",
             ) from ex
-        if project.default_database_id is not None:
-            authorize_semantic_scope(request, _scope_from_project(project))
-        if not _has_project_permission(project, permission):
+        except SupersetAuthError as ex:
+            raise HTTPException(status_code=ex.status_code, detail=str(ex)) from ex
+        except PermissionError as ex:
             raise HTTPException(
                 status_code=403,
                 detail="Insufficient semantic project permission.",
-            )
-        return project
+            ) from ex
 
     @api.get("/health", response_model=HealthResponse)
     def health() -> HealthResponse:
@@ -509,7 +551,12 @@ def create_app(  # noqa: C901
         except ValidationError as ex:
             raise HTTPException(status_code=422, detail=str(ex)) from ex
         try:
-            authorize_semantic_scope(fastapi_request, parsed_scope)
+            authorize_semantic_scope(
+                fastapi_request,
+                parsed_scope,
+                identity=identity,
+                permission=SemanticPermission.WRITE,
+            )
             content = await file.read()
             document = create_document(
                 filename=file.filename or "document",
@@ -519,8 +566,7 @@ def create_app(  # noqa: C901
                 owner_id=identity.owner_id,
                 config=app_config,
                 store=active_semantic_layer_store,
-                storage=active_document_storage
-                or LocalDocumentStorage(app_config.agent_storage_dir),
+                storage=active_document_storage,
                 extractor=active_document_extractor,
             )
         except ValueError as ex:
@@ -578,21 +624,16 @@ def create_app(  # noqa: C901
 
         if not request.schema_name:
             raise HTTPException(status_code=400, detail="schema_name is required.")
-        authorize_semantic_scope(
-            fastapi_request,
-            ConversationScope(
-                database_id=request.database_id,
-                catalog_name=request.catalog_name,
-                schema_name=request.schema_name,
-            ),
-        )
         try:
-            return active_semantic_project_store.resolve(
-                request,
-                owner_id=identity.owner_id,
+            return build_semantic_access_service(fastapi_request).resolve_project(
+                identity=identity,
+                request=request,
+                permission=SemanticPermission.READ,
             )
         except ValueError as ex:
             raise HTTPException(status_code=400, detail=str(ex)) from ex
+        except SupersetAuthError as ex:
+            raise HTTPException(status_code=ex.status_code, detail=str(ex)) from ex
 
     @api.get(
         "/agent/semantic-layer/projects",
@@ -607,20 +648,18 @@ def create_app(  # noqa: C901
     ) -> list[SemanticProject]:
         """List semantic projects visible in a governed database scope."""
 
-        authorize_semantic_scope(
-            fastapi_request,
-            ConversationScope(
-                database_id=database_id,
-                catalog_name=catalog_name,
-                schema_name=schema_name,
-            ),
-        )
-        return active_semantic_project_store.list(
-            owner_id=identity.owner_id,
+        scope = ConversationScope(
             database_id=database_id,
             catalog_name=catalog_name,
             schema_name=schema_name,
         )
+        try:
+            return build_semantic_access_service(fastapi_request).list_projects(
+                identity=identity,
+                scope=scope,
+            )
+        except SupersetAuthError as ex:
+            raise HTTPException(status_code=ex.status_code, detail=str(ex)) from ex
 
     @api.get(
         "/agent/semantic-layer/projects/{project_id}",
@@ -922,8 +961,7 @@ def create_app(  # noqa: C901
                 owner_id=identity.owner_id,
                 config=app_config,
                 store=active_semantic_layer_store,
-                storage=active_document_storage
-                or LocalDocumentStorage(app_config.agent_storage_dir),
+                storage=active_document_storage,
                 extractor=active_document_extractor,
             )
         except ValueError as ex:
@@ -972,7 +1010,11 @@ def create_app(  # noqa: C901
             ) from ex
         if document.project_id != project_id:
             raise HTTPException(status_code=404, detail="Semantic document not found.")
-        return _enrichment_proposal(project=project, document=document)
+        return _enrichment_proposal(
+            project=project,
+            document=document,
+            wren_client=active_wren_client,
+        )
 
     @api.get(
         "/agent/semantic-layer/projects/{project_id}/state",
@@ -1011,7 +1053,12 @@ def create_app(  # noqa: C901
         """List semantic-layer documents for a governed Superset scope."""
 
         scope = _scope_from_query(database_id, catalog_name, schema_name, dataset_ids)
-        authorize_semantic_scope(fastapi_request, scope)
+        authorize_semantic_scope(
+            fastapi_request,
+            scope,
+            identity=identity,
+            permission=SemanticPermission.READ,
+        )
         return active_semantic_layer_store.list_documents(
             scope,
             owner_id=identity.owner_id,
@@ -1038,7 +1085,12 @@ def create_app(  # noqa: C901
                 status_code=404,
                 detail="Semantic document not found.",
             ) from ex
-        authorize_semantic_scope(fastapi_request, document.scope)
+        authorize_semantic_scope(
+            fastapi_request,
+            document.scope,
+            identity=identity,
+            permission=SemanticPermission.READ,
+        )
         return document
 
     @api.patch(
@@ -1058,7 +1110,12 @@ def create_app(  # noqa: C901
                 document_id,
                 owner_id=identity.owner_id,
             )
-            authorize_semantic_scope(fastapi_request, document.scope)
+            authorize_semantic_scope(
+                fastapi_request,
+                document.scope,
+                identity=identity,
+                permission=SemanticPermission.WRITE,
+            )
             reviewed_document = apply_review(
                 active_semantic_layer_store,
                 document_id=document_id,
@@ -1092,7 +1149,12 @@ def create_app(  # noqa: C901
     ) -> SemanticLayerVersion:
         """Rebuild the reviewed semantic overlay for a governed scope."""
 
-        authorize_semantic_scope(fastapi_request, request.scope)
+        authorize_semantic_scope(
+            fastapi_request,
+            request.scope,
+            identity=identity,
+            permission=SemanticPermission.WRITE,
+        )
         _append_semantic_event(
             store=active_semantic_layer_store,
             owner_id=identity.owner_id,
@@ -1142,7 +1204,12 @@ def create_app(  # noqa: C901
         """Return semantic-layer state for a governed Superset scope."""
 
         scope = _scope_from_query(database_id, catalog_name, schema_name, dataset_ids)
-        authorize_semantic_scope(fastapi_request, scope)
+        authorize_semantic_scope(
+            fastapi_request,
+            scope,
+            identity=identity,
+            permission=SemanticPermission.READ,
+        )
         return active_semantic_layer_store.get_state(
             scope,
             owner_id=identity.owner_id,
@@ -1160,7 +1227,12 @@ def create_app(  # noqa: C901
         """Stream stored semantic-layer events as server-sent events."""
 
         scope = _scope_from_query(database_id, catalog_name, schema_name, dataset_ids)
-        authorize_semantic_scope(fastapi_request, scope)
+        authorize_semantic_scope(
+            fastapi_request,
+            scope,
+            identity=identity,
+            permission=SemanticPermission.READ,
+        )
         events = active_semantic_layer_store.list_events(
             scope,
             owner_id=identity.owner_id,
@@ -1274,6 +1346,22 @@ def _create_mdl_file_store(
     )
 
 
+def _create_document_storage(config: AgentConfig) -> DocumentStorage:
+    if config.document_storage == "local":
+        return LocalDocumentStorage(config.agent_storage_dir)
+    if config.document_storage == "s3":
+        return S3DocumentStorage(
+            bucket=config.document_s3_bucket or "",
+            prefix=config.document_s3_prefix,
+            endpoint_url=config.document_s3_endpoint_url,
+            region_name=config.document_s3_region_name,
+        )
+    raise ValueError(
+        "Unsupported AI_AGENT_DOCUMENT_STORAGE value "
+        f"{config.document_storage!r}. Expected one of: local, s3."
+    )
+
+
 def _scope_from_query(
     database_id: int,
     catalog_name: str | None,
@@ -1301,58 +1389,16 @@ def _scope_from_project(project: SemanticProject) -> ConversationScope:
     )
 
 
-def _has_project_permission(project: SemanticProject, permission: str) -> bool:
-    ranks = {"read": 1, "write": 2, "admin": 3}
-    return ranks.get(project.permission, 0) >= ranks[permission]
-
-
 def _enrichment_proposal(
     *,
     project: SemanticProject,
     document: SemanticDocument,
+    wren_client: WrenClient,
 ) -> MdlEnrichmentProposal:
-    text = document.extracted_text or document.extracted_text_preview or ""
-    description = document.summary or text.strip()[:500] or document.filename
-    model_name = _safe_mdl_name(project.schema_name)
-    payload = {
-        "models": [
-            {
-                "name": model_name,
-                "description": description,
-                "properties": {
-                    "database_label": project.database_label,
-                    "catalog_name": project.catalog_name,
-                    "schema_name": project.schema_name,
-                    "source_document_id": document.id,
-                    "source_document": document.filename,
-                },
-            }
-        ]
-    }
-    proposed_yaml = yaml.safe_dump(
-        payload,
-        sort_keys=False,
-        allow_unicode=False,
+    return wren_client.propose_mdl_from_document(
+        project=project,
+        document=document,
     )
-    proposed_path = f"{model_name}/{_safe_mdl_name(document.filename)}.yaml"
-    validation = validate_mdl_yaml(proposed_yaml)
-    return MdlEnrichmentProposal(
-        source_document_id=document.id,
-        proposed_path=proposed_path,
-        proposed_yaml=proposed_yaml,
-        validation=validation,
-        warnings=[
-            "Generated MDL is a review draft. Confirm model names, columns, metrics, "
-            "and relationships before activation."
-        ],
-    )
-
-
-def _safe_mdl_name(value: str) -> str:
-    lowered = value.lower()
-    chars = [char if char.isalnum() else "_" for char in lowered]
-    name = "_".join("".join(chars).split("_"))
-    return name or "semantic_model"
 
 
 def _wren_materialization_base(config: AgentConfig) -> Path:

@@ -126,6 +126,7 @@ class ConversationTurnRequest(BaseModel):
     execution_mode: ExecutionMode = "manual"
     execute: bool | None = None
     approved_sql: str | None = Field(default=None, min_length=1)
+    approved_artifact_id: str | None = None
     model: str | None = None
     max_steps: int = Field(default=8, ge=2, le=16)
 

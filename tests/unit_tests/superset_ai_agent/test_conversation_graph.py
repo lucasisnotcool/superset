@@ -39,7 +39,12 @@ from superset_ai_agent.integrations.superset.client import (
     MetricSummary,
 )
 from superset_ai_agent.llm.base import ChatMessage, ModelResult
-from superset_ai_agent.schemas import AgentQueryRequest, ExecutionResult, ModelInfo
+from superset_ai_agent.schemas import (
+    AgentQueryRequest,
+    ExecutionResult,
+    ModelInfo,
+    SqlExecutionSource,
+)
 
 
 class FakeModelClient:
@@ -98,6 +103,7 @@ class FakeSupersetClient:
         results: list[ExecutionResult | Exception] | None = None,
     ) -> None:
         self.executed_sql: list[str] = []
+        self.execution_sources: list[SqlExecutionSource | None] = []
         self.results = results or []
 
     def list_databases(self) -> list[DatabaseSummary]:
@@ -147,8 +153,10 @@ class FakeSupersetClient:
         catalog_name: str | None = None,
         schema_name: str | None = None,
         limit: int = 1000,
+        source: SqlExecutionSource | None = None,
     ) -> ExecutionResult:
         self.executed_sql.append(sql)
+        self.execution_sources.append(source)
         if self.results:
             result = self.results[
                 min(len(self.executed_sql) - 1, len(self.results) - 1)
@@ -290,6 +298,9 @@ def test_conversation_graph_executes_valid_sql_when_requested() -> None:
     assert superset_client.executed_sql == [
         "SELECT name, SUM(num) AS total_births FROM birth_names GROUP BY name LIMIT 10"
     ]
+    assert superset_client.execution_sources
+    assert superset_client.execution_sources[0] is not None
+    assert superset_client.execution_sources[0].source == "ai_agent_conversation"
     assert [event.step for event in response.trace] == [
         "load_conversation",
         "load_context",
@@ -353,6 +364,10 @@ def test_conversation_graph_updates_approved_sql_artifact_in_manual_mode() -> No
     assert response.message.artifacts == []
     assert response.artifacts[0].id == artifact.id
     assert response.artifacts[0].execution_result is not None
+    assert superset_client.execution_sources
+    assert superset_client.execution_sources[0] is not None
+    assert superset_client.execution_sources[0].source == "ai_agent_manual"
+    assert superset_client.execution_sources[0].artifact_id == artifact.id
     assert [message.role for message in response.conversation.messages] == [
         "user",
         "assistant",

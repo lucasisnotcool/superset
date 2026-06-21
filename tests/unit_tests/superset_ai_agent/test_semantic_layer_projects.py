@@ -35,7 +35,7 @@ def test_database_uri_fingerprint_removes_credentials_and_default_port() -> None
         "postgresql://user:secret@Example.com:5432/warehouse?sslmode=require"
     )
     right = fingerprint_database_uri(
-        "postgresql://user:other@example.com/warehouse?sslmode=require"
+        "postgresql://analyst:other@example.com/warehouse?sslmode=require"
     )
 
     assert left == right
@@ -43,7 +43,7 @@ def test_database_uri_fingerprint_removes_credentials_and_default_port() -> None
         normalize_database_uri(
             "postgresql://user:secret@Example.com:5432/warehouse?password=secret"
         )
-        == "postgresql://user@example.com/warehouse"
+        == "postgresql://example.com/warehouse"
     )
 
 
@@ -69,7 +69,7 @@ def test_project_resolution_is_one_project_per_database_catalog_schema() -> None
 
     assert shared_project.id == owner_project.id
     assert shared_project.name == "Sales.prod.pipeline"
-    assert shared_project.permission == "write"
+    assert shared_project.permission == "read"
     assert store.get(owner_project.id, owner_id="owner").permission == "admin"
 
 

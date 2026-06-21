@@ -76,6 +76,20 @@ export interface AuditInfo {
   source?: string | null;
 }
 
+export interface WrenRetrievalArtifact {
+  project_id?: string | null;
+  database_id?: number | null;
+  catalog_name?: string | null;
+  schema_name?: string | null;
+  candidate_table_names: string[];
+  candidate_metric_names: string[];
+  candidate_example_ids: string[];
+  candidate_document_ids: string[];
+  scanned_table_count: number;
+  omitted_table_count: number;
+  context_truncated: boolean;
+}
+
 export interface WrenContextArtifact {
   enabled: boolean;
   available: boolean;
@@ -89,6 +103,7 @@ export interface WrenContextArtifact {
   semantic_layer_version?: string | null;
   indexing_status?: string | null;
   context_items: Record<string, unknown>[];
+  retrieval?: WrenRetrievalArtifact | null;
   dry_plan?: Record<string, unknown> | null;
   warnings: string[];
 }

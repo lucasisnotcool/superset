@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 import hashlib
-from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
 DEFAULT_PORTS = {
@@ -73,9 +73,7 @@ def normalize_database_uri(uri: str) -> str:
     scheme = split.scheme.lower()
     hostname = (split.hostname or "").lower()
     port = _normalized_port(scheme, split.port)
-    username = quote(unquote(split.username or ""), safe="")
-    auth = f"{username}@" if username else ""
-    netloc = f"{auth}{hostname}"
+    netloc = hostname
     if port is not None:
         netloc = f"{netloc}:{port}"
 

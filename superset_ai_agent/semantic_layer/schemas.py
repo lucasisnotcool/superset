@@ -202,6 +202,7 @@ class SemanticProjectResolveRequest(BaseModel):
     catalog_name: str | None = None
     schema_name: str
     supplied_uri: str | None = None
+    database_uri_fingerprint: str | None = None
     create_if_missing: bool = True
 
 

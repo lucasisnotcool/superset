@@ -20,6 +20,7 @@ from __future__ import annotations
 import json  # noqa: TID251 - tests cover the standalone agent JSON contract
 
 from superset_ai_agent.config import AgentConfig
+from superset_ai_agent.conversations.schemas import ConversationScope
 from superset_ai_agent.graph import TextToSqlGraph
 from superset_ai_agent.integrations.superset.client import (
     AgentContext,
@@ -32,15 +33,19 @@ from superset_ai_agent.llm.base import ChatMessage, ModelResult
 from superset_ai_agent.schemas import (
     AgentQueryRequest,
     ExecutionResult,
+    SqlExecutionSource,
     WrenContextArtifact,
 )
 from superset_ai_agent.semantic_layer.mdl_files import InMemoryMdlFileStore
+from superset_ai_agent.semantic_layer.memory import InMemorySemanticLayerStore
 from superset_ai_agent.semantic_layer.projects import InMemorySemanticProjectStore
 from superset_ai_agent.semantic_layer.schemas import (
     MdlFileCreateRequest,
     MdlFileUpdateRequest,
+    SemanticLayerVersion,
     SemanticProjectResolveRequest,
 )
+from superset_ai_agent.semantic_layer.store import scope_hash
 
 
 class FakeModelClient:
@@ -92,6 +97,9 @@ class FakeContextProvider:
 
 
 class FakeSupersetClient:
+    def __init__(self) -> None:
+        self.execution_sources: list[SqlExecutionSource | None] = []
+
     def get_database_dialect(self, database_id: int) -> str:
         return "sqlite"
 
@@ -103,7 +111,9 @@ class FakeSupersetClient:
         catalog_name: str | None = None,
         schema_name: str | None = None,
         limit: int = 1000,
+        source: SqlExecutionSource | None = None,
     ) -> ExecutionResult:
+        self.execution_sources.append(source)
         return ExecutionResult(
             columns=["name", "total_births"],
             rows=[{"name": "Michael", "total_births": 2467129}],
@@ -169,6 +179,7 @@ def test_graph_generates_valid_sql_without_execution() -> None:
         AgentQueryRequest(
             question="top names",
             database_id=1,
+            schema_name="main",
             dataset_ids=[16],
             execute=False,
         )
@@ -197,6 +208,7 @@ def test_graph_records_wren_context_and_dry_plan() -> None:
         AgentQueryRequest(
             question="top names",
             database_id=1,
+            schema_name="main",
             dataset_ids=[16],
             execute=False,
         )
@@ -218,6 +230,34 @@ def test_graph_records_wren_context_and_dry_plan() -> None:
         "dry_plan_with_wren",
         "validate_sql",
     ]
+
+
+def test_graph_skips_wren_context_without_schema() -> None:
+    wren_client = FakeWrenClient()
+    graph = TextToSqlGraph(
+        config=AgentConfig(wren_dry_plan_enabled=True),
+        model_client=FakeModelClient(
+            "SELECT name, SUM(num) AS total_births FROM birth_names GROUP BY name"
+        ),
+        context_provider=FakeContextProvider(),
+        superset_client=FakeSupersetClient(),
+        wren_client=wren_client,
+    )
+
+    response = graph.run(
+        AgentQueryRequest(
+            question="top names",
+            database_id=1,
+            dataset_ids=[16],
+            execute=False,
+        )
+    )
+
+    assert response.wren_context is not None
+    assert response.wren_context.available is False
+    assert response.wren_context.dry_plan is None
+    assert wren_client.mdl_paths == []
+    assert response.trace[1].summary == "Wren context requires a selected schema."
 
 
 def test_graph_materializes_schema_project_for_wren_context(tmp_path) -> None:
@@ -274,7 +314,58 @@ def test_graph_materializes_schema_project_for_wren_context(tmp_path) -> None:
     assert wren_client.mdl_paths == [response.wren_context.mdl_path]
 
 
+def test_graph_merges_indexed_semantic_context() -> None:
+    semantic_layer_store = InMemorySemanticLayerStore()
+    scope = ConversationScope(database_id=1, schema_name="main")
+    semantic_layer_store.save_version(
+        SemanticLayerVersion(
+            scope=scope,
+            scope_hash=scope_hash(scope),
+            version="v1",
+            status="idle",
+            wren_context=WrenContextArtifact(
+                enabled=True,
+                available=True,
+                document_ids=["doc-1"],
+                semantic_layer_version="v1",
+                indexing_status="indexed",
+                context_items=[{"kind": "document", "name": "terms"}],
+                warnings=["Indexed semantic context loaded."],
+            ),
+        ),
+        owner_id="analyst",
+    )
+    graph = TextToSqlGraph(
+        config=AgentConfig(),
+        model_client=FakeModelClient(
+            "SELECT name, SUM(num) AS total_births FROM birth_names GROUP BY name"
+        ),
+        context_provider=FakeContextProvider(),
+        superset_client=FakeSupersetClient(),
+        wren_client=FakeWrenClient(),
+        semantic_layer_store=semantic_layer_store,
+    )
+
+    response = graph.run(
+        AgentQueryRequest(
+            question="Show total births",
+            database_id=1,
+            schema_name="main",
+        ),
+        owner_id="analyst",
+    )
+
+    assert response.wren_context is not None
+    assert response.wren_context.semantic_layer_version == "v1"
+    assert response.wren_context.indexing_status == "indexed"
+    assert response.wren_context.document_ids == ["doc-1"]
+    assert response.wren_context.context_items == [
+        {"kind": "document", "name": "terms"}
+    ]
+
+
 def test_graph_executes_valid_sql_when_requested() -> None:
+    superset_client = FakeSupersetClient()
     graph = TextToSqlGraph(
         config=AgentConfig(),
         model_client=FakeModelClient(
@@ -282,7 +373,7 @@ def test_graph_executes_valid_sql_when_requested() -> None:
             "FROM birth_names GROUP BY name LIMIT 10"
         ),
         context_provider=FakeContextProvider(),
-        superset_client=FakeSupersetClient(),
+        superset_client=superset_client,
     )
 
     response = graph.run(
@@ -303,6 +394,9 @@ def test_graph_executes_valid_sql_when_requested() -> None:
     assert response.chart_spec.type == "bar"
     assert response.data_preview is not None
     assert response.recommended_followups
+    assert superset_client.execution_sources
+    assert superset_client.execution_sources[0] is not None
+    assert superset_client.execution_sources[0].source == "ai_agent"
     assert [event.step for event in response.trace] == [
         "load_context",
         "load_wren_context",

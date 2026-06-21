@@ -55,6 +55,7 @@ class SemanticProjectStore(Protocol):
         *,
         owner_id: str = DEFAULT_OWNER_ID,
         database_id: int | None = None,
+        database_uri_fingerprint: str | None = None,
         catalog_name: str | None = None,
         schema_name: str | None = None,
     ) -> list[SemanticProject]:
@@ -123,6 +124,7 @@ class InMemorySemanticProjectStore:
         *,
         owner_id: str = DEFAULT_OWNER_ID,
         database_id: int | None = None,
+        database_uri_fingerprint: str | None = None,
         catalog_name: str | None = None,
         schema_name: str | None = None,
     ) -> list[SemanticProject]:
@@ -133,6 +135,10 @@ class InMemorySemanticProjectStore:
             and project.deleted_at is None
             and project.status == "active"
             and (database_id is None or project.default_database_id == database_id)
+            and (
+                database_uri_fingerprint is None
+                or project.database_uri_fingerprint == database_uri_fingerprint
+            )
             and (
                 catalog_name is None
                 or _catalog_key(project.catalog_name) == _catalog_key(catalog_name)
@@ -235,6 +241,7 @@ class SqlAlchemySemanticProjectStore:
         *,
         owner_id: str = DEFAULT_OWNER_ID,
         database_id: int | None = None,
+        database_uri_fingerprint: str | None = None,
         catalog_name: str | None = None,
         schema_name: str | None = None,
     ) -> list[SemanticProject]:
@@ -250,6 +257,11 @@ class SqlAlchemySemanticProjectStore:
             if database_id is not None:
                 query = query.where(
                     AiAgentSemanticProject.default_database_id == database_id
+                )
+            if database_uri_fingerprint is not None:
+                query = query.where(
+                    AiAgentSemanticProject.database_uri_fingerprint
+                    == database_uri_fingerprint
                 )
             if catalog_name is not None:
                 query = query.where(
@@ -327,6 +339,8 @@ class SqlAlchemySemanticProjectStore:
 
 
 def _request_fingerprint(request: SemanticProjectResolveRequest) -> str:
+    if request.database_uri_fingerprint:
+        return request.database_uri_fingerprint
     if request.supplied_uri:
         return fingerprint_database_uri(request.supplied_uri)
     return fingerprint_database_identity(database_id=request.database_id)
@@ -406,7 +420,7 @@ def _with_permission(project: SemanticProject, owner_id: str) -> SemanticProject
     if project.owner_id == owner_id:
         return project.model_copy(update={"permission": "admin"}, deep=True)
     if project.visibility == "db_access":
-        return project.model_copy(update={"permission": "write"}, deep=True)
+        return project.model_copy(update={"permission": "read"}, deep=True)
     return project.model_copy(update={"permission": "read"}, deep=True)
 
 

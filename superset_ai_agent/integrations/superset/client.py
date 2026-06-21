@@ -22,16 +22,32 @@ import os
 from functools import cached_property
 from typing import Any, Protocol
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from superset_ai_agent.config import AgentConfig
-from superset_ai_agent.schemas import AuditInfo, ExecutionResult
+from superset_ai_agent.schemas import AuditInfo, ExecutionResult, SqlExecutionSource
+from superset_ai_agent.semantic_layer.uri_fingerprint import (
+    fingerprint_database_identity,
+    fingerprint_database_uri,
+)
 
 
 class DatabaseSummary(BaseModel):
     id: int
     name: str
     backend: str | None = None
+
+
+class DatabaseIdentity(BaseModel):
+    """Non-secret database identity used for semantic-layer matching."""
+
+    database_id: int
+    database_name: str
+    backend: str | None = None
+    driver: str | None = None
+    uri_fingerprint: str
+    catalog_name: str | None = None
+    schema_names: list[str] = Field(default_factory=list)
 
 
 class ColumnSummary(BaseModel):
@@ -87,6 +103,22 @@ class SupersetClient(Protocol):
     def list_databases(self) -> list[DatabaseSummary]:
         """List databases available to the current integration context."""
 
+    def get_database_identity(
+        self,
+        *,
+        database_id: int,
+        catalog_name: str | None = None,
+    ) -> DatabaseIdentity:
+        """Return non-secret database identity for semantic-layer matching."""
+
+    def list_database_schemas(
+        self,
+        *,
+        database_id: int,
+        catalog_name: str | None = None,
+    ) -> list[str]:
+        """List schemas visible to the current integration context."""
+
     def list_datasets(
         self,
         *,
@@ -116,11 +148,34 @@ class SupersetClient(Protocol):
         catalog_name: str | None = None,
         schema_name: str | None = None,
         limit: int = 1000,
+        source: SqlExecutionSource | None = None,
     ) -> ExecutionResult:
         """Execute validated SQL and return a capped result."""
 
     def get_database_dialect(self, database_id: int) -> str | None:
         """Return the SQL dialect/backend for validation and prompting."""
+
+    def list_semantic_layers(self) -> list[dict[str, Any]]:
+        """List Superset semantic layers through the governed adapter."""
+
+    def create_semantic_layer(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Create a Superset semantic layer through the governed adapter."""
+
+    def update_semantic_layer(
+        self,
+        uuid: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Update a Superset semantic layer through the governed adapter."""
+
+    def delete_semantic_layer(self, uuid: str) -> None:
+        """Delete a Superset semantic layer through the governed adapter."""
+
+    def create_semantic_views(
+        self,
+        views: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Create Superset semantic views through the governed adapter."""
 
 
 class LocalSupersetClient:
@@ -163,6 +218,52 @@ class LocalSupersetClient:
                 )
                 for database in databases
             ]
+
+    def get_database_identity(
+        self,
+        *,
+        database_id: int,
+        catalog_name: str | None = None,
+    ) -> DatabaseIdentity:
+        with self._app.app_context():
+            from superset import db
+            from superset.models.core import Database
+
+            database = db.session.query(Database).filter_by(id=database_id).one()
+            return DatabaseIdentity(
+                database_id=database.id,
+                database_name=database.database_name,
+                backend=getattr(database, "backend", None),
+                driver=getattr(database, "driver", None),
+                uri_fingerprint=fingerprint_database_uri(
+                    database.sqlalchemy_uri_decrypted
+                ),
+                catalog_name=catalog_name,
+                schema_names=self.list_database_schemas(
+                    database_id=database_id,
+                    catalog_name=catalog_name,
+                ),
+            )
+
+    def list_database_schemas(
+        self,
+        *,
+        database_id: int,
+        catalog_name: str | None = None,
+    ) -> list[str]:
+        with self._app.app_context():
+            from superset import db
+            from superset.models.core import Database
+
+            database = db.session.query(Database).filter_by(id=database_id).one()
+            return sorted(
+                database.get_all_schema_names(
+                    catalog=catalog_name,
+                    cache=database.schema_cache_enabled,
+                    cache_timeout=database.schema_cache_timeout or None,
+                    force=False,
+                )
+            )
 
     def list_datasets(
         self,
@@ -216,6 +317,7 @@ class LocalSupersetClient:
         catalog_name: str | None = None,
         schema_name: str | None = None,
         limit: int = 1000,
+        source: SqlExecutionSource | None = None,
     ) -> ExecutionResult:
         with self._app.app_context():
             from superset import db
@@ -236,7 +338,11 @@ class LocalSupersetClient:
                     catalog_name=catalog_name,
                     schema_name=schema_name,
                     row_limit=limit,
-                    source="local_superset_client",
+                    client_id=source.client_id if source else None,
+                    sql_editor_id=source.sql_editor_id if source else None,
+                    tab=source.tab if source else None,
+                    source_hash=source.request_id if source else None,
+                    source=source.source if source else "local_superset_client",
                 ),
             )
 
@@ -250,6 +356,38 @@ class LocalSupersetClient:
             if backend == "sqlite":
                 return "sqlite"
             return backend
+
+    def list_semantic_layers(self) -> list[dict[str, Any]]:
+        raise SupersetAdapterNotImplementedError(
+            "The local Superset adapter does not publish semantic layers."
+        )
+
+    def create_semantic_layer(self, payload: dict[str, Any]) -> dict[str, Any]:
+        raise SupersetAdapterNotImplementedError(
+            "The local Superset adapter does not publish semantic layers."
+        )
+
+    def update_semantic_layer(
+        self,
+        uuid: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        raise SupersetAdapterNotImplementedError(
+            "The local Superset adapter does not publish semantic layers."
+        )
+
+    def delete_semantic_layer(self, uuid: str) -> None:
+        raise SupersetAdapterNotImplementedError(
+            "The local Superset adapter does not publish semantic layers."
+        )
+
+    def create_semantic_views(
+        self,
+        views: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        raise SupersetAdapterNotImplementedError(
+            "The local Superset adapter does not publish semantic layers."
+        )
 
     @staticmethod
     def _serialize_dataset(dataset: Any) -> DatasetMetadata:

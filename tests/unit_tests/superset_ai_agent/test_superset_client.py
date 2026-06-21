@@ -33,6 +33,7 @@ from superset_ai_agent.integrations.superset.client import (
 from superset_ai_agent.integrations.superset.factory import create_superset_client
 from superset_ai_agent.integrations.superset.mcp import SupersetMcpClient
 from superset_ai_agent.integrations.superset.rest import SupersetRestClient
+from superset_ai_agent.schemas import SqlExecutionSource
 
 
 @dataclass
@@ -194,6 +195,10 @@ def test_rest_adapter_is_wired_as_skeleton() -> None:
             assert body["database_id"] == 1
             assert body["catalog"] == "prod"
             assert body["runAsync"] is False
+            assert len(body["client_id"]) <= 11
+            assert body["client_id"].startswith("ai")
+            assert body["sql_editor_id"] == "ai_agent"
+            assert body["tab"] == "AI Agent"
             return httpx.Response(
                 200,
                 json={
@@ -204,12 +209,15 @@ def test_rest_adapter_is_wired_as_skeleton() -> None:
                         {"name": "total_births"},
                     ],
                     "query": {
-                        "id": 123,
+                        "queryId": 123,
                         "resultsKey": "result-key",
                         "executedSql": "select 1",
                         "databaseId": 1,
                         "schema": None,
                         "queryLimit": 1000,
+                        "id": body["client_id"],
+                        "sqlEditorId": body["sql_editor_id"],
+                        "tab": body["tab"],
                     },
                 },
             )
@@ -239,6 +247,7 @@ def test_rest_adapter_is_wired_as_skeleton() -> None:
         database_id=1,
         catalog_name="prod",
         sql="select 1",
+        source=SqlExecutionSource(source="ai_agent", request_id="request-1"),
     )
     assert result.columns == ["name", "total_births"]
     assert result.row_count == 1
@@ -249,6 +258,12 @@ def test_rest_adapter_is_wired_as_skeleton() -> None:
     assert result.audit.executed_sql == "select 1"
     assert result.audit.database_id == 1
     assert result.audit.catalog_name == "prod"
+    assert result.audit.client_id is not None
+    assert len(result.audit.client_id) <= 11
+    assert result.audit.sql_editor_id == "ai_agent"
+    assert result.audit.tab == "AI Agent"
+    assert result.audit.source == "ai_agent"
+    assert result.audit.source_hash is not None
     assert requests[0].url.path == "/api/v1/security/login"
 
 
@@ -281,6 +296,59 @@ def test_rest_adapter_forwards_user_session_without_service_login() -> None:
 
     assert client.get_database_dialect(1) == "sqlite"
     assert [request.url.path for request in requests] == ["/api/v1/database/1"]
+
+
+def test_rest_adapter_gets_database_identity() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.url.path != "/api/v1/security/login"
+        assert request.headers["cookie"] == "session=user-session"
+        if request.url.path == "/api/v1/ai-agent/database/1/identity":
+            assert request.url.params["catalog"] == "prod"
+            return httpx.Response(
+                200,
+                json={
+                    "result": {
+                        "database_id": 1,
+                        "database_name": "warehouse",
+                        "backend": "postgresql",
+                        "driver": "psycopg2",
+                        "uri_fingerprint": "fingerprint-1",
+                        "catalog": "prod",
+                        "schemas": ["finance", "pipeline"],
+                    }
+                },
+            )
+        return httpx.Response(404, text=request.url.path)
+
+    client = SupersetRestClient(
+        AgentConfig(
+            superset_auth_mode="user_session",
+            superset_base_url="http://localhost:8091",
+        ),
+        transport=httpx.MockTransport(handler),
+        request_auth=SupersetRequestAuth(cookie_header="session=user-session"),
+    )
+
+    identity = client.get_database_identity(database_id=1, catalog_name="prod")
+
+    assert identity.database_id == 1
+    assert identity.database_name == "warehouse"
+    assert identity.backend == "postgresql"
+    assert identity.driver == "psycopg2"
+    assert identity.uri_fingerprint == "fingerprint-1"
+    assert identity.catalog_name == "prod"
+    assert identity.schema_names == ["finance", "pipeline"]
+    assert client.list_database_schemas(database_id=1, catalog_name="prod") == [
+        "finance",
+        "pipeline",
+    ]
+    assert [request.url.path for request in requests] == [
+        "/api/v1/ai-agent/database/1/identity",
+        "/api/v1/ai-agent/database/1/identity",
+    ]
 
 
 def test_rest_adapter_fetches_csrf_with_user_session_for_post() -> None:
@@ -324,6 +392,146 @@ def test_rest_adapter_fetches_csrf_with_user_session_for_post() -> None:
     assert [request.url.path for request in requests] == [
         "/api/v1/security/csrf_token/",
         "/api/v1/sqllab/execute/",
+    ]
+
+
+def test_rest_adapter_preserves_query_audit_when_polling_results() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/api/v1/security/csrf_token/":
+            return httpx.Response(200, json={"result": "csrf"})
+        if request.url.path == "/api/v1/sqllab/execute/":
+            return httpx.Response(
+                200,
+                json={
+                    "query": {
+                        "id": 456,
+                        "resultsKey": "async-key",
+                        "executedSql": "select 1",
+                        "databaseId": 1,
+                        "schema": "sales",
+                        "queryLimit": 25,
+                    },
+                },
+            )
+        if request.url.path == "/api/v1/sqllab/results/":
+            assert request.url.params["q"] == "(key:async-key)"
+            return httpx.Response(
+                200,
+                json={
+                    "status": "success",
+                    "data": [{"value": 1}],
+                    "columns": [{"name": "value"}],
+                },
+            )
+        return httpx.Response(404, text=request.url.path)
+
+    client = SupersetRestClient(
+        AgentConfig(
+            superset_auth_mode="user_session",
+            superset_base_url="http://localhost:8091",
+            superset_sql_poll_interval_seconds=0,
+        ),
+        transport=httpx.MockTransport(handler),
+        request_auth=SupersetRequestAuth(cookie_header="session=user-session"),
+    )
+
+    result = client.execute_sql(
+        database_id=1,
+        sql="select 1",
+        schema_name="sales",
+        limit=25,
+    )
+
+    assert result.audit is not None
+    assert result.audit.query_id == 456
+    assert result.audit.results_key == "async-key"
+    assert result.audit.executed_sql == "select 1"
+    assert result.audit.database_id == 1
+    assert result.audit.schema_name == "sales"
+    assert result.audit.row_limit == 25
+    assert [request.url.path for request in requests] == [
+        "/api/v1/security/csrf_token/",
+        "/api/v1/sqllab/execute/",
+        "/api/v1/sqllab/results/",
+    ]
+
+
+def test_rest_adapter_semantic_layer_bridge_uses_superset_rest() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/api/v1/security/csrf_token/":
+            return httpx.Response(200, json={"result": "csrf"})
+        if request.url.path == "/api/v1/semantic_layer/":
+            if request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json={
+                        "result": [
+                            {
+                                "uuid": "layer-1",
+                                "name": "Sales semantic layer",
+                            }
+                        ]
+                    },
+                )
+            if request.method == "POST":
+                body = json.loads(request.content)
+                assert body["name"] == "Sales semantic layer"
+                return httpx.Response(201, json={"result": {"uuid": "layer-1"}})
+        if request.url.path == "/api/v1/semantic_layer/layer-1":
+            if request.method == "PUT":
+                body = json.loads(request.content)
+                assert body["description"] == "Updated"
+                return httpx.Response(200, json={"result": {"uuid": "layer-1"}})
+            if request.method == "DELETE":
+                return httpx.Response(200, json={"message": "OK"})
+        if request.url.path == "/api/v1/semantic_view/":
+            body = json.loads(request.content)
+            assert body["views"][0]["semantic_layer_uuid"] == "layer-1"
+            return httpx.Response(
+                201,
+                json={"result": {"created": [{"uuid": "view-1", "name": "Deals"}]}},
+            )
+        return httpx.Response(404, text=request.url.path)
+
+    client = SupersetRestClient(
+        AgentConfig(
+            superset_auth_mode="user_session",
+            superset_base_url="http://localhost:8091",
+        ),
+        transport=httpx.MockTransport(handler),
+        request_auth=SupersetRequestAuth(cookie_header="session=user-session"),
+    )
+
+    assert client.list_semantic_layers()[0]["uuid"] == "layer-1"
+    assert client.create_semantic_layer(
+        {
+            "name": "Sales semantic layer",
+            "type": "wren",
+            "configuration": {},
+        }
+    ) == {"uuid": "layer-1"}
+    assert client.update_semantic_layer(
+        "layer-1",
+        {"description": "Updated"},
+    ) == {"uuid": "layer-1"}
+    assert client.create_semantic_views(
+        [{"name": "Deals", "semantic_layer_uuid": "layer-1", "configuration": {}}]
+    ) == {"created": [{"uuid": "view-1", "name": "Deals"}]}
+    client.delete_semantic_layer("layer-1")
+
+    assert [request.url.path for request in requests] == [
+        "/api/v1/semantic_layer/",
+        "/api/v1/security/csrf_token/",
+        "/api/v1/semantic_layer/",
+        "/api/v1/semantic_layer/layer-1",
+        "/api/v1/semantic_view/",
+        "/api/v1/semantic_layer/layer-1",
     ]
 
 

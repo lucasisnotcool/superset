@@ -17,21 +17,61 @@
 
 from __future__ import annotations
 
+from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.context.base import ContextProvider
 from superset_ai_agent.integrations.superset.client import AgentContext, SupersetClient
 from superset_ai_agent.schemas import AgentQueryRequest
+from superset_ai_agent.semantic_layer.retrieval import (
+    RetrievedContext,
+    retrieve_schema_context,
+)
 
 
 class SupersetMetadataContextProvider(ContextProvider):
     """Phase 1 context provider backed by Superset dataset metadata."""
 
-    def __init__(self, superset_client: SupersetClient):
+    def __init__(
+        self,
+        superset_client: SupersetClient,
+        *,
+        config: AgentConfig | None = None,
+    ):
         self.superset_client = superset_client
+        self.config = config or AgentConfig()
+        self.last_retrieval: RetrievedContext | None = None
 
     def get_context(self, request: AgentQueryRequest) -> AgentContext:
-        return self.superset_client.get_agent_context(
+        self.last_retrieval = None
+        if request.dataset_ids or not request.schema_name:
+            return self.superset_client.get_agent_context(
+                database_id=request.database_id,
+                catalog_name=request.catalog_name,
+                schema_name=request.schema_name,
+                dataset_ids=request.dataset_ids,
+            )
+
+        base_context = self.superset_client.get_agent_context(
             database_id=request.database_id,
             catalog_name=request.catalog_name,
             schema_name=request.schema_name,
-            dataset_ids=request.dataset_ids,
+            dataset_ids=[],
         )
+        candidate_datasets = self.superset_client.list_datasets(
+            database_id=request.database_id,
+            catalog_name=request.catalog_name,
+            schema_name=request.schema_name,
+            limit=max(
+                self.config.wren_schema_table_scan_limit,
+                self.config.wren_schema_table_candidate_limit,
+                self.config.max_context_datasets,
+            ),
+        )
+        if not candidate_datasets:
+            return base_context
+        retrieved = retrieve_schema_context(
+            request=request,
+            context=base_context.model_copy(update={"datasets": candidate_datasets}),
+            config=self.config,
+        )
+        self.last_retrieval = retrieved
+        return retrieved.context

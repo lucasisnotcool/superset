@@ -22,10 +22,13 @@ from dataclasses import dataclass
 from typing import cast, Literal
 
 SupersetAdapterMode = Literal["local", "rest", "mcp"]
+WrenAdapterMode = Literal["file", "http"]
 ConversationStoreMode = Literal["memory", "sqlalchemy"]
 SemanticLayerStoreMode = Literal["memory", "sqlalchemy"]
+DocumentStorageMode = Literal["local", "s3"]
 IdentityProviderMode = Literal["static", "signed_header", "superset_session"]
 SupersetAuthMode = Literal["service_account", "user_session"]
+MigrationBootstrapMode = Literal["error", "stamp_existing"]
 ModelProviderMode = Literal[
     "ollama",
     "openai",
@@ -33,6 +36,7 @@ ModelProviderMode = Literal[
     "azure_openai",
 ]
 StructuredOutputMode = Literal["json_schema", "json_object", "prompt_only"]
+SemanticAccessMode = Literal["superset_only", "db_uri_match", "superset_or_uri"]
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -83,11 +87,22 @@ class AgentConfig:
     agent_database_url: str = "sqlite:///./.data/ai_agent.db"
     agent_database_echo: bool = False
     agent_run_migrations: bool = True
+    agent_migration_bootstrap: MigrationBootstrapMode = "error"
     agent_storage_dir: str = "./.data"
+    document_storage: DocumentStorageMode = "local"
+    document_s3_bucket: str | None = None
+    document_s3_prefix: str = "superset-ai-agent/documents"
+    document_s3_endpoint_url: str | None = None
+    document_s3_region_name: str | None = None
     max_history_messages: int = 12
     max_prompt_result_rows: int = 5
     max_agent_sql_iterations: int = 3
     wren_enabled: bool = True
+    wren_adapter: WrenAdapterMode = "file"
+    wren_base_url: str | None = None
+    wren_api_key: str | None = None
+    wren_timeout_seconds: float = 30.0
+    wren_onboarding_enabled: bool = False
     wren_project_path: str | None = None
     wren_mdl_path: str | None = None
     wren_memory_path: str | None = None
@@ -95,6 +110,13 @@ class AgentConfig:
     wren_execution_enabled: bool = False
     wren_context_limit: int = 8
     wren_example_limit: int = 5
+    wren_schema_table_scan_limit: int = 100
+    wren_schema_table_candidate_limit: int = 12
+    wren_schema_metric_candidate_limit: int = 20
+    wren_schema_example_candidate_limit: int = 5
+    wren_schema_document_candidate_limit: int = 5
+    wren_schema_context_token_budget: int = 6000
+    wren_require_schema_scope: bool = True
     wren_max_document_bytes: int = 2_000_000
     wren_allowed_document_types: tuple[str, ...] = (
         "text/plain",
@@ -102,6 +124,8 @@ class AgentConfig:
         "text/csv",
         "application/json",
     )
+    semantic_access_mode: SemanticAccessMode = "superset_or_uri"
+    semantic_full_access_grants_write: bool = False
     superset_agent_adapter: SupersetAdapterMode = "rest"
     superset_auth_mode: SupersetAuthMode = "user_session"
     superset_base_url: str = "http://localhost:8091"
@@ -246,7 +270,37 @@ class AgentConfig:
                 "AI_AGENT_RUN_MIGRATIONS",
                 cls.agent_run_migrations,
             ),
+            agent_migration_bootstrap=cast(
+                MigrationBootstrapMode,
+                os.getenv(
+                    "AI_AGENT_MIGRATION_BOOTSTRAP",
+                    cls.agent_migration_bootstrap,
+                )
+                .strip()
+                .lower(),
+            ),
             agent_storage_dir=os.getenv("AI_AGENT_STORAGE_DIR", cls.agent_storage_dir),
+            document_storage=cast(
+                DocumentStorageMode,
+                os.getenv("AI_AGENT_DOCUMENT_STORAGE", cls.document_storage)
+                .strip()
+                .lower(),
+            ),
+            document_s3_bucket=(
+                os.getenv("AI_AGENT_DOCUMENT_S3_BUCKET") or cls.document_s3_bucket
+            ),
+            document_s3_prefix=os.getenv(
+                "AI_AGENT_DOCUMENT_S3_PREFIX",
+                cls.document_s3_prefix,
+            ),
+            document_s3_endpoint_url=(
+                os.getenv("AI_AGENT_DOCUMENT_S3_ENDPOINT_URL")
+                or cls.document_s3_endpoint_url
+            ),
+            document_s3_region_name=(
+                os.getenv("AI_AGENT_DOCUMENT_S3_REGION_NAME")
+                or cls.document_s3_region_name
+            ),
             max_history_messages=int(
                 os.getenv(
                     "AI_AGENT_MAX_HISTORY_MESSAGES",
@@ -266,6 +320,19 @@ class AgentConfig:
                 )
             ),
             wren_enabled=_env_bool("WREN_ENABLED", cls.wren_enabled),
+            wren_adapter=cast(
+                WrenAdapterMode,
+                os.getenv("WREN_ADAPTER", cls.wren_adapter).strip().lower(),
+            ),
+            wren_base_url=os.getenv("WREN_BASE_URL") or cls.wren_base_url,
+            wren_api_key=os.getenv("WREN_API_KEY") or cls.wren_api_key,
+            wren_timeout_seconds=float(
+                os.getenv("WREN_TIMEOUT_SECONDS", str(cls.wren_timeout_seconds))
+            ),
+            wren_onboarding_enabled=_env_bool(
+                "WREN_ONBOARDING_ENABLED",
+                cls.wren_onboarding_enabled,
+            ),
             wren_project_path=os.getenv("WREN_PROJECT_PATH") or cls.wren_project_path,
             wren_mdl_path=os.getenv("WREN_MDL_PATH") or cls.wren_mdl_path,
             wren_memory_path=os.getenv("WREN_MEMORY_PATH") or cls.wren_memory_path,
@@ -283,6 +350,46 @@ class AgentConfig:
             wren_example_limit=int(
                 os.getenv("WREN_EXAMPLE_LIMIT", str(cls.wren_example_limit))
             ),
+            wren_schema_table_scan_limit=int(
+                os.getenv(
+                    "WREN_SCHEMA_TABLE_SCAN_LIMIT",
+                    str(cls.wren_schema_table_scan_limit),
+                )
+            ),
+            wren_schema_table_candidate_limit=int(
+                os.getenv(
+                    "WREN_SCHEMA_TABLE_CANDIDATE_LIMIT",
+                    str(cls.wren_schema_table_candidate_limit),
+                )
+            ),
+            wren_schema_metric_candidate_limit=int(
+                os.getenv(
+                    "WREN_SCHEMA_METRIC_CANDIDATE_LIMIT",
+                    str(cls.wren_schema_metric_candidate_limit),
+                )
+            ),
+            wren_schema_example_candidate_limit=int(
+                os.getenv(
+                    "WREN_SCHEMA_EXAMPLE_CANDIDATE_LIMIT",
+                    str(cls.wren_schema_example_candidate_limit),
+                )
+            ),
+            wren_schema_document_candidate_limit=int(
+                os.getenv(
+                    "WREN_SCHEMA_DOCUMENT_CANDIDATE_LIMIT",
+                    str(cls.wren_schema_document_candidate_limit),
+                )
+            ),
+            wren_schema_context_token_budget=int(
+                os.getenv(
+                    "WREN_SCHEMA_CONTEXT_TOKEN_BUDGET",
+                    str(cls.wren_schema_context_token_budget),
+                )
+            ),
+            wren_require_schema_scope=_env_bool(
+                "WREN_REQUIRE_SCHEMA_SCOPE",
+                cls.wren_require_schema_scope,
+            ),
             wren_max_document_bytes=int(
                 os.getenv(
                     "WREN_MAX_DOCUMENT_BYTES",
@@ -292,6 +399,19 @@ class AgentConfig:
             wren_allowed_document_types=_env_list(
                 "WREN_ALLOWED_DOCUMENT_TYPES",
                 cls.wren_allowed_document_types,
+            ),
+            semantic_access_mode=cast(
+                SemanticAccessMode,
+                os.getenv(
+                    "AI_AGENT_SEMANTIC_ACCESS_MODE",
+                    cls.semantic_access_mode,
+                )
+                .strip()
+                .lower(),
+            ),
+            semantic_full_access_grants_write=_env_bool(
+                "AI_AGENT_SEMANTIC_FULL_ACCESS_GRANTS_WRITE",
+                cls.semantic_full_access_grants_write,
             ),
             superset_agent_adapter=cast(
                 SupersetAdapterMode,

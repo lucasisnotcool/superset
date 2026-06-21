@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json  # noqa: TID251 - keep the standalone agent independent of Superset
 from typing import Any, Literal, TypedDict
+from uuid import uuid4
 
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
@@ -27,6 +28,7 @@ from superset_ai_agent.artifacts.charts import infer_chart_spec
 from superset_ai_agent.artifacts.insights import build_artifact_bundle, profile_result
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.context.base import ContextProvider
+from superset_ai_agent.conversations.schemas import ConversationScope
 from superset_ai_agent.conversations.store import DEFAULT_OWNER_ID
 from superset_ai_agent.integrations.superset.client import AgentContext, SupersetClient
 from superset_ai_agent.integrations.wren.client import DisabledWrenClient, WrenClient
@@ -39,13 +41,17 @@ from superset_ai_agent.schemas import (
     ChartSpec,
     ExecutionResult,
     InsightCard,
+    SqlExecutionSource,
     SqlValidation,
     TraceEvent,
     WrenContextArtifact,
+    WrenRetrievalArtifact,
 )
 from superset_ai_agent.semantic_layer.mdl_files import MdlFileStore
 from superset_ai_agent.semantic_layer.projects import SemanticProjectStore
+from superset_ai_agent.semantic_layer.runtime import merge_indexed_semantic_context
 from superset_ai_agent.semantic_layer.schemas import WrenMaterializationResult
+from superset_ai_agent.semantic_layer.store import SemanticLayerStore
 from superset_ai_agent.semantic_layer.wren_runtime import (
     materialize_request_semantic_project,
 )
@@ -74,6 +80,7 @@ class AgentState(TypedDict, total=False):
     audit: AuditInfo | None
     recommended_followups: list[str]
     wren_context: WrenContextArtifact | None
+    wren_retrieval: WrenRetrievalArtifact | None
     wren_materialization: WrenMaterializationResult | None
     wren_mdl_path: str | None
     trace: list[TraceEvent]
@@ -92,6 +99,7 @@ class TextToSqlGraph:
         context_provider: ContextProvider,
         superset_client: SupersetClient,
         wren_client: WrenClient | None = None,
+        semantic_layer_store: SemanticLayerStore | None = None,
         semantic_project_store: SemanticProjectStore | None = None,
         mdl_file_store: MdlFileStore | None = None,
     ):
@@ -100,6 +108,7 @@ class TextToSqlGraph:
         self.context_provider = context_provider
         self.superset_client = superset_client
         self.wren_client = wren_client or DisabledWrenClient()
+        self.semantic_layer_store = semantic_layer_store
         self.semantic_project_store = semantic_project_store
         self.mdl_file_store = mdl_file_store
         self.graph = self._compile_graph()
@@ -123,6 +132,7 @@ class TextToSqlGraph:
             "audit": None,
             "recommended_followups": [],
             "wren_context": None,
+            "wren_retrieval": None,
             "wren_materialization": None,
             "wren_mdl_path": None,
             "error": None,
@@ -195,9 +205,19 @@ class TextToSqlGraph:
     def _load_context(self, state: AgentState) -> AgentState:
         request = state["request"]
         context = self.context_provider.get_context(request)
+        retrieval = getattr(self.context_provider, "last_retrieval", None)
+        retrieval_artifact = (
+            retrieval.retrieval if retrieval is not None else None
+        )
+        details = (
+            retrieval_artifact.model_dump()
+            if retrieval_artifact is not None
+            else {}
+        )
         return {
             **state,
             "context": context,
+            "wren_retrieval": retrieval_artifact,
             "trace": [
                 *state.get("trace", []),
                 TraceEvent(
@@ -206,6 +226,7 @@ class TextToSqlGraph:
                         f"Loaded {len(context.datasets)} dataset(s) from "
                         f"database {context.database.name}."
                     ),
+                    details=details,
                 ),
             ],
         }
@@ -213,6 +234,25 @@ class TextToSqlGraph:
     def _load_wren_context(self, state: AgentState) -> AgentState:
         request = state["request"]
         context = state["context"]
+        if self.config.wren_require_schema_scope and not request.schema_name:
+            wren_context = WrenContextArtifact(
+                enabled=self.config.wren_enabled,
+                available=False,
+                warnings=["Select a database schema before loading Wren context."],
+            )
+            return {
+                **state,
+                "wren_context": wren_context,
+                "trace": [
+                    *state.get("trace", []),
+                    TraceEvent(
+                        step="load_wren_context",
+                        status="warning",
+                        summary="Wren context requires a selected schema.",
+                        details=wren_context.model_dump(),
+                    ),
+                ],
+            }
         materialization = None
         project_id = None
         mdl_path = None
@@ -244,6 +284,17 @@ class TextToSqlGraph:
             status: Literal["ok", "warning", "error"] = "warning"
         else:
             status = "ok" if wren_context.available else "warning"
+        wren_context = merge_indexed_semantic_context(
+            semantic_layer_store=self.semantic_layer_store,
+            scope=ConversationScope(
+                database_id=request.database_id,
+                catalog_name=request.catalog_name,
+                schema_name=request.schema_name,
+                dataset_ids=request.dataset_ids,
+            ),
+            owner_id=state.get("owner_id", DEFAULT_OWNER_ID),
+            wren_context=wren_context,
+        )
         if materialization is not None:
             warnings = list(wren_context.warnings)
             if materialization.file_count == 0:
@@ -257,9 +308,19 @@ class TextToSqlGraph:
                     "warnings": warnings,
                 }
             )
+        retrieval_artifact = state.get("wren_retrieval")
+        if retrieval_artifact is not None and project_id is not None:
+            retrieval_artifact = retrieval_artifact.model_copy(
+                update={"project_id": project_id}
+            )
+        if retrieval_artifact is not None:
+            wren_context = wren_context.model_copy(
+                update={"retrieval": retrieval_artifact}
+            )
         return {
             **state,
             "wren_context": wren_context,
+            "wren_retrieval": retrieval_artifact,
             "wren_materialization": materialization,
             "wren_mdl_path": mdl_path,
             "trace": [
@@ -304,6 +365,8 @@ class TextToSqlGraph:
         if not self.config.wren_dry_plan_enabled:
             return state
         request = state["request"]
+        if self.config.wren_require_schema_scope and not request.schema_name:
+            return state
         try:
             dry_plan = self.wren_client.dry_plan(
                 question=request.question,
@@ -404,6 +467,10 @@ class TextToSqlGraph:
                 catalog_name=request.catalog_name,
                 schema_name=request.schema_name,
                 limit=self.config.default_sql_limit,
+                source=SqlExecutionSource(
+                    source="ai_agent",
+                    request_id=uuid4().hex,
+                ),
             )
         except Exception as ex:  # pylint: disable=broad-except
             return {

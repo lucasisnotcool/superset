@@ -17,8 +17,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import json as json_lib
 import time
+from dataclasses import dataclass
 from typing import Any, Literal
+from uuid import uuid4
 
 import httpx
 
@@ -27,13 +31,21 @@ from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.integrations.superset.client import (
     AgentContext,
     ColumnSummary,
+    DatabaseIdentity,
     DatabaseSummary,
     DatasetMetadata,
     MetricSummary,
     SupersetAdapterError,
     SupersetAuthError,
 )
-from superset_ai_agent.schemas import AuditInfo, ExecutionResult
+from superset_ai_agent.schemas import AuditInfo, ExecutionResult, SqlExecutionSource
+
+
+@dataclass(frozen=True)
+class _SourceMarker:
+    payload: dict[str, str]
+    source_hash: str | None = None
+    source: str | None = None
 
 
 class SupersetRestClient:
@@ -142,6 +154,20 @@ class SupersetRestClient:
 
         return self.request("GET", f"/api/v1/database/{database_id}")
 
+    def get_database_identity_raw(
+        self,
+        *,
+        database_id: int,
+        catalog_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Return raw AI-agent database identity payload from Superset REST."""
+
+        return self.request(
+            "GET",
+            f"/api/v1/ai-agent/database/{database_id}/identity",
+            params={"catalog": catalog_name} if catalog_name else None,
+        )
+
     def list_datasets_raw(
         self,
         *,
@@ -185,9 +211,12 @@ class SupersetRestClient:
         catalog_name: str | None = None,
         schema_name: str | None = None,
         limit: int = 1000,
+        source: SqlExecutionSource | None = None,
+        marker: _SourceMarker | None = None,
     ) -> dict[str, Any]:
         """Return raw SQL Lab execution payload."""
 
+        marker = marker or _source_marker(source)
         payload = {
             "database_id": database_id,
             "sql": sql,
@@ -196,6 +225,7 @@ class SupersetRestClient:
             "queryLimit": limit,
             "runAsync": False,
             "expand_data": True,
+            **marker.payload,
         }
         response = self.request("POST", "/api/v1/sqllab/execute/", json=payload)
         query = response.get("query")
@@ -204,7 +234,10 @@ class SupersetRestClient:
             and query.get("resultsKey")
             and "data" not in response
         ):
-            return self.get_sqllab_results_raw(str(query["resultsKey"]))
+            results = self.get_sqllab_results_raw(str(query["resultsKey"]))
+            if isinstance(query, dict):
+                results.setdefault("query", query)
+            return results
         return response
 
     def get_sqllab_results_raw(self, key: str) -> dict[str, Any]:
@@ -229,6 +262,34 @@ class SupersetRestClient:
 
         payload = self.list_databases_raw()
         return [_normalize_database(item) for item in _items(payload, "databases")]
+
+    def get_database_identity(
+        self,
+        *,
+        database_id: int,
+        catalog_name: str | None = None,
+    ) -> DatabaseIdentity:
+        """Return non-secret database identity through Superset REST."""
+
+        return _normalize_database_identity(
+            self.get_database_identity_raw(
+                database_id=database_id,
+                catalog_name=catalog_name,
+            )
+        )
+
+    def list_database_schemas(
+        self,
+        *,
+        database_id: int,
+        catalog_name: str | None = None,
+    ) -> list[str]:
+        """List schemas through the AI-agent database identity endpoint."""
+
+        return self.get_database_identity(
+            database_id=database_id,
+            catalog_name=catalog_name,
+        ).schema_names
 
     def list_datasets(
         self,
@@ -290,9 +351,11 @@ class SupersetRestClient:
         catalog_name: str | None = None,
         schema_name: str | None = None,
         limit: int = 1000,
+        source: SqlExecutionSource | None = None,
     ) -> ExecutionResult:
         """Execute SQL through SQL Lab REST and normalize the result."""
 
+        marker = _source_marker(source)
         result = _normalize_execution_result(
             self.execute_sql_raw(
                 database_id=database_id,
@@ -300,6 +363,8 @@ class SupersetRestClient:
                 catalog_name=catalog_name,
                 schema_name=schema_name,
                 limit=limit,
+                source=source,
+                marker=marker,
             ),
             adapter="rest",
         )
@@ -309,12 +374,55 @@ class SupersetRestClient:
             catalog_name=catalog_name,
             schema_name=schema_name,
             limit=limit,
+            marker=marker,
         )
 
     def get_database_dialect(self, database_id: int) -> str | None:
         """Return database backend from REST metadata."""
 
         return _normalize_database(self.get_database_raw(database_id)).backend
+
+    def list_semantic_layers(self) -> list[dict[str, Any]]:
+        """List Superset semantic layers through REST."""
+
+        payload = self.request("GET", "/api/v1/semantic_layer/")
+        result = payload.get("result")
+        if isinstance(result, list):
+            return [item for item in result if isinstance(item, dict)]
+        return []
+
+    def create_semantic_layer(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Create a Superset semantic layer through REST."""
+
+        return _result(
+            self.request("POST", "/api/v1/semantic_layer/", json=payload)
+        )
+
+    def update_semantic_layer(
+        self,
+        uuid: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Update a Superset semantic layer through REST."""
+
+        return _result(
+            self.request("PUT", f"/api/v1/semantic_layer/{uuid}", json=payload)
+        )
+
+    def delete_semantic_layer(self, uuid: str) -> None:
+        """Delete a Superset semantic layer through REST."""
+
+        self.request("DELETE", f"/api/v1/semantic_layer/{uuid}")
+
+    def create_semantic_views(
+        self,
+        views: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Bulk create Superset semantic views through REST."""
+
+        return _result(
+            self.request("POST", "/api/v1/semantic_view/", json={"views": views})
+        )
 
     def _client(self) -> httpx.Client:
         if self._http_client is None:
@@ -454,6 +562,24 @@ def _normalize_database(payload: dict[str, Any]) -> DatabaseSummary:
     )
 
 
+def _normalize_database_identity(payload: dict[str, Any]) -> DatabaseIdentity:
+    data = _result(payload)
+    schemas = data.get("schemas")
+    return DatabaseIdentity(
+        database_id=int(data.get("database_id") or data.get("id") or 0),
+        database_name=str(data.get("database_name") or data.get("name") or ""),
+        backend=data.get("backend"),
+        driver=data.get("driver"),
+        uri_fingerprint=str(data.get("uri_fingerprint") or ""),
+        catalog_name=data.get("catalog") or data.get("catalog_name"),
+        schema_names=(
+            [str(schema) for schema in schemas]
+            if isinstance(schemas, list)
+            else []
+        ),
+    )
+
+
 def _normalize_dataset(payload: dict[str, Any]) -> DatasetMetadata:
     data = _result(payload)
     database = data.get("database")
@@ -564,9 +690,9 @@ def _normalize_audit_info(
     query_id = (
         result.get("query_id")
         or result.get("queryId")
-        or query.get("id")
         or query.get("query_id")
         or query.get("queryId")
+        or query.get("id")
     )
     results_key = (
         result.get("resultsKey")
@@ -599,6 +725,21 @@ def _normalize_audit_info(
         or query.get("timeout")
         or query.get("timeout_seconds")
     )
+    client_id = (
+        result.get("client_id")
+        or result.get("clientId")
+        or result.get("id")
+        or query.get("client_id")
+        or query.get("clientId")
+        or query.get("id")
+    )
+    sql_editor_id = (
+        result.get("sql_editor_id")
+        or result.get("sqlEditorId")
+        or query.get("sql_editor_id")
+        or query.get("sqlEditorId")
+    )
+    tab = result.get("tab") or query.get("tab")
     return AuditInfo(
         adapter=adapter,
         query_id=query_id,
@@ -609,6 +750,9 @@ def _normalize_audit_info(
         schema_name=result.get("schema") or query.get("schema"),
         row_limit=row_limit,
         timeout_seconds=timeout_seconds,
+        client_id=str(client_id) if client_id is not None else None,
+        sql_editor_id=str(sql_editor_id) if sql_editor_id is not None else None,
+        tab=str(tab) if tab is not None else None,
         source="sqllab_rest" if adapter == "rest" else "superset_mcp",
     )
 
@@ -620,8 +764,10 @@ def _with_request_audit(
     catalog_name: str | None,
     schema_name: str | None,
     limit: int,
+    marker: _SourceMarker | None = None,
 ) -> ExecutionResult:
     audit = result.audit or AuditInfo(adapter="rest")
+    payload = marker.payload if marker is not None else {}
     return result.model_copy(
         update={
             "audit": audit.model_copy(
@@ -630,10 +776,41 @@ def _with_request_audit(
                     "catalog_name": audit.catalog_name or catalog_name,
                     "schema_name": audit.schema_name or schema_name,
                     "row_limit": audit.row_limit or limit,
+                    "client_id": audit.client_id or payload.get("client_id"),
+                    "sql_editor_id": audit.sql_editor_id
+                    or payload.get("sql_editor_id"),
+                    "tab": audit.tab or payload.get("tab"),
+                    "source_hash": audit.source_hash
+                    or (marker.source_hash if marker else None),
+                    "source": marker.source if marker and marker.source else audit.source,
                 }
             )
         }
     )
+
+
+def _source_marker(source: SqlExecutionSource | None) -> _SourceMarker:
+    if source is None:
+        return _SourceMarker(payload={})
+
+    source_hash = _source_hash(source)
+    client_id = source.client_id or f"ai{uuid4().hex[:9]}"
+    payload = {
+        "client_id": client_id[:11],
+        "sql_editor_id": source.sql_editor_id or source.source,
+        "tab": source.tab or "AI Agent",
+    }
+    return _SourceMarker(
+        payload=payload,
+        source_hash=source_hash,
+        source=source.source,
+    )
+
+
+def _source_hash(source: SqlExecutionSource) -> str:
+    payload = source.model_dump(exclude_none=True, exclude={"client_id"})
+    serialized = json_lib.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
 
 
 def _optional_int(value: Any) -> int | None:

@@ -33,8 +33,10 @@ from superset_ai_agent.conversations.store import (
     ConversationArtifactNotFoundError,
     ConversationNotFoundError,
 )
-from superset_ai_agent.persistence.database import create_session_factory
-from superset_ai_agent.persistence.models import Base
+from superset_ai_agent.persistence.database import (
+    create_all_for_tests,
+    create_session_factory,
+)
 from superset_ai_agent.schemas import (
     ChartEncoding,
     ChartSpec,
@@ -51,7 +53,7 @@ def _store() -> SqlAlchemyConversationStore:
         future=True,
         poolclass=StaticPool,
     )
-    Base.metadata.create_all(engine)
+    create_all_for_tests(engine)
     return SqlAlchemyConversationStore(create_session_factory(engine))
 
 
