@@ -61,6 +61,12 @@ services:
       - /bin/bash
       - -c
       - |
+        app_root="$${SUPERSET_APP_ROOT:-/}"
+        if [ "$$app_root" = "/" ]; then
+          export SUPERSET_STATIC_ROOT="/static"
+        else
+          export SUPERSET_STATIC_ROOT="$${app_root%/}/static"
+        fi
         /docker-entrypoint.d/20-envsubst-on-templates.sh
         node_upstream="$${SUPERSET_NODE_UPSTREAM:-superset-node:9000}"
         url="http://$${node_upstream}/static/assets/manifest.json"
