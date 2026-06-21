@@ -88,9 +88,9 @@ services:
       - |
         app_root="$${SUPERSET_APP_ROOT:-/}"
         if [ "$$app_root" = "/" ]; then
-          export SUPERSET_STATIC_ROOT="/static"
+          export SUPERSET_STATIC_ASSETS_ROOT="/static/assets"
         else
-          export SUPERSET_STATIC_ROOT="$${app_root%/}/static"
+          export SUPERSET_STATIC_ASSETS_ROOT="$${app_root%/}/static/assets"
         fi
         /docker-entrypoint.d/20-envsubst-on-templates.sh
         node_upstream="$${SUPERSET_NODE_UPSTREAM:-superset-node:9000}"

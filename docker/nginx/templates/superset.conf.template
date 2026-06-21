@@ -47,7 +47,7 @@ server {
         proxy_set_header Host $host;
     }
 
-    location ${SUPERSET_STATIC_ROOT} {
+    location ${SUPERSET_STATIC_ASSETS_ROOT} {
         proxy_pass http://superset_node;
         proxy_http_version 1.1;
         proxy_set_header Host localhost;
