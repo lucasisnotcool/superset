@@ -25,7 +25,10 @@ from superset_ai_agent.context.base import ContextProvider
 from superset_ai_agent.conversation_graph import ConversationGraph
 from superset_ai_agent.conversations.memory import InMemoryConversationStore
 from superset_ai_agent.conversations.schemas import (
+    ConversationArtifact,
+    ConversationMessage,
     ConversationScope,
+    ConversationSqlExecutionRequest,
     ConversationTurnRequest,
 )
 from superset_ai_agent.integrations.superset.client import (
@@ -275,10 +278,26 @@ def test_conversation_graph_executes_valid_sql_when_requested() -> None:
     ]
 
 
-def test_conversation_graph_executes_approved_sql_once_in_manual_mode() -> None:
+def test_conversation_graph_updates_approved_sql_artifact_in_manual_mode() -> None:
     store = InMemoryConversationStore()
     scope = ConversationScope(database_id=1, dataset_ids=[16])
     conversation = store.create(scope)
+    artifact = ConversationArtifact(
+        sql="SELECT name FROM birth_names",
+        explanation="Returns names.",
+    )
+    store.append(
+        conversation.id,
+        ConversationMessage(role="user", content="Show names"),
+    )
+    store.append(
+        conversation.id,
+        ConversationMessage(
+            role="assistant",
+            content="I drafted SQL.",
+            artifacts=[artifact],
+        ),
+    )
     superset_client = FakeSupersetClient()
     model_client = FakeModelClient(
         {
@@ -296,19 +315,32 @@ def test_conversation_graph_executes_approved_sql_once_in_manual_mode() -> None:
         conversation_store=store,
     )
 
-    response = graph.run(
+    response = graph.execute_approved_sql(
         conversation_id=conversation.id,
-        request=ConversationTurnRequest(
-            message="Execute selected SQL.",
+        request=ConversationSqlExecutionRequest(
             scope=scope,
             execution_mode="manual",
-            approved_sql="SELECT name FROM birth_names",
+            sql="SELECT name FROM birth_names",
+            artifact_id=artifact.id,
         ),
     )
 
     assert response.status == "ok"
     assert response.message.content == "The approved query returned Michael."
+    assert response.message.artifacts == []
+    assert response.artifacts[0].id == artifact.id
     assert response.artifacts[0].execution_result is not None
+    assert [message.role for message in response.conversation.messages] == [
+        "user",
+        "assistant",
+        "assistant",
+    ]
+    updated_artifact = response.conversation.messages[1].artifacts[0]
+    assert updated_artifact.id == artifact.id
+    assert updated_artifact.execution_result is not None
+    assert response.conversation.messages[-1].content == (
+        "The approved query returned Michael."
+    )
     assert superset_client.executed_sql == ["SELECT name FROM birth_names\nLIMIT 25"]
     assert len(model_client.messages) == 1
     assert [event.step for event in response.trace] == [
@@ -321,10 +353,26 @@ def test_conversation_graph_executes_approved_sql_once_in_manual_mode() -> None:
     ]
 
 
-def test_conversation_graph_does_not_repair_or_execute_invalid_approved_sql() -> None:
+def test_conversation_graph_updates_invalid_approved_sql_without_execution() -> None:
     store = InMemoryConversationStore()
     scope = ConversationScope(database_id=1, dataset_ids=[16])
     conversation = store.create(scope)
+    artifact = ConversationArtifact(
+        sql="DROP TABLE birth_names",
+        explanation="Invalid SQL.",
+    )
+    store.append(
+        conversation.id,
+        ConversationMessage(role="user", content="Drop the table"),
+    )
+    store.append(
+        conversation.id,
+        ConversationMessage(
+            role="assistant",
+            content="I drafted SQL.",
+            artifacts=[artifact],
+        ),
+    )
     superset_client = FakeSupersetClient()
     model_client = FakeModelClient(
         {
@@ -342,19 +390,26 @@ def test_conversation_graph_does_not_repair_or_execute_invalid_approved_sql() ->
         conversation_store=store,
     )
 
-    response = graph.run(
+    response = graph.execute_approved_sql(
         conversation_id=conversation.id,
-        request=ConversationTurnRequest(
-            message="Execute selected SQL.",
+        request=ConversationSqlExecutionRequest(
             scope=scope,
             execution_mode="manual",
-            approved_sql="DROP TABLE birth_names",
+            sql="DROP TABLE birth_names",
+            artifact_id=artifact.id,
         ),
     )
 
     assert response.status == "error"
-    assert response.artifacts[0].validation is not None
-    assert response.artifacts[0].validation.is_valid is False
+    updated_artifact = response.conversation.messages[1].artifacts[0]
+    assert updated_artifact.id == artifact.id
+    assert updated_artifact.validation is not None
+    assert updated_artifact.validation.is_valid is False
+    assert updated_artifact.execution_result is None
+    assert response.conversation.messages[-1].role == "assistant"
+    assert response.conversation.messages[-1].content.startswith(
+        "SQL validation failed before execution."
+    )
     assert superset_client.executed_sql == []
     assert model_client.messages == []
 

@@ -67,6 +67,7 @@ export interface ConversationScope {
 }
 
 export interface ConversationArtifact {
+  id: string;
   type: 'sql';
   sql: string;
   explanation?: string | null;
@@ -120,6 +121,7 @@ export interface ConversationSqlExecutionRequest {
   sql: string;
   scope: ConversationScope;
   execution_mode: ExecutionMode;
+  artifact_id?: string | null;
   model?: string | null;
 }
 

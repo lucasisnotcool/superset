@@ -218,6 +218,7 @@ test('conversation API helpers use typed conversation endpoints', async () => {
         sql: 'select 1',
         scope,
         execution_mode: 'manual',
+        artifact_id: 'artifact-1',
       })
     ).message.content,
   ).toBe('Executed');
@@ -238,5 +239,6 @@ test('conversation API helpers use typed conversation endpoints', async () => {
     sql: 'select 1',
     scope,
     execution_mode: 'manual',
+    artifact_id: 'artifact-1',
   });
 });

@@ -334,10 +334,12 @@ the model, and stop when it can answer. The loop is capped by
 `AI_AGENT_MAX_SQL_ITERATIONS`.
 
 In `manual` mode, pressing Execute on a valid SQL artifact executes only that
-approved statement, renders the returned rows in chat, and then sends the result
-observation back to the model for a follow-up answer. In `auto` mode, valid
-read-only SQL drafts follow the same validate/execute/observe loop without a
-button press.
+approved statement, updates that SQL artifact with the returned rows, changes
+the button state to Executed, and then sends the result observation back to the
+model for a follow-up answer. The approval is not recorded as a separate user
+message. In `auto` mode, valid read-only SQL drafts follow the same
+validate/execute/observe loop without a button press; executed SQL artifacts are
+rendered before the answer that used their rows.
 
 Conversation state is process-local by default. These values can be edited in
 `superset_ai_agent/.env`:

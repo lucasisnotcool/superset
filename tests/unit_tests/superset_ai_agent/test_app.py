@@ -25,6 +25,7 @@ from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.conversations.memory import InMemoryConversationStore
 from superset_ai_agent.conversations.schemas import (
     ConversationMessage,
+    ConversationSqlExecutionRequest,
     ConversationTurnRequest,
     ConversationTurnResponse,
 )
@@ -67,6 +68,7 @@ class StaticConversationGraph:
     def __init__(self, store: InMemoryConversationStore):
         self.store = store
         self.requests: list[ConversationTurnRequest] = []
+        self.sql_execution_requests: list[ConversationSqlExecutionRequest] = []
 
     def run(
         self,
@@ -84,6 +86,30 @@ class StaticConversationGraph:
             conversation_id,
             ConversationMessage(role="user", content=request.message),
             owner_id=owner_id,
+        )
+        conversation = self.store.append(
+            conversation_id,
+            message,
+            owner_id=owner_id,
+        )
+        return ConversationTurnResponse(
+            status="ok",
+            conversation_id=conversation_id,
+            message=message,
+            conversation=conversation,
+        )
+
+    def execute_approved_sql(
+        self,
+        *,
+        conversation_id: str,
+        request: ConversationSqlExecutionRequest,
+        owner_id: str = "local",
+    ) -> ConversationTurnResponse:
+        self.sql_execution_requests.append(request)
+        message = ConversationMessage(
+            role="assistant",
+            content=f"Executed: {request.sql}",
         )
         conversation = self.store.append(
             conversation_id,
@@ -248,10 +274,12 @@ def test_execute_conversation_sql_endpoint_passes_approved_sql_to_graph() -> Non
                 "dataset_ids": [16],
             },
             "execution_mode": "manual",
+            "artifact_id": "artifact-1",
         },
     )
 
     assert response.status_code == 200
-    assert graph.requests[-1].message == "Execute selected SQL."
-    assert graph.requests[-1].approved_sql == "select 1"
-    assert graph.requests[-1].execution_mode == "manual"
+    assert graph.requests == []
+    assert graph.sql_execution_requests[-1].sql == "select 1"
+    assert graph.sql_execution_requests[-1].artifact_id == "artifact-1"
+    assert graph.sql_execution_requests[-1].execution_mode == "manual"

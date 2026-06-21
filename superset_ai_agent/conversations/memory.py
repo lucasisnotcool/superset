@@ -21,11 +21,13 @@ from datetime import datetime, timezone
 
 from superset_ai_agent.conversations.schemas import (
     Conversation,
+    ConversationArtifact,
     ConversationMessage,
     ConversationScope,
     ConversationSummary,
 )
 from superset_ai_agent.conversations.store import (
+    ConversationArtifactNotFoundError,
     ConversationNotFoundError,
     DEFAULT_OWNER_ID,
 )
@@ -100,6 +102,23 @@ class InMemoryConversationStore:
             conversation.title = _title_from_message(message.content)
         conversation.updated_at = _utc_now()
         return conversation.model_copy(deep=True)
+
+    def replace_artifact(
+        self,
+        conversation_id: str,
+        artifact_id: str,
+        artifact: ConversationArtifact,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> Conversation:
+        conversation = self._find(conversation_id, owner_id=owner_id)
+        for message in conversation.messages:
+            for index, existing_artifact in enumerate(message.artifacts):
+                if existing_artifact.id == artifact_id:
+                    message.artifacts[index] = artifact
+                    conversation.updated_at = _utc_now()
+                    return conversation.model_copy(deep=True)
+        raise ConversationArtifactNotFoundError(artifact_id)
 
     def delete(
         self,

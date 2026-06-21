@@ -29,11 +29,13 @@ from superset_ai_agent.conversations.schemas import (
     Conversation,
     ConversationArtifact,
     ConversationMessage,
+    ConversationSqlExecutionRequest,
     ConversationTurnRequest,
     ConversationTurnResponse,
     ExecutionMode,
 )
 from superset_ai_agent.conversations.store import (
+    ConversationArtifactNotFoundError,
     ConversationStore,
     DEFAULT_OWNER_ID,
 )
@@ -116,33 +118,11 @@ class ConversationGraph:
             owner_id=owner_id,
         )
 
-        initial_state: ConversationState = {
-            "conversation_id": conversation_id,
-            "owner_id": owner_id,
-            "request": request,
-            "trace": [],
-            "repair_attempts": 0,
-            "execution_result": None,
-            "artifacts": [],
-            "pending_artifact": None,
-            "sql_iterations": 0,
-            "sql_observations": [],
-            "error": None,
-        }
-        try:
-            state = self.graph.invoke(initial_state)
-        except Exception as ex:  # pylint: disable=broad-except
-            state = {
-                **initial_state,
-                "error": str(ex),
-                "trace": [
-                    TraceEvent(
-                        step="conversation_error",
-                        status="error",
-                        summary=str(ex),
-                    )
-                ],
-            }
+        state = self._invoke_graph(
+            conversation_id=conversation_id,
+            request=request,
+            owner_id=owner_id,
+        )
         assistant_message = self._assistant_message_from_state(state)
         conversation = self.conversation_store.append(
             conversation_id,
@@ -158,6 +138,119 @@ class ConversationGraph:
             trace=state.get("trace", []),
             conversation=conversation,
         )
+
+    def execute_approved_sql(
+        self,
+        *,
+        conversation_id: str,
+        request: ConversationSqlExecutionRequest,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> ConversationTurnResponse:
+        """Execute approved SQL and update the original artifact in place."""
+
+        self.conversation_store.update_scope(
+            conversation_id,
+            request.scope,
+            owner_id=owner_id,
+        )
+        turn_request = ConversationTurnRequest(
+            message="Execute selected SQL.",
+            scope=request.scope,
+            execution_mode=request.execution_mode,
+            approved_sql=request.sql,
+            model=request.model,
+            max_steps=request.max_steps,
+        )
+        state = self._invoke_graph(
+            conversation_id=conversation_id,
+            request=turn_request,
+            owner_id=owner_id,
+        )
+
+        conversation = self.conversation_store.get(
+            conversation_id,
+            owner_id=owner_id,
+        )
+        original_artifact = _find_artifact(
+            conversation,
+            artifact_id=request.artifact_id,
+            sql=request.sql,
+        )
+        updated_artifact = _artifact_with_execution_state(
+            original_artifact=original_artifact,
+            state=state,
+        )
+        response_artifacts: list[ConversationArtifact] = []
+        if updated_artifact and original_artifact:
+            try:
+                conversation = self.conversation_store.replace_artifact(
+                    conversation_id,
+                    original_artifact.id,
+                    updated_artifact,
+                    owner_id=owner_id,
+                )
+                response_artifacts = [updated_artifact]
+            except ConversationArtifactNotFoundError:
+                response_artifacts = [updated_artifact]
+        elif updated_artifact:
+            response_artifacts = [updated_artifact]
+
+        assistant_message = self._assistant_message_from_state(state)
+        assistant_message = assistant_message.model_copy(
+            update={
+                "content": _approved_sql_response_content(state, assistant_message),
+                "artifacts": [],
+            }
+        )
+        conversation = self.conversation_store.append(
+            conversation_id,
+            assistant_message,
+            owner_id=owner_id,
+        )
+        status = self._status_from_state(state)
+        return ConversationTurnResponse(
+            status=status,
+            conversation_id=conversation_id,
+            message=assistant_message,
+            artifacts=response_artifacts,
+            trace=state.get("trace", []),
+            conversation=conversation,
+        )
+
+    def _invoke_graph(
+        self,
+        *,
+        conversation_id: str,
+        request: ConversationTurnRequest,
+        owner_id: str,
+    ) -> ConversationState:
+        initial_state: ConversationState = {
+            "conversation_id": conversation_id,
+            "owner_id": owner_id,
+            "request": request,
+            "trace": [],
+            "repair_attempts": 0,
+            "execution_result": None,
+            "artifacts": [],
+            "pending_artifact": None,
+            "sql_iterations": 0,
+            "sql_observations": [],
+            "error": None,
+        }
+        try:
+            return self.graph.invoke(initial_state)
+        except Exception as ex:  # pylint: disable=broad-except
+            return {
+                **initial_state,
+                "error": str(ex),
+                "trace": [
+                    TraceEvent(
+                        step="conversation_error",
+                        status="error",
+                        summary=str(ex),
+                    )
+                ],
+            }
 
     def _compile_graph(self) -> Any:
         graph = StateGraph(ConversationState)
@@ -637,3 +730,69 @@ def _execution_observation(
         "rows": result.rows[:max_prompt_result_rows],
         "row_count": result.row_count,
     }
+
+
+def _find_artifact(
+    conversation: Conversation,
+    *,
+    artifact_id: str | None,
+    sql: str,
+) -> ConversationArtifact | None:
+    if artifact_id:
+        for message in reversed(conversation.messages):
+            for artifact in reversed(message.artifacts):
+                if artifact.id == artifact_id:
+                    return artifact
+
+    sql_key = _sql_match_key(sql)
+    for message in reversed(conversation.messages):
+        for artifact in reversed(message.artifacts):
+            artifact_sql = _sql_match_key(artifact.sql)
+            normalized_sql = _sql_match_key(
+                artifact.validation.normalized_sql if artifact.validation else None
+            )
+            if sql_key in {artifact_sql, normalized_sql}:
+                return artifact
+    return None
+
+
+def _artifact_with_execution_state(
+    *,
+    original_artifact: ConversationArtifact | None,
+    state: ConversationState,
+) -> ConversationArtifact | None:
+    state_artifact = _latest_state_artifact(state)
+    if state_artifact is None:
+        return None
+    if original_artifact is None:
+        return state_artifact
+    return original_artifact.model_copy(
+        update={
+            "sql": state_artifact.sql,
+            "validation": state_artifact.validation,
+            "execution_result": state_artifact.execution_result,
+            "trace": state_artifact.trace,
+        }
+    )
+
+
+def _latest_state_artifact(state: ConversationState) -> ConversationArtifact | None:
+    artifacts = state.get("artifacts", [])
+    if artifacts:
+        return artifacts[-1]
+    return state.get("pending_artifact")
+
+
+def _approved_sql_response_content(
+    state: ConversationState,
+    assistant_message: ConversationMessage,
+) -> str:
+    validation = state.get("validation")
+    if validation and not validation.is_valid:
+        errors = "\n".join(validation.errors)
+        return f"SQL validation failed before execution.\n\n{errors}".strip()
+    return assistant_message.content
+
+
+def _sql_match_key(sql: str | None) -> str:
+    return " ".join((sql or "").strip().rstrip(";").split())

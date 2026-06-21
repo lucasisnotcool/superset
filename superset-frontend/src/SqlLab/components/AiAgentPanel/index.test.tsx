@@ -79,6 +79,7 @@ test('sends a conversation message and renders SQL artifact', async () => {
         created_at: '2026-06-19T00:00:00Z',
         artifacts: [
           {
+            id: 'artifact-1',
             type: 'sql',
             sql: 'SELECT name FROM birth_names LIMIT 10',
             explanation: 'Returns names.',
@@ -99,19 +100,11 @@ test('sends a conversation message and renders SQL artifact', async () => {
   const executedConversation = {
     ...conversation,
     messages: [
-      ...completedConversation.messages,
       {
-        id: 'message-3',
-        role: 'user',
-        content: 'Execute selected SQL.',
-        created_at: '2026-06-19T00:00:00Z',
-        artifacts: [],
+        ...completedConversation.messages[0],
       },
       {
-        id: 'message-4',
-        role: 'assistant',
-        content: 'The query returned one row.',
-        created_at: '2026-06-19T00:00:00Z',
+        ...completedConversation.messages[1],
         artifacts: [
           {
             ...completedConversation.messages[1].artifacts[0],
@@ -120,8 +113,23 @@ test('sends a conversation message and renders SQL artifact', async () => {
               rows: [{ name: 'Michael' }],
               row_count: 1,
             },
+            trace: [
+              {
+                step: 'approved_sql',
+                status: 'ok',
+                summary: 'Using approved SQL artifact for execution.',
+                details: {},
+              },
+            ],
           },
         ],
+      },
+      {
+        id: 'message-3',
+        role: 'assistant',
+        content: 'The query returned one row.',
+        created_at: '2026-06-19T00:00:00Z',
+        artifacts: [],
       },
     ],
   };
@@ -142,8 +150,8 @@ test('sends a conversation message and renders SQL artifact', async () => {
     {
       status: 'ok',
       conversation_id: 'conversation-1',
-      message: executedConversation.messages[3],
-      artifacts: executedConversation.messages[3].artifacts,
+      message: executedConversation.messages[2],
+      artifacts: executedConversation.messages[1].artifacts,
       trace: [],
       conversation: executedConversation,
     },
@@ -184,11 +192,14 @@ test('sends a conversation message and renders SQL artifact', async () => {
     expect(screen.getByText('The query returned one row.')).toBeInTheDocument();
   });
   expect(screen.getByText('Michael')).toBeInTheDocument();
+  expect(screen.queryByText('Execute selected SQL.')).not.toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Executed' })).toBeInTheDocument();
   const [executeCall] = fetchMock.callHistory.calls(
     'http://agent.local/agent/conversations/conversation-1/execute-sql',
   );
   expect(JSON.parse(String(executeCall.options.body))).toMatchObject({
     sql: 'SELECT name FROM birth_names LIMIT 10',
     execution_mode: 'manual',
+    artifact_id: 'artifact-1',
   });
 });

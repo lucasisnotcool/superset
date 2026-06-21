@@ -116,7 +116,7 @@ store, so tests can replace external services without changing route code.
 | File | Component | Responsibility |
 | --- | --- | --- |
 | `superset_ai_agent/conversations/schemas.py` | `Conversation`, `ConversationScope`, `ConversationMessage`, `ConversationArtifact` | Persisted chat contract, active SQL Lab scope, generated SQL artifacts, execution modes, and turn responses. |
-| `superset_ai_agent/conversations/store.py` | `ConversationStore` protocol | Storage boundary for conversation CRUD. |
+| `superset_ai_agent/conversations/store.py` | `ConversationStore` protocol | Storage boundary for conversation CRUD and artifact replacement after SQL execution. |
 | `superset_ai_agent/conversations/memory.py` | `InMemoryConversationStore` | Process-local store used by the current POC and tests. |
 
 ### Context And Prompts
@@ -214,8 +214,9 @@ Status behavior:
 `ConversationGraph.run()`. `POST
 /agent/conversations/{conversation_id}/execute-sql` wraps a reviewed SQL
 artifact as `approved_sql`, skips the initial model draft, validates the SQL,
-executes only that approved statement in `manual` mode, and then redrafts from
-the execution observation.
+executes only that approved statement in `manual` mode, replaces the original
+artifact with validation and result state, and then appends only the final
+assistant answer after redrafting from the execution observation.
 
 ```mermaid
 graph TD
@@ -282,7 +283,7 @@ These routes are served by `superset_ai_agent/app.py`, typically on host port
 | `GET` | `/agent/conversations` | none | `list[ConversationSummary]` | List conversation history for the current owner. |
 | `GET` | `/agent/conversations/{conversation_id}` | none | `Conversation` | Fetch a full transcript. |
 | `POST` | `/agent/conversations/{conversation_id}/messages` | `ConversationTurnRequest` | `ConversationTurnResponse` | Append a user message and run one agent turn. |
-| `POST` | `/agent/conversations/{conversation_id}/execute-sql` | `ConversationSqlExecutionRequest` | `ConversationTurnResponse` | Execute a reviewed SQL artifact and continue the conversation from the returned rows. |
+| `POST` | `/agent/conversations/{conversation_id}/execute-sql` | `ConversationSqlExecutionRequest` | `ConversationTurnResponse` | Execute a reviewed SQL artifact, update that artifact with returned rows, and append the follow-up answer. |
 | `DELETE` | `/agent/conversations/{conversation_id}` | none | `{ "deleted": true }` | Delete a conversation. |
 
 The frontend typed client for all of these routes is

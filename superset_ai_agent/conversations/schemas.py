@@ -52,6 +52,7 @@ class ConversationScope(BaseModel):
 class ConversationArtifact(BaseModel):
     """Structured artifact emitted by the assistant."""
 
+    id: str = Field(default_factory=_new_id)
     type: Literal["sql"] = "sql"
     sql: str
     explanation: str | None = None
@@ -125,6 +126,7 @@ class ConversationSqlExecutionRequest(BaseModel):
     sql: str = Field(min_length=1)
     scope: ConversationScope
     execution_mode: ExecutionMode = "manual"
+    artifact_id: str | None = None
     model: str | None = None
     max_steps: int = Field(default=8, ge=2, le=16)
 

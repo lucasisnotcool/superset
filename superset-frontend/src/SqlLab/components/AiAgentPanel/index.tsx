@@ -639,6 +639,7 @@ const AiAgentPanel = () => {
         sql: artifact.validation.normalized_sql || artifact.sql,
         scope,
         execution_mode: executionMode,
+        artifact_id: artifact.id,
       });
       setConversation(result.conversation);
       await refreshConversationSummaries();
@@ -736,130 +737,146 @@ const AiAgentPanel = () => {
       </ContextBar>
 
       <Transcript ref={transcriptRef}>
-        {messages.map(message => (
-          <MessageBlock key={message.id} data-message-role={message.role}>
-            <MessageBubble data-message-role={message.role}>
-              {message.content}
-            </MessageBubble>
-            {message.artifacts.map((artifact, index) => {
-              const validationStatus = getValidationStatus(artifact);
-              const resultColumns = getResultColumns(artifact);
-              const resultRows =
-                artifact.execution_result?.rows.slice(0, 10) || [];
-              const canExecuteArtifact =
-                Boolean(artifact.sql) &&
-                Boolean(conversation) &&
-                !artifact.execution_result &&
-                artifact.validation?.is_valid === true &&
-                artifact.validation?.is_read_only === true;
+        {messages.map(message => {
+          const renderArtifactsBeforeMessage =
+            message.role === 'assistant' &&
+            message.artifacts.some(artifact => artifact.execution_result) &&
+            !message.artifacts.some(artifact =>
+              artifact.trace.some(event => event.step === 'approved_sql'),
+            );
+          const artifactBlocks = message.artifacts.map((artifact, index) => {
+            const validationStatus = getValidationStatus(artifact);
+            const resultColumns = getResultColumns(artifact);
+            const resultRows =
+              artifact.execution_result?.rows.slice(0, 10) || [];
+            const isExecuted = Boolean(artifact.execution_result);
+            const canExecuteArtifact =
+              Boolean(artifact.sql) &&
+              Boolean(conversation) &&
+              !isExecuted &&
+              artifact.validation?.is_valid === true &&
+              artifact.validation?.is_read_only === true;
 
-              return (
-                <ArtifactBlock key={`${message.id}-${artifact.type}-${index}`}>
-                  {artifact.explanation && (
-                    <MetaText>{artifact.explanation}</MetaText>
-                  )}
-                  <SqlBlockRow>
-                    <SqlBlock>{artifact.sql}</SqlBlock>
-                    <Tooltip title={getValidationTooltip(artifact)}>
-                      <ValidationStatus
-                        data-validation-status={validationStatus}
-                      >
-                        {validationStatus === 'valid' ? (
-                          <Icons.CheckCircleOutlined iconSize="m" />
-                        ) : validationStatus === 'invalid' ? (
-                          <Icons.CloseCircleOutlined iconSize="m" />
-                        ) : (
-                          <Icons.InfoCircleOutlined iconSize="m" />
-                        )}
-                      </ValidationStatus>
-                    </Tooltip>
-                  </SqlBlockRow>
-                  {artifact.validation?.errors.length ? (
-                    <Alert
-                      type="warning"
-                      message={artifact.validation.errors.join('\n')}
-                    />
-                  ) : null}
-                  {artifact.execution_result && (
-                    <>
-                      <MetaText>
-                        {t(
-                          '%s row(s) returned',
-                          artifact.execution_result.row_count,
-                        )}
-                      </MetaText>
-                      {resultColumns.length > 0 && resultRows.length > 0 && (
-                        <ResultScroller>
-                          <ResultTable>
-                            <thead>
-                              <tr>
+            return (
+              <ArtifactBlock key={`${message.id}-${artifact.type}-${index}`}>
+                {artifact.explanation && (
+                  <MetaText>{artifact.explanation}</MetaText>
+                )}
+                <SqlBlockRow>
+                  <SqlBlock>{artifact.sql}</SqlBlock>
+                  <Tooltip title={getValidationTooltip(artifact)}>
+                    <ValidationStatus data-validation-status={validationStatus}>
+                      {validationStatus === 'valid' ? (
+                        <Icons.CheckCircleOutlined iconSize="m" />
+                      ) : validationStatus === 'invalid' ? (
+                        <Icons.CloseCircleOutlined iconSize="m" />
+                      ) : (
+                        <Icons.InfoCircleOutlined iconSize="m" />
+                      )}
+                    </ValidationStatus>
+                  </Tooltip>
+                </SqlBlockRow>
+                {artifact.validation?.errors.length ? (
+                  <Alert
+                    type="warning"
+                    message={artifact.validation.errors.join('\n')}
+                  />
+                ) : null}
+                {artifact.execution_result && (
+                  <>
+                    <MetaText>
+                      {t(
+                        '%s row(s) returned',
+                        artifact.execution_result.row_count,
+                      )}
+                    </MetaText>
+                    {resultColumns.length > 0 && resultRows.length > 0 && (
+                      <ResultScroller>
+                        <ResultTable>
+                          <thead>
+                            <tr>
+                              {resultColumns.map(column => (
+                                <th key={column}>{column}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {resultRows.map((row, rowIndex) => (
+                              <tr key={rowIndex}>
                                 {resultColumns.map(column => (
-                                  <th key={column}>{column}</th>
+                                  <td key={column}>
+                                    {formatResultValue(row[column])}
+                                  </td>
                                 ))}
                               </tr>
-                            </thead>
-                            <tbody>
-                              {resultRows.map((row, rowIndex) => (
-                                <tr key={rowIndex}>
-                                  {resultColumns.map(column => (
-                                    <td key={column}>
-                                      {formatResultValue(row[column])}
-                                    </td>
-                                  ))}
-                                </tr>
-                              ))}
-                            </tbody>
-                          </ResultTable>
-                        </ResultScroller>
-                      )}
-                    </>
-                  )}
-                  <Flex gap="small" wrap="wrap">
-                    <Button
-                      aria-label={t('Insert')}
-                      buttonStyle="tertiary"
-                      onClick={() => onInsertSql(artifact.sql)}
-                      disabled={!artifact.sql || !queryEditor?.id}
-                      icon={<Icons.EditOutlined iconSize="m" />}
-                    >
-                      {t('Insert')}
-                    </Button>
-                    <Button
-                      aria-label={t('Copy')}
-                      buttonStyle="tertiary"
-                      onClick={() => onCopySql(artifact.sql)}
-                      disabled={!artifact.sql}
-                      icon={<Icons.CopyOutlined iconSize="m" />}
-                    >
-                      {t('Copy')}
-                    </Button>
-                    <Button
-                      aria-label={t('Execute')}
-                      buttonStyle="tertiary"
-                      onClick={() => onExecuteArtifact(artifact)}
-                      disabled={!canExecuteArtifact || isLoading}
-                      icon={<Icons.PlayCircleOutlined iconSize="m" />}
-                    >
-                      {t('Execute')}
-                    </Button>
-                  </Flex>
-                  {artifact.trace.length > 0 && (
-                    <TraceDetails>
-                      <summary>{t('Trace')}</summary>
-                      <TraceList>
-                        {artifact.trace.map((event, index) => (
-                          <li key={`${event.step}-${index}`}>
-                            {event.step}: {event.summary}
-                          </li>
-                        ))}
-                      </TraceList>
-                    </TraceDetails>
-                  )}
-                </ArtifactBlock>
-              );
-            })}
-          </MessageBlock>
-        ))}
+                            ))}
+                          </tbody>
+                        </ResultTable>
+                      </ResultScroller>
+                    )}
+                  </>
+                )}
+                <Flex gap="small" wrap="wrap">
+                  <Button
+                    aria-label={t('Insert')}
+                    buttonStyle="tertiary"
+                    onClick={() => onInsertSql(artifact.sql)}
+                    disabled={!artifact.sql || !queryEditor?.id}
+                    icon={<Icons.EditOutlined iconSize="m" />}
+                  >
+                    {t('Insert')}
+                  </Button>
+                  <Button
+                    aria-label={t('Copy')}
+                    buttonStyle="tertiary"
+                    onClick={() => onCopySql(artifact.sql)}
+                    disabled={!artifact.sql}
+                    icon={<Icons.CopyOutlined iconSize="m" />}
+                  >
+                    {t('Copy')}
+                  </Button>
+                  <Button
+                    aria-label={isExecuted ? t('Executed') : t('Execute')}
+                    buttonStyle="tertiary"
+                    onClick={() => onExecuteArtifact(artifact)}
+                    disabled={isExecuted || !canExecuteArtifact || isLoading}
+                    icon={
+                      isExecuted ? (
+                        <Icons.CheckCircleOutlined iconSize="m" />
+                      ) : (
+                        <Icons.PlayCircleOutlined iconSize="m" />
+                      )
+                    }
+                  >
+                    {isExecuted ? t('Executed') : t('Execute')}
+                  </Button>
+                </Flex>
+                {artifact.trace.length > 0 && (
+                  <TraceDetails>
+                    <summary>{t('Trace')}</summary>
+                    <TraceList>
+                      {artifact.trace.map((event, index) => (
+                        <li key={`${event.step}-${index}`}>
+                          {event.step}: {event.summary}
+                        </li>
+                      ))}
+                    </TraceList>
+                  </TraceDetails>
+                )}
+              </ArtifactBlock>
+            );
+          });
+
+          return (
+            <MessageBlock key={message.id} data-message-role={message.role}>
+              {renderArtifactsBeforeMessage && artifactBlocks}
+              <MessageBubble data-message-role={message.role}>
+                {message.content}
+              </MessageBubble>
+              {!renderArtifactsBeforeMessage && artifactBlocks}
+            </MessageBlock>
+          );
+        })}
         {isLoading && (
           <MessageBlock data-message-role="assistant">
             <MessageBubble data-message-role="assistant">

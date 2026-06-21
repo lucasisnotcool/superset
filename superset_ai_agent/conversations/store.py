@@ -21,6 +21,7 @@ from typing import Protocol
 
 from superset_ai_agent.conversations.schemas import (
     Conversation,
+    ConversationArtifact,
     ConversationMessage,
     ConversationScope,
     ConversationSummary,
@@ -31,6 +32,10 @@ DEFAULT_OWNER_ID = "local"
 
 class ConversationNotFoundError(KeyError):
     """Raised when a conversation cannot be found for the owner."""
+
+
+class ConversationArtifactNotFoundError(KeyError):
+    """Raised when an artifact cannot be found in a conversation."""
 
 
 class ConversationStore(Protocol):
@@ -76,6 +81,16 @@ class ConversationStore(Protocol):
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> Conversation:
         """Append a message to a conversation."""
+
+    def replace_artifact(
+        self,
+        conversation_id: str,
+        artifact_id: str,
+        artifact: ConversationArtifact,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> Conversation:
+        """Replace one artifact in a conversation."""
 
     def delete(
         self,

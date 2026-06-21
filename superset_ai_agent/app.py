@@ -205,16 +205,9 @@ def create_app(  # noqa: C901
         """Execute an approved SQL artifact and continue the conversation."""
 
         try:
-            return active_conversation_graph.run(
+            return active_conversation_graph.execute_approved_sql(
                 conversation_id=conversation_id,
-                request=ConversationTurnRequest(
-                    message="Execute selected SQL.",
-                    scope=request.scope,
-                    execution_mode=request.execution_mode,
-                    approved_sql=request.sql,
-                    model=request.model,
-                    max_steps=request.max_steps,
-                ),
+                request=request,
                 owner_id=DEFAULT_OWNER_ID,
             )
         except ConversationNotFoundError as ex:
