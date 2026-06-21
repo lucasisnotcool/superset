@@ -161,6 +161,13 @@ PowerShell helper commands:
 .\scripts\docker-compose-ai-up.ps1 down
 ```
 
+For a read-only diagnostics report of the Docker AI stack:
+
+```powershell
+.\scripts\docker-compose-ai-diagnostics.ps1
+.\scripts\docker-compose-ai-diagnostics.ps1 -OutputPath .\diagnostics\ai-docker.txt
+```
+
 If Windows blocks script execution, run:
 
 ```powershell
