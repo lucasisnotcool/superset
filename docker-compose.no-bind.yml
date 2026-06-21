@@ -122,7 +122,24 @@ services:
         required: false
     build:
       <<: *common-build
-    command: ["/app/docker/docker-bootstrap.sh", "app"]
+    command:
+      - /bin/bash
+      - -c
+      - |
+        manifest="/app/superset/static/assets/manifest.json"
+        max_attempts=300
+        echo "Waiting for webpack manifest at $$manifest..."
+        attempt=0
+        until python -c "import json, sys; data = json.load(open(sys.argv[1])); sys.exit(0 if data.get('entrypoints', {}).get('spa', {}).get('js') else 1)" "$$manifest" 2>/dev/null; do
+          attempt=$$((attempt + 1))
+          if [ "$$attempt" -ge "$$max_attempts" ]; then
+            echo "ERROR: webpack manifest was not ready at $$manifest after $$max_attempts attempts (~10 minutes)." >&2
+            exit 1
+          fi
+          sleep 2
+        done
+        echo "Webpack manifest is ready; starting Superset."
+        exec /app/docker/docker-bootstrap.sh app
     restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -132,6 +149,8 @@ services:
     depends_on:
       superset-init:
         condition: service_completed_successfully
+      superset-node:
+        condition: service_started
     volumes: *superset-runtime-volumes
 
   superset-websocket:
@@ -184,6 +203,7 @@ services:
       superset: "http://superset:8088"
       WEBPACK_DEVSERVER_HOST: "0.0.0.0"
       WEBPACK_DEVSERVER_PORT: "9000"
+      CLEAR_WEBPACK_MANIFEST_ON_START: "true"
     command: ["/app/docker/docker-frontend.sh"]
     env_file:
       - path: docker/.env

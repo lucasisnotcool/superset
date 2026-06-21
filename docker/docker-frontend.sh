@@ -27,6 +27,11 @@ if [ "$BUILD_SUPERSET_FRONTEND_IN_DOCKER" = "true" ]; then
     echo "Building Superset frontend in dev mode inside docker container"
     cd /app/superset-frontend
 
+    if [ "$CLEAR_WEBPACK_MANIFEST_ON_START" = "true" ]; then
+        echo "Clearing stale webpack manifest"
+        rm -f /app/superset/static/assets/manifest.json
+    fi
+
     if [ "$NPM_RUN_PRUNE" = "true" ]; then
         echo "Running \"npm run prune\""
         npm run prune

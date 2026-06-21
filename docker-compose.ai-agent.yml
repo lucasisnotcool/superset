@@ -35,9 +35,6 @@ services:
     environment:
       SUPERSET_AI_AGENT_URL: /ai-agent
       SUPERSET_AI_AGENT_PROXY: http://superset-ai-agent:5050
-    depends_on:
-      superset-ai-agent:
-        condition: service_started
 
   nginx:
     environment:

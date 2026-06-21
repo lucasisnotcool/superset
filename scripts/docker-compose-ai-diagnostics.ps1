@@ -475,22 +475,10 @@ if [ ! -s "$p" ]; then
   exit 0
 fi
 ls -l "$p"
-(sha256sum "$p" 2>/dev/null || shasum -a 256 "$p" 2>/dev/null || true)
-python - <<'PY'
-import json
-p = "/app/superset/static/assets/manifest.json"
-with open(p) as handle:
-    data = json.load(handle)
-entrypoints = data.get("entrypoints", {})
-print("entrypoints=" + ",".join(sorted(entrypoints)))
-for key in ("preamble", "spa", "menu", "embedded"):
-    entry = entrypoints.get(key, {})
-    scripts = entry.get("js", [])
-    styles = entry.get("css", [])
-    print(f"{key}: js={len(scripts)} css={len(styles)}")
-    for script in scripts[:8]:
-        print("  " + script)
-PY
+sha256sum "$p" 2>/dev/null || shasum -a 256 "$p" 2>/dev/null || true
+py=python3
+command -v python3 >/dev/null 2>&1 || py=python
+"$py" -c "import json; p='/app/superset/static/assets/manifest.json'; data=json.load(open(p)); eps=data.get('entrypoints', {}); print('entrypoints=' + ','.join(sorted(eps))); [print(k + ': js=' + str(len(eps.get(k, {}).get('js', []))) + ' css=' + str(len(eps.get(k, {}).get('css', [])))) or [print('  ' + s) for s in eps.get(k, {}).get('js', [])[:8]] for k in ('preamble', 'spa', 'menu', 'embedded')]"
 '@
 
     $result = Invoke-ContainerCommand -Service $Service -Command $manifestCommand
@@ -549,7 +537,6 @@ function Main {
             "superset-websocket",
             "superset-worker",
             "superset-worker-beat",
-            "superset-init",
             "db",
             "redis"
         )
@@ -558,7 +545,6 @@ function Main {
         $assetsPath = "/app/superset/static/assets"
         [void](Test-ServiceMount -Service "superset" -Destination $assetsPath)
         [void](Test-ServiceMount -Service "superset-node" -Destination $assetsPath)
-        [void](Test-ServiceMount -Service "superset-init" -Destination $assetsPath)
 
         Write-Section "Nginx Runtime Config"
         $nginxConfigCommand = @'
@@ -627,6 +613,9 @@ grep -nE "location .*/static" /etc/nginx/conf.d/superset.conf || true
             Write-Host "HTML had no entry scripts; probing preamble/spa scripts from manifest instead."
             $pathsToProbe = @($manifestScripts)
         }
+        if ($htmlAnalysis.EntryScripts.Count -eq 0 -and $manifestScripts.Count -gt 0) {
+            Add-Finding -Level "ERROR" -Message "Host manifest has SPA scripts, but /sqllab/ HTML has none. Superset Flask did not load the webpack manifest before rendering."
+        }
         Write-AssetProbes -Paths $pathsToProbe
 
         Write-Section "Container Manifest Analysis"
@@ -647,21 +636,18 @@ for url in \
   http://superset-websocket:8080/health
 do
   echo "--- $url"
-  curl -sS -o /dev/null -w "status=%{http_code} content_type=%{content_type} bytes=%{size_download} time=%{time_total}\n" "$url" || true
+  curl --max-time 10 -sS -o /dev/null -w "status=%{http_code} content_type=%{content_type} bytes=%{size_download} time=%{time_total}\n" "$url" || true
 done
 echo "--- direct superset /sqllab/ entry scripts"
-curl -sS http://superset:8088/sqllab/ | grep -oE '/static/assets/[^"]+\.entry\.js' | head -20 || true
+curl --max-time 10 -sS http://superset:8088/sqllab/ | grep -oE '/static/assets/[^"]+\.entry\.js' | head -20 || true
 '@
         Write-CommandResult -Label "nginx internal curl probes" -Result (Invoke-ContainerCommand -Service "nginx" -Command $internalProbeCommand) -AllowFailure
 
         Write-Section "Recent Nginx Logs"
-        $nginxLogCommand = @"
-echo "--- access.log filtered ---"
-tail -n $Tail /var/log/nginx/access.log 2>/dev/null | grep -E "sqllab|static/assets|entry\.js|chunk\.js|manifest|appbuilder|api|ws|well-known" || true
-echo "--- error.log ---"
-tail -n $Tail /var/log/nginx/error.log 2>/dev/null || true
-"@
-        Write-CommandResult -Label "nginx access/error logs" -Result (Invoke-ContainerCommand -Service "nginx" -Command $nginxLogCommand) -AllowFailure
+        Write-CommandResult `
+            -Label "docker compose logs nginx" `
+            -Result (Invoke-Compose -Arguments @("logs", "--tail", "$Tail", "nginx")) `
+            -AllowFailure
 
         if (-not $SkipLogs) {
             Write-Section "Recent Compose Logs"
