@@ -204,7 +204,8 @@ manifest), so **Phase 0 makes DB-backed semantic persistence the baseline**
 | 2 | Memory learning loop (NL→SQL examples) | `[COMPLETE]` (2026-06-22) |
 | 3 | MDL completeness (cubes/metrics) | `[COMPLETE]` (2026-06-22) |
 | 3 | wren-core deep-validation CI job | `[TODO]` (RE1) |
-| 4 | Orchestrator/Skills + intent classification + SDK facade | `[TODO]` |
+| 4 | Intent classification + Skills | `[COMPLETE]` (2026-06-22) |
+| 4 | SemanticPipeline facade + framework adapters | `[TODO]` (deferred) |
 
 ---
 
@@ -817,6 +818,32 @@ semantically inconsistent manifest.
 ---
 
 ## Phase 4 — Orchestrator / Skills + Embeddable Surface
+
+### Phase 4 status — intent + skills `[COMPLETE]` (2026-06-22)
+
+**Intent classification and Skills landed** as standalone, tested units. Source:
+[`intent.py`](intent.py) (`classify_intent` → `text_to_sql`/`general`/`clarify`,
+fails closed to `text_to_sql`); [`skills/`](skills/) (`onboarding`,
+`generate-mdl`, `enrich-context`, `usage` Markdown + `get_skill`/`list_skills`
+loader). Tests:
+[`test_intent_and_skills.py`](../tests/unit_tests/superset_ai_agent/test_intent_and_skills.py)
+(6 — each intent, fail-closed on error/bad-JSON, skill listing/loading, unknown
+skill). Suite: **231 passed, 2 skipped**; `ruff` clean.
+
+**Residual risk RO1 (gap vs intent):** `classify_intent` is **not yet wired into
+the graphs** — it is a tested utility, but the conversation graph still routes
+answer-vs-SQL inside `_draft_response`. Wiring it as a pre-node (short-circuit
+`general`/`clarify`) is a follow-up; the existing routing already covers the
+common case.
+
+**Residual risk RO2 (deferred):** the **SemanticPipeline facade (4.1)** and
+**LangChain/Pydantic-AI adapters (4.4)** are not implemented. The six seams are
+individually usable and tested, but there is no single importable
+"plan-and-execute" object yet, and no framework tool wrappers. These are the
+"embed beyond Wren" surface and the recommended next build once the seams settle.
+
+**Residual risk RO3 (UI gap):** skills are backend-only; nothing surfaces them in
+the UI, and intent classification has no UI affordance.
 
 **Parity target:** Wren's plan-and-execute SDK, Markdown **skills** that guide
 agents, intent classification, and framework adapters (LangChain/Pydantic-AI).
