@@ -42,7 +42,11 @@ import {
 } from '@superset-ui/core/components';
 import type { SqlLabRootState } from 'src/SqlLab/types';
 import useQueryEditor from 'src/SqlLab/hooks/useQueryEditor';
-import { addTable, removeTables } from 'src/SqlLab/actions/sqlLab';
+import {
+  addTable,
+  removeTables,
+  openSemanticLayerEditor,
+} from 'src/SqlLab/actions/sqlLab';
 import {
   getItem,
   setItem,
@@ -274,6 +278,17 @@ const TableExploreTree: React.FC<Props> = ({ queryEditorId }) => {
     });
   }, []);
 
+  const handleOpenSemanticLayer = useCallback(
+    (
+      schemaDbId: number,
+      catalogName: string | null | undefined,
+      schemaName: string,
+    ) => {
+      dispatch(openSemanticLayerEditor(schemaDbId, catalogName, schemaName));
+    },
+    [dispatch],
+  );
+
   const sortedTreeData = useMemo(() => {
     if (pinnedSchemas.size === 0) return treeData;
     const pinned = treeData.filter(node => pinnedSchemas.has(node.name));
@@ -406,6 +421,7 @@ const TableExploreTree: React.FC<Props> = ({ queryEditorId }) => {
         handleUnpinTable={handleUnpinTable}
         handlePinSchema={handlePinSchema}
         handleUnpinSchema={handleUnpinSchema}
+        handleOpenSemanticLayer={handleOpenSemanticLayer}
         refreshTableSchema={refreshTableSchema}
         sortedTables={sortedTables}
         toggleSortColumns={toggleSortColumns}
@@ -421,6 +437,7 @@ const TableExploreTree: React.FC<Props> = ({ queryEditorId }) => {
       handleUnpinTable,
       handlePinSchema,
       handleUnpinSchema,
+      handleOpenSemanticLayer,
       refreshTableSchema,
       sortedTables,
       toggleSortColumns,

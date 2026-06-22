@@ -272,6 +272,8 @@ export default function getInitialState({
       ),
       queryEditors: Object.values(queryEditors),
       tabHistory: dedupeTabHistory(tabHistory),
+      semanticLayerEditors: [],
+      activeSemanticLayerEditorId: null,
       tables: Object.values(tables),
       queriesLastUpdate: Date.now(),
       editorTabLastUpdatedAt,

@@ -42,7 +42,12 @@ import { LOG_ACTIONS_SQLLAB_FETCH_FAILED_QUERY } from 'src/logger/LogUtils';
 import type { BootstrapData } from 'src/types/bootstrapTypes';
 import getBootstrapData from 'src/utils/getBootstrapData';
 import { logEvent } from 'src/logger/actions';
-import type { QueryEditor, SqlLabRootState, Table } from '../types';
+import type {
+  QueryEditor,
+  SemanticLayerEditorTab,
+  SqlLabRootState,
+  Table,
+} from '../types';
 import { newQueryTabName } from '../utils/newQueryTabName';
 import getInitialState from '../reducers/getInitialState';
 import { rehydratePersistedState } from '../utils/reduxStateToLocalStorageHelper';
@@ -176,6 +181,11 @@ export const SET_EDITOR_TAB_LAST_UPDATE = 'SET_EDITOR_TAB_LAST_UPDATE';
 export const SET_LAST_UPDATED_ACTIVE_TAB = 'SET_LAST_UPDATED_ACTIVE_TAB';
 export const CLEAR_DESTROYED_QUERY_EDITOR = 'CLEAR_DESTROYED_QUERY_EDITOR';
 
+export const OPEN_SEMANTIC_LAYER_EDITOR = 'OPEN_SEMANTIC_LAYER_EDITOR';
+export const CLOSE_SEMANTIC_LAYER_EDITOR = 'CLOSE_SEMANTIC_LAYER_EDITOR';
+export const SET_ACTIVE_SEMANTIC_LAYER_EDITOR =
+  'SET_ACTIVE_SEMANTIC_LAYER_EDITOR';
+
 // SqlLab action interface with optional properties for reducer compatibility.
 // Uses explicit property types instead of `any` for better type safety.
 export interface SqlLabAction {
@@ -232,6 +242,9 @@ export interface SqlLabAction {
   json?: Record<string, unknown>;
   oldQueryId?: string;
   newQuery?: { id: string };
+  // Semantic layer editor tabs
+  semanticLayerEditor?: SemanticLayerEditorTab;
+  semanticLayerEditorId?: string | null;
 }
 
 // Use AnyAction for ThunkAction/ThunkDispatch to maintain compatibility with
@@ -832,6 +845,60 @@ export function setActiveQueryEditor(queryEditor: QueryEditor): SqlLabAction {
   return {
     type: SET_ACTIVE_QUERY_EDITOR,
     queryEditor,
+  };
+}
+
+export const buildSemanticLayerEditorId = (
+  databaseId: number,
+  catalogName: string | null | undefined,
+  schemaName: string,
+): string =>
+  // Avoid ':' as a delimiter: this id is used as the antd Tabs `key`, which
+  // antd threads into generated DOM `id`/`aria-controls` attributes. Colons
+  // are valid in HTML ids but are CSS pseudo-class syntax, so any unescaped
+  // selector built from this id (including testing-library's accessibility
+  // checks) breaks with a SyntaxError.
+  `semantic-layer__${databaseId}__${catalogName ?? 'none'}__${schemaName}`;
+
+export function setActiveSemanticLayerEditor(
+  semanticLayerEditorId: string | null,
+): SqlLabAction {
+  return {
+    type: SET_ACTIVE_SEMANTIC_LAYER_EDITOR,
+    semanticLayerEditorId,
+  };
+}
+
+export function closeSemanticLayerEditor(
+  semanticLayerEditorId: string,
+): SqlLabAction {
+  return {
+    type: CLOSE_SEMANTIC_LAYER_EDITOR,
+    semanticLayerEditorId,
+  };
+}
+
+export function openSemanticLayerEditor(
+  databaseId: number,
+  catalogName: string | null | undefined,
+  schemaName: string,
+): SqlLabThunkAction {
+  return function (dispatch: AppDispatch, getState: GetState) {
+    const { sqlLab } = getState();
+    const id = buildSemanticLayerEditorId(databaseId, catalogName, schemaName);
+    const exists = sqlLab.semanticLayerEditors.some(tab => tab.id === id);
+    if (!exists) {
+      dispatch({
+        type: OPEN_SEMANTIC_LAYER_EDITOR,
+        semanticLayerEditor: {
+          id,
+          databaseId,
+          catalogName: catalogName ?? null,
+          schemaName,
+        },
+      });
+    }
+    dispatch(setActiveSemanticLayerEditor(id));
   };
 }
 

@@ -717,6 +717,8 @@ export const initialState = {
     databases: {},
     queryEditors: [defaultQueryEditor, extraQueryEditor1, extraQueryEditor2],
     tabHistory: [defaultQueryEditor.id],
+    semanticLayerEditors: [],
+    activeSemanticLayerEditorId: null,
     tables: [],
     workspaceQueries: [],
     queriesLastUpdate: 0,

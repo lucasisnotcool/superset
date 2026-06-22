@@ -17,23 +17,48 @@
  * under the License.
  */
 import {
+  act,
+  createStore,
   fireEvent,
   render,
   screen,
   waitFor,
 } from 'spec/helpers/testing-library';
 import fetchMock from 'fetch-mock';
+import reducerIndex from 'spec/helpers/reducerIndex';
 import TabbedSqlEditors from 'src/SqlLab/components/TabbedSqlEditors';
 import { extraQueryEditor1, initialState } from 'src/SqlLab/fixtures';
 import { newQueryTabName } from 'src/SqlLab/utils/newQueryTabName';
+import {
+  buildSemanticLayerEditorId,
+  closeSemanticLayerEditor,
+  openSemanticLayerEditor,
+} from 'src/SqlLab/actions/sqlLab';
 import { Store } from 'redux';
-import { RootState } from 'src/views/store';
-import { QueryEditor } from 'src/SqlLab/types';
+import { AppDispatch, RootState } from 'src/views/store';
+import {
+  QueryEditor,
+  SemanticLayerEditorTab,
+  SqlLabRootState,
+} from 'src/SqlLab/types';
+
+const getSqlLabState = (store: Store) =>
+  (store.getState() as unknown as { sqlLab: SqlLabRootState['sqlLab'] })
+    .sqlLab;
 
 jest.mock('src/SqlLab/components/SqlEditor', () =>
   // eslint-disable-next-line react/display-name
   ({ queryEditor }: { queryEditor: QueryEditor }) => (
     <div data-test="mock-sql-editor">{queryEditor.id}</div>
+  ),
+);
+
+jest.mock('src/SqlLab/components/AiAgentPanel/SemanticLayerEditor', () =>
+  // eslint-disable-next-line react/display-name
+  ({ schemaName }: SemanticLayerEditorTab) => (
+    <div data-test="mock-semantic-layer-editor">
+      semantic-layer-content-{schemaName}
+    </div>
   ),
 );
 
@@ -171,4 +196,50 @@ test('should have an empty state when query editors is empty', async () => {
   await waitFor(() =>
     expect(getByText('Add a new tab to create SQL Query')).toBeInTheDocument(),
   );
+});
+
+test('opening a semantic-layer tab adds it to the tablist and focuses it', async () => {
+  const store = createStore(initialState, reducerIndex);
+  const dispatch = store.dispatch as AppDispatch;
+  setup(store);
+
+  act(() => {
+    dispatch(openSemanticLayerEditor(1, 'prod', 'main'));
+  });
+
+  await screen.findByText('main');
+  expect(getSqlLabState(store).activeSemanticLayerEditorId).toEqual(
+    buildSemanticLayerEditorId(1, 'prod', 'main'),
+  );
+  const semanticTabButton = screen
+    .getAllByRole('tab')
+    .find(tab => tab.textContent?.includes('main'));
+  expect(semanticTabButton?.closest('.ant-tabs-tab')).toHaveClass(
+    'ant-tabs-tab-active',
+  );
+});
+
+test('closing a semantic-layer tab falls back to the previous query tab without mutating tabHistory', async () => {
+  const store = createStore(initialState, reducerIndex);
+  const dispatch = store.dispatch as AppDispatch;
+  setup(store);
+  const tabHistoryBeforeOpen = getSqlLabState(store).tabHistory;
+
+  act(() => {
+    dispatch(openSemanticLayerEditor(1, 'prod', 'main'));
+  });
+  await screen.findByText('main');
+  expect(getSqlLabState(store).tabHistory).toEqual(tabHistoryBeforeOpen);
+
+  act(() => {
+    dispatch(
+      closeSemanticLayerEditor(buildSemanticLayerEditorId(1, 'prod', 'main')),
+    );
+  });
+
+  await waitFor(() => {
+    expect(screen.queryByText('main')).not.toBeInTheDocument();
+  });
+  expect(getSqlLabState(store).activeSemanticLayerEditorId).toBeNull();
+  expect(getSqlLabState(store).tabHistory).toEqual(tabHistoryBeforeOpen);
 });

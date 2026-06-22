@@ -36,7 +36,6 @@ import { EMPTY_STATE_QE_ID } from 'src/SqlLab/hooks/useQueryEditor';
 
 import useDatabaseSelector from '../SqlEditorTopBar/useDatabaseSelector';
 import TableExploreTree from '../TableExploreTree';
-import SemanticLayerDrawer from '../AiAgentPanel/SemanticLayerDrawer';
 
 export interface SqlEditorLeftBarProps {
   queryEditorId: string;
@@ -83,7 +82,6 @@ const SqlEditorLeftBar = ({ queryEditorId }: SqlEditorLeftBarProps) => {
   const [modalSchema, setModalSchema] = useState<SchemaOption | undefined>(
     undefined,
   );
-  const [semanticLayerOpen, setSemanticLayerOpen] = useState(false);
 
   const openSelectorModal = useCallback(() => {
     setModalDb(db ?? undefined);
@@ -207,30 +205,7 @@ const SqlEditorLeftBar = ({ queryEditorId }: SqlEditorLeftBarProps) => {
         </span>
       </Popover>
       <StyledDivider />
-      <Button
-        buttonSize="small"
-        buttonStyle="tertiary"
-        disabled={!db?.id || !schema}
-        onClick={() => setSemanticLayerOpen(true)}
-        icon={<Icons.DatabaseOutlined iconSize="m" />}
-      >
-        {t('Semantic layer')}
-      </Button>
       <TableExploreTree queryEditorId={activeQEId} />
-      <SemanticLayerDrawer
-        open={semanticLayerOpen}
-        scope={
-          db?.id && schema
-            ? {
-                database_id: db.id,
-                catalog_name: catalog ?? null,
-                schema_name: schema,
-                dataset_ids: [],
-              }
-            : null
-        }
-        onClose={() => setSemanticLayerOpen(false)}
-      />
       {shouldShowReset && (
         <Button
           buttonSize="small"

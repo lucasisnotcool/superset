@@ -18,9 +18,19 @@
  */
 import type { ReactChild } from 'react';
 import fetchMock from 'fetch-mock';
-import { render, screen, waitFor } from 'spec/helpers/testing-library';
+import {
+  createStore,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from 'spec/helpers/testing-library';
 import userEvent from '@testing-library/user-event';
+import type { Store } from 'redux';
+import reducerIndex from 'spec/helpers/reducerIndex';
 import { initialState, defaultQueryEditor } from 'src/SqlLab/fixtures';
+import { buildSemanticLayerEditorId } from 'src/SqlLab/actions/sqlLab';
+import type { SqlLabRootState } from 'src/SqlLab/types';
 
 import { ViewLocations } from 'src/SqlLab/contributions';
 import {
@@ -28,6 +38,10 @@ import {
   cleanupExtensions,
 } from 'spec/helpers/extensionTestHelpers';
 import TableExploreTree from '.';
+
+const getSqlLabState = (store: Store) =>
+  (store.getState() as unknown as { sqlLab: SqlLabRootState['sqlLab'] })
+    .sqlLab;
 
 jest.mock(
   'react-virtualized-auto-sizer',
@@ -345,4 +359,41 @@ test('closes a schema while searchTerm is active and keeps it closed', async () 
   });
   // The schema node itself remains visible as a matching ancestor (just collapsed)
   expect(screen.getByText('public')).toBeInTheDocument();
+});
+
+test('clicking a schema row\'s "Open semantic layer" action dispatches openSemanticLayerEditor for that row, not the active editor', async () => {
+  // Regression test for the bug where semantic-layer access was bound to
+  // whatever schema the active query editor's dropdown had selected, instead
+  // of the specific schema row the user clicked in the tree (which can show
+  // multiple schemas at once).
+  const store = createStore(getInitialState(), reducerIndex);
+  render(<TableExploreTree queryEditorId={mockedQueryEditorId} />, { store });
+
+  await waitFor(() => {
+    expect(screen.getByText('public')).toBeInTheDocument();
+  });
+
+  // Hover-revealed action buttons render a <span role="button"> with no
+  // visible text or aria-label; target it via its data-test attribute
+  // (testIdAttribute is configured to 'data-test' in spec/helpers/setup.ts),
+  // the same convention used by the existing pin/refresh schema actions.
+  const action = screen.getByTestId('semantic-layer-public');
+  fireEvent.click(action);
+
+  const expectedId = buildSemanticLayerEditorId(
+    mockedDatabase.id,
+    null,
+    'public',
+  );
+  expect(getSqlLabState(store).semanticLayerEditors).toEqual([
+    {
+      id: expectedId,
+      databaseId: mockedDatabase.id,
+      catalogName: null,
+      schemaName: 'public',
+    },
+  ]);
+  expect(getSqlLabState(store).activeSemanticLayerEditorId).toEqual(
+    expectedId,
+  );
 });

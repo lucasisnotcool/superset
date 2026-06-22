@@ -40,7 +40,10 @@ import {
 import { Icons } from '@superset-ui/core/components/Icons';
 import { useAppDispatch } from 'src/SqlLab/hooks/useAppDispatch';
 import type { QueryEditor, SqlLabRootState } from 'src/SqlLab/types';
-import { queryEditorSetSql } from 'src/SqlLab/actions/sqlLab';
+import {
+  openSemanticLayerEditor,
+  queryEditorSetSql,
+} from 'src/SqlLab/actions/sqlLab';
 import {
   addDangerToast,
   addInfoToast,
@@ -59,7 +62,9 @@ import {
   getAgentBaseUrl,
   getAgentHealth,
   getConversation,
+  getProjectSemanticLayerState,
   listConversations,
+  resolveSemanticProject,
   sendConversationMessage,
   type ExecutionMode,
   type SemanticLayerState,
@@ -69,7 +74,6 @@ import AuditInfoPanel from './AuditInfoPanel';
 import DataPreviewToggle from './DataPreviewToggle';
 import FollowupQuestions from './FollowupQuestions';
 import InsightCards from './InsightCards';
-import SemanticLayerDrawer from './SemanticLayerDrawer';
 import SemanticLayerStateBadge from './SemanticLayerStateBadge';
 
 const Panel = styled.div`
@@ -407,7 +411,6 @@ const AiAgentPanel = () => {
   const [health, setHealth] = useState<AgentHealthResponse | null>(null);
   const [isHealthError, setIsHealthError] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [isSemanticLayerOpen, setIsSemanticLayerOpen] = useState(false);
   const [semanticLayerState, setSemanticLayerState] =
     useState<SemanticLayerState | null>(null);
 
@@ -470,6 +473,38 @@ const AiAgentPanel = () => {
       isMounted = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (!currentScope?.schema_name) {
+      setSemanticLayerState(null);
+      return undefined;
+    }
+    let isMounted = true;
+    resolveSemanticProject({
+      database_id: currentScope.database_id,
+      catalog_name: currentScope.catalog_name ?? null,
+      schema_name: currentScope.schema_name,
+      create_if_missing: false,
+    })
+      .then(project => getProjectSemanticLayerState(project.id))
+      .then(nextState => {
+        if (isMounted) {
+          setSemanticLayerState(nextState);
+        }
+      })
+      .catch(() => {
+        if (isMounted) {
+          setSemanticLayerState(null);
+        }
+      });
+    return () => {
+      isMounted = false;
+    };
+  }, [
+    currentScope?.database_id,
+    currentScope?.catalog_name,
+    currentScope?.schema_name,
+  ]);
 
   useEffect(() => {
     if (transcriptRef.current) {
@@ -659,8 +694,18 @@ const AiAgentPanel = () => {
             tooltip={t('Semantic layer')}
             buttonSize="small"
             buttonStyle="tertiary"
-            disabled={!currentScope}
-            onClick={() => setIsSemanticLayerOpen(true)}
+            disabled={!currentScope?.schema_name}
+            onClick={() => {
+              if (typeof databaseId === 'number' && currentScope?.schema_name) {
+                dispatch(
+                  openSemanticLayerEditor(
+                    databaseId,
+                    currentScope.catalog_name,
+                    currentScope.schema_name,
+                  ),
+                );
+              }
+            }}
             icon={<Icons.DatabaseOutlined iconSize="m" />}
           />
           <Button
@@ -864,13 +909,6 @@ const AiAgentPanel = () => {
         )}
         {error && <Alert type="error" message={error} />}
       </Transcript>
-
-      <SemanticLayerDrawer
-        open={isSemanticLayerOpen}
-        scope={currentScope}
-        onClose={() => setIsSemanticLayerOpen(false)}
-        onStateChange={setSemanticLayerState}
-      />
 
       <Composer>
         <Input.TextArea

@@ -19,21 +19,27 @@
 import { PureComponent } from 'react';
 import { EditableTabs } from '@superset-ui/core/components/Tabs';
 import { connect } from 'react-redux';
-import type { QueryEditor, SqlLabRootState } from 'src/SqlLab/types';
+import type {
+  QueryEditor,
+  SemanticLayerEditorTab,
+  SqlLabRootState,
+} from 'src/SqlLab/types';
 import { t } from '@apache-superset/core/translation';
 import { FeatureFlag, isFeatureEnabled } from '@superset-ui/core';
-import { styled } from '@apache-superset/core/theme';
+import { styled, css } from '@apache-superset/core/theme';
 import { Logger } from 'src/logger/LogUtils';
-import { EmptyState, Tooltip } from '@superset-ui/core/components';
+import { EmptyState, Tooltip, Typography } from '@superset-ui/core/components';
 import { ErrorBoundary } from 'src/components/ErrorBoundary';
 import { detectOS } from 'src/utils/common';
 import * as Actions from 'src/SqlLab/actions/sqlLab';
 import { Icons } from '@superset-ui/core/components/Icons';
 import SqlEditor from '../SqlEditor';
 import SqlEditorTabHeader from '../SqlEditorTabHeader';
+import SemanticLayerEditor from '../AiAgentPanel/SemanticLayerEditor';
 
 const DEFAULT_PROPS = {
   queryEditors: [],
+  semanticLayerEditors: [],
   offline: false,
   saveQueryWarning: null,
   scheduleQueryWarning: null,
@@ -90,6 +96,17 @@ const TabTitle = styled.span`
   text-transform: none;
 `;
 
+const SemanticLayerTabLabel = styled.span`
+  ${({ theme }) => css`
+    display: inline-flex;
+    align-items: center;
+    gap: ${theme.sizeUnit}px;
+    line-height: 24px;
+    text-transform: none;
+    max-width: 200px;
+  `}
+`;
+
 const AddTabIconWrapper = styled.span`
   display: inline-flex;
   vertical-align: middle;
@@ -137,6 +154,18 @@ class TabbedSqlEditors extends PureComponent<TabbedSqlEditorsProps> {
   }
 
   handleSelect(key: string) {
+    const semanticTab = this.props.semanticLayerEditors.find(
+      tab => tab.id === key,
+    );
+    if (semanticTab) {
+      if (key !== this.props.activeSemanticLayerEditorId) {
+        this.props.actions.setActiveSemanticLayerEditor(key);
+      }
+      return;
+    }
+    if (this.props.activeSemanticLayerEditorId) {
+      this.props.actions.setActiveSemanticLayerEditor(null);
+    }
     const qeid = this.props.tabHistory[this.props.tabHistory.length - 1];
     if (key !== qeid) {
       const queryEditor = this.props.queryEditors.find(qe => qe.id === key);
@@ -149,6 +178,13 @@ class TabbedSqlEditors extends PureComponent<TabbedSqlEditorsProps> {
 
   handleEdit(key: string, action: string) {
     if (action === 'remove') {
+      const semanticTab = this.props.semanticLayerEditors.find(
+        tab => tab.id === key,
+      );
+      if (semanticTab) {
+        this.props.actions.closeSemanticLayerEditor(key);
+        return;
+      }
       const qe = this.props.queryEditors.find(qe => qe.id === key);
       if (qe) {
         this.removeQueryEditor(qe);
@@ -221,12 +257,40 @@ class TabbedSqlEditors extends PureComponent<TabbedSqlEditorsProps> {
       ),
     };
 
-    const tabItems =
-      this.props.queryEditors?.length > 0 ? editors : [emptyTabState];
+    const semanticLayerTabs = this.props.semanticLayerEditors.map(
+      (tab: SemanticLayerEditorTab) => ({
+        key: tab.id,
+        label: (
+          <SemanticLayerTabLabel>
+            <Icons.DatabaseOutlined iconSize="s" />
+            <Typography.Text ellipsis={{ tooltip: tab.schemaName }}>
+              {tab.schemaName}
+            </Typography.Text>
+          </SemanticLayerTabLabel>
+        ),
+        children: (
+          <ErrorBoundary>
+            <SemanticLayerEditor
+              databaseId={tab.databaseId}
+              catalogName={tab.catalogName}
+              schemaName={tab.schemaName}
+            />
+          </ErrorBoundary>
+        ),
+      }),
+    );
+
+    const tabItems = [
+      ...(this.props.queryEditors?.length > 0 ? editors : [emptyTabState]),
+      ...semanticLayerTabs,
+    ];
 
     return (
       <StyledEditableTabs
-        activeKey={this.props.tabHistory[this.props.tabHistory.length - 1]}
+        activeKey={
+          this.props.activeSemanticLayerEditorId ??
+          this.props.tabHistory[this.props.tabHistory.length - 1]
+        }
         id="a11y-query-editor-tabs"
         className="SqlEditorTabs"
         data-test="sql-editor-tabs"
@@ -234,7 +298,11 @@ class TabbedSqlEditors extends PureComponent<TabbedSqlEditorsProps> {
         hideAdd={this.props.offline}
         onTabClick={this.onTabClicked}
         onEdit={this.handleEdit}
-        type={this.props.queryEditors?.length === 0 ? 'card' : 'editable-card'}
+        type={
+          this.props.queryEditors?.length === 0 && semanticLayerTabs.length === 0
+            ? 'card'
+            : 'editable-card'
+        }
         addIcon={
           <Tooltip
             id="add-tab"
@@ -261,6 +329,9 @@ export function mapStateToProps({ sqlLab, common }: SqlLabRootState) {
     queryEditors: sqlLab.queryEditors ?? DEFAULT_PROPS.queryEditors,
     queries: sqlLab.queries,
     tabHistory: sqlLab.tabHistory,
+    semanticLayerEditors:
+      sqlLab.semanticLayerEditors ?? DEFAULT_PROPS.semanticLayerEditors,
+    activeSemanticLayerEditorId: sqlLab.activeSemanticLayerEditorId ?? null,
     defaultDbId: common.conf.SQLLAB_DEFAULT_DBID,
     displayLimit: common.conf.DISPLAY_MAX_ROW,
     offline: sqlLab.offline ?? DEFAULT_PROPS.offline,

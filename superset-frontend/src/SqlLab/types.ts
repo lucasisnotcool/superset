@@ -84,6 +84,13 @@ export type toastState = {
 
 export type UnsavedQueryEditor = Partial<QueryEditor>;
 
+export interface SemanticLayerEditorTab {
+  id: string; // see buildSemanticLayerEditorId in actions/sqlLab.ts
+  databaseId: number;
+  catalogName: string | null;
+  schemaName: string;
+}
+
 export interface Table {
   id: string;
   dbId: number;
@@ -108,6 +115,8 @@ export type SqlLabRootState = {
     queries: Record<string, QueryResponse & { inLocalStorage?: boolean }>;
     queryEditors: QueryEditor[];
     tabHistory: string[]; // default is activeTab ? [activeTab.id.toString()] : []
+    semanticLayerEditors: SemanticLayerEditorTab[];
+    activeSemanticLayerEditorId: string | null;
     tables: Table[];
     queriesLastUpdate: number;
     errorMessage: string | null;

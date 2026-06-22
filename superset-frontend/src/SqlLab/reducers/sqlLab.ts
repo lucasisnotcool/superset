@@ -483,6 +483,41 @@ export default function sqlLabReducer(
       }
       return state;
     },
+    [actions.OPEN_SEMANTIC_LAYER_EDITOR]() {
+      const exists = state.semanticLayerEditors.some(
+        tab => tab.id === action.semanticLayerEditor!.id,
+      );
+      if (exists) {
+        return state;
+      }
+      return {
+        ...state,
+        semanticLayerEditors: [
+          ...state.semanticLayerEditors,
+          action.semanticLayerEditor!,
+        ],
+      };
+    },
+    [actions.CLOSE_SEMANTIC_LAYER_EDITOR]() {
+      const semanticLayerEditors = state.semanticLayerEditors.filter(
+        tab => tab.id !== action.semanticLayerEditorId,
+      );
+      const wasActive =
+        state.activeSemanticLayerEditorId === action.semanticLayerEditorId;
+      return {
+        ...state,
+        semanticLayerEditors,
+        activeSemanticLayerEditorId: wasActive
+          ? null
+          : state.activeSemanticLayerEditorId,
+      };
+    },
+    [actions.SET_ACTIVE_SEMANTIC_LAYER_EDITOR]() {
+      return {
+        ...state,
+        activeSemanticLayerEditorId: action.semanticLayerEditorId ?? null,
+      };
+    },
     [actions.LOAD_QUERY_EDITOR]() {
       const mergeUnsavedState = alterInArr(
         state,

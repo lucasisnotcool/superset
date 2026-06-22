@@ -17,14 +17,23 @@
  * under the License.
  */
 import fetchMock from 'fetch-mock';
+import reducerIndex from 'spec/helpers/reducerIndex';
 import {
+  createStore,
   render,
   screen,
   userEvent,
   waitFor,
 } from 'spec/helpers/testing-library';
+import type { Store } from 'redux';
 import { initialState } from 'src/SqlLab/fixtures';
+import { buildSemanticLayerEditorId } from 'src/SqlLab/actions/sqlLab';
+import type { SqlLabRootState } from 'src/SqlLab/types';
 import AiAgentPanel from '.';
+
+const getSqlLabState = (store: Store) =>
+  (store.getState() as unknown as { sqlLab: SqlLabRootState['sqlLab'] })
+    .sqlLab;
 
 const originalAgentUrl = process.env.SUPERSET_AI_AGENT_URL;
 
@@ -270,7 +279,7 @@ test('sends a conversation message and renders SQL artifact', async () => {
   });
 });
 
-test('opens semantic-layer drawer and uploads a document', async () => {
+test('Semantic layer button opens a semantic-layer tab for the current scope', async () => {
   const scopedState = {
     ...initialState,
     sqlLab: {
@@ -301,14 +310,6 @@ test('opens semantic-layer drawer and uploads a document', async () => {
     project,
   );
   fetchMock.get(
-    'http://agent.local/agent/semantic-layer/projects/project-1/mdl-files',
-    [],
-  );
-  fetchMock.get(
-    'http://agent.local/agent/semantic-layer/documents?database_id=1&schema_name=main&catalog_name=prod',
-    [],
-  );
-  fetchMock.get(
     'http://agent.local/agent/semantic-layer/projects/project-1/state',
     {
       project_id: 'project-1',
@@ -324,67 +325,36 @@ test('opens semantic-layer drawer and uploads a document', async () => {
       last_error: null,
     },
   );
-  fetchMock.post(
-    'http://agent.local/agent/semantic-layer/projects/project-1/documents',
-    {
-      id: 'document-1',
-      project_id: 'project-1',
-      filename: 'notes.md',
-      content_type: 'text/markdown',
-      size_bytes: 12,
-      status: 'needs_review',
-      scope: {
-        database_id: 1,
-        catalog_name: 'prod',
-        schema_name: 'main',
-        dataset_ids: [],
-      },
-      checksum: 'abc',
-      storage_uri: 'file:///tmp/notes.md',
-      proposed_updates: [],
-      warnings: [],
-      created_at: '2026-06-19T00:00:00Z',
-      updated_at: '2026-06-19T00:00:00Z',
-    },
-  );
-  fetchMock.post(
-    'http://agent.local/agent/semantic-layer/projects/project-1/documents/document-1/enrich',
-    {
-      source_document_id: 'document-1',
-      proposed_path: 'models/notes.yaml',
-      proposed_yaml: 'models:\n  - name: notes\n',
-      validation: { valid: true, messages: [] },
-      warnings: [],
-    },
-  );
 
-  const { container } = render(<AiAgentPanel />, {
-    useRedux: true,
-    initialState: scopedState,
-  });
+  const store = createStore(scopedState, reducerIndex);
+  render(<AiAgentPanel />, { store });
 
-  await userEvent.click(screen.getByRole('button', { name: 'Semantic layer' }));
-  await waitFor(() => {
-    expect(
-      screen.getByRole('dialog', { name: 'Semantic layer' }),
-    ).toBeInTheDocument();
-  });
-
-  const inputs =
-    container.querySelectorAll<HTMLInputElement>('input[type="file"]');
-  expect(inputs).toHaveLength(2);
-  await userEvent.upload(
-    inputs[1],
-    new File(['Metric gross_moves = count moves'], 'notes.md', {
-      type: 'text/markdown',
-    }),
-  );
-
+  // The status badge fetches project state in the background on mount,
+  // using create_if_missing: false since it's a passive read, not user
+  // intent to create a project.
   await waitFor(() => {
     expect(
       fetchMock.callHistory.calls(
-        'http://agent.local/agent/semantic-layer/projects/project-1/documents',
+        'http://agent.local/agent/semantic-layer/projects/resolve',
       ),
     ).toHaveLength(1);
   });
+  const [resolveCall] = fetchMock.callHistory.calls(
+    'http://agent.local/agent/semantic-layer/projects/resolve',
+  );
+  expect(JSON.parse(String(resolveCall.options.body))).toMatchObject({
+    create_if_missing: false,
+  });
+
+  await userEvent.click(screen.getByRole('button', { name: 'Semantic layer' }));
+
+  const expectedId = buildSemanticLayerEditorId(1, 'prod', 'main');
+  await waitFor(() => {
+    expect(getSqlLabState(store).semanticLayerEditors).toEqual([
+      { id: expectedId, databaseId: 1, catalogName: 'prod', schemaName: 'main' },
+    ]);
+  });
+  expect(getSqlLabState(store).activeSemanticLayerEditorId).toEqual(
+    expectedId,
+  );
 });

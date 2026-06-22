@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { ChangeEvent, useCallback, useEffect, useRef, useState } from 'react';
+import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { t } from '@apache-superset/core/translation';
 import { css, styled } from '@apache-superset/core/theme';
 import { Alert } from '@apache-superset/core/components';
@@ -43,32 +43,20 @@ import {
   uploadMdlFile,
   uploadProjectSourceDocument,
   WrenMaterializationResult,
-} from './api';
-import SemanticLayerStateBadge from './SemanticLayerStateBadge';
+} from '../api';
+import SemanticLayerStateBadge from '../SemanticLayerStateBadge';
 
-const Overlay = styled.div`
-  ${({ theme }) => css`
-    position: absolute;
-    inset: 0;
-    z-index: 2;
-    display: flex;
-    justify-content: flex-end;
-    background: ${theme.colorBgMask};
-  `}
-`;
-
-const Drawer = styled.div`
+const EditorRoot = styled.div`
   ${({ theme }) => css`
     display: flex;
     flex-direction: column;
-    width: min(920px, 100%);
     height: 100%;
+    min-height: 0;
     background: ${theme.colorBgBase};
-    border-left: 1px solid ${theme.colorBorderSecondary};
   `}
 `;
 
-const DrawerHeader = styled.div`
+const EditorHeader = styled.div`
   ${({ theme }) => css`
     display: flex;
     align-items: center;
@@ -79,7 +67,7 @@ const DrawerHeader = styled.div`
   `}
 `;
 
-const DrawerBody = styled.div`
+const EditorBody = styled.div`
   ${({ theme }) => css`
     display: grid;
     flex: 1;
@@ -168,19 +156,27 @@ const defaultYaml = `models:
     description: ''
 `;
 
-export interface SemanticLayerDrawerProps {
-  open: boolean;
-  scope: ConversationScope | null;
-  onClose: () => void;
-  onStateChange?: (state: SemanticLayerState | null) => void;
+export interface SemanticLayerEditorProps {
+  databaseId: number;
+  catalogName: string | null;
+  schemaName: string;
 }
 
-export default function SemanticLayerDrawer({
-  open,
-  scope,
-  onClose,
-  onStateChange,
-}: SemanticLayerDrawerProps) {
+export default function SemanticLayerEditor({
+  databaseId,
+  catalogName,
+  schemaName,
+}: SemanticLayerEditorProps) {
+  const scope: ConversationScope = useMemo(
+    () => ({
+      database_id: databaseId,
+      catalog_name: catalogName,
+      schema_name: schemaName,
+      dataset_ids: [],
+    }),
+    [databaseId, catalogName, schemaName],
+  );
+
   const [project, setProject] = useState<SemanticProject | null>(null);
   const [mdlFiles, setMdlFiles] = useState<MdlFile[]>([]);
   const [documents, setDocuments] = useState<SemanticDocument[]>([]);
@@ -201,12 +197,11 @@ export default function SemanticLayerDrawer({
     project?.permission === 'write' || project?.permission === 'admin';
 
   const refresh = useCallback(async () => {
-    if (!scope?.schema_name) {
+    if (!scope.schema_name) {
       setProject(null);
       setMdlFiles([]);
       setDocuments([]);
       setState(null);
-      onStateChange?.(null);
       return;
     }
     const nextProject = await resolveSemanticProject({
@@ -224,7 +219,6 @@ export default function SemanticLayerDrawer({
     setMdlFiles(nextFiles);
     setDocuments(nextDocuments);
     setState(nextState);
-    onStateChange?.(nextState);
     const selectedFile =
       nextFiles.find(file => file.id === activeFileId) || nextFiles[0] || null;
     if (selectedFile) {
@@ -232,21 +226,15 @@ export default function SemanticLayerDrawer({
       setEditorPath(selectedFile.path);
       setEditorValue(selectedFile.content);
     }
-  }, [activeFileId, onStateChange, scope]);
+  }, [activeFileId, scope]);
 
   useEffect(() => {
-    if (open) {
-      refresh().catch(ex => {
-        setError(
-          ex instanceof Error ? ex.message : t('Unable to load semantic layer'),
-        );
-      });
-    }
-  }, [open, refresh]);
-
-  if (!open) {
-    return null;
-  }
+    refresh().catch(ex => {
+      setError(
+        ex instanceof Error ? ex.message : t('Unable to load semantic layer'),
+      );
+    });
+  }, [refresh]);
 
   const withLoading = async (action: () => Promise<void>, fallback: string) => {
     setIsLoading(true);
@@ -350,31 +338,170 @@ export default function SemanticLayerDrawer({
     }, t('Unable to materialize Wren project'));
 
   return (
-    <Overlay>
-      <Drawer role="dialog" aria-label={t('Semantic layer')}>
-        <DrawerHeader>
-          <Flex vertical gap={0}>
-            <Typography.Title level={5} style={{ margin: 0 }}>
-              {project?.name || t('Semantic layer')}
-            </Typography.Title>
-            <SemanticLayerStateBadge state={state} />
+    <EditorRoot data-test="semantic-layer-editor">
+      <EditorHeader>
+        <Flex vertical gap={0}>
+          <Typography.Title level={5} style={{ margin: 0 }}>
+            {project?.name || t('Semantic layer')}
+          </Typography.Title>
+          <SemanticLayerStateBadge state={state} />
+        </Flex>
+      </EditorHeader>
+      <EditorBody>
+        <BrowserPane>
+          {error && <Alert type="warning" message={error} />}
+          {!scope.schema_name && (
+            <Alert type="warning" message={t('Select a database and schema.')} />
+          )}
+          <Flex gap="small" wrap="wrap">
+            <Button
+              buttonStyle="primary"
+              disabled={!project || !canWrite || isLoading}
+              onClick={() => saveFile()}
+              icon={<Icons.SaveOutlined iconSize="m" />}
+            >
+              {t('Save')}
+            </Button>
+            <Button
+              buttonStyle="tertiary"
+              disabled={!project || !canWrite || isLoading}
+              onClick={() => {
+                setActiveFileId(null);
+                setEditorPath('models/new_model.yaml');
+                setEditorValue(defaultYaml);
+                setProposal(null);
+              }}
+              icon={<Icons.PlusOutlined iconSize="m" />}
+            >
+              {t('New')}
+            </Button>
           </Flex>
-          <Button
-            aria-label={t('Close semantic layer')}
-            buttonStyle="tertiary"
-            onClick={onClose}
-            icon={<Icons.CloseOutlined iconSize="m" />}
+          <ScrollList>
+            {mdlFiles.map(file => (
+              <FileButton
+                key={file.id}
+                type="button"
+                data-active={file.id === activeFileId}
+                onClick={() => selectFile(file)}
+              >
+                <span>{file.path}</span>
+                <Typography.Text type="secondary">{file.status}</Typography.Text>
+              </FileButton>
+            ))}
+          </ScrollList>
+          <Flex gap="small" wrap="wrap">
+            <Button
+              buttonStyle="tertiary"
+              disabled={!project || !canWrite || isLoading}
+              onClick={() => mdlInputRef.current?.click()}
+              icon={<Icons.UploadOutlined iconSize="m" />}
+            >
+              {t('MDL')}
+            </Button>
+            <Button
+              buttonStyle="tertiary"
+              disabled={!project || !canWrite || isLoading}
+              onClick={() => sourceInputRef.current?.click()}
+              icon={<Icons.FileTextOutlined iconSize="m" />}
+            >
+              {t('Document')}
+            </Button>
+            <Button
+              buttonStyle="tertiary"
+              disabled={!project || isLoading}
+              onClick={materializeProject}
+              icon={<Icons.SyncOutlined iconSize="m" />}
+            >
+              {t('Materialize')}
+            </Button>
+          </Flex>
+          <HiddenFileInput
+            ref={mdlInputRef}
+            type="file"
+            accept=".yaml,.yml,text/yaml,application/x-yaml"
+            onChange={uploadMdl}
           />
-        </DrawerHeader>
-        <DrawerBody>
-          <BrowserPane>
-            {error && <Alert type="warning" message={error} />}
-            {!scope?.schema_name && (
-              <Alert
-                type="warning"
-                message={t('Select a database and schema.')}
-              />
-            )}
+          <HiddenFileInput
+            ref={sourceInputRef}
+            type="file"
+            accept=".md,.txt,text/markdown,text/plain"
+            onChange={uploadSourceDocument}
+          />
+          {documents.map(document => (
+            <SourceDocumentItem key={document.id}>
+              <Typography.Text strong>{document.filename}</Typography.Text>
+              <Typography.Text type="secondary">
+                {document.status}
+              </Typography.Text>
+              {document.summary && (
+                <Typography.Paragraph>{document.summary}</Typography.Paragraph>
+              )}
+              <Button
+                buttonStyle="tertiary"
+                buttonSize="small"
+                disabled={!project || !canWrite || isLoading}
+                onClick={() =>
+                  withLoading(async () => {
+                    if (!project) {
+                      return;
+                    }
+                    const nextProposal = await enrichProjectDocument(
+                      project.id,
+                      document.id,
+                    );
+                    setProposal(nextProposal);
+                    setActiveFileId(null);
+                    setEditorPath(nextProposal.proposed_path);
+                    setEditorValue(nextProposal.proposed_yaml);
+                  }, t('Unable to enrich document'))
+                }
+                icon={<Icons.FunctionOutlined iconSize="m" />}
+              >
+                {t('Enrich')}
+              </Button>
+            </SourceDocumentItem>
+          ))}
+        </BrowserPane>
+        <EditorPane>
+          {proposal && (
+            <Alert
+              type="info"
+              message={t('Review proposed MDL before saving.')}
+              description={proposal.warnings.join(' ')}
+            />
+          )}
+          {materialization && (
+            <Alert
+              type="success"
+              message={t('Wren project materialized')}
+              description={t('%s active file(s)', materialization.file_count)}
+            />
+          )}
+          <Input
+            value={editorPath}
+            disabled={!canWrite || isLoading}
+            onChange={(event: ChangeEvent<HTMLInputElement>) =>
+              setEditorPath(event.target.value)
+            }
+          />
+          <StyledEditorHost
+            id={`semantic-mdl-${project?.id || 'empty'}`}
+            height="100%"
+            language="yaml"
+            onChange={setEditorValue}
+            readOnly={!canWrite || isLoading}
+            value={editorValue}
+            width="100%"
+          />
+          {activeFile?.validation && !activeFile.validation.valid && (
+            <Alert
+              type="warning"
+              message={activeFile.validation.messages
+                .map(message => message.message)
+                .join('\n')}
+            />
+          )}
+          <Flex justify="space-between" gap="small" wrap="wrap">
             <Flex gap="small" wrap="wrap">
               <Button
                 buttonStyle="primary"
@@ -382,182 +509,28 @@ export default function SemanticLayerDrawer({
                 onClick={() => saveFile()}
                 icon={<Icons.SaveOutlined iconSize="m" />}
               >
-                {t('Save')}
+                {t('Save draft')}
               </Button>
               <Button
                 buttonStyle="tertiary"
                 disabled={!project || !canWrite || isLoading}
-                onClick={() => {
-                  setActiveFileId(null);
-                  setEditorPath('models/new_model.yaml');
-                  setEditorValue(defaultYaml);
-                  setProposal(null);
-                }}
-                icon={<Icons.PlusOutlined iconSize="m" />}
+                onClick={() => saveFile('active')}
+                icon={<Icons.CheckCircleOutlined iconSize="m" />}
               >
-                {t('New')}
+                {t('Activate')}
               </Button>
             </Flex>
-            <ScrollList>
-              {mdlFiles.map(file => (
-                <FileButton
-                  key={file.id}
-                  type="button"
-                  data-active={file.id === activeFileId}
-                  onClick={() => selectFile(file)}
-                >
-                  <span>{file.path}</span>
-                  <Typography.Text type="secondary">
-                    {file.status}
-                  </Typography.Text>
-                </FileButton>
-              ))}
-            </ScrollList>
-            <Flex gap="small" wrap="wrap">
-              <Button
-                buttonStyle="tertiary"
-                disabled={!project || !canWrite || isLoading}
-                onClick={() => mdlInputRef.current?.click()}
-                icon={<Icons.UploadOutlined iconSize="m" />}
-              >
-                {t('MDL')}
-              </Button>
-              <Button
-                buttonStyle="tertiary"
-                disabled={!project || !canWrite || isLoading}
-                onClick={() => sourceInputRef.current?.click()}
-                icon={<Icons.FileTextOutlined iconSize="m" />}
-              >
-                {t('Document')}
-              </Button>
-              <Button
-                buttonStyle="tertiary"
-                disabled={!project || isLoading}
-                onClick={materializeProject}
-                icon={<Icons.SyncOutlined iconSize="m" />}
-              >
-                {t('Materialize')}
-              </Button>
-            </Flex>
-            <HiddenFileInput
-              ref={mdlInputRef}
-              type="file"
-              accept=".yaml,.yml,text/yaml,application/x-yaml"
-              onChange={uploadMdl}
-            />
-            <HiddenFileInput
-              ref={sourceInputRef}
-              type="file"
-              accept=".md,.txt,text/markdown,text/plain"
-              onChange={uploadSourceDocument}
-            />
-            {documents.map(document => (
-              <SourceDocumentItem key={document.id}>
-                <Typography.Text strong>{document.filename}</Typography.Text>
-                <Typography.Text type="secondary">
-                  {document.status}
-                </Typography.Text>
-                {document.summary && (
-                  <Typography.Paragraph>
-                    {document.summary}
-                  </Typography.Paragraph>
-                )}
-                <Button
-                  buttonStyle="tertiary"
-                  buttonSize="small"
-                  disabled={!project || !canWrite || isLoading}
-                  onClick={() =>
-                    withLoading(async () => {
-                      if (!project) {
-                        return;
-                      }
-                      const nextProposal = await enrichProjectDocument(
-                        project.id,
-                        document.id,
-                      );
-                      setProposal(nextProposal);
-                      setActiveFileId(null);
-                      setEditorPath(nextProposal.proposed_path);
-                      setEditorValue(nextProposal.proposed_yaml);
-                    }, t('Unable to enrich document'))
-                  }
-                  icon={<Icons.FunctionOutlined iconSize="m" />}
-                >
-                  {t('Enrich')}
-                </Button>
-              </SourceDocumentItem>
-            ))}
-          </BrowserPane>
-          <EditorPane>
-            {proposal && (
-              <Alert
-                type="info"
-                message={t('Review proposed MDL before saving.')}
-                description={proposal.warnings.join(' ')}
-              />
-            )}
-            {materialization && (
-              <Alert
-                type="success"
-                message={t('Wren project materialized')}
-                description={t('%s active file(s)', materialization.file_count)}
-              />
-            )}
-            <Input
-              value={editorPath}
-              disabled={!canWrite || isLoading}
-              onChange={(event: ChangeEvent<HTMLInputElement>) =>
-                setEditorPath(event.target.value)
-              }
-            />
-            <StyledEditorHost
-              id={`semantic-mdl-${project?.id || 'empty'}`}
-              height="100%"
-              language="yaml"
-              onChange={setEditorValue}
-              readOnly={!canWrite || isLoading}
-              value={editorValue}
-              width="100%"
-            />
-            {activeFile?.validation && !activeFile.validation.valid && (
-              <Alert
-                type="warning"
-                message={activeFile.validation.messages
-                  .map(message => message.message)
-                  .join('\n')}
-              />
-            )}
-            <Flex justify="space-between" gap="small" wrap="wrap">
-              <Flex gap="small" wrap="wrap">
-                <Button
-                  buttonStyle="primary"
-                  disabled={!project || !canWrite || isLoading}
-                  onClick={() => saveFile()}
-                  icon={<Icons.SaveOutlined iconSize="m" />}
-                >
-                  {t('Save draft')}
-                </Button>
-                <Button
-                  buttonStyle="tertiary"
-                  disabled={!project || !canWrite || isLoading}
-                  onClick={() => saveFile('active')}
-                  icon={<Icons.CheckCircleOutlined iconSize="m" />}
-                >
-                  {t('Activate')}
-                </Button>
-              </Flex>
-              <Button
-                buttonStyle="danger"
-                disabled={!activeFile || !project || !canWrite || isLoading}
-                onClick={() => activeFile && deleteFile(activeFile)}
-                icon={<Icons.DeleteOutlined iconSize="m" />}
-              >
-                {t('Delete')}
-              </Button>
-            </Flex>
-          </EditorPane>
-        </DrawerBody>
-      </Drawer>
-    </Overlay>
+            <Button
+              buttonStyle="danger"
+              disabled={!activeFile || !project || !canWrite || isLoading}
+              onClick={() => activeFile && deleteFile(activeFile)}
+              icon={<Icons.DeleteOutlined iconSize="m" />}
+            >
+              {t('Delete')}
+            </Button>
+          </Flex>
+        </EditorPane>
+      </EditorBody>
+    </EditorRoot>
   );
 }

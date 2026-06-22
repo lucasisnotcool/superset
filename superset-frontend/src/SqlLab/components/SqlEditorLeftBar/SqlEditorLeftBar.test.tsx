@@ -238,6 +238,18 @@ test('ignore schema api when current schema is deprecated', async () => {
   );
 });
 
+test('does not render a database-wide "Semantic layer" button', async () => {
+  // Regression guard: the semantic layer entrypoint moved to a per-schema
+  // action in TableExploreTree, since one global button bound to the active
+  // query editor's schema was disconnected from whichever schema row a user
+  // was actually browsing (the tree can show multiple schemas at once).
+  await renderAndWait(mockedProps, undefined, initialState);
+
+  expect(
+    screen.queryByRole('button', { name: 'Semantic layer' }),
+  ).not.toBeInTheDocument();
+});
+
 test('uses EMPTY_STATE_QE_ID when queryEditorId is empty', async () => {
   const useDatabaseSelectorSpy = jest.spyOn(
     useDatabaseSelectorModule,

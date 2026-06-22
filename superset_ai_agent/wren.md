@@ -43,6 +43,49 @@ precedence:
    should show semantic-layer status and an "Open semantic layer" action, not
    own MDL file CRUD.
 
+## Audit Note (2026-06-22)
+
+This document was fact-checked end-to-end against the actual repository
+contents on 2026-06-22 (backend `superset_ai_agent/`, Superset core
+`superset/`, and `superset-frontend/src/SqlLab/`). The large majority of
+"Confirmed Current Code Facts," the "Codebase Source Map And Completion
+Status" table, and the R1-R10 status claims in section 22 held up against
+source, including the highest-risk claim — that `superset/ai_agent/api.py`
+exists as a real Superset-core REST endpoint — which is fully accurate.
+Corrections were made inline and are marked with **"Verified current state
+(2026-06-22)"** callouts; they cover:
+
+- the agent DB migration was implemented as one consolidated
+  `0001_initial_agent_tables.py` rather than the planned 0001/0002 split
+  (section 15);
+- the `WrenClient` protocol still threads a plain `mdl_path` string rather than
+  a `project`/`materialized_project_path` pair — schema-scoping is achieved one
+  layer up, in the graphs, not in the protocol itself (section 5);
+- URI-fingerprint salting is wired on the Superset-core side
+  (`AI_AGENT_SEMANTIC_URI_FINGERPRINT_SALT` Flask config) but not on the
+  agent's own `supplied_uri` fallback path, and several planned `AgentConfig`
+  fields (`semantic_uri_fingerprint_salt`, `semantic_uri_proof_ttl_seconds`,
+  `semantic_uri_match_requires_validation`, `semantic_partial_access_enabled`)
+  were never implemented (section 16);
+- the project materializer landed as a function, not a
+  `WrenProjectMaterializer` class, with a simpler directory layout and no
+  temp-dir/atomic-rename step (section 21, "Runtime Materialization");
+- several referenced test files do not exist (`test_identity.py`,
+  `test_persistence_migrations.py`, `test_wren_project_materializer.py`,
+  `test_semantic_layer_mdl_api.py`, `test_semantic_layer_uri_fingerprint.py`,
+  all three `tests/integration_tests/...` paths, and 14 of 16 listed frontend
+  component tests) — the underlying behavior is generally tested elsewhere
+  under a different filename, but the specific paths were wrong;
+- two `artifacts/insights.py` function signatures differ slightly from the
+  Phase-1 skeleton (section 2);
+- the frontend `WrenContextArtifact`/`AuditInfo` types now carry more fields
+  than the Phase-1 spec shows (section 9).
+
+None of these corrections change an overall `[COMPLETE]`/`[PARTIAL]`/`[TODO]`
+status; they sharpen the evidence behind those statuses. Re-verify any
+"Verified current state" note before relying on it if substantial further
+work has landed since this date.
+
 ## Confirmed Current Code Facts
 
 The current agent service is implemented in these files:
@@ -937,6 +980,25 @@ def build_artifact_bundle(
     """Build summary, cards, preview, and follow-up suggestions."""
 ```
 
+**Verified current state (2026-06-22):** all of these landed in
+`superset_ai_agent/artifacts/insights.py` with three signature differences
+from the skeleton above:
+
+- `profile_result(result, *, row_limit, question: str = "")` — gained an
+  optional `question` parameter not in the original plan (`insights.py:86-91`);
+- `detect_category_column(result, profiles: list[ColumnProfile])` — takes the
+  column-profile list directly rather than the full `ResultAnalysis`
+  (`insights.py:160-163`);
+- `detect_primary_metric(question, numeric_columns: list[str])` — takes the
+  numeric column name list directly rather than the full `ResultAnalysis`
+  (`insights.py:194-207`).
+
+All other functions (`is_numeric_value`, `is_time_value`,
+`compute_category_stats`, `build_answer_summary`, `build_insight_cards`,
+`build_recommended_followups`, `build_artifact_bundle`) match the skeleton
+signatures as written, and `tests/unit_tests/superset_ai_agent/test_artifact_insights.py`
+exists with coverage for these cases.
+
 Handling rules:
 
 | Case | Behavior |
@@ -1245,6 +1307,22 @@ but the finalized schema-scoped runtime should pass both the resolved
 `SemanticProject` and the materialized project directory into Wren. This
 prevents Wren from loading a global MDL path when a user selected only one
 database/schema.
+
+**Verified current state (2026-06-22):** the implemented `WrenClient` protocol
+in `superset_ai_agent/integrations/wren/client.py:39-93` did not adopt the
+`project`/`materialized_project_path` parameters shown above. `fetch_context`
+and `dry_plan` still take a single `mdl_path: str | None = None` keyword
+(matching the "compatibility shim" shape, not the target shape). Schema-scoping
+is achieved one layer up instead: `TextToSqlGraph._load_wren_context`
+(`superset_ai_agent/graph.py:258-325`) and
+`ConversationGraph._load_wren_context` resolve the `SemanticProject`,
+materialize it, and pass the resulting `materialization.path` in as `mdl_path`.
+This means R4/R6/R10's "schema-scoped" claims hold in practice — Wren only ever
+receives the one materialized directory for the selected project — but the
+`WrenClient` protocol itself was never widened to accept a `project` argument.
+`preview_document_updates` and `propose_mdl_from_document` *did* land with
+`project: SemanticProject` parameters as planned, so the protocol is partially
+upgraded, not fully on the original plan.
 
 Do not include an execution method. If a future Wren SDK requires an execution
 capability on a lower-level object, keep it private and make `factory.py` fail
@@ -1853,7 +1931,20 @@ export interface WrenContextArtifact {
   dry_plan?: Record<string, unknown> | null;
   warnings: string[];
 }
+```
 
+**Verified current state (2026-06-22):** the implemented interface in
+`superset-frontend/src/SqlLab/components/AiAgentPanel/api.ts:93-109` carries six
+additional fields beyond this Phase-1 spec, added as the project-aware Wren
+work in sections 14-16 landed: `project_id`, `mdl_path`,
+`materialized_file_count`, `materialized_checksum`, `context_items` (replacing
+a bare `dry_plan`-only model with structured retrieved-context items), and
+`retrieval` (a nested `WrenRetrievalArtifact`, see section 16). `AuditInfo` was
+similarly extended with `client_id`, `sql_editor_id`, `tab`, and `source_hash`
+per section 18. Treat the interfaces in this section as the historical Phase-1
+baseline, not the current full shape.
+
+```ts
 export interface ExecutionResult {
   columns: string[];
   rows: Record<string, unknown>[];
@@ -2015,7 +2106,7 @@ tests/unit_tests/superset_ai_agent/test_graph.py
 tests/unit_tests/superset_ai_agent/test_conversation_graph.py
 tests/unit_tests/superset_ai_agent/test_conversation_sqlalchemy_store.py
 tests/unit_tests/superset_ai_agent/test_config.py
-tests/unit_tests/superset_ai_agent/test_identity.py
+tests/unit_tests/superset_ai_agent/test_auth.py
 tests/unit_tests/superset_ai_agent/test_persistence_database.py
 tests/unit_tests/superset_ai_agent/test_wren_client.py
 tests/unit_tests/superset_ai_agent/test_wren_mdl_exporter.py
@@ -2026,6 +2117,12 @@ tests/unit_tests/superset_ai_agent/test_semantic_layer_sqlalchemy_store.py
 tests/unit_tests/superset_ai_agent/test_semantic_layer_file_storage.py
 tests/unit_tests/superset_ai_agent/test_superset_client.py
 ```
+
+**Verified current state (2026-06-22):** there is no `test_identity.py` — the
+identity-provider coverage this list intends lives in `test_auth.py` (8 test
+functions, confirmed). All other files listed above exist. Files that exist in
+the repo but are not listed here: `test_app.py`, `test_conversation_store.py`,
+`test_model_clients.py`, `test_sql.py`.
 
 Required backend coverage:
 
@@ -2078,6 +2175,13 @@ superset-frontend/src/SqlLab/components/AiAgentPanel/AuditInfoPanel.test.tsx
 superset-frontend/src/SqlLab/components/AiAgentPanel/FollowupQuestions.test.tsx
 superset-frontend/src/SqlLab/components/AiAgentPanel/SemanticLayerStateBadge.test.tsx
 ```
+
+**Verified current state (2026-06-22):** only `api.test.ts` and `index.test.tsx`
+exist under `AiAgentPanel/`. The six component-level test files for
+`InsightCards`, `AiChartPreview`, `DataPreviewToggle`, `AuditInfoPanel`,
+`FollowupQuestions`, and `SemanticLayerStateBadge` do not exist, even though
+their corresponding components (listed in section 10) are implemented. This
+list remains an open test-writing task, not a completed one.
 
 Required frontend coverage:
 
@@ -2366,7 +2470,20 @@ Data not stored in this DB:
 Replace `superset_ai_agent/persistence/database.py::run_migrations`, which
 currently calls `Base.metadata.create_all`, with a real Alembic lifecycle.
 
-Add:
+**Verified current state (2026-06-22):** This was implemented as a single
+consolidated migration rather than the originally planned 0001/0002 split.
+`superset_ai_agent/persistence/migrations/versions/0001_initial_agent_tables.py`
+already creates all twelve tables, including the semantic-project/access tables
+listed below (`op.create_table` calls confirmed for `ai_agent_conversations`,
+`ai_agent_messages`, `ai_agent_artifacts`, `ai_agent_semantic_documents`,
+`ai_agent_semantic_updates`, `ai_agent_semantic_layer_versions`,
+`ai_agent_wren_context_cache`, `ai_agent_events`, `ai_agent_semantic_projects`,
+`ai_agent_semantic_project_grants`, `ai_agent_semantic_access_proofs`,
+`ai_agent_semantic_mdl_files`). There is no `0002_semantic_projects_access.py`
+file and none is needed — the table list below documents schema content, not a
+pending second migration.
+
+Originally planned as:
 
 ```text
 superset_ai_agent/persistence/alembic.ini
@@ -2376,10 +2493,19 @@ superset_ai_agent/persistence/migrations/versions/0001_initial_agent_tables.py
 superset_ai_agent/persistence/migrations/versions/0002_semantic_projects_access.py
 ```
 
-`0001_initial_agent_tables.py` should create the tables already represented by
-`superset_ai_agent/persistence/models.py`.
+`0001_initial_agent_tables.py` creates the tables already represented by
+`superset_ai_agent/persistence/models.py`, including the tables originally
+scoped for 0002.
 
-`0002_semantic_projects_access.py` should add:
+This content was added directly to `0001_initial_agent_tables.py` rather than a
+separate `0002_semantic_projects_access.py` revision. Verified against
+`superset_ai_agent/persistence/migrations/versions/0001_initial_agent_tables.py:318-417`:
+column definitions match below with two confirmed differences — the unique
+scope constraint is a plain `UniqueConstraint` on
+`(database_uri_fingerprint, catalog_name, schema_name, deleted_at)` rather than
+a `WHERE deleted_at IS NULL` partial index (for SQLite/MySQL portability), and
+`ai_agent_semantic_access_proofs` has both `catalog_names` and `schema_names`
+JSON columns, not `schema_names` alone:
 
 ```python
 ai_agent_semantic_projects
@@ -2456,10 +2582,14 @@ superset_ai_agent/persistence/database.py
 superset_ai_agent/persistence/models.py
 superset_ai_agent/semantic_layer/projects.py
 superset_ai_agent/semantic_layer/access.py
-tests/unit_tests/superset_ai_agent/test_persistence_migrations.py
 tests/unit_tests/superset_ai_agent/test_semantic_layer_access.py
 tests/unit_tests/superset_ai_agent/test_semantic_layer_projects.py
 ```
+
+There is no `tests/unit_tests/superset_ai_agent/test_persistence_migrations.py`
+in the repo. Migration upgrade/idempotency behavior is covered instead by
+`tests/unit_tests/superset_ai_agent/test_persistence_database.py` (verified
+present, 3 tests as of 2026-06-22).
 
 Required behavior:
 
@@ -2561,6 +2691,28 @@ AI_AGENT_SEMANTIC_URI_MATCH_REQUIRES_VALIDATION=true
 AI_AGENT_SEMANTIC_PARTIAL_ACCESS_ENABLED=true
 AI_AGENT_SEMANTIC_FULL_ACCESS_GRANTS_WRITE=false
 ```
+
+**Verified current state (2026-06-22):** only `semantic_access_mode` and
+`semantic_full_access_grants_write` actually exist on `AgentConfig`
+(`superset_ai_agent/config.py:127-128`, wired from `AI_AGENT_SEMANTIC_ACCESS_MODE`
+and `AI_AGENT_SEMANTIC_FULL_ACCESS_GRANTS_WRITE`). `semantic_uri_fingerprint_salt`,
+`semantic_uri_proof_ttl_seconds`, `semantic_uri_match_requires_validation`, and
+`semantic_partial_access_enabled` are not present in `config.py` under any name —
+they remain unimplemented, not just renamed.
+
+Salting consequence: `superset_ai_agent/semantic_layer/uri_fingerprint.py:46`
+defines `fingerprint_database_uri(uri, *, salt=None)`, but every caller in the
+agent (`semantic_layer/projects.py:345`, used for the `supplied_uri` validation
+path) calls it with no `salt` argument, so agent-side URI fingerprinting is
+currently unsalted in every deployment. Salting *is* implemented, but only on
+the Superset-core side: `superset/ai_agent/api.py::_database_uri_fingerprint`
+(lines 116-119) reads `app.config.get("AI_AGENT_SEMANTIC_URI_FINGERPRINT_SALT")`
+— a Superset Flask config key, not an `AgentConfig` field — and salts
+Superset-proven database identity fingerprints with it. Net effect: the
+Superset-proven discovery path (`AiAgentRestApi.database_identity`) is salted
+per-deployment as intended; the agent's own `supplied_uri` fallback path is not.
+This matters because the default `semantic_access_mode` is `superset_or_uri`,
+which includes the unsalted path.
 
 Add:
 
@@ -2827,6 +2979,12 @@ tests/unit_tests/superset_ai_agent/test_semantic_layer_projects.py
 tests/unit_tests/superset_ai_agent/test_graph.py
 tests/unit_tests/superset_ai_agent/test_conversation_graph.py
 ```
+
+`test_semantic_layer_uri_fingerprint.py` does not exist as a standalone file
+(verified 2026-06-22); the fingerprinting behavior it would cover is tested
+within `test_semantic_layer_projects.py`, `test_semantic_layer_access.py`,
+`test_wren_materializer.py`, `test_superset_client.py`, and
+`test_wren_http_client.py` instead.
 
 Required coverage:
 
@@ -3191,6 +3349,18 @@ tests/unit_tests/superset_ai_agent/test_superset_client.py
 tests/integration_tests/semantic_layers/api_tests.py
 tests/integration_tests/semantic_layers/security_tests.py
 ```
+
+**Verified current state (2026-06-22):** neither
+`tests/integration_tests/semantic_layers/api_tests.py` nor
+`security_tests.py` exists; `tests/integration_tests/semantic_layers/` is not a
+directory in the repo. Separately, Superset core's pre-existing
+`superset/semantic_layers/` feature already has substantial *unit* coverage —
+`tests/unit_tests/semantic_layers/api_test.py` (90 tests),
+`models_test.py` (69 tests), `schemas_test.py` (25 tests), and
+`tests/unit_tests/commands/semantic_layer/{create,update,delete}_test.py`
+(8/13/8 tests) — but that suite predates and does not cover the URI-derived,
+DB-access-derived semantic-project access model this section proposes. The
+integration tests this section calls for remain unwritten.
 
 Required coverage:
 
@@ -3693,7 +3863,41 @@ tests/unit_tests/superset_ai_agent/test_semantic_layer_mdl_api.py
 tests/unit_tests/superset_ai_agent/test_wren_project_materializer.py
 ```
 
-`WrenProjectMaterializer` should:
+**Verified current state (2026-06-22):** this landed as a plain function,
+`materialize_wren_project()` in `superset_ai_agent/semantic_layer/wren_materializer.py:35-96`
+— there is no `WrenProjectMaterializer` class and no
+`integrations/wren/project_materializer.py` file. `test_wren_project_materializer.py`
+and `test_semantic_layer_mdl_api.py` do not exist; coverage for this behavior
+lives in `test_wren_materializer.py` and `test_semantic_layer_mdl_files.py`/
+`test_semantic_layer_api.py` instead. Checked against source, the bullets below
+hold with three corrections:
+
+- load only `status="active"` MDL files for the selected schema project —
+  confirmed (`wren_materializer.py:43-48` filters
+  `status == "active" and deleted_at is None`);
+- directory layout differs from the plan: it writes to
+  `{agent_storage_dir or wren_project_path}/wren/{project.id}/mdl/...` (keyed by
+  the project's UUID primary key), not
+  `.../projects/{database_uri_fingerprint}/{catalog_or_default}/{schema_name}/`.
+  This is still collision-free, since `project.id` is already 1:1 with the
+  `(database_uri_fingerprint, catalog_name, schema_name)` tuple, but it is not
+  human-readable from the filesystem the way the planned path was;
+- path sanitization exists but as a standalone function,
+  `normalize_mdl_path()` in `semantic_layer/mdl_files.py:409-420` (rejects
+  absolute paths, `..` traversal, and non-`.yaml`/`.yml` extensions), called
+  from `materialize_wren_project`, not as a materializer method;
+- there is no temp-directory-plus-atomic-rename step and no separate
+  per-file-checksum manifest — files are written directly into the target
+  `mdl/` directory, merged into one `mdl.json` sidecar, and a single
+  combined SHA-256 checksum plus file count is returned in
+  `WrenMaterializationResult` (`project_id`, `path`, `file_count`, `checksum`).
+  This is a real gap if multiple concurrent materializations of the same
+  project can race (a reader could observe a partially-written directory);
+- the materialized project path is returned and threaded into
+  `WrenClient.fetch_context`/`dry_plan` as `mdl_path` — confirmed, see the
+  section 5 verified-state note.
+
+Original plan text, unmodified for reference: `WrenProjectMaterializer` should:
 
 - load only `status="active"` MDL files for the selected schema project;
 - write them to a schema-specific directory such as
@@ -3714,17 +3918,28 @@ Wren runtime behavior:
 
 ### Frontend Tests
 
-Add:
+Add (path names corrected to the repo's existing test-naming convention —
+verified 2026-06-22: tests live next to the component as
+`<ComponentName>.test.tsx`, e.g. the existing
+`TableExploreTree/TableExploreTree.test.tsx` and
+`TabbedSqlEditors/TabbedSqlEditors.test.tsx`, not `index.test.tsx` or a
+`TreeNodeRenderer.test.tsx` file, which does not exist):
 
 ```text
-superset-frontend/src/SqlLab/components/TableExploreTree/TreeNodeRenderer.test.tsx
-superset-frontend/src/SqlLab/components/TabbedSqlEditors/index.test.tsx
+superset-frontend/src/SqlLab/components/TableExploreTree/TableExploreTree.test.tsx
+superset-frontend/src/SqlLab/components/TabbedSqlEditors/TabbedSqlEditors.test.tsx
 superset-frontend/src/SqlLab/components/SemanticLayerEditor/SemanticLayerEditor.test.tsx
 superset-frontend/src/SqlLab/components/SemanticLayerEditor/MdlFileBrowser.test.tsx
 superset-frontend/src/SqlLab/components/SemanticLayerEditor/MdlUploadDialog.test.tsx
 superset-frontend/src/SqlLab/components/SemanticLayerEditor/MdlEditor.test.tsx
 superset-frontend/src/SqlLab/components/SemanticLayerEditor/MdlEnrichmentReview.test.tsx
 ```
+
+New schema-row and mixed-tab assertions should extend the existing
+`TableExploreTree.test.tsx` and `TabbedSqlEditors.test.tsx` files rather than
+creating new sibling test files, consistent with how those components are
+already tested. The `SemanticLayerEditor/` directory and all five of its test
+files remain entirely unimplemented (see R5 below).
 
 Test assertions:
 
@@ -3955,6 +4170,16 @@ tests/unit_tests/superset_ai_agent/test_superset_client.py
 tests/integration_tests/views/api/test_ai_agent_database_identity.py
 ```
 
+**Verified current state (2026-06-22):** there is no
+`test_semantic_layer_uri_fingerprint.py` file. Fingerprint behavior is covered
+instead inside `test_semantic_layer_projects.py`, `test_semantic_layer_access.py`,
+`test_wren_materializer.py`, `test_superset_client.py`, and
+`test_wren_http_client.py` (fingerprint-related assertions confirmed present in
+each). `tests/integration_tests/views/api/test_ai_agent_database_identity.py`
+does not exist anywhere in the repo — no integration test currently exercises
+`AiAgentRestApi.database_identity` end-to-end; only the agent-side unit tests
+above cover the client/consumer side.
+
 Acceptance criteria:
 
 - `[COMPLETE]` raw URIs are never returned by the Superset identity endpoint;
@@ -3963,7 +4188,11 @@ Acceptance criteria:
 - `[COMPLETE]` schema project discovery uses Superset-proven
   database/schema access when available;
 - `[COMPLETE]` URI-derived semantic-layer access cannot grant SQL execution
-  permission.
+  permission;
+- `[PARTIAL]` operator-configured salting: the Superset-proven endpoint salts
+  via `AI_AGENT_SEMANTIC_URI_FINGERPRINT_SALT` (Superset Flask config), but the
+  agent's own `supplied_uri` fallback path fingerprints unsalted — see section
+  16's verified-state note.
 
 ### R4. Schema-Scoped Runtime Retrieval For Large Databases
 
@@ -4045,6 +4274,14 @@ Confirmed source state:
   maps SQL Lab query editors directly to SQL editor tabs.
 - There is no `superset-frontend/src/SqlLab/components/SemanticLayerEditor/`
   tab implementation.
+- Verified 2026-06-22: `TableExploreTree/TreeNodeRenderer.tsx` schema rows
+  currently expose only refresh and pin/unpin hover actions (identified by
+  `identifier === 'schema'`); there is no "Open semantic layer" action yet, and
+  `types.ts`/`actions/sqlLab.ts`/`reducers/sqlLab.ts` contain no
+  `SqlLabTabType`, `SemanticLayerEditorTab`, or `openSemanticLayerEditor`
+  symbols. The only existing entrypoint into semantic-layer editing is the
+  `SqlEditorLeftBar` "Semantic layer" button noted above, not a schema-row
+  action.
 
 Implementation steps:
 
@@ -4097,12 +4334,13 @@ Implementation steps:
 8. Use `EditorHost` with `language="yaml"`; do not use SQL `EditorWrapper` or
    SQL run hotkeys.
 
-Tests:
+Tests (path names corrected to match the repo's `<ComponentName>.test.tsx`
+convention, same note as section 21):
 
 ```text
-superset-frontend/src/SqlLab/components/TableExploreTree/TreeNodeRenderer.test.tsx
-superset-frontend/src/SqlLab/components/TabbedSqlEditors/index.test.tsx
-superset-frontend/src/SqlLab/components/SemanticLayerEditor/index.test.tsx
+superset-frontend/src/SqlLab/components/TableExploreTree/TableExploreTree.test.tsx
+superset-frontend/src/SqlLab/components/TabbedSqlEditors/TabbedSqlEditors.test.tsx
+superset-frontend/src/SqlLab/components/SemanticLayerEditor/SemanticLayerEditor.test.tsx
 superset-frontend/src/SqlLab/components/SemanticLayerEditor/MdlFileBrowser.test.tsx
 superset-frontend/src/SqlLab/components/SemanticLayerEditor/MdlUploadDialog.test.tsx
 superset-frontend/src/SqlLab/components/SemanticLayerEditor/MdlEditor.test.tsx
@@ -4355,6 +4593,11 @@ tests/unit_tests/superset_ai_agent/test_semantic_layer_api.py
 tests/integration_tests/semantic_layers/api_tests.py
 ```
 
+`tests/integration_tests/semantic_layers/api_tests.py` does not exist yet
+(verified 2026-06-22; see the section 19 verified-state note) — consistent with
+this row's own `[TODO]` items below, since the publish route it would cover is
+not implemented either.
+
 Acceptance criteria:
 
 - `[PARTIAL]` publication primitives use Superset REST/commands, not direct DB
@@ -4433,14 +4676,14 @@ Acceptance criteria:
 | --- | --- | --- |
 | Agent DB has no versioned migration lifecycle | [COMPLETE] | Alembic migration lifecycle merged; tests prove migrations create all agent tables and startup does not call production `create_all`. |
 | Semantic-layer sharing could leak metadata | [COMPLETE] baseline, [PARTIAL] route context | Every route uses `SemanticAccessService`; project-ID-only routes still rely on the project's stored default Superset DB ID unless the UI first resolves by the user's current DB/schema. |
-| URI matching could be spoofed | [COMPLETE] baseline | Superset-side fingerprinting is available through `AiAgentRestApi.database_identity`; raw URI fallback remains configurable and should be disabled with `AI_AGENT_SEMANTIC_ACCESS_MODE=superset_only` in hardened deployments. |
+| URI matching could be spoofed | [COMPLETE] baseline, [PARTIAL] salting | Superset-side fingerprinting is available through `AiAgentRestApi.database_identity` and is salted via Superset's own `AI_AGENT_SEMANTIC_URI_FINGERPRINT_SALT` Flask config key; the agent's `supplied_uri` fallback path (`semantic_layer/projects.py:345`) calls `fingerprint_database_uri` with no salt, so that path is unsalted in every deployment today. Disable it with `AI_AGENT_SEMANTIC_ACCESS_MODE=superset_only` in hardened deployments, or wire a salt through to the agent-side caller. See the "Verified current state" note in section 16. |
 | Users expect CRUD on semantic layers they can access | [COMPLETE] baseline, [PARTIAL] policy | Existing project/MDL CRUD remains; R2 tightens read/write/admin policy; R5 moves CRUD to target tab UI. |
 | SQL Lab audit lacks AI source marker | [COMPLETE] | `SqlExecutionSource` is threaded through graph execution and REST SQL Lab payload fields. |
 | SQL Lab tab state could break existing query behavior | [TODO] | R5 mixed tab model has reducer migration and tests for legacy SQL tabs. |
 | MDL editor could inherit SQL run hotkeys | [PARTIAL] | R5 target implementation must use a dedicated YAML `MdlEditor` and tests proving no run-query dispatch occurs. |
 | Existing scope-based semantic records could be orphaned | [PARTIAL] | R2/R10 keep compatibility routes and graph merge behavior; a dedicated migration/backfill for old records remains optional deployment work. |
 | Catalog-aware databases could collide on schema names | [COMPLETE] baseline, [PARTIAL] tests | Existing schemas carry `catalog_name`; R2/R3 add access proofs and tests around catalog-qualified project keys. |
-| Wren project directory can drift from DB state | [COMPLETE] baseline | Existing materializer writes active files; R4/R10 add selected-project runtime checks and trace metadata. |
+| Wren project directory can drift from DB state | [COMPLETE] baseline, [PARTIAL] write safety | Existing materializer writes active files; R4/R10 add selected-project runtime checks and trace metadata. Verified gap: `materialize_wren_project` (`semantic_layer/wren_materializer.py:35-96`) writes directly into the target `mdl/` directory with no temp-dir-plus-atomic-rename step, so a concurrent `fetch_context`/`dry_plan` call could read a partially-written directory during re-materialization. |
 | Markdown source documents could be materialized as MDL | [COMPLETE] baseline | Existing materialization reads MDL files, not source documents; keep regression tests in R6/R10. |
 | Markdown enrichment could produce incorrect MDL | [PARTIAL] | R6 makes Wren proposals review-only, visible, validated, and explicitly activated. |
 | Unsupported uploads could create unclear user expectations | [PARTIAL] | R5 upload dialog accepts only YAML MDL and Markdown for enrichment in the target UI. |
