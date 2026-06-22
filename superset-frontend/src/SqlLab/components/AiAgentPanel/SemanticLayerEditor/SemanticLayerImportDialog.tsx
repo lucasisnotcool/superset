@@ -16,10 +16,15 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { ChangeEvent, DragEvent, useRef, useState } from 'react';
+import { ChangeEvent, DragEvent, useMemo, useRef, useState } from 'react';
 import ReactDiffViewer from 'react-diff-viewer-continued';
 import { t } from '@apache-superset/core/translation';
-import { css, styled } from '@apache-superset/core/theme';
+import {
+  css,
+  isThemeDark,
+  styled,
+  useTheme,
+} from '@apache-superset/core/theme';
 import { Alert } from '@apache-superset/core/components';
 import { Button, Flex, Modal, Typography } from '@superset-ui/core/components';
 import { Icons } from '@superset-ui/core/components/Icons';
@@ -33,7 +38,13 @@ import {
 } from '../api';
 
 type StagedKind = 'mdl' | 'enrichment';
-type StagedStatus = 'pending' | 'draft' | 'active' | 'error';
+type StagedStatus =
+  | 'uploading'
+  | 'enriching'
+  | 'pending'
+  | 'draft'
+  | 'active'
+  | 'error';
 
 interface StagedItem {
   id: string;
@@ -90,11 +101,32 @@ const HiddenInput = styled.input`
   display: none;
 `;
 
+const StatusRow = styled.span`
+  ${({ theme }) => css`
+    display: inline-flex;
+    align-items: center;
+    gap: ${theme.sizeUnit}px;
+    color: ${theme.colorTextSecondary};
+  `}
+`;
+
 const newId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
 const isMarkdown = (filename: string) => /\.(md|markdown|txt)$/i.test(filename);
 
 const isYaml = (filename: string) => /\.(ya?ml)$/i.test(filename);
+
+const isProcessing = (status: StagedStatus) =>
+  status === 'uploading' || status === 'enriching';
+
+const STATUS_LABELS: Record<StagedStatus, string> = {
+  uploading: t('Uploading…'),
+  enriching: t('Enriching…'),
+  pending: t('Ready'),
+  draft: t('Draft'),
+  active: t('Active'),
+  error: t('Error'),
+};
 
 export interface SemanticLayerImportDialogProps {
   show: boolean;
@@ -117,9 +149,15 @@ export default function SemanticLayerImportDialog({
   const [error, setError] = useState<string | null>(null);
   const [isBusy, setIsBusy] = useState(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const theme = useTheme();
 
   const existingByPath = (path: string) =>
     existingFiles.find(file => file.path === path) || null;
+
+  const patchItem = (id: string, patch: Partial<StagedItem>) =>
+    setItems(current =>
+      current.map(item => (item.id === id ? { ...item, ...patch } : item)),
+    );
 
   const stageFiles = async (files: FileList | File[]) => {
     if (!projectId) {
@@ -127,61 +165,104 @@ export default function SemanticLayerImportDialog({
     }
     setError(null);
     setIsBusy(true);
+    // Stage a placeholder for every dropped file up front so the user gets
+    // immediate "Uploading…"/"Enriching…" feedback while each file is read and
+    // (for Markdown) sent through the enrichment pipeline.
+    const entries = Array.from(files).map(file => ({ file, id: newId() }));
+    setItems(current => [
+      ...current,
+      ...entries.map(({ file, id }) => {
+        const supported = isYaml(file.name) || isMarkdown(file.name);
+        return {
+          id,
+          filename: file.name,
+          path: file.name,
+          content: '',
+          kind: (isMarkdown(file.name) ? 'enrichment' : 'mdl') as StagedKind,
+          validation: null,
+          status: (supported ? 'uploading' : 'error') as StagedStatus,
+          error: supported
+            ? undefined
+            : t('Unsupported file type. Drop a .yaml, .yml or .md file.'),
+        };
+      }),
+    ]);
     try {
-      const staged: StagedItem[] = [];
-      for (const file of Array.from(files)) {
-        // eslint-disable-next-line no-await-in-loop
-        const text = await file.text();
+      for (const { file, id } of entries) {
         if (isYaml(file.name)) {
           // YAML is treated as a new/updated MDL file directly.
-          staged.push({
-            id: newId(),
-            filename: file.name,
+          // eslint-disable-next-line no-await-in-loop
+          const text = await file.text();
+          patchItem(id, {
             path: `models/${file.name.replace(/\.(ya?ml)$/i, '')}.yaml`,
             content: text,
-            kind: 'mdl',
-            validation: null,
             status: 'pending',
           });
         } else if (isMarkdown(file.name)) {
           // Markdown goes through the enrichment pipeline.
+          // eslint-disable-next-line no-await-in-loop
+          const text = await file.text();
           // eslint-disable-next-line no-await-in-loop
           const document = await createProjectDocumentFromText(
             projectId,
             text,
             file.name,
           );
+          patchItem(id, { status: 'enriching' });
           // eslint-disable-next-line no-await-in-loop
           const proposal = await enrichProjectDocument(projectId, document.id);
-          staged.push({
-            id: newId(),
-            filename: file.name,
+          patchItem(id, {
             path: proposal.proposed_path,
             content: proposal.proposed_yaml,
             kind: 'enrichment',
             validation: proposal.validation,
             status: 'pending',
           });
-        } else {
-          staged.push({
-            id: newId(),
-            filename: file.name,
-            path: file.name,
-            content: '',
-            kind: 'mdl',
-            validation: null,
-            status: 'error',
-            error: t('Unsupported file type. Drop a .yaml, .yml or .md file.'),
-          });
         }
       }
-      setItems(current => [...current, ...staged]);
     } catch (ex) {
       setError(ex instanceof Error ? ex.message : t('Unable to read files'));
     } finally {
       setIsBusy(false);
     }
   };
+
+  // Theme the diff viewer so it matches the MDL editor (monospace font,
+  // themed surfaces and text) instead of the library's hard-coded light theme.
+  const diffStyles = useMemo(() => {
+    const variables = {
+      diffViewerBackground: theme.colorBgContainer,
+      diffViewerColor: theme.colorText,
+      addedBackground: theme.colorSuccessBg,
+      addedColor: theme.colorText,
+      removedBackground: theme.colorErrorBg,
+      removedColor: theme.colorText,
+      wordAddedBackground: theme.colorSuccessBgHover,
+      wordRemovedBackground: theme.colorErrorBgHover,
+      addedGutterBackground: theme.colorSuccessBg,
+      removedGutterBackground: theme.colorErrorBg,
+      gutterBackground: theme.colorBgLayout,
+      gutterColor: theme.colorTextTertiary,
+      addedGutterColor: theme.colorText,
+      removedGutterColor: theme.colorText,
+      codeFoldBackground: theme.colorBgLayout,
+      codeFoldGutterBackground: theme.colorBgLayout,
+      emptyLineBackground: theme.colorBgContainer,
+      diffViewerTitleBackground: theme.colorBgLayout,
+      diffViewerTitleColor: theme.colorText,
+      diffViewerTitleBorderColor: theme.colorBorder,
+    };
+    return {
+      variables: { dark: variables, light: variables },
+      diffContainer: {
+        borderRadius: `${theme.borderRadius}px`,
+        border: `1px solid ${theme.colorBorder}`,
+      },
+      contentText: { fontFamily: theme.fontFamilyCode },
+      gutter: { fontFamily: theme.fontFamilyCode },
+      lineNumber: { fontFamily: theme.fontFamilyCode },
+    };
+  }, [theme]);
 
   const onDrop = (event: DragEvent<HTMLButtonElement>) => {
     event.preventDefault();
@@ -197,9 +278,13 @@ export default function SemanticLayerImportDialog({
     event.target.value = '';
   };
 
-  const persistItem = async (item: StagedItem, activate: boolean) => {
+  const persistItem = async (
+    item: StagedItem,
+    activate: boolean,
+    { refresh = true }: { refresh?: boolean } = {},
+  ): Promise<boolean> => {
     if (!projectId) {
-      return;
+      return false;
     }
     const existing = existingByPath(item.path);
     try {
@@ -221,42 +306,44 @@ export default function SemanticLayerImportDialog({
       if (activate) {
         await updateMdlFile(projectId, fileId, { status: 'active' });
       }
-      setItems(current =>
-        current.map(staged =>
-          staged.id === item.id
-            ? {
-                ...staged,
-                status: activate ? 'active' : 'draft',
-                error: undefined,
-              }
-            : staged,
-        ),
-      );
-      await onApplied();
+      patchItem(item.id, {
+        status: activate ? 'active' : 'draft',
+        error: undefined,
+      });
+      if (refresh) {
+        await onApplied();
+      }
+      return true;
     } catch (ex) {
       const message = ex instanceof Error ? ex.message : t('Save failed');
-      setItems(current =>
-        current.map(staged =>
-          staged.id === item.id
-            ? { ...staged, status: 'error', error: message }
-            : staged,
-        ),
-      );
+      patchItem(item.id, { status: 'error', error: message });
+      return false;
     }
   };
 
   const persistAll = async (activate: boolean) => {
     setIsBusy(true);
+    let allSucceeded = true;
     try {
       const pending = items.filter(
         item => item.status === 'pending' || item.status === 'draft',
       );
       for (const item of pending) {
+        // Defer the browser refresh until every file is persisted: refreshing
+        // per file re-resolves the project (a backend database lookup) once per
+        // file, which is the source of the GET /api/v1/database burst.
         // eslint-disable-next-line no-await-in-loop
-        await persistItem(item, activate);
+        const ok = await persistItem(item, activate, { refresh: false });
+        allSucceeded = allSucceeded && ok;
       }
+      // Single refresh so the main MDL browser reflects every new/updated file.
+      await onApplied();
     } finally {
       setIsBusy(false);
+    }
+    // Dismiss the dialog once everything has been applied cleanly.
+    if (allSucceeded) {
+      close();
     }
   };
 
@@ -328,7 +415,14 @@ export default function SemanticLayerImportDialog({
                   ({item.kind === 'enrichment' ? t('enriched') : t('MDL')})
                 </Typography.Text>
               </Typography.Text>
-              <Typography.Text type="secondary">{item.status}</Typography.Text>
+              <StatusRow data-test="semantic-import-item-status">
+                {isProcessing(item.status) && (
+                  <Icons.LoadingOutlined iconSize="m" spin />
+                )}
+                <Typography.Text type="secondary">
+                  {STATUS_LABELS[item.status]}
+                </Typography.Text>
+              </StatusRow>
             </Flex>
             {item.error && <Alert type="error" message={item.error} />}
             {item.validation && !item.validation.valid && (
@@ -345,6 +439,8 @@ export default function SemanticLayerImportDialog({
                   oldValue={existingByPath(item.path)?.content ?? ''}
                   newValue={item.content}
                   splitView
+                  useDarkTheme={isThemeDark(theme)}
+                  styles={diffStyles}
                   leftTitle={t('Current')}
                   rightTitle={t('Proposed')}
                 />

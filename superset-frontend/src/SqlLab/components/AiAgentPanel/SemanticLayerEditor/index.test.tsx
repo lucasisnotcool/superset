@@ -17,8 +17,19 @@
  * under the License.
  */
 import fetchMock from 'fetch-mock';
-import { render, screen, userEvent, waitFor } from 'spec/helpers/testing-library';
+import {
+  createStore,
+  render,
+  screen,
+  userEvent,
+  waitFor,
+} from 'spec/helpers/testing-library';
+import reducerIndex from 'spec/helpers/reducerIndex';
 import SemanticLayerEditor from '.';
+
+interface ToastState {
+  messageToasts: { text: string }[];
+}
 
 const originalAgentUrl = process.env.SUPERSET_AI_AGENT_URL;
 
@@ -109,10 +120,14 @@ const mockOnboard = (warnings: string[] = []) => {
 };
 
 test('loads the project once per scope without re-fetch loops', async () => {
-  mockBaseRoutes([mdlFile('a', 'models/a.yaml'), mdlFile('b', 'models/b.yaml')]);
+  mockBaseRoutes([
+    mdlFile('a', 'models/a.yaml'),
+    mdlFile('b', 'models/b.yaml'),
+  ]);
 
   render(
     <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="main" />,
+    { useRedux: true },
   );
 
   await waitFor(() => {
@@ -136,12 +151,14 @@ test('loads the project once per scope without re-fetch loops', async () => {
   ).toHaveLength(1);
 });
 
-test('eagerly onboards an empty schema and surfaces warnings', async () => {
+test('eagerly onboards an empty schema and surfaces warnings as a toast', async () => {
   mockBaseRoutes([]);
   mockOnboard(['models/moves.yaml cannot be activated until fixed: bad']);
+  const store = createStore({}, reducerIndex);
 
   render(
     <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="main" />,
+    { store },
   );
 
   await waitFor(() => {
@@ -152,7 +169,12 @@ test('eagerly onboards an empty schema and surfaces warnings', async () => {
     ).toHaveLength(1);
   });
   await waitFor(() => {
-    expect(screen.getByTestId('onboarding-warnings')).toBeInTheDocument();
+    const { messageToasts } = store.getState() as unknown as ToastState;
+    expect(
+      messageToasts.some(toast =>
+        toast.text.includes('Onboarding completed with warnings'),
+      ),
+    ).toBe(true);
   });
 });
 
@@ -161,6 +183,7 @@ test('opens the Add dialog with a drop zone', async () => {
 
   render(
     <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="main" />,
+    { useRedux: true },
   );
 
   await waitFor(() => {
@@ -180,6 +203,7 @@ test('manual Onboard button triggers onboarding', async () => {
 
   render(
     <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="main" />,
+    { useRedux: true },
   );
 
   await waitFor(() => {

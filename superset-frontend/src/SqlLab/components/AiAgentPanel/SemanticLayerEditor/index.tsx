@@ -24,11 +24,24 @@ import {
   useRef,
   useState,
 } from 'react';
+import { useDispatch } from 'react-redux';
 import { t } from '@apache-superset/core/translation';
 import { css, styled } from '@apache-superset/core/theme';
 import { Alert } from '@apache-superset/core/components';
-import { Button, Flex, Input, Typography } from '@superset-ui/core/components';
+import {
+  Button,
+  Flex,
+  Input,
+  Switch,
+  Tooltip,
+  Typography,
+} from '@superset-ui/core/components';
 import { Icons } from '@superset-ui/core/components/Icons';
+import {
+  addDangerToast,
+  addSuccessToast,
+  addWarningToast,
+} from 'src/components/MessageToasts/actions';
 import { EditorHost } from 'src/core/editors';
 import {
   ConversationScope,
@@ -112,7 +125,7 @@ const ScrollList = styled.div`
   `}
 `;
 
-const FileButton = styled.button<{ 'data-active': boolean }>`
+const FileButton = styled.div<{ 'data-active': boolean }>`
   ${({ theme, 'data-active': active }) => css`
     display: flex;
     width: 100%;
@@ -128,8 +141,33 @@ const FileButton = styled.button<{ 'data-active': boolean }>`
     color: ${theme.colorText};
     cursor: pointer;
     text-align: left;
+
+    &:focus-visible {
+      outline: 2px solid ${theme.colorPrimaryBorder};
+      outline-offset: -1px;
+    }
   `}
 `;
+
+const FilePath = styled.span`
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+// The status toggle keeps a constant width across every row: antd sizes the
+// Switch to the wider of its two labels, and the cell never flexes, so the file
+// name (which does flex) is what absorbs the remaining space.
+const ToggleCell = styled.div`
+  flex: 0 0 auto;
+  display: flex;
+  justify-content: flex-end;
+`;
+
+const STATUS_TOGGLE_HELP = t(
+  'Toggle on to activate this MDL file so it is included in the semantic ' +
+    'layer; toggle off to keep it as a draft.',
+);
 
 const StyledEditorHost = styled(EditorHost)`
   &.ace_editor {
@@ -154,6 +192,7 @@ export default function SemanticLayerEditor({
   catalogName,
   schemaName,
 }: SemanticLayerEditorProps) {
+  const dispatch = useDispatch();
   const scope: ConversationScope = useMemo(
     () => ({
       database_id: databaseId,
@@ -170,10 +209,8 @@ export default function SemanticLayerEditor({
   const [activeFileId, setActiveFileId] = useState<string | null>(null);
   const [editorPath, setEditorPath] = useState('models/new_model.yaml');
   const [editorValue, setEditorValue] = useState(defaultYaml);
-  const [onboardingWarnings, setOnboardingWarnings] = useState<string[]>([]);
   const [showImportDialog, setShowImportDialog] = useState(false);
   const [isOnboarding, setIsOnboarding] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const onboardedProjectsRef = useRef<Set<string>>(new Set());
   // Mirror the active file id in a ref so `refresh` can read the current
@@ -225,19 +262,20 @@ export default function SemanticLayerEditor({
 
   useEffect(() => {
     refresh().catch(ex => {
-      setError(
-        ex instanceof Error ? ex.message : t('Unable to load semantic layer'),
+      dispatch(
+        addDangerToast(
+          ex instanceof Error ? ex.message : t('Unable to load semantic layer'),
+        ),
       );
     });
-  }, [refresh]);
+  }, [refresh, dispatch]);
 
   const withLoading = async (action: () => Promise<void>, fallback: string) => {
     setIsLoading(true);
-    setError(null);
     try {
       await action();
     } catch (ex) {
-      setError(ex instanceof Error ? ex.message : fallback);
+      dispatch(addDangerToast(ex instanceof Error ? ex.message : fallback));
     } finally {
       setIsLoading(false);
     }
@@ -297,23 +335,35 @@ export default function SemanticLayerEditor({
   const runOnboard = useCallback(
     async (targetProjectId: string) => {
       setIsOnboarding(true);
-      setError(null);
       try {
         const job = await runOnboarding(targetProjectId);
         if (job.status === 'failed') {
           throw new Error(job.error || t('Onboarding failed'));
         }
-        setOnboardingWarnings(job.result?.warnings ?? []);
+        const warnings = job.result?.warnings ?? [];
+        if (warnings.length > 0) {
+          dispatch(
+            addWarningToast(
+              t('Onboarding completed with warnings: %s', warnings.join('; ')),
+            ),
+          );
+        } else {
+          dispatch(
+            addSuccessToast(t('Schema onboarded into the semantic layer.')),
+          );
+        }
         await refresh();
       } catch (ex) {
-        setError(
-          ex instanceof Error ? ex.message : t('Unable to onboard schema'),
+        dispatch(
+          addDangerToast(
+            ex instanceof Error ? ex.message : t('Unable to onboard schema'),
+          ),
         );
       } finally {
         setIsOnboarding(false);
       }
     },
-    [refresh],
+    [refresh, dispatch],
   );
 
   const onboardProject = () => {
@@ -321,6 +371,39 @@ export default function SemanticLayerEditor({
       runOnboard(project.id);
     }
   };
+
+  // Toggle a single file between active (in the semantic layer) and draft.
+  const toggleFileStatus = (file: MdlFile, activate: boolean) =>
+    withLoading(async () => {
+      if (!project) {
+        return;
+      }
+      await updateMdlFile(project.id, file.id, {
+        status: activate ? 'active' : 'draft',
+      });
+      await refresh();
+    }, t('Unable to update MDL file'));
+
+  const allActive =
+    mdlFiles.length > 0 && mdlFiles.every(file => file.status === 'active');
+
+  // Activate (or deactivate) every MDL file in the library in one pass, then
+  // refresh once so the browser reflects the new statuses.
+  const setAllStatuses = (activate: boolean) =>
+    withLoading(async () => {
+      if (!project) {
+        return;
+      }
+      const nextStatus: MdlFileStatus = activate ? 'active' : 'draft';
+      await Promise.all(
+        mdlFiles
+          .filter(file => file.status !== nextStatus)
+          .map(file =>
+            updateMdlFile(project.id, file.id, { status: nextStatus }),
+          ),
+      );
+      await refresh();
+    }, t('Unable to update MDL files'));
 
   // Eagerly onboard a schema that has no MDL yet so the user lands on a
   // populated semantic layer. Fires at most once per project.
@@ -349,7 +432,6 @@ export default function SemanticLayerEditor({
       </EditorHeader>
       <EditorBody>
         <BrowserPane>
-          {error && <Alert type="warning" message={error} />}
           {!scope.schema_name && (
             <Alert
               type="warning"
@@ -378,17 +460,55 @@ export default function SemanticLayerEditor({
             {mdlFiles.map(file => (
               <FileButton
                 key={file.id}
-                type="button"
+                role="button"
+                tabIndex={0}
                 data-active={file.id === activeFileId}
                 onClick={() => selectFile(file)}
+                onKeyDown={event => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    selectFile(file);
+                  }
+                }}
               >
-                <span>{file.path}</span>
-                <Typography.Text type="secondary">
-                  {file.status}
-                </Typography.Text>
+                <FilePath>{file.path}</FilePath>
+                <ToggleCell
+                  // Keep clicks/keys on the toggle from selecting the row.
+                  onClick={event => event.stopPropagation()}
+                  onKeyDown={event => event.stopPropagation()}
+                  role="presentation"
+                >
+                  <Tooltip title={STATUS_TOGGLE_HELP}>
+                    <Switch
+                      size="small"
+                      checked={file.status === 'active'}
+                      disabled={!canWrite || isLoading}
+                      checkedChildren={t('Active')}
+                      unCheckedChildren={t('Draft')}
+                      onChange={checked => toggleFileStatus(file, checked)}
+                    />
+                  </Tooltip>
+                </ToggleCell>
               </FileButton>
             ))}
           </ScrollList>
+          <Button
+            block
+            buttonStyle="tertiary"
+            disabled={
+              !project || !canWrite || isLoading || mdlFiles.length === 0
+            }
+            onClick={() => setAllStatuses(!allActive)}
+            icon={
+              allActive ? (
+                <Icons.MinusCircleOutlined iconSize="m" />
+              ) : (
+                <Icons.CheckCircleOutlined iconSize="m" />
+              )
+            }
+          >
+            {allActive ? t('Deactivate all') : t('Activate all')}
+          </Button>
           <Flex gap="small" wrap="wrap">
             <Button
               buttonStyle="tertiary"
@@ -410,22 +530,6 @@ export default function SemanticLayerEditor({
           </Flex>
         </BrowserPane>
         <EditorPane>
-          {onboardingWarnings.length > 0 && (
-            <Alert
-              type="warning"
-              data-test="onboarding-warnings"
-              message={t('Onboarding completed with warnings')}
-              description={
-                <ul>
-                  {onboardingWarnings.map(warning => (
-                    <li key={warning}>{warning}</li>
-                  ))}
-                </ul>
-              }
-              closable
-              onClose={() => setOnboardingWarnings([])}
-            />
-          )}
           <Input
             value={editorPath}
             disabled={!canWrite || isLoading}
