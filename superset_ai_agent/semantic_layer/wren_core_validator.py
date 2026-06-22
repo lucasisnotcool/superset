@@ -39,6 +39,10 @@ import base64
 import json  # noqa: TID251 - standalone agent JSON contract
 from typing import Any
 
+from superset_ai_agent.semantic_layer.mdl_compile import (
+    model_to_camel,
+    relationship_to_camel,
+)
 from superset_ai_agent.semantic_layer.schemas import (
     MdlValidationMessage,
     MdlValidationResult,
@@ -106,64 +110,16 @@ def to_wren_core_manifest(
     models: list[dict[str, Any]],
     relationships: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Map snake_case MDL models/relationships to the wren-core manifest shape."""
+    """Map snake_case MDL models/relationships to the wren-core manifest shape.
+
+    Delegates to :mod:`superset_ai_agent.semantic_layer.mdl_compile`, the single
+    source of the snake->camel mapping, so deep validation and engine
+    compilation can never drift apart (wren_full.md R9/R16).
+    """
 
     return {
         "catalog": "wren",
         "schema": "public",
-        "models": [_model_to_wren_core(model) for model in models],
-        "relationships": [
-            _relationship_to_wren_core(relationship) for relationship in relationships
-        ],
+        "models": [model_to_camel(model) for model in models],
+        "relationships": [relationship_to_camel(rel) for rel in relationships],
     }
-
-
-def _model_to_wren_core(model: dict[str, Any]) -> dict[str, Any]:
-    reference = model.get("table_reference") or {}
-    out: dict[str, Any] = {
-        "name": model.get("name"),
-        "columns": [
-            _column_to_wren_core(column) for column in model.get("columns", [])
-        ],
-    }
-    if isinstance(reference, dict) and reference.get("table"):
-        out["tableReference"] = _drop_none(
-            {
-                "catalog": reference.get("catalog"),
-                "schema": reference.get("schema"),
-                "table": reference.get("table"),
-            }
-        )
-    if model.get("ref_sql"):
-        out["refSql"] = model["ref_sql"]
-    if model.get("primary_key"):
-        out["primaryKey"] = model["primary_key"]
-    return _drop_none(out)
-
-
-def _column_to_wren_core(column: dict[str, Any]) -> dict[str, Any]:
-    return _drop_none(
-        {
-            "name": column.get("name"),
-            "type": column.get("type"),
-            "isCalculated": bool(column.get("is_calculated", False)),
-            "expression": column.get("expression"),
-            "relationship": column.get("relationship"),
-            "notNull": bool(column.get("not_null", False)),
-        }
-    )
-
-
-def _relationship_to_wren_core(relationship: dict[str, Any]) -> dict[str, Any]:
-    return _drop_none(
-        {
-            "name": relationship.get("name"),
-            "models": relationship.get("models"),
-            "joinType": relationship.get("join_type"),
-            "condition": relationship.get("condition"),
-        }
-    )
-
-
-def _drop_none(value: dict[str, Any]) -> dict[str, Any]:
-    return {key: item for key, item in value.items() if item is not None}

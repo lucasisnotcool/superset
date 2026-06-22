@@ -18,12 +18,13 @@
 from __future__ import annotations
 
 import hashlib
-import json
+import json  # noqa: TID251 - standalone agent JSON contract
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from superset_ai_agent.semantic_layer.mdl_compile import compile_manifest
 from superset_ai_agent.semantic_layer.mdl_files import normalize_mdl_path
 from superset_ai_agent.semantic_layer.mdl_validator import validate_project_manifest
 from superset_ai_agent.semantic_layer.schemas import (
@@ -89,6 +90,29 @@ def materialize_wren_project(
         encoding="utf-8",
     )
     checksum.update(sidecar_path.read_bytes())
+
+    # Canonical, engine-ready camelCase manifest (single source: compile_manifest).
+    # Written additively alongside the readable mdl.json; this is what the
+    # wren-core SemanticEngine consumes (wren_full.md R9/R16).
+    compiled = compile_manifest(
+        active_files,
+        catalog=project.catalog_name or "wren",
+        schema=project.schema_name or "public",
+        data_source={
+            "name": project.database_label or project.name,
+            "type": project.database_backend,
+            "properties": {
+                "superset_database_id": project.default_database_id,
+                "semantic_project_id": project.id,
+                "schema_name": project.schema_name,
+            },
+        },
+    )
+    manifest_path = project_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(compiled.to_engine_manifest(), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
 
     warnings: list[str] = []
     if active_files:

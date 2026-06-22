@@ -194,7 +194,8 @@ manifest), so **Phase 0 makes DB-backed semantic persistence the baseline**
 | Phase | Workstream | Status |
 | --- | --- | --- |
 | 0 | Durable semantic persistence baseline (MDL in DB) | `[COMPLETE]` (2026-06-22) |
-| 0 | Seam refactor + MDL compile canonicalization | `[TODO]` |
+| 0 | MDL compile canonicalization (0.3) | `[COMPLETE]` (2026-06-22) |
+| 0 | Seam refactor + default bindings (0.1–0.2, 0.4) | `[TODO]` |
 | 1 | SemanticEngine (wren-core rewrite) — **keystone** | `[TODO]` |
 | 1 | Semantic-SQL prompt + correction loop | `[TODO]` |
 | 2 | Embedder + EmbeddingRetriever (LanceDB) | `[TODO]` |
@@ -330,20 +331,46 @@ baseline. No new tables for *existing* state — wiring + defaults only.
 - [ ] `SupersetExecutor`: thin Protocol alias documenting that execution stays in
       `SupersetClient.execute_sql`.
 
-### 0.3 MDL compile canonicalization (closes R9/R16)
+### 0.3 MDL compile canonicalization (closes R9/R16) — `[COMPLETE]` (2026-06-22)
 
-- [ ] Treat MDL files as **authoring YAML** (snake_case, unchanged on disk).
-- [ ] Add `semantic_layer/mdl_compile.py::compile_manifest(mdl_files) ->
-      CompiledManifest` that emits the **canonical camelCase engine manifest**
-      (`tableReference`, `joinType`, `isCalculated`, `refSql`, `primaryKey`),
-      reusing the mapping in
-      [`wren_core_validator.py`](semantic_layer/wren_core_validator.py)`::to_wren_core_manifest`.
-      This becomes the single source of camelCase truth.
-- [ ] Refactor [`wren_materializer.py`](semantic_layer/wren_materializer.py) to
-      delegate its `mdl.json` envelope to `compile_manifest` (one casing, one
-      place). Keep the checksum + sidecar behavior.
-- [ ] Fix the `mdl_exporter` envelope mismatch (R9) by routing it through the
-      same compile step.
+**Resolved.** Authoring YAML stays snake_case; a single compile step produces the
+canonical camelCase engine manifest, and the deep-validation mapping now shares
+that exact code path so they cannot drift.
+
+- [x] MDL files remain **authoring YAML** (snake_case, unchanged on disk).
+- [x] Added [`semantic_layer/mdl_compile.py`](semantic_layer/mdl_compile.py)
+      `compile_manifest(...) -> CompiledManifest` — the **single source of
+      camelCase truth** (`tableReference`, `joinType`, `isCalculated`, `refSql`,
+      `primaryKey`, plus `views`/`metrics`/`dataSource`). `CompiledManifest`
+      carries `to_engine_manifest()` and `to_base64_json()` (exactly wren-core's
+      `to_manifest` input — the Phase-1 seam consumes this directly).
+- [x] Reconciled [`wren_core_validator.py`](semantic_layer/wren_core_validator.py)
+      `to_wren_core_manifest` to **delegate** to `mdl_compile`'s shared mappers
+      (`model_to_camel` / `relationship_to_camel`), removing the duplicate
+      mapping (R9/R16).
+- [x] [`wren_materializer.py`](semantic_layer/wren_materializer.py) now also
+      writes the canonical `manifest.json` (camelCase, via `compile_manifest`)
+      **additively** beside the readable `mdl.json`, mirroring Wren's YAML→
+      compiled-`mdl.json` model. The existing `mdl.json` (consumed by
+      `fetch_context`) is intentionally left as the readable merged view so the
+      LLM-context shape and the materializer test are unchanged.
+
+Tests: [`test_mdl_compile.py`](../tests/unit_tests/superset_ai_agent/test_mdl_compile.py)
+(5) — snake→camel mapping, multi-file merge order, base64 round-trip, malformed
+YAML skipped, and **delegation parity** (validator output == compile output).
+Suite: **195 passed, 1 skipped**; `ruff` clean on changed files.
+
+**Residual risk RC1:** `mdl_exporter.py` still emits its own envelope and was
+**not** rerouted through `compile_manifest` (it is unwired today — only used by
+the deterministic onboarding fallback). Reroute it when the Modeler seam lands
+(Phase 4) to fully retire ad-hoc casing. Low impact: its model bodies are
+already snake_case and pass through the same validator.
+
+**Residual risk RC2:** `compile_manifest` merge is **append-only** (later files
+add models; no override/dedupe). Two active files defining the same model name
+yield duplicate models in the manifest — the structural validator's
+duplicate-name check (R1) catches this at activation, but the compile step itself
+does not dedupe. Acceptable; revisit if multi-file projects become common.
 
 ### 0.4 Factory + wiring
 
