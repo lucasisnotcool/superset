@@ -229,6 +229,7 @@ def test_graph_records_wren_context_and_dry_plan() -> None:
         "load_wren_context",
         "draft_sql",
         "dry_plan_with_wren",
+        "plan_semantic_sql",
         "validate_sql",
     ]
 
@@ -470,6 +471,7 @@ def test_graph_executes_valid_sql_when_requested() -> None:
         "load_context",
         "load_wren_context",
         "draft_sql",
+        "plan_semantic_sql",
         "validate_sql",
         "execute_sql",
         "build_artifacts",

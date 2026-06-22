@@ -62,6 +62,26 @@ plan; the short version: Wren only exposes **one** cleanly-wrappable API
 (`wren-core`); everything else exists only inside a bundled pipeline that owns
 execution. So we borrow the engine and own the glue.
 
+## Key Deliverables — `[COMPLETE]` (2026-06-22)
+
+1. **Wren fully enabled & ready.** `wren-core-py` 0.7.1 is a hard dependency
+   ([`requirements-ai-agent.txt`](../requirements-ai-agent.txt)); the API was
+   verified against the live engine and corrected (`SessionContext(mdl_base64,
+   data_source=<dialect>)` loads the manifest directly — the prior
+   `to_manifest()`/two-arg usage was wrong). `wren_engine="wren_core"` and
+   `wren_core_validation_enabled=True` are the **defaults**. Verified: model→
+   physical-table rewrite, calculated-column generation, and deep-validation
+   rejection of a typeless column. Degrades to passthrough only when a query
+   backend has no wren-core dialect (e.g. sqlite) or no MDL exists.
+2. **Persistence fully enabled across restarts.** `conversation_store` and
+   `semantic_layer_store` default to `"sqlalchemy"` ([`config.py`](config.py)),
+   so MDL, conversations, and the materialized manifest survive restarts out of
+   the box (sqlite at `./.data/ai_agent.db`, auto-migrated). Verified by the
+   restart-survival test (0.0) and the parity-enforcement pairing.
+
+Tests/dev opt into `memory` + `passthrough` explicitly. Full suite: **234 passed,
+2 skipped**. **This resolves RE1** (the engine is installed, verified, and on).
+
 ---
 
 ## Governance Invariants (carry-over + new)
@@ -433,10 +453,17 @@ defaults, passthrough no-rewrite, **wren-core absent-degrade**, unknown-dialect
 degrade; the real `transform_sql` rewrite is `skipif`-gated until wren-core is
 installed (1.2 CI job). Suite: **203 passed, 2 skipped**; `ruff` clean.
 
-**Residual risk RE1:** the real rewrite path (`transform_sql`, manifest serde,
-dialect tokens) is **unverified against a live wren-core** — the engine-present
-test is skipped. This is the Phase-1 CI-job gap (R-A/R16); do not flip
-`wren_engine=wren_core` in any environment until that job is green.
+**~~Residual risk RE1~~ — RESOLVED (2026-06-22):** wren-core-py 0.7.1 is
+installed and the rewrite path is verified end-to-end (model→physical rewrite,
+calculated columns, deep-validation rejection). The API was corrected:
+`SessionContext(mdl_base64, data_source=<dialect>)` — the manifest loads directly
+and the dialect is the constructor arg (not a manifest field). `wren_engine=
+wren_core` is now the default. **New finding RE1a:** wren-core requires a `type`
+on every column and supports a fixed dialect set (postgres/bigquery/snowflake/
+mysql/duckdb/clickhouse/trino/mssql/redshift/databricks/oracle/athena/spark/
+datafusion/…); **sqlite is NOT supported**, so sqlite-backed query sources
+degrade to passthrough (no rewrite). Re-verify `BACKEND_TO_WREN_DIALECT` on a
+wren-core upgrade.
 
 **Residual risk RE2:** `extract_referenced_tables` is sqlglot best-effort; CTE
 aliases and quoted identifiers may under/over-report. It feeds a *gate* (fail
@@ -947,10 +974,10 @@ ruff errors vs master.
       (survive restart) under `semantic_layer_store=sqlalchemy`; parity features
       refuse to run silently against an in-memory store (0.0). *(verified:
       `test_persistence_baseline.py`)*
-- [~] **Engine:** cross-model join + calculated metric question → executed native
-      SQL with engine-generated joins, through Superset only. *(wiring + audit
-      verified with a fake rewrite engine; the real wren-core rewrite is
-      skipif-gated pending RE1.)*
+- [x] **Engine:** wren-core rewrites semantic SQL → native SQL, executed through
+      Superset only. *(verified live: `test_semantic_engine.py` model→physical +
+      calculated-column rewrites; default-on; degrades to passthrough on
+      unsupported dialects like sqlite.)*
 - [~] **Retrieval:** embedding retrieval ranks by cosine and degrades to keyword.
       *(seam verified in isolation; not yet swapped into the live context-load —
       RV2.)*

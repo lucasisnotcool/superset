@@ -254,11 +254,18 @@ class HeaderIdentityProvider:
 
 
 def _local_config(**overrides) -> AgentConfig:
-    return AgentConfig(
-        identity_provider="static",
-        superset_auth_mode="service_account",
-        **overrides,
-    )
+    defaults = {
+        "identity_provider": "static",
+        "superset_auth_mode": "service_account",
+        # Keep these app tests lightweight/in-memory; persistence + the wren
+        # engine have their own dedicated tests.
+        "conversation_store": "memory",
+        "semantic_layer_store": "memory",
+        "wren_engine": "passthrough",
+        "wren_core_validation_enabled": False,
+    }
+    defaults.update(overrides)
+    return AgentConfig(**defaults)
 
 
 def _create_test_app(store: InMemoryConversationStore | None = None) -> FastAPI:
@@ -619,6 +626,10 @@ def test_conversation_endpoints_scope_history_by_signed_identity() -> None:
             identity_provider="signed_header",
             signed_identity_header="x-agent-identity",
             signed_identity_secret="secret",
+            conversation_store="memory",
+            semantic_layer_store="memory",
+            wren_engine="passthrough",
+            wren_core_validation_enabled=False,
         ),
         ollama_client=FakeOllamaClient(),
         text_to_sql_graph=StaticGraph(),

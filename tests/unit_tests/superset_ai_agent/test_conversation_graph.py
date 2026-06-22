@@ -389,6 +389,7 @@ def test_conversation_graph_executes_valid_sql_when_requested() -> None:
         "load_context",
         "load_wren_context",
         "draft_response",
+        "plan_semantic_sql",
         "validate_sql",
         "execute_sql",
         "build_artifacts",

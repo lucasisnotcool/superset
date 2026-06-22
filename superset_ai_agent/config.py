@@ -81,8 +81,10 @@ class AgentConfig:
     max_repair_attempts: int = 1
     max_context_datasets: int = 8
     max_sample_rows: int = 5
-    conversation_store: ConversationStoreMode = "memory"
-    semantic_layer_store: SemanticLayerStoreMode = "memory"
+    # Persistence is ON by default so MDL, conversations, and the materialized
+    # manifest survive restarts. Tests/embedding can opt into "memory".
+    conversation_store: ConversationStoreMode = "sqlalchemy"
+    semantic_layer_store: SemanticLayerStoreMode = "sqlalchemy"
     identity_provider: IdentityProviderMode = "superset_session"
     allow_static_identity_with_persistence: bool = False
     signed_identity_header: str = "X-Superset-Ai-Agent-Identity"
@@ -130,12 +132,15 @@ class AgentConfig:
     semantic_access_mode: SemanticAccessMode = "superset_or_uri"
     semantic_full_access_grants_write: bool = False
     semantic_activation_requires_live_schema: bool = False
-    wren_core_validation_enabled: bool = False
+    # Wren's semantic engine is enabled by default (wren-core-py is a hard dep);
+    # it degrades to passthrough when a query's backend has no wren-core dialect
+    # or no MDL exists for the scope.
+    wren_core_validation_enabled: bool = True
     # Wren full-parity seams (see wren_full.md). All default to the
     # zero-dependency binding so the service starts unchanged; turning any of
     # these on requires durable semantic persistence (semantic_layer_store=
     # sqlalchemy), enforced at startup.
-    wren_engine: WrenEngineMode = "passthrough"
+    wren_engine: WrenEngineMode = "wren_core"
     wren_semantic_sql_enabled: bool = False
     wren_retriever: WrenRetrieverMode = "keyword"
     wren_memory_store: WrenMemoryStoreMode = "none"

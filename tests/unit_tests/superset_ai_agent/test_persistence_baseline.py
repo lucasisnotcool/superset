@@ -54,10 +54,16 @@ def _config(**overrides) -> AgentConfig:
     return AgentConfig(**overrides)
 
 
-def test_parity_features_disabled_by_default() -> None:
-    assert _parity_features_enabled(_config()) is False
-    # Default config keeps the in-memory store legal.
+def test_parity_features_enabled_by_default_with_durable_persistence() -> None:
+    # Wren engine + sqlalchemy persistence are the defaults; the pairing is valid.
+    assert _parity_features_enabled(_config()) is True
     _validate_semantic_persistence_config(_config())
+
+
+def test_parity_features_disabled_when_explicitly_passthrough() -> None:
+    config = _config(wren_engine="passthrough", semantic_layer_store="memory")
+    assert _parity_features_enabled(config) is False
+    _validate_semantic_persistence_config(config)
 
 
 @pytest.mark.parametrize(
@@ -83,7 +89,15 @@ def test_parity_feature_allowed_with_sqlalchemy_persistence() -> None:
 
 def test_memory_store_sqlalchemy_requires_agent_database() -> None:
     assert _requires_agent_database(_config(wren_memory_store="sqlalchemy")) is True
-    assert _requires_agent_database(_config()) is False
+    # Default config is sqlalchemy-backed, so it also requires the agent DB.
+    assert _requires_agent_database(_config()) is True
+    # Fully in-memory config needs no DB.
+    assert (
+        _requires_agent_database(
+            _config(conversation_store="memory", semantic_layer_store="memory")
+        )
+        is False
+    )
 
 
 def test_mdl_survives_restart_with_sqlalchemy_store(tmp_path) -> None:

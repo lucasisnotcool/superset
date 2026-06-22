@@ -66,8 +66,16 @@ def test_extract_referenced_tables_handles_joins_and_bad_sql() -> None:
     assert extract_referenced_tables("not valid sql ;;;") == []
 
 
-def test_factory_defaults_to_passthrough() -> None:
-    assert isinstance(create_semantic_engine(AgentConfig()), PassthroughEngine)
+def test_factory_defaults_to_wren_core() -> None:
+    # Wren's engine is enabled by default.
+    assert isinstance(create_semantic_engine(AgentConfig()), WrenCoreEngine)
+
+
+def test_factory_returns_passthrough_when_selected() -> None:
+    assert isinstance(
+        create_semantic_engine(AgentConfig(wren_engine="passthrough")),
+        PassthroughEngine,
+    )
 
 
 def test_factory_returns_wren_core_when_selected() -> None:

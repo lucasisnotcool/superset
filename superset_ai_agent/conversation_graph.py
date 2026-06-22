@@ -873,12 +873,15 @@ class ConversationGraph:
 
         draft = state["draft"]
         sql = draft.sql or ""
-        if self.semantic_engine.name == "passthrough" or not sql:
+        # Pre-approved SQL is the user-confirmed final native query; never send it
+        # back through the engine rewrite. Also a no-op for passthrough/empty SQL.
+        is_approved = bool(state["request"].approved_sql)
+        if self.semantic_engine.name == "passthrough" or not sql or is_approved:
             return {
                 **state,
                 "semantic_sql": sql,
                 "native_sql": sql,
-                "engine": self.semantic_engine.name,
+                "engine": self.semantic_engine.name if not is_approved else "approved",
             }
 
         result = plan_semantic_sql_step(

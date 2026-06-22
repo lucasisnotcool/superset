@@ -157,7 +157,7 @@ def test_engine_rewrite_reaches_execution_and_audit() -> None:
 def test_passthrough_engine_is_a_no_op_but_stamps_audit() -> None:
     superset = _RecordingSupersetClient()
     graph = TextToSqlGraph(
-        config=AgentConfig(),  # default wren_engine=passthrough
+        config=AgentConfig(wren_engine="passthrough"),
         model_client=_FakeModelClient(_SEMANTIC_SQL),
         context_provider=_FakeContextProvider(),
         superset_client=superset,

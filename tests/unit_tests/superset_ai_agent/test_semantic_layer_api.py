@@ -110,11 +110,18 @@ class ToggleContextProvider:
 
 
 def _local_config(**overrides) -> AgentConfig:
-    return AgentConfig(
-        identity_provider="static",
-        superset_auth_mode="service_account",
-        **overrides,
-    )
+    defaults = {
+        "identity_provider": "static",
+        "superset_auth_mode": "service_account",
+        # These API tests inject in-memory stores; keep config lightweight so the
+        # persistence enforcement + wren engine don't require a DB here.
+        "conversation_store": "memory",
+        "semantic_layer_store": "memory",
+        "wren_engine": "passthrough",
+        "wren_core_validation_enabled": False,
+    }
+    defaults.update(overrides)
+    return AgentConfig(**defaults)
 
 
 def _client(
