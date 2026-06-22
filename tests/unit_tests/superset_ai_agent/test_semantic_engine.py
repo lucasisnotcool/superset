@@ -122,8 +122,40 @@ def test_wren_core_unknown_dialect_degrades(monkeypatch) -> None:
 @pytest.mark.skipif(
     not wren_core_available(), reason="wren-core engine not installed"
 )
-def test_wren_core_rewrites_when_installed() -> None:  # pragma: no cover
+def test_wren_core_rewrites_model_to_physical_table() -> None:
     engine = WrenCoreEngine()
     planned = engine.plan_sql(_SQL, _manifest(), dialect="postgres")
     assert planned.engine == "wren_core"
-    assert planned.native_sql
+    assert planned.rewritten is True
+    # The logical model `deals` is expanded to the physical `sales.deals`.
+    assert "sales.deals" in planned.native_sql
+
+
+_CALC_YAML = """
+models:
+  - name: deals
+    table_reference:
+      schema: sales
+      table: deals
+    columns:
+      - name: amount
+        type: DOUBLE
+      - name: margin
+        type: DOUBLE
+        is_calculated: true
+        expression: amount * 0.1
+"""
+
+
+@pytest.mark.skipif(
+    not wren_core_available(), reason="wren-core engine not installed"
+)
+def test_wren_core_computes_calculated_column() -> None:
+    engine = WrenCoreEngine()
+    planned = engine.plan_sql(
+        "SELECT margin FROM deals",
+        compile_manifest(yaml_contents=[_CALC_YAML]),
+        dialect="postgres",
+    )
+    # The engine — not the LLM — generates the calculated expression.
+    assert "amount * 0.1" in planned.native_sql.replace(" ", " ")

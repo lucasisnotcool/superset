@@ -49,19 +49,18 @@ from superset_ai_agent.semantic_layer.schemas import (
 )
 
 try:  # pragma: no cover - exercised only when wren-core is installed
-    from wren_core import SessionContext, to_manifest  # type: ignore
+    from wren_core import SessionContext  # type: ignore
 
     _WREN_CORE_IMPORT_ERROR: str | None = None
 except Exception as ex:  # pylint: disable=broad-except
     SessionContext = None  # type: ignore[assignment,misc]
-    to_manifest = None  # type: ignore[assignment]
     _WREN_CORE_IMPORT_ERROR = str(ex)
 
 
 def wren_core_available() -> bool:
     """Return whether the optional wren-core engine is importable."""
 
-    return SessionContext is not None and to_manifest is not None
+    return SessionContext is not None
 
 
 def validate_with_wren_core(
@@ -101,8 +100,8 @@ def validate_engine_manifest(engine_manifest: dict[str, Any]) -> MdlValidationRe
         json.dumps(engine_manifest).encode("utf-8")
     ).decode("ascii")
     try:
-        manifest = to_manifest(encoded)  # type: ignore[misc]
-        SessionContext(manifest, [])  # type: ignore[misc]
+        # Constructing a SessionContext loads + validates the manifest.
+        SessionContext(encoded)  # type: ignore[misc]
     except Exception as ex:  # pylint: disable=broad-except
         return MdlValidationResult(
             valid=False,

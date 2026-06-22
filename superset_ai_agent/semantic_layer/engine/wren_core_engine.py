@@ -27,9 +27,10 @@ flows through ``validate_read_only_sql`` and the Superset executor.
 degrades to passthrough behavior with a warning, so the service runs unchanged
 (governance invariant: every seam degrades closed).
 
-NOTE: the transform path is exercised only when wren-core is installed; the
-dialect token map (`base.BACKEND_TO_WREN_DIALECT`) and manifest serde shape MUST
-be re-verified against the installed wren-core version (wren_full.md R-A/R16).
+Verified against wren-core-py 0.7.1: `SessionContext(mdl_base64, data_source=
+<dialect>)` then `transform_sql(...)`. The dialect is the constructor argument
+(not a manifest field), and the manifest must omit a typed `dataSource`. Re-verify
+the dialect token map (`base.BACKEND_TO_WREN_DIALECT`) on a wren-core upgrade.
 """
 
 from __future__ import annotations
@@ -37,7 +38,6 @@ from __future__ import annotations
 from superset_ai_agent.semantic_layer.engine.base import (
     extract_referenced_tables,
     PlannedSql,
-    resolve_dialect,
 )
 from superset_ai_agent.semantic_layer.engine.passthrough import PassthroughEngine
 from superset_ai_agent.semantic_layer.mdl_compile import CompiledManifest
@@ -49,10 +49,9 @@ from superset_ai_agent.semantic_layer.wren_core_validator import (
 )
 
 try:  # pragma: no cover - exercised only when wren-core is installed
-    from wren_core import SessionContext, to_manifest  # type: ignore
+    from wren_core import SessionContext  # type: ignore
 except Exception:  # pylint: disable=broad-except
     SessionContext = None  # type: ignore[assignment,misc]
-    to_manifest = None  # type: ignore[assignment]
 
 
 class WrenCoreEngine:
@@ -93,12 +92,7 @@ class WrenCoreEngine:
                 dialect,
                 "wren-core is not installed; semantic rewrite skipped.",
             )
-        engine_manifest = manifest.to_engine_manifest()
-        # Ensure the data source carries the resolved dialect so transform_sql
-        # targets the correct native dialect.
-        resolved = dialect or resolve_dialect(
-            (engine_manifest.get("dataSource") or {}).get("type")
-        )
+        resolved = dialect
         if resolved is None:
             return _degraded(
                 semantic_sql,
@@ -106,17 +100,13 @@ class WrenCoreEngine:
                 "Unknown/unmapped SQL dialect; semantic rewrite skipped.",
             )
         try:
-            compiled = CompiledManifest.model_validate(
-                {
-                    **manifest.model_dump(by_alias=True),
-                    "data_source": {
-                        **(manifest.data_source or {}),
-                        "type": resolved,
-                    },
-                }
+            # wren-core 0.7.x: SessionContext loads the base64 manifest directly,
+            # and the target dialect is the ``data_source`` constructor argument
+            # (NOT a manifest field). The manifest must omit a typed dataSource.
+            ctx = SessionContext(  # type: ignore[misc]
+                manifest.to_base64_json(),
+                data_source=resolved,
             )
-            wren_manifest = to_manifest(compiled.to_base64_json())  # type: ignore[misc]
-            ctx = SessionContext(wren_manifest, [])  # type: ignore[misc]
             native_sql = ctx.transform_sql(semantic_sql)  # type: ignore[misc]
         except Exception as ex:  # pylint: disable=broad-except
             return _degraded(

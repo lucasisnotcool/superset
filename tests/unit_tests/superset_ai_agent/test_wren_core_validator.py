@@ -26,7 +26,20 @@ from superset_ai_agent.semantic_layer.wren_core_validator import (
     wren_core_available,
 )
 
+# wren-core requires every column to carry a ``type``; a complete model
+# round-trips through deep validation cleanly.
 _VALID_MODEL = (
+    "models:\n"
+    "  - name: deals\n"
+    "    table_reference:\n"
+    "      table: deals\n"
+    "    columns:\n"
+    "      - name: stage\n"
+    "        type: VARCHAR\n"
+)
+
+# Same model but a column is missing its required ``type`` — wren-core rejects it.
+_INCOMPLETE_MODEL = (
     "models:\n"
     "  - name: deals\n"
     "    table_reference:\n"
@@ -71,8 +84,9 @@ def test_validate_with_wren_core_no_op_when_unavailable() -> None:
     assert any(m.code == "wren_core_unavailable" for m in result.messages)
 
 
-def test_deep_validate_flag_is_safe_without_wren_core() -> None:
-    # deep_validate must not break the structural result when wren-core is absent.
+def test_deep_validate_passes_complete_manifest() -> None:
+    # A complete manifest is valid whether or not wren-core is installed
+    # (no-op valid when absent; engine-accepted when present).
     result = validate_project_manifest([_VALID_MODEL], deep_validate=True)
     assert result.valid is True
 
@@ -80,17 +94,8 @@ def test_deep_validate_flag_is_safe_without_wren_core() -> None:
 @pytest.mark.skipif(
     not wren_core_available(), reason="wren-core not installed"
 )
-def test_wren_core_rejects_unknown_column_reference() -> None:  # pragma: no cover
-    # When wren-core is installed, a relationship to a missing model should fail.
-    result = validate_with_wren_core(
-        [{"name": "deals", "table_reference": {"table": "deals"}, "columns": []}],
-        [
-            {
-                "name": "bad",
-                "models": ["deals", "ghost"],
-                "join_type": "MANY_TO_ONE",
-                "condition": "deals.x = ghost.y",
-            }
-        ],
-    )
+def test_wren_core_rejects_incomplete_manifest() -> None:
+    # A column missing its required ``type`` is rejected by the live engine.
+    result = validate_project_manifest([_INCOMPLETE_MODEL], deep_validate=True)
     assert result.valid is False
+    assert any(m.code == "wren_core_error" for m in result.messages)
