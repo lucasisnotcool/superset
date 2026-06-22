@@ -118,6 +118,12 @@ class ConversationCreateRequest(BaseModel):
     scope: ConversationScope
 
 
+class ConversationTitleUpdateRequest(BaseModel):
+    """Request to rename a conversation."""
+
+    title: str = Field(min_length=1, max_length=255)
+
+
 class ConversationTurnRequest(BaseModel):
     """Request to append a user message and run the conversation agent."""
 

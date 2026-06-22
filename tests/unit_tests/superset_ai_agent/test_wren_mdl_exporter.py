@@ -70,13 +70,14 @@ def test_export_agent_context_to_mdl_maps_superset_metadata() -> None:
 
     assert mdl["dataSource"]["properties"]["superset_database_id"] == 1
     assert mdl["models"][0]["name"] == "gross_moves"
-    assert mdl["models"][0]["tableReference"] == {
+    assert mdl["models"][0]["table_reference"] == {
         "schema": "main",
         "table": "gross moves",
     }
     assert mdl["models"][0]["columns"][0]["name"] == "stage"
-    assert mdl["models"][0]["columns"][1]["isTime"] is True
-    assert mdl["models"][0]["measures"][0]["expression"] == "COUNT(*)"
+    assert mdl["models"][0]["columns"][0]["is_calculated"] is False
+    assert mdl["models"][0]["columns"][1]["properties"]["is_time"] is True
+    assert mdl["models"][0]["metrics"][0]["expression"] == "COUNT(*)"
     assert mdl["semanticOverlay"]["semantic_updates"][0]["id"] == "update-1"
 
 

@@ -38,18 +38,16 @@ the UI under **Data > Datasets** — you should see `seagate_sites`,
 `seagate_production_events`, `seagate_quality_tests`, `seagate_shipments`.
 
 Note the `examples` database's numeric id (**Data > Databases**, commonly
-`1` on a fresh install) and its schema name (open any `seagate_*` dataset's
-**Edit** modal, or check SQL Lab — the Docker stack's `examples` database is
-Postgres and defaults to schema `public`; a native SQLite-backed `examples`
-database defaults to schema `main`). The commands below use
-`<DB_ID>` and `<SCHEMA>` as placeholders for these two values.
+`1` on a fresh install). All `seagate_*` tables are loaded into the `seagate`
+schema, which the loader creates automatically. The commands below use
+`<DB_ID>` as a placeholder; use `schema_name: "seagate"` for all calls.
 
 ## 2. Resolve the Wren semantic project for this schema
 
 ```bash
 curl -X POST http://localhost:8090/ai-agent/agent/semantic-layer/projects/resolve \
   -H "Content-Type: application/json" \
-  -d '{"database_id": <DB_ID>, "schema_name": "<SCHEMA>"}'
+  -d '{"database_id": <DB_ID>, "schema_name": "seagate"}'
 ```
 
 Keep the returned `id` if you want to scope later calls to a specific
@@ -66,7 +64,7 @@ curl -X POST http://localhost:8090/ai-agent/agent/query \
   -d '{
     "question": "How many patties are currently on the griddle, company-wide?",
     "database_id": <DB_ID>,
-    "schema_name": "<SCHEMA>",
+    "schema_name": "seagate",
     "execute": true
   }'
 ```
@@ -79,7 +77,7 @@ Tigerline, Golden Yield, Diner Week, ...) to be misread or refused outright.
 
 ```bash
 curl -X POST http://localhost:8090/ai-agent/agent/semantic-layer/documents \
-  -F 'scope={"database_id": <DB_ID>, "schema_name": "<SCHEMA>"}' \
+  -F 'scope={"database_id": <DB_ID>, "schema_name": "seagate"}' \
   -F 'file=@superset_ai_agent/dev_fixtures/seagate_manufacturing/bi_glossary.md;type=text/markdown'
 ```
 
@@ -93,14 +91,14 @@ curl -X PATCH http://localhost:8090/ai-agent/agent/semantic-layer/documents/<DOC
 ```
 
 (List documents at any point with
-`GET /ai-agent/agent/semantic-layer/documents?database_id=<DB_ID>&schema_name=<SCHEMA>`.)
+`GET /ai-agent/agent/semantic-layer/documents?database_id=<DB_ID>&schema_name=seagate`.)
 
 ## 5. Rebuild the semantic-layer index
 
 ```bash
 curl -X POST http://localhost:8090/ai-agent/agent/semantic-layer/index/rebuild \
   -H "Content-Type: application/json" \
-  -d '{"scope": {"database_id": <DB_ID>, "schema_name": "<SCHEMA>"}}'
+  -d '{"scope": {"database_id": <DB_ID>, "schema_name": "seagate"}}'
 ```
 
 This materializes the approved updates into active Wren MDL files.

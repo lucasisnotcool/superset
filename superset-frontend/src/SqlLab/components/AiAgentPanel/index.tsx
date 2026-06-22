@@ -19,6 +19,7 @@
 import {
   ChangeEvent,
   KeyboardEvent,
+  type ReactNode,
   useEffect,
   useMemo,
   useRef,
@@ -27,17 +28,19 @@ import {
 import { useSelector } from 'react-redux';
 import { t } from '@apache-superset/core/translation';
 import { Alert } from '@apache-superset/core/components';
-import { css, styled } from '@apache-superset/core/theme';
+import { css, keyframes, styled } from '@apache-superset/core/theme';
 import {
   Button,
   Flex,
   Input,
+  SafeMarkdown,
   Select,
   Tooltip,
   Typography,
   type SelectValue,
 } from '@superset-ui/core/components';
 import { Icons } from '@superset-ui/core/components/Icons';
+import { extendedDayjs } from '@superset-ui/core/utils/dates';
 import { useAppDispatch } from 'src/SqlLab/hooks/useAppDispatch';
 import type { QueryEditor, SqlLabRootState } from 'src/SqlLab/types';
 import {
@@ -66,12 +69,21 @@ import {
   listConversations,
   resolveSemanticProject,
   sendConversationMessage,
+  streamConversationMessage,
+  streamExecuteConversationSql,
+  StreamInterruptedError,
+  StreamUnavailableError,
+  updateConversationTitle,
+  type ConversationProgressEvent,
+  type ConversationTurnResponse,
   type ExecutionMode,
   type SemanticLayerState,
 } from './api';
 import AiChartPreview from './AiChartPreview';
 import AuditInfoPanel from './AuditInfoPanel';
+import DatasetSelect from './DatasetSelect';
 import DataPreviewToggle from './DataPreviewToggle';
+import MarkdownCodeBlock from './MarkdownCodeBlock';
 import FollowupQuestions from './FollowupQuestions';
 import InsightCards from './InsightCards';
 import SemanticLayerStateBadge from './SemanticLayerStateBadge';
@@ -171,6 +183,14 @@ const HistoryButton = styled.button`
   `}
 `;
 
+const TranscriptWrapper = styled.div`
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+`;
+
 const Transcript = styled.div`
   ${({ theme }) => css`
     display: flex;
@@ -180,6 +200,32 @@ const Transcript = styled.div`
     gap: ${theme.sizeUnit * 3}px;
     padding: ${theme.sizeUnit * 3}px;
     overflow: auto;
+  `}
+`;
+
+const JumpToLatestButton = styled.button`
+  ${({ theme }) => css`
+    position: absolute;
+    left: 50%;
+    bottom: ${theme.sizeUnit * 3}px;
+    transform: translateX(-50%);
+    z-index: 1;
+    display: inline-flex;
+    align-items: center;
+    gap: ${theme.sizeUnit}px;
+    padding: ${theme.sizeUnit}px ${theme.sizeUnit * 3}px;
+    border: 1px solid ${theme.colorBorder};
+    border-radius: ${theme.borderRadius * 4}px;
+    background: ${theme.colorBgElevated};
+    color: ${theme.colorText};
+    box-shadow: ${theme.boxShadowSecondary};
+    cursor: pointer;
+    font-size: ${theme.fontSizeSM}px;
+
+    &:hover {
+      border-color: ${theme.colorPrimary};
+      color: ${theme.colorPrimary};
+    }
   `}
 `;
 
@@ -207,6 +253,65 @@ const MessageBubble = styled.div<{ 'data-message-role': 'user' | 'assistant' }>`
     white-space: pre-wrap;
     overflow-wrap: anywhere;
     line-height: 1.5;
+  `}
+`;
+
+const MessageMeta = styled.div<{ 'data-message-role': 'user' | 'assistant' }>`
+  ${({ theme, 'data-message-role': messageRole }) => css`
+    display: flex;
+    align-items: center;
+    gap: ${theme.sizeUnit}px;
+    justify-content: ${messageRole === 'user' ? 'flex-end' : 'flex-start'};
+    color: ${theme.colorTextTertiary};
+    font-size: ${theme.fontSizeSM}px;
+    /* Reveal the action buttons on hover/focus to keep the transcript calm. */
+    .message-actions {
+      opacity: 0;
+      transition: opacity 0.15s ease;
+    }
+    &:hover .message-actions,
+    &:focus-within .message-actions {
+      opacity: 1;
+    }
+  `}
+`;
+
+const MarkdownContent = styled.div`
+  ${({ theme }) => css`
+    white-space: normal;
+    overflow-wrap: anywhere;
+
+    p,
+    ul,
+    ol,
+    pre,
+    blockquote,
+    table {
+      margin: 0 0 ${theme.sizeUnit * 2}px;
+    }
+    > :last-child {
+      margin-bottom: 0;
+    }
+    ul,
+    ol {
+      padding-left: ${theme.sizeUnit * 4}px;
+    }
+    code {
+      padding: 0 ${theme.sizeUnit}px;
+      border-radius: ${theme.borderRadiusSM}px;
+      background: ${theme.colorBgElevated};
+      font-size: ${theme.fontSizeSM}px;
+    }
+    pre {
+      padding: ${theme.sizeUnit * 2}px;
+      overflow: auto;
+      background: ${theme.colorBgElevated};
+      border-radius: ${theme.borderRadius}px;
+    }
+    pre code {
+      padding: 0;
+      background: transparent;
+    }
   `}
 `;
 
@@ -279,6 +384,63 @@ const Composer = styled.div`
   `}
 `;
 
+const rotateGlow = keyframes`
+  to {
+    transform: rotate(1turn);
+  }
+`;
+
+const ComposerInput = styled.div<{ 'data-loading'?: boolean }>`
+  ${({ theme, 'data-loading': loading }) => css`
+    position: relative;
+    border-radius: ${theme.borderRadius}px;
+
+    /* A rotating gradient ring shown only while the agent is working, to signal
+       activity the same way a spinner does. The textarea sits on top with an
+       opaque background, so only the 2px overhang reads as a glowing border. */
+    &::before {
+      content: '';
+      position: absolute;
+      inset: -2px;
+      border-radius: ${theme.borderRadius + 2}px;
+      background: conic-gradient(
+        from 0deg,
+        ${theme.colorPrimary},
+        ${theme.colorBgBase} 35%,
+        ${theme.colorPrimary} 50%,
+        ${theme.colorBgBase} 85%,
+        ${theme.colorPrimary}
+      );
+      opacity: ${loading ? 1 : 0};
+      animation: ${rotateGlow} 1.4s linear infinite;
+      animation-play-state: ${loading ? 'running' : 'paused'};
+      transition: opacity 0.2s ease;
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    .ant-input,
+    textarea {
+      position: relative;
+      z-index: 1;
+    }
+  `}
+`;
+
+const ProgressBubble = styled.div`
+  ${({ theme }) => css`
+    display: inline-flex;
+    align-items: center;
+    gap: ${theme.sizeUnit * 2}px;
+    padding: ${theme.sizeUnit * 2}px ${theme.sizeUnit * 3}px;
+    border: 1px solid ${theme.colorBorderSecondary};
+    border-radius: ${theme.borderRadius}px;
+    background: ${theme.colorBgContainer};
+    color: ${theme.colorTextSecondary};
+    line-height: 1.5;
+  `}
+`;
+
 const ExecutionModeControl = styled.div`
   ${() => css`
     min-width: 176px;
@@ -320,12 +482,6 @@ const TraceList = styled.ul`
   `}
 `;
 
-const parseDatasetIds = (value: string) =>
-  value
-    .split(',')
-    .map(item => Number.parseInt(item.trim(), 10))
-    .filter(Number.isFinite);
-
 const getActiveQueryEditor = ({
   sqlLab: {
     queryEditors,
@@ -355,13 +511,49 @@ const buildConversationScope = (
   selected_text: queryEditor?.selectedText || null,
 });
 
-const conversationDatasetInput = (conversation: Conversation | null) =>
-  conversation?.scope.dataset_ids.join(',') || '';
+// Custom renderers for assistant markdown: fenced code is highlighted with a
+// copy button, and the default `pre` wrapper is dropped so the highlighter owns
+// the block layout.
+const markdownComponents = {
+  code: MarkdownCodeBlock,
+  pre: ({ children }: { children?: ReactNode }) => <>{children}</>,
+};
 
 const executionModes: ExecutionMode[] = ['manual', 'read_only', 'auto'];
 
 const isExecutionMode = (value: SelectValue): value is ExecutionMode =>
   typeof value === 'string' && executionModes.includes(value as ExecutionMode);
+
+// Persist the chosen execution mode per conversation so reopening a chat keeps
+// its approval setting; new chats inherit the last-used default.
+const EXEC_MODE_STORAGE_PREFIX = 'sqllab:ai-agent:exec-mode:';
+
+const execModeStorageKey = (conversationId?: string) =>
+  `${EXEC_MODE_STORAGE_PREFIX}${conversationId ?? 'default'}`;
+
+const loadExecutionMode = (conversationId?: string): ExecutionMode | null => {
+  try {
+    const stored = window.localStorage.getItem(
+      execModeStorageKey(conversationId),
+    );
+    return isExecutionMode(stored as SelectValue)
+      ? (stored as ExecutionMode)
+      : null;
+  } catch {
+    return null;
+  }
+};
+
+const storeExecutionMode = (
+  conversationId: string | undefined,
+  mode: ExecutionMode,
+) => {
+  try {
+    window.localStorage.setItem(execModeStorageKey(conversationId), mode);
+  } catch {
+    // Ignore storage failures (private mode, quota, disabled storage).
+  }
+};
 
 const getValidationStatus = (artifact: ConversationArtifact) => {
   if (!artifact.validation) {
@@ -384,10 +576,43 @@ const getValidationTooltip = (artifact: ConversationArtifact) => {
     : t('SQL is invalid.');
 };
 
+// Treat the transcript as "pinned" within a small slack of the bottom so the
+// auto-scroll keeps following new content unless the user scrolls up to read.
+const SCROLL_PIN_THRESHOLD_PX = 40;
+
+const isScrolledToBottom = (el: HTMLElement) =>
+  el.scrollHeight - el.scrollTop - el.clientHeight <= SCROLL_PIN_THRESHOLD_PX;
+
+const isAbortError = (ex: unknown): boolean =>
+  ex instanceof DOMException
+    ? ex.name === 'AbortError'
+    : ex instanceof Error && ex.name === 'AbortError';
+
+const normalizeSql = (sql: string | null | undefined) =>
+  (sql || '').trim().replace(/;+$/, '').replace(/\s+/g, ' ');
+
+// The turn-level trace is cumulative: when the agent retries, a freshly drafted
+// retry artifact inherits the failed `execute_sql` event from the earlier
+// attempt. Attribute the error only when its recorded SQL matches this
+// artifact's own SQL, so a never-executed retry draft is not treated as failed.
 const getExecutionError = (artifact: ConversationArtifact) => {
-  const executionEvent = artifact.trace.find(
-    event => event.step === 'execute_sql' && event.status === 'error',
+  const artifactSqlKeys = new Set(
+    [artifact.sql, artifact.validation?.normalized_sql]
+      .map(normalizeSql)
+      .filter(Boolean),
   );
+  const executionEvent = artifact.trace.find(event => {
+    if (event.step !== 'execute_sql' || event.status !== 'error') {
+      return false;
+    }
+    const eventSql = event.details.sql;
+    // Older trace events may omit the SQL; fall back to attributing the error
+    // only when the artifact itself was never executed successfully.
+    if (typeof eventSql !== 'string') {
+      return !artifact.execution_result;
+    }
+    return artifactSqlKeys.has(normalizeSql(eventSql));
+  });
   if (!executionEvent) {
     return null;
   }
@@ -399,9 +624,12 @@ const AiAgentPanel = () => {
   const dispatch = useAppDispatch();
   const queryEditor = useSelector(getActiveQueryEditor);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
   const [composerValue, setComposerValue] = useState('');
-  const [datasetIds, setDatasetIds] = useState('');
-  const [executionMode, setExecutionMode] = useState<ExecutionMode>('manual');
+  const [datasetIds, setDatasetIds] = useState<number[]>([]);
+  const [executionMode, setExecutionMode] = useState<ExecutionMode>(
+    () => loadExecutionMode() ?? 'manual',
+  );
   const [isLoading, setIsLoading] = useState(false);
   const [conversation, setConversation] = useState<Conversation | null>(null);
   const [conversationSummaries, setConversationSummaries] = useState<
@@ -411,20 +639,22 @@ const AiAgentPanel = () => {
   const [health, setHealth] = useState<AgentHealthResponse | null>(null);
   const [isHealthError, setIsHealthError] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [pendingUserMessage, setPendingUserMessage] = useState<string | null>(
+    null,
+  );
+  const [progress, setProgress] = useState<string | null>(null);
+  const [isPinnedToBottom, setIsPinnedToBottom] = useState(true);
+  const [feedback, setFeedback] = useState<Record<string, 'up' | 'down'>>({});
   const [semanticLayerState, setSemanticLayerState] =
     useState<SemanticLayerState | null>(null);
 
-  const parsedDatasetIds = useMemo(
-    () => parseDatasetIds(datasetIds),
-    [datasetIds],
-  );
   const databaseId = queryEditor?.dbId;
   const currentScope = useMemo(
     () =>
       typeof databaseId === 'number'
-        ? buildConversationScope(queryEditor, databaseId, parsedDatasetIds)
+        ? buildConversationScope(queryEditor, databaseId, datasetIds)
         : null,
-    [databaseId, parsedDatasetIds, queryEditor],
+    [databaseId, datasetIds, queryEditor],
   );
   const canSend =
     Boolean(composerValue.trim()) && typeof databaseId === 'number';
@@ -507,15 +737,71 @@ const AiAgentPanel = () => {
   ]);
 
   useEffect(() => {
+    if (isPinnedToBottom && transcriptRef.current) {
+      transcriptRef.current.scrollTop = transcriptRef.current.scrollHeight;
+    }
+  }, [
+    messages.length,
+    isLoading,
+    pendingUserMessage,
+    progress,
+    isPinnedToBottom,
+  ]);
+
+  const onTranscriptScroll = () => {
+    if (transcriptRef.current) {
+      setIsPinnedToBottom(isScrolledToBottom(transcriptRef.current));
+    }
+  };
+
+  const jumpToLatest = () => {
     if (transcriptRef.current) {
       transcriptRef.current.scrollTop = transcriptRef.current.scrollHeight;
     }
-  }, [messages.length, isLoading]);
+    setIsPinnedToBottom(true);
+  };
 
   const refreshConversationSummaries = () =>
     listConversations()
       .then(setConversationSummaries)
       .catch(() => setConversationSummaries([]));
+
+  // Best-effort resync of the transcript with the server (e.g. after the user
+  // cancels a turn) without surfacing errors of its own.
+  const reloadConversation = async (conversationId?: string) => {
+    if (!conversationId) {
+      return;
+    }
+    try {
+      setConversation(await getConversation(conversationId));
+      await refreshConversationSummaries();
+    } catch {
+      // Leave the current state in place if the resync fails.
+    }
+  };
+
+  // Centralised handling for a failed turn: cancellations and dropped streams
+  // resync silently/with a notice; everything else surfaces as an error.
+  const handleTurnError = async (
+    ex: unknown,
+    conversationId: string | undefined,
+    fallbackMessage: string,
+  ) => {
+    if (isAbortError(ex)) {
+      await reloadConversation(conversationId);
+      return;
+    }
+    if (ex instanceof StreamInterruptedError) {
+      dispatch(
+        addInfoToast(t('Connection interrupted — reloading the latest reply.')),
+      );
+      await reloadConversation(conversationId);
+      return;
+    }
+    const messageText = ex instanceof Error ? ex.message : fallbackMessage;
+    setError(messageText);
+    dispatch(addDangerToast(messageText));
+  };
 
   const ensureConversation = async (scope: ConversationScope) => {
     if (conversation) {
@@ -523,41 +809,92 @@ const AiAgentPanel = () => {
     }
     const createdConversation = await createConversation(scope);
     setConversation(createdConversation);
-    setDatasetIds(conversationDatasetInput(createdConversation));
+    setDatasetIds(createdConversation.scope.dataset_ids);
+    // Carry the current default mode onto the freshly created conversation.
+    storeExecutionMode(createdConversation.id, executionMode);
     await refreshConversationSummaries();
     return createdConversation;
   };
+
+  const onExecutionModeChange = (value: SelectValue) => {
+    if (isExecutionMode(value)) {
+      setExecutionMode(value);
+      storeExecutionMode(conversation?.id, value);
+    }
+  };
+
+  const onProgressUpdate = (event: ConversationProgressEvent) =>
+    setProgress(event.summary);
+
+  // Run a turn over the streaming endpoint, falling back to the buffered request
+  // only when streaming never started (StreamUnavailableError). A mid-stream
+  // failure means the turn was already sent, so it must not be retried.
+  const runConversationTurn = async (
+    conversationId: string,
+    payload: Parameters<typeof sendConversationMessage>[1],
+    signal: AbortSignal,
+  ): Promise<ConversationTurnResponse> => {
+    try {
+      return await streamConversationMessage(conversationId, payload, {
+        onProgress: onProgressUpdate,
+        signal,
+      });
+    } catch (ex) {
+      if (ex instanceof StreamUnavailableError) {
+        return sendConversationMessage(conversationId, payload);
+      }
+      throw ex;
+    }
+  };
+
+  const onCancel = () => abortRef.current?.abort();
 
   const onSend = async (messageOverride?: string) => {
     const message = (messageOverride || composerValue).trim();
     if (!message || typeof databaseId !== 'number' || !currentScope) {
       return;
     }
+    const controller = new AbortController();
+    abortRef.current = controller;
     setIsLoading(true);
     setError(null);
+    setProgress(null);
+    // Show the user's message immediately instead of a placeholder while the
+    // agent works; it is reconciled once the turn response arrives.
+    setPendingUserMessage(message);
+    let activeConversationId: string | undefined;
     try {
       const activeConversation = await ensureConversation(currentScope);
+      activeConversationId = activeConversation.id;
       if (!messageOverride) {
         setComposerValue('');
       }
-      const result = await sendConversationMessage(activeConversation.id, {
-        message,
-        scope: currentScope,
-        execution_mode: executionMode,
-      });
+      const result = await runConversationTurn(
+        activeConversation.id,
+        {
+          message,
+          scope: currentScope,
+          execution_mode: executionMode,
+        },
+        controller.signal,
+      );
       setConversation(result.conversation);
-      setDatasetIds(conversationDatasetInput(result.conversation));
+      setDatasetIds(result.conversation.scope.dataset_ids);
       await refreshConversationSummaries();
       if (result.status === 'error') {
         dispatch(addDangerToast(t('The agent could not complete the turn.')));
       }
     } catch (ex) {
-      const messageText =
-        ex instanceof Error ? ex.message : t('Agent request failed');
-      setError(messageText);
-      dispatch(addDangerToast(messageText));
+      await handleTurnError(
+        ex,
+        activeConversationId,
+        t('Agent request failed'),
+      );
     } finally {
+      abortRef.current = null;
       setIsLoading(false);
+      setProgress(null);
+      setPendingUserMessage(null);
     }
   };
 
@@ -572,14 +909,18 @@ const AiAgentPanel = () => {
     setConversation(null);
     setComposerValue('');
     setError(null);
-    setDatasetIds('');
+    setDatasetIds([]);
+    setExecutionMode(loadExecutionMode() ?? 'manual');
   };
 
   const onOpenConversation = async (conversationId: string) => {
     try {
       const result = await getConversation(conversationId);
       setConversation(result);
-      setDatasetIds(conversationDatasetInput(result));
+      setDatasetIds(result.scope.dataset_ids);
+      setExecutionMode(
+        loadExecutionMode(result.id) ?? loadExecutionMode() ?? 'manual',
+      );
       setIsHistoryOpen(false);
     } catch (ex) {
       const messageText =
@@ -624,6 +965,63 @@ const AiAgentPanel = () => {
       .catch(() => dispatch(addInfoToast(t('Copy failed.'))));
   };
 
+  const onCopyMessage = (content: string) => {
+    if (!content) {
+      return;
+    }
+    copyTextToClipboard(() => Promise.resolve(content))
+      .then(() => dispatch(addSuccessToast(t('Message copied.'))))
+      .catch(() => dispatch(addInfoToast(t('Copy failed.'))));
+  };
+
+  // Re-run the most recent user prompt to produce a fresh assistant turn.
+  const onRegenerate = () => {
+    if (isLoading) {
+      return;
+    }
+    const lastUserMessage = [...messages]
+      .reverse()
+      .find(message => message.role === 'user');
+    if (lastUserMessage?.content) {
+      onSend(lastUserMessage.content);
+    }
+  };
+
+  // Lightweight feedback hook: records the rating locally and acknowledges it.
+  // A backend feedback endpoint can later consume this signal.
+  const onFeedback = (messageId: string, rating: 'up' | 'down') => {
+    setFeedback(previous => {
+      const next = { ...previous };
+      if (next[messageId] === rating) {
+        delete next[messageId];
+      } else {
+        next[messageId] = rating;
+      }
+      return next;
+    });
+    dispatch(addInfoToast(t('Thanks for the feedback.')));
+  };
+
+  const onRenameConversation = async (title: string) => {
+    const trimmed = title.trim();
+    if (!conversation || !trimmed || trimmed === conversation.title) {
+      return;
+    }
+    try {
+      const updated = await updateConversationTitle(conversation.id, trimmed);
+      setConversation(updated);
+      await refreshConversationSummaries();
+    } catch (ex) {
+      dispatch(
+        addDangerToast(
+          ex instanceof Error
+            ? ex.message
+            : t('Conversation could not be renamed'),
+        ),
+      );
+    }
+  };
+
   const onExecuteArtifact = async (artifact: ConversationArtifact) => {
     if (
       !conversation ||
@@ -637,37 +1035,68 @@ const AiAgentPanel = () => {
       dispatch(addDangerToast(getValidationTooltip(artifact)));
       return;
     }
+    const conversationId = conversation.id;
+    const payload = {
+      sql: artifact.validation.normalized_sql || artifact.sql,
+      scope: currentScope,
+      execution_mode: executionMode,
+      artifact_id: artifact.id,
+    };
+    const controller = new AbortController();
+    abortRef.current = controller;
     setIsLoading(true);
     setError(null);
+    setProgress(null);
     try {
-      const result = await executeConversationSql(conversation.id, {
-        sql: artifact.validation.normalized_sql || artifact.sql,
-        scope: currentScope,
-        execution_mode: executionMode,
-        artifact_id: artifact.id,
-      });
+      let result: ConversationTurnResponse;
+      try {
+        result = await streamExecuteConversationSql(conversationId, payload, {
+          onProgress: onProgressUpdate,
+          signal: controller.signal,
+        });
+      } catch (ex) {
+        if (ex instanceof StreamUnavailableError) {
+          result = await executeConversationSql(conversationId, payload);
+        } else {
+          throw ex;
+        }
+      }
       setConversation(result.conversation);
       await refreshConversationSummaries();
       if (result.status === 'error') {
         dispatch(addDangerToast(t('The agent could not execute SQL.')));
       }
     } catch (ex) {
-      const messageText =
-        ex instanceof Error ? ex.message : t('SQL execution failed');
-      setError(messageText);
-      dispatch(addDangerToast(messageText));
+      await handleTurnError(ex, conversationId, t('SQL execution failed'));
     } finally {
+      abortRef.current = null;
       setIsLoading(false);
+      setProgress(null);
     }
   };
 
   return (
     <Panel data-test="sql-lab-ai-agent-panel">
       <Header>
-        <Flex vertical gap={0}>
-          <Typography.Title level={5} style={{ margin: 0 }}>
-            {t('AI SQL')}
-          </Typography.Title>
+        <Flex vertical gap={0} style={{ minWidth: 0 }}>
+          {conversation ? (
+            <Typography.Title
+              level={5}
+              style={{ margin: 0 }}
+              ellipsis={{ tooltip: conversation.title }}
+              editable={{
+                onChange: onRenameConversation,
+                tooltip: t('Rename conversation'),
+                maxLength: 255,
+              }}
+            >
+              {conversation.title}
+            </Typography.Title>
+          ) : (
+            <Typography.Title level={5} style={{ margin: 0 }}>
+              {t('AI SQL')}
+            </Typography.Title>
+          )}
           <Tooltip title={getAgentBaseUrl()}>
             <MetaText>{healthLabel}</MetaText>
           </Tooltip>
@@ -729,21 +1158,15 @@ const AiAgentPanel = () => {
           </Chip>
           {queryEditor?.schema && <Chip>{queryEditor.schema}</Chip>}
           {queryEditor?.catalog && <Chip>{queryEditor.catalog}</Chip>}
-          {parsedDatasetIds.map(datasetId => (
-            <Chip key={datasetId}>{t('Dataset %s', datasetId)}</Chip>
-          ))}
           {queryEditor?.selectedText && <Chip>{t('Selection')}</Chip>}
           <SemanticLayerStateBadge state={semanticLayerState} />
         </ContextChips>
-        <Flex gap="small" align="center">
-          <Input
-            value={datasetIds}
-            placeholder={t('Dataset IDs')}
-            onChange={(event: ChangeEvent<HTMLInputElement>) =>
-              setDatasetIds(event.target.value)
-            }
-          />
-        </Flex>
+        <DatasetSelect
+          databaseId={databaseId}
+          schema={queryEditor?.schema}
+          value={datasetIds}
+          onChange={setDatasetIds}
+        />
         {isHistoryOpen && (
           <HistoryPanel>
             {conversationSummaries.map(summary => (
@@ -762,164 +1185,267 @@ const AiAgentPanel = () => {
         )}
       </ContextBar>
 
-      <Transcript ref={transcriptRef}>
-        {messages.map(message => {
-          const renderArtifactsBeforeMessage =
-            message.role === 'assistant' &&
-            message.artifacts.some(artifact => artifact.execution_result) &&
-            !message.artifacts.some(artifact =>
-              artifact.trace.some(event => event.step === 'approved_sql'),
-            );
-          const artifactBlocks = message.artifacts.map((artifact, index) => {
-            const validationStatus = getValidationStatus(artifact);
-            const executionError = getExecutionError(artifact);
-            const isExecuted = Boolean(artifact.execution_result);
-            const canExecuteArtifact =
-              Boolean(artifact.sql) &&
-              Boolean(conversation) &&
-              !executionError &&
-              !isExecuted &&
-              artifact.validation?.is_valid === true &&
-              artifact.validation?.is_read_only === true;
+      <TranscriptWrapper>
+        <Transcript
+          ref={transcriptRef}
+          onScroll={onTranscriptScroll}
+          data-test="agent-transcript"
+        >
+          {messages.map((message, messageIndex) => {
+            const isLastMessage = messageIndex === messages.length - 1;
+            const renderArtifactsBeforeMessage =
+              message.role === 'assistant' &&
+              message.artifacts.some(artifact => artifact.execution_result) &&
+              !message.artifacts.some(artifact =>
+                artifact.trace.some(event => event.step === 'approved_sql'),
+              );
+            const artifactBlocks = message.artifacts.map((artifact, index) => {
+              const validationStatus = getValidationStatus(artifact);
+              const executionError = getExecutionError(artifact);
+              const isExecuted = Boolean(artifact.execution_result);
+              // A successful execution does not lock the button — re-running is
+              // allowed and the label/icon change is what signals the prior run.
+              const canExecuteArtifact =
+                Boolean(artifact.sql) &&
+                Boolean(conversation) &&
+                !executionError &&
+                artifact.validation?.is_valid === true &&
+                artifact.validation?.is_read_only === true;
+
+              return (
+                <ArtifactBlock key={`${message.id}-${artifact.type}-${index}`}>
+                  {artifact.answer_summary && (
+                    <Typography.Text strong>
+                      {artifact.answer_summary}
+                    </Typography.Text>
+                  )}
+                  <InsightCards cards={artifact.insight_cards} />
+                  {artifact.explanation && (
+                    <MetaText>{artifact.explanation}</MetaText>
+                  )}
+                  <AiChartPreview
+                    chartSpec={artifact.chart_spec}
+                    result={artifact.execution_result || artifact.data_preview}
+                  />
+                  <SqlBlockRow>
+                    <SqlBlock>{artifact.sql}</SqlBlock>
+                    <Tooltip title={getValidationTooltip(artifact)}>
+                      <ValidationStatus
+                        data-validation-status={validationStatus}
+                      >
+                        {validationStatus === 'valid' ? (
+                          <Icons.CheckCircleOutlined iconSize="m" />
+                        ) : validationStatus === 'invalid' ? (
+                          <Icons.CloseCircleOutlined iconSize="m" />
+                        ) : (
+                          <Icons.InfoCircleOutlined iconSize="m" />
+                        )}
+                      </ValidationStatus>
+                    </Tooltip>
+                  </SqlBlockRow>
+                  {artifact.validation?.errors.length ? (
+                    <Alert
+                      type="warning"
+                      message={artifact.validation.errors.join('\n')}
+                    />
+                  ) : null}
+                  {executionError ? (
+                    <Alert type="warning" message={executionError} />
+                  ) : null}
+                  <DataPreviewToggle
+                    result={artifact.execution_result || artifact.data_preview}
+                  />
+                  <AuditInfoPanel
+                    audit={artifact.audit || artifact.execution_result?.audit}
+                  />
+                  <Flex gap="small" wrap="wrap">
+                    <Button
+                      aria-label={t('Insert')}
+                      buttonStyle="tertiary"
+                      onClick={() => onInsertSql(artifact.sql)}
+                      disabled={!artifact.sql || !queryEditor?.id}
+                      icon={<Icons.EditOutlined iconSize="m" />}
+                    >
+                      {t('Insert')}
+                    </Button>
+                    <Button
+                      aria-label={t('Copy')}
+                      buttonStyle="tertiary"
+                      onClick={() => onCopySql(artifact.sql)}
+                      disabled={!artifact.sql}
+                      icon={<Icons.CopyOutlined iconSize="m" />}
+                    >
+                      {t('Copy')}
+                    </Button>
+                    <Button
+                      aria-label={isExecuted ? t('Executed') : t('Execute')}
+                      buttonStyle={isExecuted ? 'secondary' : 'tertiary'}
+                      onClick={() => onExecuteArtifact(artifact)}
+                      disabled={!canExecuteArtifact || isLoading}
+                      icon={
+                        isExecuted ? (
+                          <Icons.CheckCircleOutlined iconSize="m" />
+                        ) : (
+                          <Icons.PlayCircleOutlined iconSize="m" />
+                        )
+                      }
+                    >
+                      {isExecuted ? t('Executed') : t('Execute')}
+                    </Button>
+                  </Flex>
+                  <FollowupQuestions
+                    questions={artifact.recommended_followups}
+                    disabled={isLoading}
+                    onSelect={question => onSend(question)}
+                  />
+                  {artifact.wren_context && (
+                    <TraceDetails>
+                      <summary>{t('Wren context')}</summary>
+                      <SqlBlock>
+                        {JSON.stringify(artifact.wren_context, null, 2)}
+                      </SqlBlock>
+                    </TraceDetails>
+                  )}
+                  {artifact.trace.length > 0 && (
+                    <TraceDetails>
+                      <summary>{t('Trace')}</summary>
+                      <TraceList>
+                        {artifact.trace.map((event, index) => (
+                          <li key={`${event.step}-${index}`}>
+                            {event.step}: {event.summary}
+                          </li>
+                        ))}
+                      </TraceList>
+                    </TraceDetails>
+                  )}
+                </ArtifactBlock>
+              );
+            });
 
             return (
-              <ArtifactBlock key={`${message.id}-${artifact.type}-${index}`}>
-                {artifact.answer_summary && (
-                  <Typography.Text strong>
-                    {artifact.answer_summary}
-                  </Typography.Text>
+              <MessageBlock key={message.id} data-message-role={message.role}>
+                {renderArtifactsBeforeMessage && artifactBlocks}
+                {message.content.trim() && (
+                  <MessageBubble data-message-role={message.role}>
+                    {message.role === 'assistant' ? (
+                      <MarkdownContent>
+                        <SafeMarkdown
+                          source={message.content}
+                          components={markdownComponents}
+                        />
+                      </MarkdownContent>
+                    ) : (
+                      message.content
+                    )}
+                  </MessageBubble>
                 )}
-                <InsightCards cards={artifact.insight_cards} />
-                {artifact.explanation && (
-                  <MetaText>{artifact.explanation}</MetaText>
-                )}
-                <AiChartPreview
-                  chartSpec={artifact.chart_spec}
-                  result={artifact.execution_result || artifact.data_preview}
-                />
-                <SqlBlockRow>
-                  <SqlBlock>{artifact.sql}</SqlBlock>
-                  <Tooltip title={getValidationTooltip(artifact)}>
-                    <ValidationStatus data-validation-status={validationStatus}>
-                      {validationStatus === 'valid' ? (
-                        <Icons.CheckCircleOutlined iconSize="m" />
-                      ) : validationStatus === 'invalid' ? (
-                        <Icons.CloseCircleOutlined iconSize="m" />
-                      ) : (
-                        <Icons.InfoCircleOutlined iconSize="m" />
-                      )}
-                    </ValidationStatus>
+                {!renderArtifactsBeforeMessage && artifactBlocks}
+                <MessageMeta data-message-role={message.role}>
+                  <Tooltip
+                    title={extendedDayjs(message.created_at).format('LLL')}
+                  >
+                    <span>{extendedDayjs(message.created_at).fromNow()}</span>
                   </Tooltip>
-                </SqlBlockRow>
-                {artifact.validation?.errors.length ? (
-                  <Alert
-                    type="warning"
-                    message={artifact.validation.errors.join('\n')}
-                  />
-                ) : null}
-                {executionError ? (
-                  <Alert type="warning" message={executionError} />
-                ) : null}
-                <DataPreviewToggle
-                  result={artifact.execution_result || artifact.data_preview}
-                />
-                <AuditInfoPanel
-                  audit={artifact.audit || artifact.execution_result?.audit}
-                />
-                <Flex gap="small" wrap="wrap">
-                  <Button
-                    aria-label={t('Insert')}
-                    buttonStyle="tertiary"
-                    onClick={() => onInsertSql(artifact.sql)}
-                    disabled={!artifact.sql || !queryEditor?.id}
-                    icon={<Icons.EditOutlined iconSize="m" />}
-                  >
-                    {t('Insert')}
-                  </Button>
-                  <Button
-                    aria-label={t('Copy')}
-                    buttonStyle="tertiary"
-                    onClick={() => onCopySql(artifact.sql)}
-                    disabled={!artifact.sql}
-                    icon={<Icons.CopyOutlined iconSize="m" />}
-                  >
-                    {t('Copy')}
-                  </Button>
-                  <Button
-                    aria-label={isExecuted ? t('Executed') : t('Execute')}
-                    buttonStyle="tertiary"
-                    onClick={() => onExecuteArtifact(artifact)}
-                    disabled={isExecuted || !canExecuteArtifact || isLoading}
-                    icon={
-                      isExecuted ? (
-                        <Icons.CheckCircleOutlined iconSize="m" />
-                      ) : (
-                        <Icons.PlayCircleOutlined iconSize="m" />
-                      )
-                    }
-                  >
-                    {isExecuted ? t('Executed') : t('Execute')}
-                  </Button>
-                </Flex>
-                <FollowupQuestions
-                  questions={artifact.recommended_followups}
-                  disabled={isLoading}
-                  onSelect={question => onSend(question)}
-                />
-                {artifact.wren_context && (
-                  <TraceDetails>
-                    <summary>{t('Wren context')}</summary>
-                    <SqlBlock>
-                      {JSON.stringify(artifact.wren_context, null, 2)}
-                    </SqlBlock>
-                  </TraceDetails>
-                )}
-                {artifact.trace.length > 0 && (
-                  <TraceDetails>
-                    <summary>{t('Trace')}</summary>
-                    <TraceList>
-                      {artifact.trace.map((event, index) => (
-                        <li key={`${event.step}-${index}`}>
-                          {event.step}: {event.summary}
-                        </li>
-                      ))}
-                    </TraceList>
-                  </TraceDetails>
-                )}
-              </ArtifactBlock>
+                  <Flex className="message-actions" align="center" gap={0}>
+                    {message.content.trim() && (
+                      <Button
+                        aria-label={t('Copy message')}
+                        tooltip={t('Copy message')}
+                        buttonSize="small"
+                        buttonStyle="link"
+                        onClick={() => onCopyMessage(message.content)}
+                        icon={<Icons.CopyOutlined iconSize="s" />}
+                      />
+                    )}
+                    {message.role === 'assistant' && (
+                      <>
+                        <Button
+                          aria-label={t('Good response')}
+                          tooltip={t('Good response')}
+                          buttonSize="small"
+                          buttonStyle="link"
+                          onClick={() => onFeedback(message.id, 'up')}
+                          icon={
+                            feedback[message.id] === 'up' ? (
+                              <Icons.LikeFilled iconSize="s" />
+                            ) : (
+                              <Icons.LikeOutlined iconSize="s" />
+                            )
+                          }
+                        />
+                        <Button
+                          aria-label={t('Bad response')}
+                          tooltip={t('Bad response')}
+                          buttonSize="small"
+                          buttonStyle="link"
+                          onClick={() => onFeedback(message.id, 'down')}
+                          icon={
+                            feedback[message.id] === 'down' ? (
+                              <Icons.DislikeFilled iconSize="s" />
+                            ) : (
+                              <Icons.DislikeOutlined iconSize="s" />
+                            )
+                          }
+                        />
+                        {isLastMessage && (
+                          <Button
+                            aria-label={t('Regenerate')}
+                            tooltip={t('Regenerate response')}
+                            buttonSize="small"
+                            buttonStyle="link"
+                            disabled={isLoading}
+                            onClick={onRegenerate}
+                            icon={<Icons.ReloadOutlined iconSize="s" />}
+                          />
+                        )}
+                      </>
+                    )}
+                  </Flex>
+                </MessageMeta>
+              </MessageBlock>
             );
-          });
-
-          return (
-            <MessageBlock key={message.id} data-message-role={message.role}>
-              {renderArtifactsBeforeMessage && artifactBlocks}
-              <MessageBubble data-message-role={message.role}>
-                {message.content}
+          })}
+          {pendingUserMessage && (
+            <MessageBlock data-message-role="user">
+              <MessageBubble data-message-role="user">
+                {pendingUserMessage}
               </MessageBubble>
-              {!renderArtifactsBeforeMessage && artifactBlocks}
             </MessageBlock>
-          );
-        })}
-        {isLoading && (
-          <MessageBlock data-message-role="assistant">
-            <MessageBubble data-message-role="assistant">
-              {t('Working...')}
-            </MessageBubble>
-          </MessageBlock>
+          )}
+          {isLoading && (
+            <MessageBlock data-message-role="assistant">
+              <ProgressBubble data-test="agent-progress">
+                <Icons.LoadingOutlined iconSize="m" spin />
+                {progress || t('Working…')}
+              </ProgressBubble>
+            </MessageBlock>
+          )}
+          {error && <Alert type="error" message={error} />}
+        </Transcript>
+        {!isPinnedToBottom && (
+          <JumpToLatestButton
+            type="button"
+            onClick={jumpToLatest}
+            data-test="jump-to-latest"
+          >
+            <Icons.DownOutlined iconSize="s" />
+            {t('Jump to latest')}
+          </JumpToLatestButton>
         )}
-        {error && <Alert type="error" message={error} />}
-      </Transcript>
+      </TranscriptWrapper>
 
       <Composer>
-        <Input.TextArea
-          rows={3}
-          value={composerValue}
-          placeholder={t('Ask about this database')}
-          onKeyDown={onComposerKeyDown}
-          onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
-            setComposerValue(event.target.value)
-          }
-        />
+        <ComposerInput data-loading={isLoading}>
+          <Input.TextArea
+            rows={3}
+            value={composerValue}
+            placeholder={t('Ask about this database')}
+            onKeyDown={onComposerKeyDown}
+            onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
+              setComposerValue(event.target.value)
+            }
+          />
+        </ComposerInput>
         <Flex justify="space-between" align="center" gap="small" wrap="wrap">
           <Flex gap="small" align="center" wrap="wrap">
             <ExecutionModeControl>
@@ -928,27 +1454,33 @@ const AiAgentPanel = () => {
                 options={executionModeOptions}
                 value={executionMode}
                 showSearch={false}
-                onChange={value => {
-                  if (isExecutionMode(value)) {
-                    setExecutionMode(value);
-                  }
-                }}
+                onChange={onExecutionModeChange}
               />
             </ExecutionModeControl>
             <MetaText>
               {health?.default_model || health?.model_provider}
             </MetaText>
           </Flex>
-          <Button
-            aria-label={t('Send')}
-            buttonStyle="primary"
-            onClick={() => onSend()}
-            disabled={!canSend || isLoading}
-            loading={isLoading}
-            icon={<Icons.ArrowRightOutlined iconSize="m" />}
-          >
-            {t('Send')}
-          </Button>
+          {isLoading ? (
+            <Button
+              aria-label={t('Stop')}
+              buttonStyle="danger"
+              onClick={onCancel}
+              icon={<Icons.StopOutlined iconSize="m" />}
+            >
+              {t('Stop')}
+            </Button>
+          ) : (
+            <Button
+              aria-label={t('Send')}
+              buttonStyle="primary"
+              onClick={() => onSend()}
+              disabled={!canSend}
+              icon={<Icons.ArrowRightOutlined iconSize="m" />}
+            >
+              {t('Send')}
+            </Button>
+          )}
         </Flex>
       </Composer>
     </Panel>

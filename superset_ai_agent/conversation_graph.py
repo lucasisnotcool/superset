@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json  # noqa: TID251 - keep the standalone agent independent of Superset
+from collections.abc import Generator, Iterator
 from typing import Any, Literal, TypedDict
 from uuid import uuid4
 
@@ -203,6 +204,20 @@ class ConversationGraph:
             conversation=conversation,
         )
 
+    @staticmethod
+    def _approved_turn_request(
+        request: ConversationSqlExecutionRequest,
+    ) -> ConversationTurnRequest:
+        return ConversationTurnRequest(
+            message="Execute selected SQL.",
+            scope=request.scope,
+            execution_mode=request.execution_mode,
+            approved_sql=request.sql,
+            approved_artifact_id=request.artifact_id,
+            model=request.model,
+            max_steps=request.max_steps,
+        )
+
     def execute_approved_sql(
         self,
         *,
@@ -217,20 +232,27 @@ class ConversationGraph:
             request.scope,
             owner_id=owner_id,
         )
-        turn_request = ConversationTurnRequest(
-            message="Execute selected SQL.",
-            scope=request.scope,
-            execution_mode=request.execution_mode,
-            approved_sql=request.sql,
-            approved_artifact_id=request.artifact_id,
-            model=request.model,
-            max_steps=request.max_steps,
-        )
         state = self._invoke_graph(
             conversation_id=conversation_id,
-            request=turn_request,
+            request=self._approved_turn_request(request),
             owner_id=owner_id,
         )
+        return self._assemble_execute_response(
+            conversation_id=conversation_id,
+            request=request,
+            state=state,
+            owner_id=owner_id,
+        )
+
+    def _assemble_execute_response(
+        self,
+        *,
+        conversation_id: str,
+        request: ConversationSqlExecutionRequest,
+        state: ConversationState,
+        owner_id: str,
+    ) -> ConversationTurnResponse:
+        """Replace the approved artifact in place and append the assistant turn."""
 
         conversation = self.conversation_store.get(
             conversation_id,
@@ -290,14 +312,59 @@ class ConversationGraph:
             conversation=conversation,
         )
 
-    def _invoke_graph(
+    def execute_approved_sql_stream(
+        self,
+        *,
+        conversation_id: str,
+        request: ConversationSqlExecutionRequest,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> Iterator[dict[str, Any]]:
+        """Stream an approved-SQL execution turn (progress then complete).
+
+        Mirrors :meth:`execute_approved_sql` but streams each newly produced
+        trace event, so retries during execution are visible live.
+        """
+
+        self.conversation_store.update_scope(
+            conversation_id,
+            request.scope,
+            owner_id=owner_id,
+        )
+        turn_request = self._approved_turn_request(request)
+        initial_state = self._initial_state(
+            conversation_id=conversation_id,
+            request=turn_request,
+            owner_id=owner_id,
+        )
+        final_state: ConversationState = initial_state
+        emitted = 0
+        try:
+            for state in self.graph.stream(initial_state, stream_mode="values"):
+                final_state = state
+                emitted = yield from self._emit_new_trace(state, emitted)
+        except GeneratorExit:
+            self._append_cancellation_message(conversation_id, owner_id)
+            raise
+        except Exception as ex:  # pylint: disable=broad-except
+            final_state, error_event = self._error_state(initial_state, final_state, ex)
+            yield _progress_event(error_event)
+
+        response = self._assemble_execute_response(
+            conversation_id=conversation_id,
+            request=request,
+            state=final_state,
+            owner_id=owner_id,
+        )
+        yield {"type": "complete", "response": response}
+
+    def _initial_state(
         self,
         *,
         conversation_id: str,
         request: ConversationTurnRequest,
         owner_id: str,
     ) -> ConversationState:
-        initial_state: ConversationState = {
+        return {
             "conversation_id": conversation_id,
             "owner_id": owner_id,
             "request": request,
@@ -323,6 +390,19 @@ class ConversationGraph:
             "reflection_feedback": None,
             "error": None,
         }
+
+    def _invoke_graph(
+        self,
+        *,
+        conversation_id: str,
+        request: ConversationTurnRequest,
+        owner_id: str,
+    ) -> ConversationState:
+        initial_state = self._initial_state(
+            conversation_id=conversation_id,
+            request=request,
+            owner_id=owner_id,
+        )
         try:
             return self.graph.invoke(initial_state)
         except SupersetAuthError:
@@ -339,6 +419,118 @@ class ConversationGraph:
                     )
                 ],
             }
+
+    def run_stream(
+        self,
+        *,
+        conversation_id: str,
+        request: ConversationTurnRequest,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> Iterator[dict[str, Any]]:
+        """Run a conversation turn, yielding step progress then the final turn.
+
+        Mirrors :meth:`run` but streams each newly produced trace event as a
+        ``progress`` dict so callers can surface live agent activity, then yields
+        a terminal ``complete`` dict carrying the full turn response. All
+        failures are converted into progress/complete events rather than raised,
+        because the HTTP status is already committed once streaming begins.
+        """
+
+        user_message = ConversationMessage(role="user", content=request.message)
+        self.conversation_store.update_scope(
+            conversation_id,
+            request.scope,
+            owner_id=owner_id,
+        )
+        self.conversation_store.append(
+            conversation_id,
+            user_message,
+            owner_id=owner_id,
+        )
+
+        initial_state = self._initial_state(
+            conversation_id=conversation_id,
+            request=request,
+            owner_id=owner_id,
+        )
+        final_state: ConversationState = initial_state
+        emitted = 0
+        try:
+            for state in self.graph.stream(initial_state, stream_mode="values"):
+                final_state = state
+                emitted = yield from self._emit_new_trace(state, emitted)
+        except GeneratorExit:
+            # The client disconnected (e.g. pressed Stop); record a cancellation
+            # so the stored transcript stays consistent, then propagate.
+            self._append_cancellation_message(conversation_id, owner_id)
+            raise
+        except Exception as ex:  # pylint: disable=broad-except
+            final_state, error_event = self._error_state(initial_state, final_state, ex)
+            yield _progress_event(error_event)
+
+        assistant_message = self._assistant_message_from_state(final_state)
+        conversation = self.conversation_store.append(
+            conversation_id,
+            assistant_message,
+            owner_id=owner_id,
+        )
+        status = self._status_from_state(final_state)
+        response = ConversationTurnResponse(
+            status=status,
+            conversation_id=conversation_id,
+            message=assistant_message,
+            artifacts=assistant_message.artifacts,
+            trace=final_state.get("trace", []),
+            conversation=conversation,
+        )
+        yield {"type": "complete", "response": response}
+
+    def _emit_new_trace(
+        self,
+        state: ConversationState,
+        emitted: int,
+    ) -> Generator[dict[str, Any], None, int]:
+        """Yield a ``progress`` event for each trace entry not yet streamed.
+
+        Returns the updated count of emitted trace entries.
+        """
+
+        trace = state.get("trace", [])
+        while emitted < len(trace):
+            yield _progress_event(trace[emitted])
+            emitted += 1
+        return emitted
+
+    @staticmethod
+    def _error_state(
+        initial_state: ConversationState,
+        final_state: ConversationState,
+        ex: Exception,
+    ) -> tuple[ConversationState, TraceEvent]:
+        error_event = TraceEvent(
+            step="conversation_error",
+            status="error",
+            summary=str(ex),
+        )
+        return (
+            {
+                **initial_state,
+                "error": str(ex),
+                "trace": [*final_state.get("trace", []), error_event],
+            },
+            error_event,
+        )
+
+    def _append_cancellation_message(
+        self,
+        conversation_id: str,
+        owner_id: str,
+    ) -> None:
+        self.conversation_store.append(
+            conversation_id,
+            ConversationMessage(role="assistant", content="Generation cancelled."),
+            owner_id=owner_id,
+        )
 
     def _compile_graph(self) -> Any:
         graph = StateGraph(ConversationState)
@@ -842,7 +1034,12 @@ class ConversationGraph:
                     step="execute_sql",
                     status="error",
                     summary="SQL execution failed.",
-                    details={"error": error},
+                    # Record the SQL that failed so the client can attribute this
+                    # error to the artifact that produced it. The turn-level trace
+                    # is cumulative, so a later retry artifact inherits this event;
+                    # without the SQL the UI cannot tell the failed draft apart
+                    # from a fresh, never-executed retry draft.
+                    details={"error": error, "sql": sql},
                 ),
             ]
             pending_artifact = state.get("pending_artifact")
@@ -1190,6 +1387,17 @@ class ConversationGraph:
         if validation and validation.is_valid:
             return "needs_review"
         return "error"
+
+
+def _progress_event(event: TraceEvent) -> dict[str, Any]:
+    """Serialize a trace event as a streaming ``progress`` payload."""
+
+    return {
+        "type": "progress",
+        "step": event.step,
+        "status": event.status,
+        "summary": event.summary,
+    }
 
 
 def _conversation_payload(

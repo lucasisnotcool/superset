@@ -26,6 +26,7 @@ import yaml
 
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.integrations.superset.client import AgentContext
+from superset_ai_agent.integrations.wren.mdl_exporter import model_from_dataset
 from superset_ai_agent.schemas import WrenContextArtifact
 from superset_ai_agent.semantic_layer.mdl_validation import validate_mdl_yaml
 from superset_ai_agent.semantic_layer.schemas import (
@@ -90,6 +91,14 @@ class WrenClient(Protocol):
 
     def validate_mdl_project(self, *, mdl_path: str) -> dict[str, Any]:
         """Validate a materialized MDL project without executing queries."""
+
+    def generate_base_model(
+        self,
+        *,
+        project: SemanticProject,
+        superset_context: AgentContext,
+    ) -> list[MdlEnrichmentProposal]:
+        """Return reviewable base MDL proposals from schema introspection."""
 
 
 class DisabledWrenClient:
@@ -159,6 +168,17 @@ class DisabledWrenClient:
             "planning_only": True,
             "warnings": ["Wren integration is disabled."],
         }
+
+    def generate_base_model(
+        self,
+        *,
+        project: SemanticProject,
+        superset_context: AgentContext,
+    ) -> list[MdlEnrichmentProposal]:
+        return deterministic_base_model_proposals(
+            project=project,
+            superset_context=superset_context,
+        )
 
 
 class FileWrenClient:
@@ -302,6 +322,17 @@ class FileWrenClient:
             "path": str(path),
         }
 
+    def generate_base_model(
+        self,
+        *,
+        project: SemanticProject,
+        superset_context: AgentContext,
+    ) -> list[MdlEnrichmentProposal]:
+        return deterministic_base_model_proposals(
+            project=project,
+            superset_context=superset_context,
+        )
+
     def _matched_models(
         self,
         *,
@@ -433,6 +464,37 @@ def deterministic_mdl_proposal(
             "metrics, and relationships before activation."
         ],
     )
+
+
+def deterministic_base_model_proposals(
+    *,
+    project: SemanticProject,
+    superset_context: AgentContext,
+) -> list[MdlEnrichmentProposal]:
+    """Build review-draft base MDL proposals from permission-filtered datasets."""
+
+    proposals: list[MdlEnrichmentProposal] = []
+    for dataset in superset_context.datasets:
+        model = model_from_dataset(dataset)
+        model_name = str(model.get("name") or _safe_mdl_name(dataset.table_name))
+        proposed_yaml = yaml.safe_dump(
+            {"models": [model]},
+            sort_keys=False,
+            allow_unicode=False,
+        )
+        proposals.append(
+            MdlEnrichmentProposal(
+                source_document_id=f"onboarding:{dataset.id}",
+                proposed_path=f"models/{model_name}.yaml",
+                proposed_yaml=proposed_yaml,
+                validation=validate_mdl_yaml(proposed_yaml),
+                warnings=[
+                    "Generated from schema introspection. Review descriptions, "
+                    "metrics, and relationships before activation."
+                ],
+            )
+        )
+    return proposals
 
 
 def _safe_mdl_name(value: str) -> str:

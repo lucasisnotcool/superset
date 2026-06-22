@@ -124,7 +124,7 @@ metrics:
 normalize_columns: false
 offset: 0
 params: null
-schema: null
+schema: seagate
 sql: null
 table_name: seagate_shipments
 template_params: null

@@ -89,6 +89,18 @@ class InMemoryConversationStore:
         conversation.updated_at = _utc_now()
         return conversation.model_copy(deep=True)
 
+    def update_title(
+        self,
+        conversation_id: str,
+        title: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> Conversation:
+        conversation = self._find(conversation_id, owner_id=owner_id)
+        conversation.title = title
+        conversation.updated_at = _utc_now()
+        return conversation.model_copy(deep=True)
+
     def append(
         self,
         conversation_id: str,

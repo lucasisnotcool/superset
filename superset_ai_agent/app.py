@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import json  # noqa: TID251 - keep the standalone agent independent of Superset
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,7 @@ from superset_ai_agent.conversations.schemas import (
     ConversationScope,
     ConversationSqlExecutionRequest,
     ConversationSummary,
+    ConversationTitleUpdateRequest,
     ConversationTurnRequest,
     ConversationTurnResponse,
 )
@@ -68,11 +70,11 @@ from superset_ai_agent.schemas import (
     TraceEvent,
     ValidateSqlRequest,
 )
-from superset_ai_agent.semantic_layer.documents import create_document
 from superset_ai_agent.semantic_layer.access import (
     SemanticAccessService,
     SemanticPermission,
 )
+from superset_ai_agent.semantic_layer.documents import create_document
 from superset_ai_agent.semantic_layer.events import to_sse
 from superset_ai_agent.semantic_layer.extractors import (
     CompositeDocumentExtractor,
@@ -84,14 +86,27 @@ from superset_ai_agent.semantic_layer.file_storage import (
     S3DocumentStorage,
 )
 from superset_ai_agent.semantic_layer.indexer import rebuild_index
-from superset_ai_agent.semantic_layer.memory import InMemorySemanticLayerStore
+from superset_ai_agent.semantic_layer.jobs import (
+    InMemoryJobStore,
+    JobNotFoundError,
+    JobRunner,
+    JobStore,
+    ThreadJobRunner,
+)
 from superset_ai_agent.semantic_layer.mdl_files import (
     InMemoryMdlFileStore,
     MdlFileNotFoundError,
     MdlFileStore,
+    MdlFileValidationError,
     SqlAlchemyMdlFileStore,
 )
-from superset_ai_agent.semantic_layer.mdl_validation import validate_mdl_yaml
+from superset_ai_agent.semantic_layer.mdl_validator import (
+    SchemaIndex,
+    validate_mdl,
+    validate_project_manifest,
+)
+from superset_ai_agent.semantic_layer.memory import InMemorySemanticLayerStore
+from superset_ai_agent.semantic_layer.onboarding import onboard_schema_project
 from superset_ai_agent.semantic_layer.projects import (
     InMemorySemanticProjectStore,
     SemanticProjectNotFoundError,
@@ -105,15 +120,17 @@ from superset_ai_agent.semantic_layer.schemas import (
     MdlFileCreateRequest,
     MdlFileUpdateRequest,
     MdlValidationResult,
-    SemanticProject,
-    SemanticProjectResolveRequest,
     SemanticDocument,
+    SemanticDocumentTextRequest,
+    SemanticJob,
     SemanticLayerEvent,
     SemanticLayerEventType,
     SemanticLayerIndexRequest,
     SemanticLayerReviewRequest,
     SemanticLayerState,
     SemanticLayerVersion,
+    SemanticProject,
+    SemanticProjectResolveRequest,
     WrenMaterializationResult,
 )
 from superset_ai_agent.semantic_layer.sqlalchemy_store import (
@@ -125,6 +142,21 @@ from superset_ai_agent.semantic_layer.store import (
 )
 from superset_ai_agent.semantic_layer.wren_materializer import materialize_wren_project
 from superset_ai_agent.tools.sql import validate_read_only_sql
+
+
+def _conversation_sse(event: dict[str, Any]) -> str:
+    """Serialize a conversation stream event as one SSE frame.
+
+    ``complete`` events carry a pydantic response model, which is dumped to a
+    JSON-safe mapping before serialization.
+    """
+
+    response = event.get("response")
+    payload = dict(event)
+    if response is not None and hasattr(response, "model_dump"):
+        payload["response"] = response.model_dump(mode="json")
+    event_type = str(payload.get("type", "message"))
+    return f"event: {event_type}\ndata: {json.dumps(payload, default=str)}\n\n"
 
 
 def create_app(  # noqa: C901
@@ -144,6 +176,8 @@ def create_app(  # noqa: C901
     context_provider: Any | None = None,
     wren_client: Any | None = None,
     identity_provider: Any | None = None,
+    job_store: JobStore | None = None,
+    job_runner: JobRunner | None = None,
 ) -> FastAPI:
     """Create the standalone AI agent API.
 
@@ -182,6 +216,8 @@ def create_app(  # noqa: C901
     )
     active_document_storage = document_storage or _create_document_storage(app_config)
     active_document_extractor = document_extractor or CompositeDocumentExtractor()
+    active_job_store = job_store or InMemoryJobStore()
+    active_job_runner = job_runner or ThreadJobRunner()
 
     app_superset_client = (
         superset_client
@@ -191,7 +227,11 @@ def create_app(  # noqa: C901
             else None
         )
     )
-    active_wren_client = wren_client or create_wren_client(app_config)
+    active_wren_client = wren_client or create_wren_client(
+        app_config,
+        model_client=active_model_client,
+        mdl_file_store=active_mdl_file_store,
+    )
     app_context_provider = context_provider or (
         SupersetMetadataContextProvider(app_superset_client, config=app_config)
         if app_superset_client is not None
@@ -459,6 +499,29 @@ def create_app(  # noqa: C901
                 detail="Conversation not found.",
             ) from ex
 
+    @api.patch(
+        "/agent/conversations/{conversation_id}",
+        response_model=Conversation,
+    )
+    def rename_conversation(
+        conversation_id: str,
+        request: ConversationTitleUpdateRequest,
+        identity: AgentIdentity = identity_dependency,
+    ) -> Conversation:
+        """Rename a conversation."""
+
+        try:
+            return active_conversation_store.update_title(
+                conversation_id,
+                request.title,
+                owner_id=identity.owner_id,
+            )
+        except ConversationNotFoundError as ex:
+            raise HTTPException(
+                status_code=404,
+                detail="Conversation not found.",
+            ) from ex
+
     @api.post(
         "/agent/conversations/{conversation_id}/messages",
         response_model=ConversationTurnResponse,
@@ -514,6 +577,86 @@ def create_app(  # noqa: C901
             raise HTTPException(status_code=ex.status_code, detail=str(ex)) from ex
         except Exception as ex:  # pylint: disable=broad-except
             raise HTTPException(status_code=502, detail=str(ex)) from ex
+
+    @api.post("/agent/conversations/{conversation_id}/messages/stream")
+    def stream_conversation_message(
+        conversation_id: str,
+        request: ConversationTurnRequest,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> StreamingResponse:
+        """Stream a conversational agent turn as server-sent events."""
+
+        # Validate existence up front so a missing conversation returns 404
+        # rather than a 200 stream carrying an error event.
+        try:
+            active_conversation_store.get(
+                conversation_id,
+                owner_id=identity.owner_id,
+            )
+        except ConversationNotFoundError as ex:
+            raise HTTPException(
+                status_code=404,
+                detail="Conversation not found.",
+            ) from ex
+
+        graph = build_conversation_graph(fastapi_request)
+
+        def event_stream() -> Any:
+            try:
+                for event in graph.run_stream(
+                    conversation_id=conversation_id,
+                    request=request,
+                    owner_id=identity.owner_id,
+                ):
+                    yield _conversation_sse(event)
+            except Exception as ex:  # pylint: disable=broad-except
+                # The HTTP status is already committed, so surface late failures
+                # as a terminal error event instead of raising.
+                yield _conversation_sse({"type": "error", "detail": str(ex)})
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+        )
+
+    @api.post("/agent/conversations/{conversation_id}/execute-sql/stream")
+    def stream_execute_conversation_sql(
+        conversation_id: str,
+        request: ConversationSqlExecutionRequest,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> StreamingResponse:
+        """Stream an approved-SQL execution turn as server-sent events."""
+
+        try:
+            active_conversation_store.get(
+                conversation_id,
+                owner_id=identity.owner_id,
+            )
+        except ConversationNotFoundError as ex:
+            raise HTTPException(
+                status_code=404,
+                detail="Conversation not found.",
+            ) from ex
+
+        graph = build_conversation_graph(fastapi_request)
+
+        def event_stream() -> Any:
+            try:
+                for event in graph.execute_approved_sql_stream(
+                    conversation_id=conversation_id,
+                    request=request,
+                    owner_id=identity.owner_id,
+                ):
+                    yield _conversation_sse(event)
+            except Exception as ex:  # pylint: disable=broad-except
+                yield _conversation_sse({"type": "error", "detail": str(ex)})
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+        )
 
     @api.delete("/agent/conversations/{conversation_id}")
     def delete_conversation(
@@ -768,6 +911,60 @@ def create_app(  # noqa: C901
             raise HTTPException(status_code=404, detail="MDL file not found.")
         return file
 
+    def _schema_index_for_project(
+        project: SemanticProject,
+        fastapi_request: Request,
+    ) -> SchemaIndex | None:
+        """Best-effort physical schema index for activation/generation checks.
+
+        A Superset outage degrades to structural-only validation rather than
+        blocking activation entirely.
+        """
+
+        if project.default_database_id is None:
+            return None
+        try:
+            request_context_provider, _ = build_superset_runtime(fastapi_request)
+            context = request_context_provider.get_context(
+                AgentQueryRequest(
+                    question="semantic layer validation",
+                    database_id=project.default_database_id,
+                    catalog_name=project.catalog_name,
+                    schema_name=project.schema_name,
+                )
+            )
+        except Exception:  # pylint: disable=broad-except
+            return None
+        return SchemaIndex.from_agent_context(context)
+
+    def _enforce_activation(
+        *,
+        project: SemanticProject,
+        fastapi_request: Request,
+        owner_id: str,
+        file_id: str,
+        new_content: str,
+    ) -> None:
+        """Block activation when the resulting project manifest is invalid."""
+
+        siblings = [
+            file.content
+            for file in active_mdl_file_store.list(project.id, owner_id=owner_id)
+            if file.id != file_id and file.status == "active"
+        ]
+        validation = validate_project_manifest(
+            [*siblings, new_content],
+            schema_index=_schema_index_for_project(project, fastapi_request),
+        )
+        if not validation.valid:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "MDL failed validation and cannot be activated.",
+                    "validation": validation.model_dump(mode="json"),
+                },
+            )
+
     @api.patch(
         "/agent/semantic-layer/projects/{project_id}/mdl-files/{file_id}",
         response_model=MdlFile,
@@ -781,7 +978,7 @@ def create_app(  # noqa: C901
     ) -> MdlFile:
         """Update one MDL YAML file in a governed semantic project."""
 
-        authorize_semantic_project(
+        project = authorize_semantic_project(
             fastapi_request,
             project_id,
             owner_id=identity.owner_id,
@@ -794,6 +991,18 @@ def create_app(  # noqa: C901
             )
             if existing.project_id != project_id:
                 raise MdlFileNotFoundError(file_id)
+            if request.status == "active":
+                _enforce_activation(
+                    project=project,
+                    fastapi_request=fastapi_request,
+                    owner_id=identity.owner_id,
+                    file_id=file_id,
+                    new_content=(
+                        request.content
+                        if request.content is not None
+                        else existing.content
+                    ),
+                )
             return active_mdl_file_store.update(
                 file_id,
                 request,
@@ -801,6 +1010,8 @@ def create_app(  # noqa: C901
             )
         except MdlFileNotFoundError as ex:
             raise HTTPException(status_code=404, detail="MDL file not found.") from ex
+        except MdlFileValidationError as ex:
+            raise HTTPException(status_code=422, detail=str(ex)) from ex
         except ValueError as ex:
             raise HTTPException(status_code=400, detail=str(ex)) from ex
 
@@ -893,6 +1104,122 @@ def create_app(  # noqa: C901
         )
 
     @api.post(
+        "/agent/semantic-layer/projects/{project_id}/onboard",
+        response_model=SemanticJob,
+        status_code=202,
+    )
+    def onboard_semantic_project(
+        project_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> SemanticJob:
+        """Start async schema onboarding; poll the returned job for the result.
+
+        The schema context is fetched synchronously (request-scoped auth); only
+        the slower LLM generation and MDL writes run in the background.
+        """
+
+        project = authorize_semantic_project(
+            fastapi_request,
+            project_id,
+            owner_id=identity.owner_id,
+            permission="write",
+        )
+        if project.default_database_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Project has no associated database for onboarding.",
+            )
+        request_context_provider, _ = build_superset_runtime(fastapi_request)
+        try:
+            context = request_context_provider.get_context(
+                AgentQueryRequest(
+                    question="semantic layer onboarding",
+                    database_id=project.default_database_id,
+                    catalog_name=project.catalog_name,
+                    schema_name=project.schema_name,
+                )
+            )
+        except SupersetAuthError as ex:
+            raise HTTPException(status_code=ex.status_code, detail=str(ex)) from ex
+
+        job = active_job_store.create(kind="onboarding", project_id=project.id)
+        owner_id = identity.owner_id
+        scope = _scope_from_project(project)
+        _append_semantic_event(
+            store=active_semantic_layer_store,
+            owner_id=owner_id,
+            event_type="onboarding_started",
+            scope=scope,
+            document_id=None,
+            message="Onboarding started.",
+            project_id=project.id,
+        )
+
+        def _run_onboarding() -> None:
+            try:
+                result = onboard_schema_project(
+                    project=project,
+                    superset_context=context,
+                    wren_client=active_wren_client,
+                    mdl_file_store=active_mdl_file_store,
+                    owner_id=owner_id,
+                )
+            except Exception as ex:  # pylint: disable=broad-except
+                active_job_store.fail(job.id, str(ex))
+                _append_semantic_event(
+                    store=active_semantic_layer_store,
+                    owner_id=owner_id,
+                    event_type="onboarding_failed",
+                    scope=scope,
+                    document_id=None,
+                    message=f"Onboarding failed: {ex}",
+                    project_id=project.id,
+                )
+                return
+            active_job_store.complete(job.id, result)
+            _append_semantic_event(
+                store=active_semantic_layer_store,
+                owner_id=owner_id,
+                event_type="onboarding_completed",
+                scope=scope,
+                document_id=None,
+                message=f"Onboarded {result.model_count} draft model(s).",
+                project_id=project.id,
+            )
+
+        active_job_runner.submit(_run_onboarding)
+        # Re-fetch so an inline runner reflects completion immediately while a
+        # threaded runner returns the still-running job for the client to poll.
+        return active_job_store.get(job.id)
+
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}/jobs/{job_id}",
+        response_model=SemanticJob,
+    )
+    def get_semantic_job(
+        project_id: str,
+        job_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> SemanticJob:
+        """Return the status/result of an async semantic-layer job."""
+
+        authorize_semantic_project(
+            fastapi_request,
+            project_id,
+            owner_id=identity.owner_id,
+            permission="read",
+        )
+        try:
+            job = active_job_store.get(job_id)
+        except JobNotFoundError as ex:
+            raise HTTPException(status_code=404, detail="Job not found.") from ex
+        if job.project_id != project_id:
+            raise HTTPException(status_code=404, detail="Job not found.")
+        return job
+
+    @api.post(
         "/agent/semantic-layer/projects/{project_id}/mdl-files/upload",
         response_model=MdlFile,
     )
@@ -981,6 +1308,54 @@ def create_app(  # noqa: C901
         )
 
     @api.post(
+        "/agent/semantic-layer/projects/{project_id}/documents/text",
+        response_model=SemanticDocument,
+    )
+    def create_project_source_document_from_text(
+        project_id: str,
+        payload: SemanticDocumentTextRequest,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> SemanticDocument:
+        """Create a source document from pasted BI markdown text."""
+
+        project = authorize_semantic_project(
+            fastapi_request,
+            project_id,
+            owner_id=identity.owner_id,
+            permission="write",
+        )
+        scope = _scope_from_project(project)
+        try:
+            document = create_document(
+                filename=payload.filename,
+                content_type=payload.content_type,
+                content=payload.text.encode("utf-8"),
+                scope=scope,
+                project_id=project_id,
+                owner_id=identity.owner_id,
+                config=app_config,
+                store=active_semantic_layer_store,
+                storage=active_document_storage,
+                extractor=active_document_extractor,
+            )
+        except ValueError as ex:
+            raise HTTPException(status_code=400, detail=str(ex)) from ex
+        _append_semantic_event(
+            store=active_semantic_layer_store,
+            owner_id=identity.owner_id,
+            event_type="document_uploaded",
+            scope=scope,
+            project_id=project_id,
+            document_id=document.id,
+            message=f"Added {document.filename} from text.",
+        )
+        return active_semantic_layer_store.get_document(
+            document.id,
+            owner_id=identity.owner_id,
+        )
+
+    @api.post(
         "/agent/semantic-layer/projects/{project_id}/documents/{document_id}/enrich",
         response_model=MdlEnrichmentProposal,
     )
@@ -1010,11 +1385,34 @@ def create_app(  # noqa: C901
             ) from ex
         if document.project_id != project_id:
             raise HTTPException(status_code=404, detail="Semantic document not found.")
-        return _enrichment_proposal(
+        proposal = _enrichment_proposal(
             project=project,
             document=document,
             wren_client=active_wren_client,
         )
+        # Re-validate the proposal against the live schema (R3) so hallucinated
+        # columns/tables are visible before the user tries to activate.
+        schema_index = _schema_index_for_project(project, fastapi_request)
+        if schema_index is not None:
+            validation = validate_mdl(
+                proposal.proposed_yaml,
+                schema_index=schema_index,
+            )
+            extra_warnings = (
+                []
+                if validation.valid
+                else [
+                    "Proposal references tables/columns absent from the schema "
+                    "and cannot be activated until corrected."
+                ]
+            )
+            proposal = proposal.model_copy(
+                update={
+                    "validation": validation,
+                    "warnings": [*proposal.warnings, *extra_warnings],
+                }
+            )
+        return proposal
 
     @api.get(
         "/agent/semantic-layer/projects/{project_id}/state",

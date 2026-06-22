@@ -73,6 +73,15 @@ class ConversationStore(Protocol):
     ) -> Conversation:
         """Update the active Superset scope for a conversation."""
 
+    def update_title(
+        self,
+        conversation_id: str,
+        title: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> Conversation:
+        """Rename a conversation."""
+
     def append(
         self,
         conversation_id: str,

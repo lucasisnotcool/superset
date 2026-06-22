@@ -15,79 +15,26 @@
 # specific language governing permissions and limitations
 # under the License.
 
+"""Backward-compatible MDL validation entry point.
+
+The real implementation now lives in
+:mod:`superset_ai_agent.semantic_layer.mdl_validator`, which performs structural
+and optional physical (schema-aware) validation. This module re-exports the
+structural-only ``validate_mdl_yaml`` so existing call sites keep working.
+"""
+
 from __future__ import annotations
 
-from typing import Any
-
-import yaml
-
-from superset_ai_agent.semantic_layer.schemas import (
-    MdlValidationMessage,
-    MdlValidationResult,
+from superset_ai_agent.semantic_layer.mdl_validator import (
+    SchemaIndex,
+    validate_mdl,
+    validate_mdl_yaml,
+    validate_project_manifest,
 )
 
-
-def validate_mdl_yaml(content: str) -> MdlValidationResult:
-    """Validate that a file contains non-empty YAML suitable for MDL review."""
-
-    if not content.strip():
-        return MdlValidationResult(
-            valid=False,
-            messages=[
-                MdlValidationMessage(
-                    message="MDL YAML is empty.",
-                    code="empty_yaml",
-                )
-            ],
-        )
-
-    try:
-        parsed = yaml.safe_load(content)
-    except yaml.YAMLError as ex:
-        return MdlValidationResult(
-            valid=False,
-            messages=[_yaml_error_message(ex)],
-        )
-
-    if not isinstance(parsed, dict | list):
-        return MdlValidationResult(
-            valid=False,
-            messages=[
-                MdlValidationMessage(
-                    message="MDL YAML must parse to an object or list.",
-                    code="invalid_root",
-                )
-            ],
-        )
-    if _is_empty(parsed):
-        return MdlValidationResult(
-            valid=False,
-            messages=[
-                MdlValidationMessage(
-                    message="MDL YAML must contain at least one model entry.",
-                    code="empty_root",
-                )
-            ],
-        )
-    return MdlValidationResult(valid=True)
-
-
-def _yaml_error_message(ex: yaml.YAMLError) -> MdlValidationMessage:
-    line: int | None = None
-    column: int | None = None
-    mark = getattr(ex, "problem_mark", None)
-    if mark is not None:
-        line = mark.line + 1
-        column = mark.column + 1
-    return MdlValidationMessage(
-        line=line,
-        column=column,
-        message=str(ex),
-        code="yaml_parse_error",
-    )
-
-
-def _is_empty(parsed: Any) -> bool:
-    if isinstance(parsed, dict | list):
-        return len(parsed) == 0
-    return parsed is None
+__all__ = [
+    "SchemaIndex",
+    "validate_mdl",
+    "validate_mdl_yaml",
+    "validate_project_manifest",
+]

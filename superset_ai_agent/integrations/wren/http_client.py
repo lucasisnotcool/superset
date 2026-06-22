@@ -23,7 +23,10 @@ import httpx
 
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.integrations.superset.client import AgentContext
-from superset_ai_agent.integrations.wren.client import deterministic_mdl_proposal
+from superset_ai_agent.integrations.wren.client import (
+    deterministic_base_model_proposals,
+    deterministic_mdl_proposal,
+)
 from superset_ai_agent.schemas import WrenContextArtifact
 from superset_ai_agent.semantic_layer.mdl_validation import validate_mdl_yaml
 from superset_ai_agent.semantic_layer.schemas import (
@@ -219,6 +222,63 @@ class WrenHttpClient:
         data.setdefault("planning_only", True)
         data.setdefault("execution", "disabled")
         return data
+
+    def generate_base_model(
+        self,
+        *,
+        project: SemanticProject,
+        superset_context: AgentContext,
+    ) -> list[MdlEnrichmentProposal]:
+        if not self.config.wren_onboarding_enabled:
+            return deterministic_base_model_proposals(
+                project=project,
+                superset_context=superset_context,
+            )
+        try:
+            payload = self._request(
+                "POST",
+                "/models/generate",
+                json={
+                    "project": project.model_dump(mode="json"),
+                    "superset_context": superset_context.model_dump(mode="json"),
+                },
+            )
+        except Exception:  # pylint: disable=broad-except
+            return deterministic_base_model_proposals(
+                project=project,
+                superset_context=superset_context,
+            )
+        proposals: list[MdlEnrichmentProposal] = []
+        for item in _payload_items(payload, "proposals"):
+            proposed_yaml = str(
+                item.get("proposed_yaml")
+                or item.get("yaml")
+                or item.get("content")
+                or ""
+            )
+            if not proposed_yaml.strip():
+                continue
+            proposals.append(
+                MdlEnrichmentProposal(
+                    source_document_id=str(
+                        item.get("source_document_id") or f"onboarding:{project.id}"
+                    ),
+                    proposed_path=str(
+                        item.get("proposed_path")
+                        or item.get("path")
+                        or "models/model.yaml"
+                    ),
+                    proposed_yaml=proposed_yaml,
+                    validation=validate_mdl_yaml(proposed_yaml),
+                    warnings=[str(warning) for warning in item.get("warnings", [])],
+                )
+            )
+        if not proposals:
+            return deterministic_base_model_proposals(
+                project=project,
+                superset_context=superset_context,
+            )
+        return proposals
 
     def _request(
         self,

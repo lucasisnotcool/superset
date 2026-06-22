@@ -29,6 +29,9 @@ interface SafeMarkdownProps {
   source: string;
   htmlSanitization?: boolean;
   htmlSchemaOverrides?: typeof defaultSchema;
+  // Optional custom renderers passed through to react-markdown (e.g. a custom
+  // `code` block). Typed loosely because react-markdown is loaded dynamically.
+  components?: Record<string, any>;
 }
 
 // Link protocols that can execute script when used as an href.
@@ -74,7 +77,10 @@ export function transformLinkUri(uri: string): string {
   // "java\tscript:" or "java\x01script:") are ignored by browsers, so strip
   // them before comparing against the blocklist.
   // eslint-disable-next-line no-control-regex
-  const scheme = url.slice(0, colon).replace(/[\u0000-\u0020]/g, '').toLowerCase();
+  const scheme = url
+    .slice(0, colon)
+    .replace(/[\u0000-\u0020]/g, '')
+    .toLowerCase();
   return DANGEROUS_LINK_PROTOCOLS.includes(scheme) ? '' : url;
 }
 
@@ -91,6 +97,7 @@ export function SafeMarkdown({
   source,
   htmlSanitization = true,
   htmlSchemaOverrides = {},
+  components,
 }: SafeMarkdownProps) {
   const escapeHtml = isFeatureEnabled(FeatureFlag.EscapeMarkdownHtml);
   const [rehypeRawPlugin, setRehypeRawPlugin] = useState<any>(null);
@@ -130,6 +137,7 @@ export function SafeMarkdown({
       remarkPlugins={[remarkGfm]}
       skipHtml={false}
       transformLinkUri={transformLinkUri}
+      components={components}
     >
       {source}
     </ReactMarkdown>

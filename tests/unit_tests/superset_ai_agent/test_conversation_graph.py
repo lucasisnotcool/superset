@@ -247,6 +247,89 @@ def test_conversation_graph_generates_valid_sql_artifact() -> None:
     assert response.artifacts[0].sql.endswith("LIMIT 25")
 
 
+def test_conversation_graph_run_stream_emits_progress_then_complete() -> None:
+    store = InMemoryConversationStore()
+    scope = ConversationScope(database_id=1, dataset_ids=[16])
+    conversation = store.create(scope)
+    graph = ConversationGraph(
+        config=AgentConfig(default_sql_limit=25),
+        model_client=FakeModelClient(
+            {
+                "response_type": "sql",
+                "message": "I drafted SQL for the top names.",
+                "sql": (
+                    "SELECT name, SUM(num) AS total_births "
+                    "FROM birth_names GROUP BY name"
+                ),
+                "explanation": "Groups names and sums births.",
+            }
+        ),
+        context_provider=FakeContextProvider(),
+        superset_client=FakeSupersetClient(),
+        conversation_store=store,
+    )
+
+    events = list(
+        graph.run_stream(
+            conversation_id=conversation.id,
+            request=ConversationTurnRequest(
+                message="Show top names",
+                scope=scope,
+            ),
+        )
+    )
+
+    progress_events = [event for event in events if event["type"] == "progress"]
+    complete_events = [event for event in events if event["type"] == "complete"]
+    # Each graph node contributes at least one streamed progress step.
+    assert [event["step"] for event in progress_events][:2] == [
+        "load_conversation",
+        "load_context",
+    ]
+    assert len(complete_events) == 1
+    response = complete_events[0]["response"]
+    assert response.status == "needs_review"
+    assert response.artifacts[0].sql.endswith("LIMIT 25")
+    # The user message and the streamed assistant turn are both persisted.
+    assert [message.role for message in response.conversation.messages] == [
+        "user",
+        "assistant",
+    ]
+
+
+def test_conversation_graph_run_stream_records_cancellation_on_disconnect() -> None:
+    store = InMemoryConversationStore()
+    scope = ConversationScope(database_id=1, dataset_ids=[16])
+    conversation = store.create(scope)
+    graph = ConversationGraph(
+        config=AgentConfig(default_sql_limit=25),
+        model_client=FakeModelClient(
+            {
+                "response_type": "answer",
+                "message": "Working on it.",
+                "sql": "",
+            }
+        ),
+        context_provider=FakeContextProvider(),
+        superset_client=FakeSupersetClient(),
+        conversation_store=store,
+    )
+
+    stream = graph.run_stream(
+        conversation_id=conversation.id,
+        request=ConversationTurnRequest(message="Show top names", scope=scope),
+    )
+    # Consume the first streamed event, then simulate a client disconnect.
+    next(stream)
+    stream.close()
+
+    messages = store.get(conversation.id).messages
+    # The user turn is persisted and a cancellation marker is appended.
+    assert messages[0].role == "user"
+    assert messages[-1].role == "assistant"
+    assert messages[-1].content == "Generation cancelled."
+
+
 def test_conversation_graph_executes_valid_sql_when_requested() -> None:
     store = InMemoryConversationStore()
     scope = ConversationScope(database_id=1, dataset_ids=[16])

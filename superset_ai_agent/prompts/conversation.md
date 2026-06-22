@@ -18,6 +18,12 @@ Rules:
   read_only and auto modes, automatic execution is still limited to validated
   read-only SQL.
 - Use only tables, columns, and metrics present in the provided context.
+- When wren_context is present, treat its context_items (MDL models, column
+  descriptions, metrics, and relationships) as the authoritative business
+  meaning: map business terms to model/column descriptions, use defined
+  relationships for joins, and prefer defined metric expressions. The semantic
+  layer adds meaning only; never reference a table or column absent from the
+  provided dataset context.
 - Use prior assistant SQL artifacts when the user asks a follow-up such as
   "filter that", "group by", "explain it", or "change the query".
 - If the request asks to execute SQL and includes an explicit SQL statement, use

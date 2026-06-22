@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import cast, Literal
 
 SupersetAdapterMode = Literal["local", "rest", "mcp"]
-WrenAdapterMode = Literal["file", "http"]
+WrenAdapterMode = Literal["file", "http", "llm"]
 ConversationStoreMode = Literal["memory", "sqlalchemy"]
 SemanticLayerStoreMode = Literal["memory", "sqlalchemy"]
 DocumentStorageMode = Literal["local", "s3"]
@@ -98,7 +98,7 @@ class AgentConfig:
     max_prompt_result_rows: int = 5
     max_agent_sql_iterations: int = 3
     wren_enabled: bool = True
-    wren_adapter: WrenAdapterMode = "file"
+    wren_adapter: WrenAdapterMode = "llm"
     wren_base_url: str | None = None
     wren_api_key: str | None = None
     wren_timeout_seconds: float = 30.0

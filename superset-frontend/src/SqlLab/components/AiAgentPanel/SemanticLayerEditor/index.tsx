@@ -26,6 +26,7 @@ import { EditorHost } from 'src/core/editors';
 import {
   ConversationScope,
   createMdlFile,
+  createProjectDocumentFromText,
   deleteMdlFile,
   enrichProjectDocument,
   getProjectSemanticLayerState,
@@ -36,6 +37,7 @@ import {
   MdlFile,
   MdlFileStatus,
   resolveSemanticProject,
+  runOnboarding,
   SemanticDocument,
   SemanticLayerState,
   SemanticProject,
@@ -187,6 +189,9 @@ export default function SemanticLayerEditor({
   const [proposal, setProposal] = useState<MdlEnrichmentProposal | null>(null);
   const [materialization, setMaterialization] =
     useState<WrenMaterializationResult | null>(null);
+  const [rawText, setRawText] = useState('');
+  const [onboardingWarnings, setOnboardingWarnings] = useState<string[]>([]);
+  const [proposalBefore, setProposalBefore] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const mdlInputRef = useRef<HTMLInputElement | null>(null);
@@ -315,14 +320,7 @@ export default function SemanticLayerEditor({
       }
       const document = await uploadProjectSourceDocument(project.id, file);
       if (file.name.toLowerCase().endsWith('.md')) {
-        const nextProposal = await enrichProjectDocument(
-          project.id,
-          document.id,
-        );
-        setProposal(nextProposal);
-        setEditorPath(nextProposal.proposed_path);
-        setEditorValue(nextProposal.proposed_yaml);
-        setActiveFileId(null);
+        showProposal(await enrichProjectDocument(project.id, document.id));
       }
       event.target.value = '';
       await refresh();
@@ -336,6 +334,49 @@ export default function SemanticLayerEditor({
       setMaterialization(await materializeSemanticProject(project.id));
       await refresh();
     }, t('Unable to materialize Wren project'));
+
+  const onboardProject = () =>
+    withLoading(async () => {
+      if (!project) {
+        return;
+      }
+      const job = await runOnboarding(project.id);
+      if (job.status === 'failed') {
+        throw new Error(job.error || t('Onboarding failed'));
+      }
+      setOnboardingWarnings(job.result?.warnings ?? []);
+      await refresh();
+      const firstFile = job.result?.files?.[0];
+      if (firstFile) {
+        setActiveFileId(firstFile.id);
+        setEditorPath(firstFile.path);
+        setEditorValue(firstFile.content);
+        setProposal(null);
+      }
+    }, t('Unable to onboard schema'));
+
+  const showProposal = (nextProposal: MdlEnrichmentProposal) => {
+    setProposalBefore(
+      mdlFiles.find(file => file.path === nextProposal.proposed_path)?.content ??
+        null,
+    );
+    setProposal(nextProposal);
+    setActiveFileId(null);
+    setEditorPath(nextProposal.proposed_path);
+    setEditorValue(nextProposal.proposed_yaml);
+  };
+
+  const enrichRawText = () =>
+    withLoading(async () => {
+      if (!project || !rawText.trim()) {
+        return;
+      }
+      const document = await createProjectDocumentFromText(project.id, rawText);
+      const nextProposal = await enrichProjectDocument(project.id, document.id);
+      showProposal(nextProposal);
+      setRawText('');
+      await refresh();
+    }, t('Unable to enrich text'));
 
   return (
     <EditorRoot data-test="semantic-layer-editor">
@@ -408,6 +449,14 @@ export default function SemanticLayerEditor({
             </Button>
             <Button
               buttonStyle="tertiary"
+              disabled={!project || !canWrite || isLoading}
+              onClick={onboardProject}
+              icon={<Icons.DatabaseOutlined iconSize="m" />}
+            >
+              {t('Onboard')}
+            </Button>
+            <Button
+              buttonStyle="tertiary"
               disabled={!project || isLoading}
               onClick={materializeProject}
               icon={<Icons.SyncOutlined iconSize="m" />}
@@ -427,6 +476,25 @@ export default function SemanticLayerEditor({
             accept=".md,.txt,text/markdown,text/plain"
             onChange={uploadSourceDocument}
           />
+          <Input.TextArea
+            data-test="semantic-layer-raw-text"
+            value={rawText}
+            disabled={!project || !canWrite || isLoading}
+            placeholder={t('Paste BI markdown to enrich the model…')}
+            autoSize={{ minRows: 2, maxRows: 6 }}
+            onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
+              setRawText(event.target.value)
+            }
+          />
+          <Button
+            buttonStyle="tertiary"
+            buttonSize="small"
+            disabled={!project || !canWrite || isLoading || !rawText.trim()}
+            onClick={enrichRawText}
+            icon={<Icons.FunctionOutlined iconSize="m" />}
+          >
+            {t('Enrich text')}
+          </Button>
           {documents.map(document => (
             <SourceDocumentItem key={document.id}>
               <Typography.Text strong>{document.filename}</Typography.Text>
@@ -445,14 +513,9 @@ export default function SemanticLayerEditor({
                     if (!project) {
                       return;
                     }
-                    const nextProposal = await enrichProjectDocument(
-                      project.id,
-                      document.id,
+                    showProposal(
+                      await enrichProjectDocument(project.id, document.id),
                     );
-                    setProposal(nextProposal);
-                    setActiveFileId(null);
-                    setEditorPath(nextProposal.proposed_path);
-                    setEditorValue(nextProposal.proposed_yaml);
                   }, t('Unable to enrich document'))
                 }
                 icon={<Icons.FunctionOutlined iconSize="m" />}
@@ -463,18 +526,73 @@ export default function SemanticLayerEditor({
           ))}
         </BrowserPane>
         <EditorPane>
+          {onboardingWarnings.length > 0 && (
+            <Alert
+              type="warning"
+              data-test="onboarding-warnings"
+              message={t('Onboarding completed with warnings')}
+              description={
+                <ul>
+                  {onboardingWarnings.map(warning => (
+                    <li key={warning}>{warning}</li>
+                  ))}
+                </ul>
+              }
+              closable
+              onClose={() => setOnboardingWarnings([])}
+            />
+          )}
           {proposal && (
             <Alert
-              type="info"
-              message={t('Review proposed MDL before saving.')}
-              description={proposal.warnings.join(' ')}
+              type={proposal.validation.valid ? 'info' : 'error'}
+              data-test="proposal-review"
+              message={
+                proposal.validation.valid
+                  ? t('Review proposed MDL before saving.')
+                  : t('Proposed MDL has validation errors and cannot be activated.')
+              }
+              description={
+                <>
+                  {proposal.warnings.length > 0 && (
+                    <Typography.Paragraph>
+                      {proposal.warnings.join(' ')}
+                    </Typography.Paragraph>
+                  )}
+                  {!proposal.validation.valid && (
+                    <ul>
+                      {proposal.validation.messages
+                        .filter(message => message.severity === 'error')
+                        .map(message => (
+                          <li key={message.message}>{message.message}</li>
+                        ))}
+                    </ul>
+                  )}
+                  {proposalBefore != null && (
+                    <details data-test="proposal-diff-before">
+                      <summary>{t('Previous content')}</summary>
+                      <pre>{proposalBefore}</pre>
+                    </details>
+                  )}
+                </>
+              }
             />
           )}
           {materialization && (
             <Alert
-              type="success"
+              type={materialization.warnings.length > 0 ? 'warning' : 'success'}
               message={t('Wren project materialized')}
-              description={t('%s active file(s)', materialization.file_count)}
+              description={
+                <>
+                  {t('%s active file(s)', materialization.file_count)}
+                  {materialization.warnings.length > 0 && (
+                    <ul>
+                      {materialization.warnings.map(warning => (
+                        <li key={warning}>{warning}</li>
+                      ))}
+                    </ul>
+                  )}
+                </>
+              }
             />
           )}
           <Input

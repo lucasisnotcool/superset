@@ -134,6 +134,24 @@ class SqlAlchemyConversationStore:
             session.commit()
         return self.get(conversation_id, owner_id=owner_id)
 
+    def update_title(
+        self,
+        conversation_id: str,
+        title: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> Conversation:
+        with self.session_factory() as session:
+            conversation = self._get_model(
+                session,
+                conversation_id,
+                owner_id=owner_id,
+            )
+            conversation.title = title
+            conversation.updated_at = _utc_now()
+            session.commit()
+        return self.get(conversation_id, owner_id=owner_id)
+
     def append(
         self,
         conversation_id: str,

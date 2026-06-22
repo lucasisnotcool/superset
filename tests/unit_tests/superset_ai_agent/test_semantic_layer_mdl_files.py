@@ -21,6 +21,7 @@ import pytest
 
 from superset_ai_agent.semantic_layer.mdl_files import (
     InMemoryMdlFileStore,
+    MdlFileValidationError,
     normalize_mdl_path,
 )
 from superset_ai_agent.semantic_layer.mdl_validation import validate_mdl_yaml
@@ -31,10 +32,28 @@ from superset_ai_agent.semantic_layer.schemas import (
 
 
 def test_mdl_validation_accepts_object_yaml() -> None:
-    result = validate_mdl_yaml("models:\n  - name: gross_moves\n")
+    result = validate_mdl_yaml(
+        "models:\n"
+        "  - name: gross_moves\n"
+        "    table_reference:\n"
+        "      table: gross_moves\n"
+        "    columns:\n"
+        "      - name: stage\n"
+    )
 
     assert result.valid is True
     assert result.messages == []
+
+
+def test_mdl_validation_accepts_minimal_model_with_warnings() -> None:
+    result = validate_mdl_yaml("models:\n  - name: gross_moves\n")
+
+    # Structurally valid, but warns that the model has no mapping or columns.
+    assert result.valid is True
+    assert {message.code for message in result.messages} == {
+        "model_without_mapping",
+        "model_without_columns",
+    }
 
 
 def test_mdl_validation_reports_parse_errors() -> None:
@@ -43,6 +62,38 @@ def test_mdl_validation_reports_parse_errors() -> None:
     assert result.valid is False
     assert result.messages[0].code == "yaml_parse_error"
     assert result.messages[0].line == 2
+
+
+def test_cannot_activate_structurally_invalid_mdl_file() -> None:
+    store = InMemoryMdlFileStore()
+    file = store.create(
+        "project-1",
+        MdlFileCreateRequest(
+            path="models/bad.yaml",
+            content=(
+                "models:\n"
+                "  - name: deals\n"
+                "    table_reference:\n"
+                "      table: deals\n"
+                "    columns:\n"
+                "      - name: stage\n"
+                "relationships:\n"
+                "  - name: r\n"
+                "    models: [deals, sites]\n"
+                "    join_type: SIDEWAYS\n"
+            ),
+        ),
+        owner_id="owner",
+    )
+    assert file.validation is not None
+    assert file.validation.valid is False
+
+    with pytest.raises(MdlFileValidationError):
+        store.update(
+            file.id,
+            MdlFileUpdateRequest(status="active"),
+            owner_id="owner",
+        )
 
 
 def test_normalize_mdl_path_rejects_unsafe_paths() -> None:

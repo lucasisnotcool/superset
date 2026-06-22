@@ -42,6 +42,32 @@ class MdlFileNotFoundError(KeyError):
     """Raised when an MDL file cannot be found."""
 
 
+class MdlFileValidationError(ValueError):
+    """Raised when an MDL file cannot be activated due to validation errors."""
+
+
+def _assert_activatable(status: str | None, content: str) -> None:
+    """Block the draft->active transition when the file has validation errors.
+
+    This is a structural defense-in-depth gate. Project-level and physical
+    (schema-aware) validation is enforced at the API activation route.
+    """
+
+    if status != "active":
+        return
+    validation = validate_mdl_yaml(content)
+    if validation.valid:
+        return
+    errors = "; ".join(
+        message.message
+        for message in validation.messages
+        if message.severity == "error"
+    )
+    raise MdlFileValidationError(
+        f"Cannot activate an MDL file with validation errors: {errors}"
+    )
+
+
 class MdlFileStore(Protocol):
     """Storage contract for project-scoped MDL YAML files."""
 
@@ -179,6 +205,10 @@ class InMemoryMdlFileStore:
             updates["validation"] = validate_mdl_yaml(request.content)
         if request.status is not None:
             updates["status"] = request.status
+        _assert_activatable(
+            request.status,
+            request.content if request.content is not None else file.content,
+        )
         updated = file.model_copy(update=updates)
         self._files[file.id] = (owner_id, updated)
         return updated.model_copy(deep=True)
@@ -335,6 +365,7 @@ class SqlAlchemyMdlFileStore:
                 )
             if request.status is not None:
                 model.status = request.status
+            _assert_activatable(request.status, model.content)
             model.updated_by = owner_id
             model.updated_at = _utc_now()
             session.commit()

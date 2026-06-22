@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+import json  # noqa: TID251 - tests cover the standalone agent JSON contract
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.requests import Request
@@ -124,6 +126,77 @@ class StaticConversationGraph:
             message=message,
             conversation=conversation,
         )
+
+    def run_stream(
+        self,
+        *,
+        conversation_id: str,
+        request: ConversationTurnRequest,
+        owner_id: str = "local",
+    ):
+        self.requests.append(request)
+        yield {
+            "type": "progress",
+            "step": "draft_response",
+            "status": "ok",
+            "summary": "Generated a SQL draft.",
+        }
+        message = ConversationMessage(
+            role="assistant",
+            content=f"Answered: {request.message}",
+        )
+        self.store.append(
+            conversation_id,
+            ConversationMessage(role="user", content=request.message),
+            owner_id=owner_id,
+        )
+        conversation = self.store.append(
+            conversation_id,
+            message,
+            owner_id=owner_id,
+        )
+        yield {
+            "type": "complete",
+            "response": ConversationTurnResponse(
+                status="ok",
+                conversation_id=conversation_id,
+                message=message,
+                conversation=conversation,
+            ),
+        }
+
+    def execute_approved_sql_stream(
+        self,
+        *,
+        conversation_id: str,
+        request: ConversationSqlExecutionRequest,
+        owner_id: str = "local",
+    ):
+        self.sql_execution_requests.append(request)
+        yield {
+            "type": "progress",
+            "step": "execute_sql",
+            "status": "ok",
+            "summary": "Executed SQL and returned 1 row(s).",
+        }
+        message = ConversationMessage(
+            role="assistant",
+            content=f"Executed: {request.sql}",
+        )
+        conversation = self.store.append(
+            conversation_id,
+            message,
+            owner_id=owner_id,
+        )
+        yield {
+            "type": "complete",
+            "response": ConversationTurnResponse(
+                status="ok",
+                conversation_id=conversation_id,
+                message=message,
+                conversation=conversation,
+            ),
+        }
 
     def execute_approved_sql(
         self,
@@ -334,6 +407,124 @@ def test_conversation_endpoints_create_list_message_and_delete() -> None:
     assert delete_response.status_code == 200
     assert delete_response.json() == {"deleted": True}
     assert client.get(f"/agent/conversations/{conversation_id}").status_code == 404
+
+
+def test_stream_conversation_message_emits_progress_then_complete() -> None:
+    app = _create_test_app()
+    client = TestClient(app)
+
+    conversation_id = client.post(
+        "/agent/conversations",
+        json={"scope": {"database_id": 1, "schema_name": None, "dataset_ids": []}},
+    ).json()["id"]
+
+    response = client.post(
+        f"/agent/conversations/{conversation_id}/messages/stream",
+        json={
+            "message": "What columns are available?",
+            "scope": {"database_id": 1, "schema_name": None, "dataset_ids": []},
+            "execution_mode": "manual",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+
+    events = [
+        json.loads(line[len("data:") :].strip())
+        for line in response.text.splitlines()
+        if line.startswith("data:")
+    ]
+    types = [event["type"] for event in events]
+    assert types[0] == "progress"
+    assert types[-1] == "complete"
+    assert events[0]["summary"] == "Generated a SQL draft."
+    complete = events[-1]["response"]
+    assert complete["status"] == "ok"
+    assert [message["role"] for message in complete["conversation"]["messages"]] == [
+        "user",
+        "assistant",
+    ]
+
+
+def test_stream_conversation_message_returns_404_for_missing_conversation() -> None:
+    app = _create_test_app()
+    client = TestClient(app)
+
+    response = client.post(
+        "/agent/conversations/does-not-exist/messages/stream",
+        json={
+            "message": "hello",
+            "scope": {"database_id": 1, "schema_name": None, "dataset_ids": []},
+            "execution_mode": "manual",
+        },
+    )
+
+    assert response.status_code == 404
+
+
+def test_rename_conversation_updates_title() -> None:
+    app = _create_test_app()
+    client = TestClient(app)
+
+    conversation_id = client.post(
+        "/agent/conversations",
+        json={"scope": {"database_id": 1, "schema_name": None, "dataset_ids": []}},
+    ).json()["id"]
+
+    response = client.patch(
+        f"/agent/conversations/{conversation_id}",
+        json={"title": "Revenue by region"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["title"] == "Revenue by region"
+    assert (
+        client.get(f"/agent/conversations/{conversation_id}").json()["title"]
+        == "Revenue by region"
+    )
+
+
+def test_rename_conversation_returns_404_for_missing_conversation() -> None:
+    app = _create_test_app()
+    client = TestClient(app)
+
+    response = client.patch(
+        "/agent/conversations/does-not-exist",
+        json={"title": "Nope"},
+    )
+
+    assert response.status_code == 404
+
+
+def test_stream_execute_conversation_sql_emits_progress_then_complete() -> None:
+    app = _create_test_app()
+    client = TestClient(app)
+
+    conversation_id = client.post(
+        "/agent/conversations",
+        json={"scope": {"database_id": 1, "schema_name": None, "dataset_ids": []}},
+    ).json()["id"]
+
+    response = client.post(
+        f"/agent/conversations/{conversation_id}/execute-sql/stream",
+        json={
+            "sql": "SELECT 1",
+            "scope": {"database_id": 1, "schema_name": None, "dataset_ids": []},
+            "execution_mode": "manual",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    events = [
+        json.loads(line[len("data:") :].strip())
+        for line in response.text.splitlines()
+        if line.startswith("data:")
+    ]
+    assert events[0]["type"] == "progress"
+    assert events[-1]["type"] == "complete"
+    assert events[-1]["response"]["message"]["content"] == "Executed: SELECT 1"
 
 
 def test_execute_conversation_sql_endpoint_passes_approved_sql_to_graph() -> None:

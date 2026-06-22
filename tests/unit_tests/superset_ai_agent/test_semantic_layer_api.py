@@ -30,8 +30,10 @@ from superset_ai_agent.integrations.superset.client import (
     DatasetMetadata,
     SupersetAuthError,
 )
+from superset_ai_agent.llm.base import ChatMessage, ModelResult
 from superset_ai_agent.schemas import AgentQueryRequest, ModelInfo
 from superset_ai_agent.semantic_layer.file_storage import LocalDocumentStorage
+from superset_ai_agent.semantic_layer.jobs import InlineJobRunner
 from superset_ai_agent.semantic_layer.memory import InMemorySemanticLayerStore
 
 
@@ -41,6 +43,16 @@ class FakeModelClient:
 
     def list_models(self) -> list[ModelInfo]:
         return [ModelInfo(name="test-model")]
+
+
+class ChatModelClient(FakeModelClient):
+    """Model client returning a fixed structured MDL proposal payload."""
+
+    def __init__(self, content: str) -> None:
+        self.content = content
+
+    def chat(self, messages: list[ChatMessage], **_: object) -> ModelResult:
+        return ModelResult(content=self.content)
 
 
 class StaticContextProvider:
@@ -76,20 +88,36 @@ def _local_config(**overrides) -> AgentConfig:
     )
 
 
-def _client(tmp_path) -> tuple[TestClient, StaticContextProvider]:
+def _client(
+    tmp_path, model_client=None
+) -> tuple[TestClient, StaticContextProvider]:
     semantic_store = InMemorySemanticLayerStore()
     context_provider = StaticContextProvider()
     app = create_app(
         config=_local_config(agent_storage_dir=str(tmp_path)),
-        model_client=FakeModelClient(),
+        model_client=model_client or FakeModelClient(),
         text_to_sql_graph=object(),
         conversation_graph=object(),
         conversation_store=InMemoryConversationStore(),
         semantic_layer_store=semantic_store,
         document_storage=LocalDocumentStorage(str(tmp_path)),
         context_provider=context_provider,
+        job_runner=InlineJobRunner(),
     )
     return TestClient(app), context_provider
+
+
+def _resolve_project(client: TestClient) -> dict:
+    response = client.post(
+        "/agent/semantic-layer/projects/resolve",
+        json={
+            "database_id": 1,
+            "database_label": "Sales",
+            "schema_name": "pipeline",
+        },
+    )
+    assert response.status_code == 200
+    return response.json()
 
 
 def test_semantic_layer_returns_auth_status_when_scope_auth_fails(tmp_path) -> None:
@@ -254,3 +282,195 @@ def test_semantic_project_mdl_and_document_flow(tmp_path) -> None:
     assert proposal["source_document_id"] == document["id"]
     assert proposal["validation"]["valid"] is True
     assert "models:" in proposal["proposed_yaml"]
+
+
+def test_onboard_creates_draft_models_deterministic_fallback(tmp_path) -> None:
+    # FakeModelClient has no chat(), so onboarding falls back to deterministic
+    # schema introspection. The inline job runner completes the job before the
+    # 202 response returns.
+    client, _ = _client(tmp_path)
+    project = _resolve_project(client)
+
+    response = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/onboard"
+    )
+
+    assert response.status_code == 202
+    job = response.json()
+    assert job["kind"] == "onboarding"
+    assert job["status"] == "completed"
+    result = job["result"]
+    assert result["project_id"] == project["id"]
+    assert result["model_count"] == 1
+    assert result["files"][0]["source_type"] == "onboarding"
+    assert result["files"][0]["status"] == "draft"
+    assert "moves" in result["files"][0]["content"]
+
+    # The job is pollable.
+    poll = client.get(
+        f"/agent/semantic-layer/projects/{project['id']}/jobs/{job['id']}"
+    )
+    assert poll.status_code == 200
+    assert poll.json()["status"] == "completed"
+
+
+def test_onboard_uses_llm_when_available(tmp_path) -> None:
+    payload = json.dumps(
+        {
+            "files": [
+                {
+                    "path": "models/moves.yaml",
+                    "yaml": (
+                        "models:\n"
+                        "  - name: moves\n"
+                        "    description: Pipeline moves documented by the model\n"
+                    ),
+                }
+            ]
+        }
+    )
+    client, _ = _client(tmp_path, model_client=ChatModelClient(payload))
+    project = _resolve_project(client)
+
+    response = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/onboard"
+    )
+
+    assert response.status_code == 202
+    result = response.json()["result"]
+    assert result["model_count"] == 1
+    assert "documented by the model" in result["files"][0]["content"]
+
+
+def test_onboard_flags_hallucinated_columns_as_non_activatable(tmp_path) -> None:
+    # "moves" exists with no columns; an LLM that invents a column produces a
+    # draft that is written but flagged non-activatable (R3).
+    payload = json.dumps(
+        {
+            "files": [
+                {
+                    "path": "models/moves.yaml",
+                    "yaml": (
+                        "models:\n"
+                        "  - name: moves\n"
+                        "    table_reference:\n"
+                        "      table: moves\n"
+                        "    columns:\n"
+                        "      - name: ghost_metric\n"
+                    ),
+                }
+            ]
+        }
+    )
+    client, _ = _client(tmp_path, model_client=ChatModelClient(payload))
+    project = _resolve_project(client)
+
+    response = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/onboard"
+    )
+
+    assert response.status_code == 202
+    result = response.json()["result"]
+    assert result["model_count"] == 1
+    assert result["files"][0]["status"] == "draft"
+    assert any("cannot be activated" in w for w in result["warnings"])
+
+
+def test_enrich_flags_hallucinated_columns(tmp_path) -> None:
+    payload = json.dumps(
+        {
+            "files": [
+                {
+                    "path": "models/moves.yaml",
+                    "yaml": (
+                        "models:\n"
+                        "  - name: moves\n"
+                        "    table_reference:\n"
+                        "      table: moves\n"
+                        "    columns:\n"
+                        "      - name: ghost_metric\n"
+                    ),
+                }
+            ]
+        }
+    )
+    client, _ = _client(tmp_path, model_client=ChatModelClient(payload))
+    project = _resolve_project(client)
+    document = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/documents/text",
+        json={"filename": "glossary.md", "text": "Ghost metric is a thing."},
+    ).json()
+
+    enrich = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/documents/"
+        f"{document['id']}/enrich"
+    )
+
+    assert enrich.status_code == 200
+    proposal = enrich.json()
+    assert proposal["validation"]["valid"] is False
+    assert any(
+        message["code"] == "unknown_column"
+        for message in proposal["validation"]["messages"]
+    )
+
+
+def test_activation_blocked_for_hallucinated_column(tmp_path) -> None:
+    # StaticContextProvider exposes table "moves" with no columns, so any
+    # referenced column is a hallucination caught by physical validation.
+    client, _ = _client(tmp_path)
+    project = _resolve_project(client)
+
+    create = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/mdl-files",
+        json={
+            "path": "models/moves.yaml",
+            "content": (
+                "models:\n"
+                "  - name: moves\n"
+                "    table_reference:\n"
+                "      table: moves\n"
+                "    columns:\n"
+                "      - name: ghost_metric\n"
+            ),
+        },
+    )
+    assert create.status_code == 200
+    file_id = create.json()["id"]
+
+    activate = client.patch(
+        f"/agent/semantic-layer/projects/{project['id']}/mdl-files/{file_id}",
+        json={"status": "active"},
+    )
+    assert activate.status_code == 422
+    detail = activate.json()["detail"]
+    assert detail["validation"]["valid"] is False
+    assert any(
+        message["code"] == "unknown_column"
+        for message in detail["validation"]["messages"]
+    )
+
+
+def test_create_document_from_text_and_enrich(tmp_path) -> None:
+    client, _ = _client(tmp_path)
+    project = _resolve_project(client)
+
+    text_response = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/documents/text",
+        json={
+            "filename": "glossary.md",
+            "text": "Gross moves count opportunities advanced per stage.",
+        },
+    )
+
+    assert text_response.status_code == 200
+    document = text_response.json()
+    assert document["project_id"] == project["id"]
+    assert document["filename"] == "glossary.md"
+
+    enrich_response = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/documents/"
+        f"{document['id']}/enrich"
+    )
+    assert enrich_response.status_code == 200
+    assert enrich_response.json()["source_document_id"] == document["id"]

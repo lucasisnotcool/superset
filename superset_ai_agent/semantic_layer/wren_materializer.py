@@ -25,6 +25,7 @@ from typing import Any
 import yaml
 
 from superset_ai_agent.semantic_layer.mdl_files import normalize_mdl_path
+from superset_ai_agent.semantic_layer.mdl_validator import validate_project_manifest
 from superset_ai_agent.semantic_layer.schemas import (
     MdlFile,
     SemanticProject,
@@ -88,11 +89,27 @@ def materialize_wren_project(
         encoding="utf-8",
     )
     checksum.update(sidecar_path.read_bytes())
+
+    warnings: list[str] = []
+    if active_files:
+        manifest_validation = validate_project_manifest(
+            [file.content for file in active_files]
+        )
+        if not manifest_validation.valid:
+            warnings.append(
+                "Materialized manifest has validation errors: "
+                + "; ".join(
+                    message.message
+                    for message in manifest_validation.messages
+                    if message.severity == "error"
+                )
+            )
     return WrenMaterializationResult(
         project_id=project.id,
         path=str(sidecar_path),
         file_count=len(active_files),
         checksum=checksum.hexdigest(),
+        warnings=warnings,
     )
 
 

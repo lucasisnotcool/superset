@@ -80,13 +80,13 @@ def model_from_dataset(dataset: DatasetMetadata) -> dict[str, Any]:
 
     model = {
         "name": _safe_identifier(dataset.table_name or f"dataset_{dataset.id}"),
-        "tableReference": {
+        "table_reference": {
             "schema": dataset.schema_name,
             "table": dataset.table_name,
         },
         "description": dataset.description,
         "columns": [column_to_field(column) for column in dataset.columns],
-        "measures": [measure_from_metric(metric) for metric in dataset.metrics],
+        "metrics": [measure_from_metric(metric) for metric in dataset.metrics],
         "properties": {
             "superset_dataset_id": dataset.id,
             "superset_database_id": dataset.database_id,
@@ -112,17 +112,20 @@ def measure_from_metric(metric: MetricSummary) -> dict[str, Any]:
 
 
 def column_to_field(column: ColumnSummary) -> dict[str, Any]:
-    """Map a Superset column to a Wren field."""
+    """Map a Superset column to a Wren field (canonical snake_case MDL)."""
 
     return _drop_none(
         {
             "name": _safe_identifier(column.name),
             "type": column.type,
-            "isTime": column.is_dttm,
+            "is_calculated": False,
             "description": column.description,
-            "properties": {
-                "superset_column_name": column.name,
-            },
+            "properties": _drop_none(
+                {
+                    "superset_column_name": column.name,
+                    "is_time": True if column.is_dttm else None,
+                }
+            ),
         }
     )
 

@@ -22,6 +22,7 @@ import json  # noqa: TID251 - tests cover the standalone agent JSON contract
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.conversations.schemas import ConversationScope
 from superset_ai_agent.graph import TextToSqlGraph
+from superset_ai_agent.integrations.wren.llm_client import LlmWrenClient
 from superset_ai_agent.integrations.superset.client import (
     AgentContext,
     ColumnSummary,
@@ -362,6 +363,74 @@ def test_graph_merges_indexed_semantic_context() -> None:
     assert response.wren_context.context_items == [
         {"kind": "document", "name": "terms"}
     ]
+
+
+def test_graph_injects_materialized_mdl_into_sql_prompt(tmp_path) -> None:
+    """Touchpoint 3: active MDL semantics reach the SQL prompt at query time."""
+
+    project_store = InMemorySemanticProjectStore()
+    mdl_store = InMemoryMdlFileStore()
+    project = project_store.resolve(
+        SemanticProjectResolveRequest(
+            database_id=1,
+            database_label="Examples",
+            schema_name="main",
+        ),
+        owner_id="analyst",
+    )
+    file = mdl_store.create(
+        project.id,
+        MdlFileCreateRequest(
+            path="models/birth_names.yaml",
+            content=(
+                "models:\n"
+                "  - name: birth_names\n"
+                "    description: Annual baby name registrations and totals\n"
+            ),
+        ),
+        owner_id="analyst",
+    )
+    mdl_store.update(
+        file.id,
+        MdlFileUpdateRequest(status="active"),
+        owner_id="analyst",
+    )
+    model_client = FakeModelClient(
+        "SELECT name, SUM(num) AS total_births FROM birth_names GROUP BY name"
+    )
+    wren_client = LlmWrenClient(
+        AgentConfig(wren_adapter="llm"),
+        model_client,
+        mdl_file_store=mdl_store,
+    )
+    graph = TextToSqlGraph(
+        config=AgentConfig(agent_storage_dir=str(tmp_path), wren_adapter="llm"),
+        model_client=model_client,
+        context_provider=FakeContextProvider(),
+        superset_client=FakeSupersetClient(),
+        wren_client=wren_client,
+        semantic_project_store=project_store,
+        mdl_file_store=mdl_store,
+    )
+
+    response = graph.run(
+        AgentQueryRequest(
+            question="Show total births by name",
+            database_id=1,
+            schema_name="main",
+        ),
+        owner_id="analyst",
+    )
+
+    assert response.wren_context is not None
+    assert response.wren_context.available is True
+    # The model/column descriptions must reach the prompt the model received.
+    prompt_text = "\n".join(
+        message.content
+        for messages in model_client.messages
+        for message in messages
+    )
+    assert "Annual baby name registrations" in prompt_text
 
 
 def test_graph_executes_valid_sql_when_requested() -> None:

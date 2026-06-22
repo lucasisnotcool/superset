@@ -537,7 +537,7 @@ def build_dataset_yaml(table_name: str, df: pd.DataFrame) -> dict:
         "normalize_columns": False,
         "offset": 0,
         "params": None,
-        "schema": None,
+        "schema": "seagate",
         "sql": None,
         "table_name": table_name,
         "template_params": None,

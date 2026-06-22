@@ -322,7 +322,11 @@ export interface AgentHealthResponse {
 export type SemanticProjectVisibility = 'private' | 'db_access' | 'custom';
 export type SemanticProjectPermission = 'read' | 'write' | 'admin';
 export type MdlFileStatus = 'draft' | 'active' | 'deleted';
-export type MdlFileSourceType = 'uploaded_mdl' | 'manual' | 'enriched_markdown';
+export type MdlFileSourceType =
+  | 'uploaded_mdl'
+  | 'manual'
+  | 'enriched_markdown'
+  | 'onboarding';
 
 export interface SemanticProject {
   id: string;
@@ -413,6 +417,27 @@ export interface WrenMaterializationResult {
   path: string;
   file_count: number;
   checksum: string;
+  warnings: string[];
+}
+
+export interface OnboardingResult {
+  project_id: string;
+  files: MdlFile[];
+  model_count: number;
+  warnings: string[];
+}
+
+export type SemanticJobStatus = 'running' | 'completed' | 'failed';
+
+export interface SemanticJob {
+  id: string;
+  kind: string;
+  status: SemanticJobStatus;
+  project_id?: string | null;
+  result?: OnboardingResult | null;
+  error?: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 const trimTrailingSlash = (url: string) => url.replace(/\/+$/, '');
@@ -512,6 +537,15 @@ export const getConversation = (conversationId: string) =>
     method: 'GET',
   });
 
+export const updateConversationTitle = (
+  conversationId: string,
+  title: string,
+) =>
+  requestJson<Conversation>(`/agent/conversations/${conversationId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ title }),
+  });
+
 export const sendConversationMessage = (
   conversationId: string,
   payload: ConversationTurnRequest,
@@ -522,6 +556,219 @@ export const sendConversationMessage = (
       method: 'POST',
       body: JSON.stringify(payload),
     },
+  );
+
+export interface ConversationProgressEvent {
+  type: 'progress';
+  step: string;
+  status: 'ok' | 'warning' | 'error';
+  summary: string;
+}
+
+/**
+ * Raised when the streaming endpoint cannot be used (missing, not OK, or no
+ * response body). The caller may safely fall back to the buffered request
+ * because the server has not yet persisted the user message in this case.
+ */
+export class StreamUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'StreamUnavailableError';
+  }
+}
+
+/**
+ * Raised when a stream that had already started drops before delivering its
+ * terminal `complete` event (e.g. a network blip). The turn may already be
+ * running server-side, so the caller should resync the conversation rather than
+ * re-send or surface a raw error.
+ */
+export class StreamInterruptedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'StreamInterruptedError';
+  }
+}
+
+interface StreamConversationOptions {
+  onProgress?: (event: ConversationProgressEvent) => void;
+  signal?: AbortSignal;
+}
+
+const isAbortError = (ex: unknown): boolean =>
+  ex instanceof DOMException
+    ? ex.name === 'AbortError'
+    : ex instanceof Error && ex.name === 'AbortError';
+
+const splitSseFrames = (buffer: string): { frames: string[]; rest: string } => {
+  const frames: string[] = [];
+  let rest = buffer;
+  let boundary = rest.indexOf('\n\n');
+  while (boundary !== -1) {
+    frames.push(rest.slice(0, boundary));
+    rest = rest.slice(boundary + 2);
+    boundary = rest.indexOf('\n\n');
+  }
+  return { frames, rest };
+};
+
+const parseSseData = (frame: string): unknown => {
+  const data = frame
+    .split('\n')
+    .filter(line => line.startsWith('data:'))
+    .map(line => line.slice(5).replace(/^ /, ''))
+    .join('\n');
+  if (!data) {
+    return undefined;
+  }
+  try {
+    return JSON.parse(data);
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * Read a conversation SSE stream to completion, surfacing each `progress` event
+ * via `onProgress` and resolving with the final turn response carried by the
+ * `complete` event. Shared by the message and execute-sql streaming endpoints.
+ */
+const consumeConversationStream = async (
+  response: Response,
+  onProgress?: (event: ConversationProgressEvent) => void,
+): Promise<ConversationTurnResponse> => {
+  let completed: ConversationTurnResponse | undefined;
+  let streamError: string | undefined;
+  const handleFrame = (frame: string) => {
+    const data = parseSseData(frame) as
+      | { type?: string; response?: ConversationTurnResponse; detail?: string }
+      | undefined;
+    if (!data || typeof data !== 'object') {
+      return;
+    }
+    if (data.type === 'progress') {
+      onProgress?.(data as unknown as ConversationProgressEvent);
+    } else if (data.type === 'complete' && data.response) {
+      completed = data.response;
+    } else if (data.type === 'error') {
+      streamError = data.detail || 'Agent request failed';
+    }
+  };
+
+  const reader = response.body?.getReader ? response.body.getReader() : null;
+  if (reader) {
+    const decoder = new TextDecoder();
+    let buffer = '';
+    try {
+      for (;;) {
+        // eslint-disable-next-line no-await-in-loop
+        const { value, done } = await reader.read();
+        if (done) {
+          break;
+        }
+        buffer += decoder.decode(value, { stream: true });
+        const { frames, rest } = splitSseFrames(buffer);
+        buffer = rest;
+        frames.forEach(handleFrame);
+      }
+    } catch (ex) {
+      // A user-initiated abort must propagate unchanged; any other read failure
+      // is a dropped connection mid-turn.
+      if (isAbortError(ex)) {
+        throw ex;
+      }
+      throw new StreamInterruptedError(
+        ex instanceof Error ? ex.message : 'Stream connection lost',
+      );
+    }
+    splitSseFrames(`${buffer}\n\n`).frames.forEach(handleFrame);
+  } else {
+    // jsdom and some fetch polyfills do not expose a streaming body; parse the
+    // buffered payload so the same code path still resolves the final response.
+    const raw = await response.text();
+    splitSseFrames(`${raw}\n\n`).frames.forEach(handleFrame);
+  }
+
+  // A server-emitted error event is a genuine agent failure.
+  if (streamError) {
+    throw new Error(streamError);
+  }
+  // The stream ended without its terminal event — treat as an interruption so
+  // the caller resyncs instead of showing a raw error.
+  if (!completed) {
+    throw new StreamInterruptedError('The agent stream ended unexpectedly.');
+  }
+  return completed;
+};
+
+/**
+ * POST to a conversation streaming endpoint and consume the SSE response.
+ * Throws StreamUnavailableError when streaming is not possible so the caller can
+ * fall back to the buffered request without re-sending. Abort errors are
+ * re-thrown unchanged so the caller can distinguish user cancellation from a
+ * transport failure.
+ */
+const streamConversationTurn = async (
+  path: string,
+  body: unknown,
+  options: StreamConversationOptions = {},
+): Promise<ConversationTurnResponse> => {
+  let response: Response;
+  try {
+    response = await fetch(`${getAgentBaseUrl()}${path}`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'text/event-stream',
+      },
+      body: JSON.stringify(body),
+      signal: options.signal,
+    });
+  } catch (ex) {
+    if (isAbortError(ex)) {
+      throw ex;
+    }
+    throw new StreamUnavailableError(
+      ex instanceof Error ? ex.message : 'Stream request failed',
+    );
+  }
+
+  if (!response.ok) {
+    throw new StreamUnavailableError(`Stream unavailable: ${response.status}`);
+  }
+
+  return consumeConversationStream(response, options.onProgress);
+};
+
+/**
+ * Stream a conversation turn. See {@link streamConversationTurn}; falls back to
+ * {@link sendConversationMessage} on StreamUnavailableError.
+ */
+export const streamConversationMessage = (
+  conversationId: string,
+  payload: ConversationTurnRequest,
+  options: StreamConversationOptions = {},
+): Promise<ConversationTurnResponse> =>
+  streamConversationTurn(
+    `/agent/conversations/${conversationId}/messages/stream`,
+    payload,
+    options,
+  );
+
+/**
+ * Stream an approved-SQL execution turn. See {@link streamConversationTurn};
+ * falls back to {@link executeConversationSql} on StreamUnavailableError.
+ */
+export const streamExecuteConversationSql = (
+  conversationId: string,
+  payload: ConversationSqlExecutionRequest,
+  options: StreamConversationOptions = {},
+): Promise<ConversationTurnResponse> =>
+  streamConversationTurn(
+    `/agent/conversations/${conversationId}/execute-sql/stream`,
+    payload,
+    options,
   );
 
 export const executeConversationSql = (
@@ -648,11 +895,61 @@ export const uploadProjectSourceDocument = (projectId: string, file: File) => {
   );
 };
 
+export const createProjectDocumentFromText = (
+  projectId: string,
+  text: string,
+  filename = 'document.md',
+) =>
+  requestJson<SemanticDocument>(
+    `/agent/semantic-layer/projects/${projectId}/documents/text`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ filename, text }),
+    },
+  );
+
 export const enrichProjectDocument = (projectId: string, documentId: string) =>
   requestJson<MdlEnrichmentProposal>(
     `/agent/semantic-layer/projects/${projectId}/documents/${documentId}/enrich`,
     { method: 'POST' },
   );
+
+export const onboardSemanticProject = (projectId: string) =>
+  requestJson<SemanticJob>(
+    `/agent/semantic-layer/projects/${projectId}/onboard`,
+    { method: 'POST' },
+  );
+
+export const getSemanticJob = (projectId: string, jobId: string) =>
+  requestJson<SemanticJob>(
+    `/agent/semantic-layer/projects/${projectId}/jobs/${jobId}`,
+    { method: 'GET' },
+  );
+
+/**
+ * Start onboarding and resolve once the async job reaches a terminal state.
+ * Polls the job endpoint; an inline backend completes on the first response.
+ */
+export const runOnboarding = async (
+  projectId: string,
+  {
+    intervalMs = 1000,
+    attempts = 60,
+  }: { intervalMs?: number; attempts?: number } = {},
+): Promise<SemanticJob> => {
+  let job = await onboardSemanticProject(projectId);
+  let remaining = attempts;
+  while (job.status === 'running' && remaining > 0) {
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise(resolve => {
+      setTimeout(resolve, intervalMs);
+    });
+    // eslint-disable-next-line no-await-in-loop
+    job = await getSemanticJob(projectId, job.id);
+    remaining -= 1;
+  }
+  return job;
+};
 
 export const materializeSemanticProject = (projectId: string) =>
   requestJson<WrenMaterializationResult>(

@@ -51,7 +51,11 @@ SemanticLayerEventType = Literal[
     "index_started",
     "index_completed",
     "index_failed",
+    "onboarding_started",
+    "onboarding_completed",
+    "onboarding_failed",
 ]
+SemanticJobStatus = Literal["running", "completed", "failed"]
 
 
 def _utc_now() -> datetime:
@@ -166,7 +170,12 @@ SemanticProjectVisibility = Literal["private", "db_access", "custom"]
 SemanticProjectStatus = Literal["active", "archived"]
 SemanticPermission = Literal["read", "write", "admin"]
 MdlFileStatus = Literal["draft", "active", "deleted"]
-MdlFileSourceType = Literal["uploaded_mdl", "manual", "enriched_markdown"]
+MdlFileSourceType = Literal[
+    "uploaded_mdl",
+    "manual",
+    "enriched_markdown",
+    "onboarding",
+]
 MdlContentType = Literal["application/x-yaml", "text/yaml"]
 
 
@@ -278,3 +287,34 @@ class WrenMaterializationResult(BaseModel):
     path: str
     file_count: int
     checksum: str
+    warnings: list[str] = Field(default_factory=list)
+
+
+class OnboardingResult(BaseModel):
+    """Result of generating draft base MDL from schema introspection."""
+
+    project_id: str
+    files: list[MdlFile] = Field(default_factory=list)
+    model_count: int = 0
+    warnings: list[str] = Field(default_factory=list)
+
+
+class SemanticDocumentTextRequest(BaseModel):
+    """Create a semantic source document from pasted text."""
+
+    filename: str = "document.md"
+    text: str
+    content_type: str = "text/markdown"
+
+
+class SemanticJob(BaseModel):
+    """Async semantic-layer job (e.g. schema onboarding) for polling."""
+
+    id: str = Field(default_factory=_new_id)
+    kind: str
+    status: SemanticJobStatus = "running"
+    project_id: str | None = None
+    result: OnboardingResult | None = None
+    error: str | None = None
+    created_at: datetime = Field(default_factory=_utc_now)
+    updated_at: datetime = Field(default_factory=_utc_now)
