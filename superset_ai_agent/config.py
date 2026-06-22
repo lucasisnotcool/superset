@@ -136,9 +136,11 @@ class AgentConfig:
     # these on requires durable semantic persistence (semantic_layer_store=
     # sqlalchemy), enforced at startup.
     wren_engine: WrenEngineMode = "passthrough"
+    wren_semantic_sql_enabled: bool = False
     wren_retriever: WrenRetrieverMode = "keyword"
     wren_memory_store: WrenMemoryStoreMode = "none"
     wren_memory_learning_enabled: bool = True
+    wren_memory_recall_k: int = 3
     superset_agent_adapter: SupersetAdapterMode = "rest"
     superset_auth_mode: SupersetAuthMode = "user_session"
     superset_base_url: str = "http://localhost:8091"
@@ -438,6 +440,10 @@ class AgentConfig:
                 WrenEngineMode,
                 os.getenv("WREN_ENGINE", cls.wren_engine).strip().lower(),
             ),
+            wren_semantic_sql_enabled=_env_bool(
+                "WREN_SEMANTIC_SQL_ENABLED",
+                cls.wren_semantic_sql_enabled,
+            ),
             wren_retriever=cast(
                 WrenRetrieverMode,
                 os.getenv("WREN_RETRIEVER", cls.wren_retriever).strip().lower(),
@@ -449,6 +455,9 @@ class AgentConfig:
             wren_memory_learning_enabled=_env_bool(
                 "WREN_MEMORY_LEARNING_ENABLED",
                 cls.wren_memory_learning_enabled,
+            ),
+            wren_memory_recall_k=int(
+                os.getenv("WREN_MEMORY_RECALL_K", str(cls.wren_memory_recall_k))
             ),
             superset_agent_adapter=cast(
                 SupersetAdapterMode,

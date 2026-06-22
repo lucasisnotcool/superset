@@ -174,3 +174,38 @@ def test_passthrough_engine_is_a_no_op_but_stamps_audit() -> None:
     assert response.audit.semantic_sql == response.audit.native_sql
     # Passthrough adds no plan_semantic_sql trace event (zero behavior change).
     assert not any(event.step == "plan_semantic_sql" for event in response.trace)
+
+
+class _CapturingModelClient(_FakeModelClient):
+    def __init__(self, sql: str) -> None:
+        super().__init__(sql)
+        self.payloads: list[str] = []
+
+    def chat(self, messages, *, model=None, format_schema=None):
+        self.payloads.append(messages[-1].content)
+        return super().chat(messages, model=model, format_schema=format_schema)
+
+
+def test_semantic_sql_mode_injects_authoring_guidance() -> None:
+    model = _CapturingModelClient(_SEMANTIC_SQL)
+    graph = TextToSqlGraph(
+        config=AgentConfig(wren_engine="wren_core", wren_semantic_sql_enabled=True),
+        model_client=model,
+        context_provider=_FakeContextProvider(),
+        superset_client=_RecordingSupersetClient(),
+        semantic_engine=_FakeRewriteEngine(),
+    )
+    graph.run(_request())
+    assert any("Semantic-SQL mode is ON" in payload for payload in model.payloads)
+
+
+def test_semantic_sql_mode_off_by_default() -> None:
+    model = _CapturingModelClient(_SEMANTIC_SQL)
+    graph = TextToSqlGraph(
+        config=AgentConfig(),  # passthrough + flag off
+        model_client=model,
+        context_provider=_FakeContextProvider(),
+        superset_client=_RecordingSupersetClient(),
+    )
+    graph.run(_request())
+    assert not any("Semantic-SQL mode is ON" in payload for payload in model.payloads)

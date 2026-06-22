@@ -198,7 +198,7 @@ manifest), so **Phase 0 makes DB-backed semantic persistence the baseline**
 | 0 | Seam refactor + default bindings (0.1–0.2, 0.4) | `[TODO]` |
 | 1 | SemanticEngine seam (protocol + passthrough + wren-core scaffold) | `[COMPLETE]` (2026-06-22) |
 | 1 | SemanticEngine graph wiring + audit (both graphs) | `[COMPLETE]` (2026-06-22) |
-| 1 | Semantic-SQL prompt mode + engine-feedback correction loop | `[TODO]` |
+| 1 | Semantic-SQL prompt mode + engine-feedback correction loop | `[COMPLETE]` (2026-06-22) |
 | 1 | Semantic-SQL prompt + correction loop | `[TODO]` |
 | 2 | Embedder + EmbeddingRetriever (LanceDB) | `[TODO]` |
 | 2 | Memory learning loop | `[TODO]` |
@@ -518,7 +518,35 @@ rewrite path is proven only via a fake engine + skipif'd wren-core test.
 - [ ] On engine error, route to the correction loop (1.4); if `engine ==
       passthrough`, behave exactly as today.
 
-### 1.3 Semantic-SQL prompt
+### 1.3 / 1.4 Semantic-SQL prompt + correction loop — `[COMPLETE]` (2026-06-22)
+
+**Resolved.** When `wren_semantic_sql_enabled` is on **and** the engine is not
+passthrough, both graphs inject `_SEMANTIC_SQL_GUIDANCE` into the model payload
+(write SQL against MDL models; the engine rewrites to native). Engine warnings
+from the plan step are folded into the repair prompt (1.4).
+
+Source: [`config.py`](config.py) (`wren_semantic_sql_enabled` +
+`WREN_SEMANTIC_SQL_ENABLED`, `wren_memory_recall_k`); [`graph.py`](graph.py) /
+[`conversation_graph.py`](conversation_graph.py) (`_SEMANTIC_SQL_GUIDANCE`,
+`semantic_sql_mode` in `_call_sql_model` / `_call_conversation_model`,
+`engine_warnings` state folded into `_repair_sql`); [`.env.example`](.env.example).
+Tests: [`test_graph_semantic_engine.py`](../tests/unit_tests/superset_ai_agent/test_graph_semantic_engine.py)
+(`test_semantic_sql_mode_injects_authoring_guidance`, `_off_by_default`). Suite:
+**208 passed, 2 skipped**; `ruff` clean.
+
+**Residual risk RG3 (dev expectation):** the prompt guidance is **prose only** —
+the dedicated `prompts/text_to_sql.md` / `conversation.md` files were not split
+into a separate semantic-SQL variant; the directive rides the user payload
+instead. Functionally equivalent and simpler, but a reviewer expecting a prompt
+file diff won't find one. Effective only with `wren_engine=wren_core` (RE1), so
+unverified end-to-end against a live model writing real semantic SQL.
+
+**Residual risk RG4:** 1.4 feedback is best-effort — engine rewrite failures
+*degrade to passthrough* (no hard error), so `engine_warnings` carries the
+soft-gate/degrade reasons, not a wren-core validation error (that arrives only
+once RE1 lands and `plan_sql` can surface a hard failure).
+
+#### Original 1.3 spec (retained)
 
 - [ ] Update [`prompts/text_to_sql.md`](prompts/text_to_sql.md) and
       `prompts/conversation.md`: instruct the model to write SQL **against MDL

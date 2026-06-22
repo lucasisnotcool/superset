@@ -65,6 +65,17 @@ from superset_ai_agent.semantic_layer.wren_runtime import (
 )
 from superset_ai_agent.tools.sql import validate_read_only_sql
 
+#: Authoring guidance injected when semantic-SQL mode is active (engine rewrites
+#: model-qualified SQL into native SQL). See wren_full.md Phase 1.3.
+_SEMANTIC_SQL_GUIDANCE = (
+    "Semantic-SQL mode is ON. Write SQL against the semantic models by their "
+    "MDL model names (see wren_context.matched_models and context_items), "
+    "referencing model columns, defined relationships, and metrics. Do not "
+    "hand-write physical joins for defined relationships; the semantic engine "
+    "rewrites your query into native SQL. Never reference tables or columns "
+    "absent from the provided semantic context."
+)
+
 
 class SqlDraft(BaseModel):
     """Structured model output for SQL generation."""
@@ -94,6 +105,7 @@ class AgentState(TypedDict, total=False):
     semantic_sql: str | None
     native_sql: str | None
     engine: str | None
+    engine_warnings: list[str]
     trace: list[TraceEvent]
     repair_attempts: int
     error: str | None
@@ -448,6 +460,7 @@ class TextToSqlGraph:
             "semantic_sql": result.semantic_sql,
             "native_sql": result.native_sql,
             "engine": result.engine,
+            "engine_warnings": result.warnings,
             "trace": [
                 *state.get("trace", []),
                 TraceEvent(
@@ -504,11 +517,13 @@ class TextToSqlGraph:
         request = state["request"]
         context = state["context"]
         validation = state["validation"]
+        # Fold semantic-engine feedback into the repair prompt (1.4).
+        repair_errors = [*validation.errors, *state.get("engine_warnings", [])]
         draft = self._call_sql_model(
             request=request,
             context=context,
             wren_context=state.get("wren_context"),
-            validation_errors=validation.errors,
+            validation_errors=repair_errors,
         )
         return {
             **state,
@@ -636,6 +651,10 @@ class TextToSqlGraph:
         validation_errors: list[str],
     ) -> SqlDraft:
         prompt = get_prompt("text_to_sql")
+        semantic_sql_mode = (
+            self.config.wren_semantic_sql_enabled
+            and self.semantic_engine.name != "passthrough"
+        )
         user_payload = {
             "question": request.question,
             "database": context.database.model_dump(),
@@ -644,6 +663,10 @@ class TextToSqlGraph:
                 wren_context.model_dump() if wren_context is not None else None
             ),
             "validation_errors_to_fix": validation_errors,
+            "semantic_sql_mode": semantic_sql_mode,
+            "semantic_sql_instructions": (
+                _SEMANTIC_SQL_GUIDANCE if semantic_sql_mode else None
+            ),
         }
         schema = SqlDraft.model_json_schema()
         result = self.model_client.chat(

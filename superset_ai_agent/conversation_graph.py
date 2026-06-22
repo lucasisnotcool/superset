@@ -81,6 +81,17 @@ from superset_ai_agent.semantic_layer.wren_runtime import (
 )
 from superset_ai_agent.tools.sql import validate_read_only_sql
 
+#: Authoring guidance injected when semantic-SQL mode is active (engine rewrites
+#: model-qualified SQL into native SQL). See wren_full.md Phase 1.3.
+_SEMANTIC_SQL_GUIDANCE = (
+    "Semantic-SQL mode is ON. Write SQL against the semantic models by their "
+    "MDL model names (see wren_context.matched_models and context_items), "
+    "referencing model columns, defined relationships, and metrics. Do not "
+    "hand-write physical joins for defined relationships; the semantic engine "
+    "rewrites your query into native SQL. Never reference tables or columns "
+    "absent from the provided semantic context."
+)
+
 
 class ConversationDraft(BaseModel):
     """Structured model output for a conversation turn."""
@@ -138,6 +149,7 @@ class ConversationState(TypedDict, total=False):
     semantic_sql: str | None
     native_sql: str | None
     engine: str | None
+    engine_warnings: list[str]
     sql_iterations: int
     sql_observations: list[dict[str, Any]]
     attempted_sql: list[str]
@@ -886,6 +898,7 @@ class ConversationGraph:
             "semantic_sql": result.semantic_sql,
             "native_sql": result.native_sql,
             "engine": result.engine,
+            "engine_warnings": result.warnings,
             "trace": [
                 *state.get("trace", []),
                 TraceEvent(
@@ -1013,6 +1026,8 @@ class ConversationGraph:
     def _repair_sql(self, state: ConversationState) -> ConversationState:
         validation = state.get("validation")
         errors = validation.errors if validation else ["SQL failed validation."]
+        # Fold semantic-engine feedback into the repair prompt (1.4).
+        errors = [*errors, *state.get("engine_warnings", [])]
         draft = self._call_conversation_model(
             state=state,
             validation_errors=errors,
@@ -1286,8 +1301,16 @@ class ConversationGraph:
         prompt = get_prompt("conversation")
         execution_mode: ExecutionMode = request.resolved_execution_mode()
         wren_context = state.get("wren_context")
+        semantic_sql_mode = (
+            self.config.wren_semantic_sql_enabled
+            and self.semantic_engine.name != "passthrough"
+        )
         payload = {
             "user_message": request.message,
+            "semantic_sql_mode": semantic_sql_mode,
+            "semantic_sql_instructions": (
+                _SEMANTIC_SQL_GUIDANCE if semantic_sql_mode else None
+            ),
             "execution_mode": execution_mode,
             "execute": execution_mode != "manual",
             "max_sql_iterations": self.config.max_agent_sql_iterations,
