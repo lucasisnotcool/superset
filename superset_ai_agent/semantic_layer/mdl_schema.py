@@ -104,6 +104,30 @@ class MdlView(BaseModel):
     properties: dict[str, Any] = Field(default_factory=dict)
 
 
+class MdlMetric(BaseModel):
+    """A reusable aggregation defined once and referenced across queries."""
+
+    model_config = ConfigDict(extra="allow")
+
+    name: str
+    base_object: str | None = None
+    expression: str | None = None
+    properties: dict[str, Any] = Field(default_factory=dict)
+
+
+class MdlCube(BaseModel):
+    """A structured aggregation object (measures, dimensions, time dimensions)."""
+
+    model_config = ConfigDict(extra="allow")
+
+    name: str
+    measures: list[dict[str, Any]] = Field(default_factory=list)
+    dimensions: list[dict[str, Any]] = Field(default_factory=list)
+    time_dimensions: list[dict[str, Any]] = Field(default_factory=list)
+    hierarchies: list[dict[str, Any]] = Field(default_factory=list)
+    properties: dict[str, Any] = Field(default_factory=dict)
+
+
 class MdlManifest(BaseModel):
     """A full MDL manifest (one file or a merged project manifest)."""
 
@@ -112,3 +136,5 @@ class MdlManifest(BaseModel):
     models: list[MdlModel] = Field(default_factory=list)
     relationships: list[MdlRelationship] = Field(default_factory=list)
     views: list[MdlView] = Field(default_factory=list)
+    metrics: list[MdlMetric] = Field(default_factory=list)
+    cubes: list[MdlCube] = Field(default_factory=list)

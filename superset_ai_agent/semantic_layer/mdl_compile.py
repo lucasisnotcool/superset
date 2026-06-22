@@ -44,6 +44,7 @@ _MODEL_KEYS: tuple[str, ...] = ("models", "semantic_models")
 _RELATIONSHIP_KEYS: tuple[str, ...] = ("relationships",)
 _VIEW_KEYS: tuple[str, ...] = ("views",)
 _METRIC_KEYS: tuple[str, ...] = ("metrics",)
+_CUBE_KEYS: tuple[str, ...] = ("cubes",)
 
 
 class CompiledManifest(BaseModel):
@@ -62,6 +63,7 @@ class CompiledManifest(BaseModel):
     relationships: list[dict[str, Any]] = Field(default_factory=list)
     views: list[dict[str, Any]] = Field(default_factory=list)
     metrics: list[dict[str, Any]] = Field(default_factory=list)
+    cubes: list[dict[str, Any]] = Field(default_factory=list)
 
     def to_engine_manifest(self) -> dict[str, Any]:
         """Return the full camelCase manifest dict wren-core's ``to_manifest`` wants."""
@@ -76,6 +78,8 @@ class CompiledManifest(BaseModel):
             out["views"] = self.views
         if self.metrics:
             out["metrics"] = self.metrics
+        if self.cubes:
+            out["cubes"] = self.cubes
         if self.data_source:
             out["dataSource"] = self.data_source
         return out
@@ -108,30 +112,34 @@ def compile_manifest(
 
     if yaml_contents is None:
         yaml_contents = [file.content for file in (mdl_files or [])]
-    models, relationships, views, metrics = _merge_yaml(yaml_contents)
+    merged = _merge_yaml(yaml_contents)
     return CompiledManifest(
         catalog=catalog,
         schema=schema,
         data_source=data_source,
-        models=[model_to_camel(model) for model in models],
-        relationships=[relationship_to_camel(rel) for rel in relationships],
-        views=[view_to_camel(view) for view in views],
-        metrics=[metric for metric in metrics if isinstance(metric, dict)],
+        models=[model_to_camel(model) for model in merged["models"]],
+        relationships=[relationship_to_camel(rel) for rel in merged["relationships"]],
+        views=[view_to_camel(view) for view in merged["views"]],
+        metrics=[metric_to_camel(metric) for metric in merged["metrics"]],
+        cubes=[cube_to_camel(cube) for cube in merged["cubes"]],
     )
 
 
-def _merge_yaml(
-    yaml_contents: list[str],
-) -> tuple[
-    list[dict[str, Any]],
-    list[dict[str, Any]],
-    list[dict[str, Any]],
-    list[dict[str, Any]],
-]:
-    models: list[dict[str, Any]] = []
-    relationships: list[dict[str, Any]] = []
-    views: list[dict[str, Any]] = []
-    metrics: list[dict[str, Any]] = []
+def _merge_yaml(yaml_contents: list[str]) -> dict[str, list[dict[str, Any]]]:
+    merged: dict[str, list[dict[str, Any]]] = {
+        "models": [],
+        "relationships": [],
+        "views": [],
+        "metrics": [],
+        "cubes": [],
+    }
+    key_map = {
+        "models": _MODEL_KEYS,
+        "relationships": _RELATIONSHIP_KEYS,
+        "views": _VIEW_KEYS,
+        "metrics": _METRIC_KEYS,
+        "cubes": _CUBE_KEYS,
+    }
     for content in yaml_contents:
         try:
             payload = yaml.safe_load(content)
@@ -139,11 +147,9 @@ def _merge_yaml(
             continue
         if not isinstance(payload, dict):
             continue
-        models.extend(_collect(payload, _MODEL_KEYS))
-        relationships.extend(_collect(payload, _RELATIONSHIP_KEYS))
-        views.extend(_collect(payload, _VIEW_KEYS))
-        metrics.extend(_collect(payload, _METRIC_KEYS))
-    return models, relationships, views, metrics
+        for target, keys in key_map.items():
+            merged[target].extend(_collect(payload, keys))
+    return merged
 
 
 def _collect(payload: dict[str, Any], keys: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -210,6 +216,29 @@ def view_to_camel(view: dict[str, Any]) -> dict[str, Any]:
         {
             "name": view.get("name"),
             "statement": view.get("statement"),
+        }
+    )
+
+
+def metric_to_camel(metric: dict[str, Any]) -> dict[str, Any]:
+    return _drop_none(
+        {
+            "name": metric.get("name"),
+            "baseObject": metric.get("base_object") or metric.get("baseObject"),
+            "expression": metric.get("expression"),
+        }
+    )
+
+
+def cube_to_camel(cube: dict[str, Any]) -> dict[str, Any]:
+    return _drop_none(
+        {
+            "name": cube.get("name"),
+            "measures": cube.get("measures"),
+            "dimensions": cube.get("dimensions"),
+            "timeDimensions": cube.get("time_dimensions")
+            or cube.get("timeDimensions"),
+            "hierarchies": cube.get("hierarchies"),
         }
     )
 

@@ -141,3 +141,42 @@ def test_to_wren_core_manifest_delegates_to_shared_mapping() -> None:
     }
     assert shared["models"][0] == compiled.models[0]
     assert shared["relationships"][0] == compiled.relationships[0]
+
+
+_CUBES_YAML = """
+models:
+  - name: sales
+    table_reference:
+      schema: public
+      table: sales
+    columns:
+      - name: amount
+        type: DOUBLE
+metrics:
+  - name: total_amount
+    base_object: sales
+    expression: SUM(amount)
+cubes:
+  - name: sales_cube
+    measures:
+      - name: total
+        expression: SUM(amount)
+    dimensions:
+      - name: region
+    time_dimensions:
+      - name: order_date
+    hierarchies:
+      - name: geo
+"""
+
+
+def test_compile_manifest_maps_metrics_and_cubes() -> None:
+    manifest = compile_manifest(yaml_contents=[_CUBES_YAML])
+    assert manifest.metrics[0]["name"] == "total_amount"
+    assert manifest.metrics[0]["baseObject"] == "sales"
+    cube = manifest.cubes[0]
+    assert cube["name"] == "sales_cube"
+    assert cube["timeDimensions"][0]["name"] == "order_date"
+    engine = manifest.to_engine_manifest()
+    assert "metrics" in engine
+    assert "cubes" in engine

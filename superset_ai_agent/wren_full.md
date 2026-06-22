@@ -202,7 +202,8 @@ manifest), so **Phase 0 makes DB-backed semantic persistence the baseline**
 | 1 | Semantic-SQL prompt + correction loop | `[TODO]` |
 | 2 | Embedder + Retriever seam (keyword default, embedding optional) | `[COMPLETE]` (2026-06-22) |
 | 2 | Memory learning loop (NL→SQL examples) | `[COMPLETE]` (2026-06-22) |
-| 3 | MDL completeness (cubes/metrics) + deep-validation CI | `[TODO]` |
+| 3 | MDL completeness (cubes/metrics) | `[COMPLETE]` (2026-06-22) |
+| 3 | wren-core deep-validation CI job | `[TODO]` (RE1) |
 | 4 | Orchestrator/Skills + intent classification + SDK facade | `[TODO]` |
 
 ---
@@ -770,6 +771,31 @@ fixture question's few-shot; write-back fires only on confirmed success.
 ---
 
 ## Phase 3 — MDL Completeness + Deep-Validation Hardening
+
+### Phase 3 status — `[COMPLETE]` for schema/compile (2026-06-22)
+
+**Metrics and cubes are first-class in the schema + compile path.** Source:
+[`mdl_schema.py`](semantic_layer/mdl_schema.py) (`MdlMetric`, `MdlCube` with
+measures/dimensions/timeDimensions/hierarchies; `MdlManifest.metrics`/`cubes`);
+[`mdl_compile.py`](semantic_layer/mdl_compile.py) (`_CUBE_KEYS`, `metric_to_camel`,
+`cube_to_camel`, `CompiledManifest.cubes`, `to_engine_manifest` emits
+`metrics`/`cubes`). Test:
+[`test_mdl_compile.py`](../tests/unit_tests/superset_ai_agent/test_mdl_compile.py)::
+`test_compile_manifest_maps_metrics_and_cubes`. Suite: **225 passed, 2 skipped**;
+`ruff` clean.
+
+**Residual risk RM1 (gap):** the structural **validator** was not extended to
+enforce metric/cube shape (base_object resolves, measure expressions present) —
+the manifest is `extra="allow"`, so malformed metrics/cubes pass structural
+validation and would only be caught by wren-core deep validation (RE1). Add
+metric/cube structural checks in `mdl_validator` as a follow-up.
+
+**Residual risk RM2:** the camelCase metric/cube shapes
+(`baseObject`/`timeDimensions`) are **unverified against a live wren-core**
+(RE1/R16). Re-verify before enabling deep validation.
+
+The deep-validation **CI job** (install wren-core, run the skipif'd tests) remains
+`[TODO]`, gated on the wren-core packaging decision (RE1).
 
 **Parity target:** Wren MDL includes cubes (measures/dimensions/time
 dimensions/hierarchies) and first-class metrics; engine deep-validates manifests.
