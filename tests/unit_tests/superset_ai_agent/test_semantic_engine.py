@@ -167,3 +167,50 @@ def test_wren_core_computes_calculated_column() -> None:
     )
     # The engine — not the LLM — generates the calculated expression.
     assert "amount * 0.1" in planned.native_sql.replace(" ", " ")
+
+
+# Parity litmus (wren_full.md Phase 1 Tests): a query joining two logical models
+# is rewritten into native SQL whose physical tables + join the engine — not the
+# LLM — materialized as CTEs.
+_MULTI_MODEL_YAML = """
+models:
+  - name: deals
+    table_reference:
+      schema: sales
+      table: deals
+    columns:
+      - name: id
+        type: BIGINT
+      - name: customer_id
+        type: BIGINT
+      - name: amount
+        type: DOUBLE
+  - name: Customers
+    table_reference:
+      schema: sales
+      table: customers
+    columns:
+      - name: id
+        type: BIGINT
+      - name: region
+        type: VARCHAR
+"""
+
+
+@pytest.mark.skipif(
+    not wren_core_available(), reason="wren-core engine not installed"
+)
+def test_wren_core_rewrites_multi_model_join() -> None:
+    engine = WrenCoreEngine()
+    planned = engine.plan_sql(
+        "SELECT c.region, SUM(d.amount) AS total FROM deals d "
+        "JOIN Customers c ON d.customer_id = c.id GROUP BY c.region",
+        compile_manifest(yaml_contents=[_MULTI_MODEL_YAML]),
+        dialect="postgres",
+    )
+    assert planned.rewritten is True
+    native = planned.native_sql.lower()
+    # Both logical models expanded to their physical tables, joined natively.
+    assert "sales.deals" in native
+    assert "sales.customers" in native
+    assert "join" in native

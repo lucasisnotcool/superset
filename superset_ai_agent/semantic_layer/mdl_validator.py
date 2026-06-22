@@ -42,6 +42,13 @@ from superset_ai_agent.semantic_layer.schemas import (
     MdlValidationResult,
 )
 
+#: Time-dimension granularities Wren/cube semantics recognize. Used for a soft
+#: check only (warning) since the camelCase cube shape is unverified against a
+#: live wren-core (RM2) — never reject a manifest on this alone.
+_TIME_GRANULARITIES = frozenset(
+    {"year", "quarter", "month", "week", "day", "hour", "minute", "second"}
+)
+
 
 @dataclass
 class SchemaIndex:
@@ -111,12 +118,15 @@ def validate_mdl(
     models = _extract_models(parsed)
     relationships = _extract_list(parsed, "relationships")
     views = _extract_list(parsed, "views")
-    if not models and not views:
+    metrics = _extract_list(parsed, "metrics")
+    cubes = _extract_list(parsed, "cubes")
+    if not models and not views and not metrics and not cubes:
         return MdlValidationResult(
             valid=False,
             messages=[
                 MdlValidationMessage(
-                    message="MDL must contain at least one model or view.",
+                    message="MDL must contain at least one model, view, metric, "
+                    "or cube.",
                     code="empty_root",
                 )
             ],
@@ -129,6 +139,20 @@ def validate_mdl(
         relationships,
         model_names,
         strict_relationships=strict_relationships,
+        messages=messages,
+    )
+    # Metrics/cubes resolve their base object against models, views, and cubes.
+    base_object_names = model_names | _names(views) | _names(cubes)
+    _validate_metrics(
+        metrics,
+        base_object_names,
+        strict=strict_relationships,
+        messages=messages,
+    )
+    _validate_cubes(
+        cubes,
+        base_object_names,
+        strict=strict_relationships,
         messages=messages,
     )
 
@@ -152,6 +176,8 @@ def validate_project_manifest(
     merged_models: list[Any] = []
     merged_relationships: list[Any] = []
     merged_views: list[Any] = []
+    merged_metrics: list[Any] = []
+    merged_cubes: list[Any] = []
     for content in contents:
         parsed, parse_message = _parse_yaml(content)
         if parse_message is not None:
@@ -159,12 +185,16 @@ def validate_project_manifest(
         merged_models.extend(_extract_models(parsed))
         merged_relationships.extend(_extract_list(parsed, "relationships"))
         merged_views.extend(_extract_list(parsed, "views"))
+        merged_metrics.extend(_extract_list(parsed, "metrics"))
+        merged_cubes.extend(_extract_list(parsed, "cubes"))
 
     merged_yaml = yaml.safe_dump(
         {
             "models": merged_models,
             "relationships": merged_relationships,
             "views": merged_views,
+            "metrics": merged_metrics,
+            "cubes": merged_cubes,
         },
         sort_keys=False,
         allow_unicode=False,
@@ -397,6 +427,280 @@ def _validate_relationships(
                         code="unresolved_relationship",
                     )
                 )
+
+
+def _validate_metrics(
+    metrics: list[Any],
+    base_object_names: set[str],
+    *,
+    strict: bool,
+    messages: list[MdlValidationMessage],
+) -> None:
+    seen_names: set[str] = set()
+    for index, metric in enumerate(metrics):
+        if not isinstance(metric, dict):
+            messages.append(
+                MdlValidationMessage(
+                    message=f"Metric #{index + 1} must be a mapping.",
+                    code="invalid_metric",
+                )
+            )
+            continue
+        name = metric.get("name")
+        if not name or not isinstance(name, str):
+            messages.append(
+                MdlValidationMessage(
+                    message=f"Metric #{index + 1} is missing a name.",
+                    code="missing_metric_name",
+                )
+            )
+            continue
+        if name in seen_names:
+            messages.append(
+                MdlValidationMessage(
+                    message=f"Duplicate metric name: {name}.",
+                    code="duplicate_metric",
+                )
+            )
+        seen_names.add(name)
+
+        base = metric.get("base_object")
+        if base and base not in base_object_names:
+            messages.append(
+                MdlValidationMessage(
+                    severity="error" if strict else "warning",
+                    message=(
+                        f"Metric {name} references base object '{base}' that is "
+                        "not defined"
+                        + ("." if strict else " in this file.")
+                    ),
+                    code="unresolved_metric_base",
+                )
+            )
+        measures = metric.get("measures")
+        has_measures = isinstance(measures, list) and bool(measures)
+        if not metric.get("expression") and not has_measures:
+            messages.append(
+                MdlValidationMessage(
+                    severity="warning",
+                    message=(
+                        f"Metric {name} has no expression or measures; it "
+                        "computes nothing."
+                    ),
+                    code="metric_without_measure",
+                )
+            )
+
+
+def _validate_cubes(
+    cubes: list[Any],
+    base_object_names: set[str],
+    *,
+    strict: bool,
+    messages: list[MdlValidationMessage],
+) -> None:
+    seen_names: set[str] = set()
+    for index, cube in enumerate(cubes):
+        if not isinstance(cube, dict):
+            messages.append(
+                MdlValidationMessage(
+                    message=f"Cube #{index + 1} must be a mapping.",
+                    code="invalid_cube",
+                )
+            )
+            continue
+        name = cube.get("name")
+        if not name or not isinstance(name, str):
+            messages.append(
+                MdlValidationMessage(
+                    message=f"Cube #{index + 1} is missing a name.",
+                    code="missing_cube_name",
+                )
+            )
+            continue
+        if name in seen_names:
+            messages.append(
+                MdlValidationMessage(
+                    message=f"Duplicate cube name: {name}.",
+                    code="duplicate_cube",
+                )
+            )
+        seen_names.add(name)
+
+        base = cube.get("base_object")
+        if base and base not in base_object_names:
+            messages.append(
+                MdlValidationMessage(
+                    severity="error" if strict else "warning",
+                    message=(
+                        f"Cube {name} references base object '{base}' that is "
+                        "not defined"
+                        + ("." if strict else " in this file.")
+                    ),
+                    code="unresolved_cube_base",
+                )
+            )
+        _validate_cube_measures(name, cube.get("measures"), messages)
+        # Dimensions, time dimensions, and hierarchies must each be named
+        # mappings. Their deeper semantics (granularity, levels) are left to
+        # wren-core deep validation; this only enforces the structural shape so a
+        # malformed entry is caught before activation (RM1a).
+        _validate_named_entries(
+            name, "dimension", cube.get("dimensions"), messages
+        )
+        _validate_named_entries(
+            name, "time dimension", cube.get("time_dimensions"), messages
+        )
+        _validate_named_entries(
+            name, "hierarchy", cube.get("hierarchies"), messages
+        )
+        _validate_cube_semantics(name, cube, messages)
+
+
+def _validate_cube_semantics(
+    cube_name: str,
+    cube: dict[str, Any],
+    messages: list[MdlValidationMessage],
+) -> None:
+    """Soft (warning-only) checks of time-dimension granularity + hierarchy levels.
+
+    Deeper than the structural shape check: a time dimension's granularity should
+    be a recognized unit, and a hierarchy's levels should resolve to dimensions
+    defined on the same cube. Warnings only — the camelCase cube shape is
+    unverified against a live wren-core (RM2), so these never reject a manifest.
+    """
+
+    dimension_names = _names(cube.get("dimensions") or []) | _names(
+        cube.get("time_dimensions") or []
+    )
+    for time_dimension in cube.get("time_dimensions") or []:
+        if not isinstance(time_dimension, dict):
+            continue
+        granularity = time_dimension.get("granularity")
+        if (
+            granularity is not None
+            and str(granularity).lower() not in _TIME_GRANULARITIES
+        ):
+            messages.append(
+                MdlValidationMessage(
+                    severity="warning",
+                    message=(
+                        f"Cube {cube_name} time dimension "
+                        f"{time_dimension.get('name')} has unrecognized "
+                        f"granularity '{granularity}'."
+                    ),
+                    code="cube_unknown_granularity",
+                )
+            )
+    for hierarchy in cube.get("hierarchies") or []:
+        if not isinstance(hierarchy, dict):
+            continue
+        levels = hierarchy.get("levels")
+        if not levels:
+            messages.append(
+                MdlValidationMessage(
+                    severity="warning",
+                    message=(
+                        f"Cube {cube_name} hierarchy {hierarchy.get('name')} "
+                        "has no levels."
+                    ),
+                    code="cube_hierarchy_without_levels",
+                )
+            )
+            continue
+        if not isinstance(levels, list):
+            continue
+        for level in levels:
+            level_name = level.get("name") if isinstance(level, dict) else level
+            if isinstance(level_name, str) and level_name not in dimension_names:
+                messages.append(
+                    MdlValidationMessage(
+                        severity="warning",
+                        message=(
+                            f"Cube {cube_name} hierarchy "
+                            f"{hierarchy.get('name')} level '{level_name}' is "
+                            "not a defined dimension."
+                        ),
+                        code="cube_hierarchy_unknown_level",
+                    )
+                )
+
+
+def _validate_named_entries(
+    cube_name: str,
+    kind: str,
+    entries: Any,
+    messages: list[MdlValidationMessage],
+) -> None:
+    """Each entry of a cube sub-list must be a mapping carrying a name."""
+
+    if entries is None:
+        return
+    if not isinstance(entries, list):
+        messages.append(
+            MdlValidationMessage(
+                message=f"Cube {cube_name} {kind}s must be a list.",
+                code="cube_invalid_entries",
+            )
+        )
+        return
+    for entry in entries:
+        if not isinstance(entry, dict) or not entry.get("name"):
+            messages.append(
+                MdlValidationMessage(
+                    message=f"Cube {cube_name} has a {kind} without a name.",
+                    code="cube_entry_without_name",
+                )
+            )
+
+
+def _validate_cube_measures(
+    cube_name: str,
+    measures: Any,
+    messages: list[MdlValidationMessage],
+) -> None:
+    if not isinstance(measures, list) or not measures:
+        messages.append(
+            MdlValidationMessage(
+                severity="warning",
+                message=f"Cube {cube_name} has no measures.",
+                code="cube_without_measures",
+            )
+        )
+        return
+    for measure in measures:
+        if not isinstance(measure, dict):
+            continue
+        measure_name = measure.get("name")
+        if not measure_name or not isinstance(measure_name, str):
+            messages.append(
+                MdlValidationMessage(
+                    message=f"Cube {cube_name} has a measure without a name.",
+                    code="cube_measure_without_name",
+                )
+            )
+            continue
+        if not measure.get("expression") and not measure.get("sql"):
+            messages.append(
+                MdlValidationMessage(
+                    severity="warning",
+                    message=(
+                        f"Cube measure {cube_name}.{measure_name} requires an "
+                        "expression."
+                    ),
+                    code="cube_measure_without_expression",
+                )
+            )
+
+
+def _names(items: list[Any]) -> set[str]:
+    """Collect the ``name`` field of each mapping in a list."""
+
+    return {
+        item["name"]
+        for item in items
+        if isinstance(item, dict) and isinstance(item.get("name"), str) and item["name"]
+    }
 
 
 def _table_name(model: dict[str, Any]) -> str | None:

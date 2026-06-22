@@ -44,6 +44,11 @@ class PlanStepResult(BaseModel):
     rewritten: bool = False
     referenced_tables: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    #: Subset of ``warnings`` a model re-draft could plausibly fix (the
+    #: hallucination gate). Degrade reasons (unsupported dialect, passthrough)
+    #: are excluded — re-drafting cannot fix those, so they never drive the
+    #: engine-correction loop (1.4).
+    correctable_warnings: list[str] = Field(default_factory=list)
 
 
 def plan_semantic_sql_step(
@@ -83,6 +88,7 @@ def plan_semantic_sql_step(
     planned = engine.plan_sql(sql, manifest, dialect=dialect)
 
     warnings = list(planned.warnings)
+    correctable_warnings: list[str] = []
     if manifest.model_names:
         known = {name.lower() for name in manifest.model_names}
         known.update(dataset.table_name.lower() for dataset in context.datasets)
@@ -92,10 +98,12 @@ def plan_semantic_sql_step(
             if table.lower() not in known
         ]
         if unknown:
-            warnings.append(
+            hallucination = (
                 "Semantic SQL references unknown models/tables: "
                 + ", ".join(sorted(unknown))
             )
+            warnings.append(hallucination)
+            correctable_warnings.append(hallucination)
 
     return PlanStepResult(
         semantic_sql=sql,
@@ -104,6 +112,7 @@ def plan_semantic_sql_step(
         rewritten=planned.rewritten,
         referenced_tables=planned.referenced_tables,
         warnings=warnings,
+        correctable_warnings=correctable_warnings,
     )
 
 

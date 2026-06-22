@@ -296,6 +296,8 @@ def test_health_and_models_use_injected_ollama_client() -> None:
     assert health["reachable"] is True
     assert health["model_provider"] == "ollama"
     assert health["ollama_reachable"] is True
+    # Test config uses semantic_layer_store="memory" → flagged non-persistent.
+    assert health["semantic_layer_persistent"] is False
     assert client.get("/models").json()[0]["name"] == "qwen2.5-coder:7b"
 
 

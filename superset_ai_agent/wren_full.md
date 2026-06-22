@@ -27,6 +27,86 @@ this document, then the earlier two.
 Status legend: `[TODO]` not started · `[WIP]` in progress · `[COMPLETE]`
 source-backed and test-verified · `[BLOCKED]` waiting on a decision/dependency.
 
+---
+
+## Progress Summary (audited 2026-06-23)
+
+Audit method: every "Completed" row below was re-verified against the working
+tree on this date — file/symbol existence, the cited test, and the suites:
+backend `pytest tests/unit_tests/superset_ai_agent` → **271 passed, 2 skipped**;
+frontend `jest src/SqlLab/components/AiAgentPanel` → **36 passed** (incl. 5
+`AuditInfoPanel` tests); `ruff` + `prettier` clean on changed files. (`oxlint` and
+project `tsc` could not run in this environment — native-binding fault / full-repo
+cost — they run in CI.) Paths are relative to `superset_ai_agent/`; tests live
+under `../tests/unit_tests/superset_ai_agent/`. The detailed per-phase write-ups
+and residual-risk IDs (`R**`) referenced here are unchanged below.
+
+### ✅ Completed (source-backed)
+
+| # | Item | Evidence (source) | Evidence (test) |
+| --- | --- | --- | --- |
+| 1 | Durable semantic persistence baseline; parity features fail closed on `memory` (0.0) | [`config.py`](config.py) `semantic_layer_store`/`conversation_store="sqlalchemy"` (L86–87); [`app.py`](app.py) `_validate_semantic_persistence_config` | `test_persistence_baseline.py` |
+| 2 | MDL compile canonicalization — single camelCase manifest source (0.3) | [`mdl_compile.py`](semantic_layer/mdl_compile.py) `compile_manifest` | `test_mdl_compile.py` |
+| 3 | SemanticEngine seam + `WrenCoreEngine` rewrite; degrades closed (1.1) | [`semantic_layer/engine/`](semantic_layer/engine/) (`base.py`, `passthrough.py`, `wren_core_engine.py`, `factory.py`) | `test_semantic_engine.py` (incl. live rewrite, skipif-gated) |
+| 4 | Engine wired into both graphs' execution path + audit provenance (1.2/1.5) | [`graph.py`](graph.py) / [`conversation_graph.py`](conversation_graph.py) `plan_semantic_sql`; [`schemas.py`](schemas.py) `AuditInfo.{semantic_sql,native_sql,engine}` | `test_graph_semantic_engine.py` |
+| 5 | Semantic-SQL prompt mode (flag-gated) (1.3) | [`config.py`](config.py) `wren_semantic_sql_enabled`; `_SEMANTIC_SQL_GUIDANCE` in both graphs | `test_graph_semantic_engine.py::test_semantic_sql_mode_*` |
+| 6 | Embedder + Retriever seams (keyword default, embedding optional) (2.1/2.2) | [`llm/embeddings.py`](llm/embeddings.py); [`semantic_layer/schema_retriever.py`](semantic_layer/schema_retriever.py) | `test_schema_retriever.py` |
+| 7 | Memory learning loop (durable NL→SQL examples) (2.3) | [`semantic_layer/memory_store.py`](semantic_layer/memory_store.py); migration [`0003_nl_sql_examples`](persistence/migrations/versions/0003_nl_sql_examples.py) | `test_memory_store.py` |
+| 8 | **Retriever seam consumed by both graphs (RV2)** | `retrieve_mdl_context` in [`schema_retriever.py`](semantic_layer/schema_retriever.py); called in both graphs' `_load_wren_context`; `WrenContextArtifact.retrieval_mode` | `test_seam_wiring.py::test_retrieve_mdl_context_*` |
+| 9 | **Conversation-graph memory write-back + recall (RV4)** | [`conversation_graph.py`](conversation_graph.py) `_execute_sql` (store) + `_draft_response` (recall) | `test_seam_wiring.py::test_conversation_memory_*` |
+| 10 | Cubes/metrics first-class in schema + compile (Phase 3) | [`mdl_schema.py`](semantic_layer/mdl_schema.py) `MdlMetric`/`MdlCube`; [`mdl_compile.py`](semantic_layer/mdl_compile.py) | `test_mdl_compile.py::test_compile_manifest_maps_metrics_and_cubes` |
+| 11 | **Metric/cube structural validation (RM1)** | [`mdl_validator.py`](semantic_layer/mdl_validator.py) `_validate_metrics`/`_validate_cubes` | `test_mdl_validator.py` (7 new) |
+| 12 | **wren-core CI engine job + multi-model-join golden (RE1)** | [`.github/workflows/superset-ai-agent.yml`](../.github/workflows/superset-ai-agent.yml) | `test_semantic_engine.py::test_wren_core_rewrites_multi_model_join` |
+| 13 | Intent classification + Skills (Phase 4) | [`intent.py`](intent.py); [`skills/`](skills/) | `test_intent_and_skills.py` |
+| 14 | **Intent classifier wired into conversation graph as a gated hint (RO1)** | [`conversation_graph.py`](conversation_graph.py) `_classify_intent` node; [`config.py`](config.py) `wren_intent_classification_enabled` (default off) | `test_seam_wiring.py::test_intent_classification_*` |
+| 15 | **SemanticPipeline facade — deterministic plan-and-execute core (4.1)** | [`semantic_layer/pipeline.py`](semantic_layer/pipeline.py) | `test_semantic_pipeline.py` (3) |
+| 16 | Dependencies: `wren-core-py` hard dep; `psycopg` documented for prod | [`requirements-ai-agent.txt`](../requirements-ai-agent.txt) (L36, L47) | n/a (CI installs wheel — RE1) |
+| 17 | **Cube dimension/time-dimension/hierarchy structural validation (RM1a)** | [`mdl_validator.py`](semantic_layer/mdl_validator.py) `_validate_named_entries` | `test_mdl_validator.py::test_cube_dimension_*` (3) |
+| 18 | **Gated engine-feedback correction loop, one-shot graph (1.4)** | [`graph.py`](graph.py) `_correct_semantic_sql` + `correct_semantic_sql` node; [`config.py`](config.py) `wren_engine_max_correction_retries` (default 0); [`planning.py`](semantic_layer/engine/planning.py) `correctable_warnings` | `test_graph_semantic_engine.py::test_engine_correction_*` (2) |
+| 19 | **Intent routing short-circuit, conversation graph (RO1a)** | [`conversation_graph.py`](conversation_graph.py) `_answer_directly` + `_route_after_intent`; [`config.py`](config.py) `wren_intent_routing_enabled` (default 0) | `test_seam_wiring.py::test_intent_routing_*` (2) |
+| 20 | **Frontend surfacing: engine + semantic/native SQL + retrieval mode (RV3)** | [`AuditInfoPanel.tsx`](../superset-frontend/src/SqlLab/components/AiAgentPanel/AuditInfoPanel.tsx) (friendly labels + engine/retrieval badges); [`api.ts`](../superset-frontend/src/SqlLab/components/AiAgentPanel/api.ts) (`AuditInfo.engine/semantic_sql/native_sql`, `WrenContextArtifact.retrieval_mode`) | `AuditInfoPanel.test.tsx` |
+| 21 | **Memory-reuse signal end-to-end + "Reused N learned example(s)" badge (RV3)** | `WrenContextArtifact.recalled_example_count` stamped in both graphs' draft nodes ([`graph.py`](graph.py) / [`conversation_graph.py`](conversation_graph.py)); badge in [`AuditInfoPanel.tsx`](../superset-frontend/src/SqlLab/components/AiAgentPanel/AuditInfoPanel.tsx) | `test_graph_semantic_engine.py` (count) + `AuditInfoPanel.test.tsx` (2) |
+| 22 | **Memory write-back dedup (RV4a)** | [`memory_store.py`](semantic_layer/memory_store.py) `_dedup_key`; `InMemoryMemory`/`SqlAlchemyMemory` refresh-in-place on repeat | `test_memory_store.py::test_*_dedup*` (3) |
+| 23 | **Ephemeral-store warning: "models not persisted" UI banner (RV3)** | [`schemas.py`](schemas.py) + [`app.py`](app.py) `HealthResponse.semantic_layer_persistent`; warning `Alert` in [`index.tsx`](../superset-frontend/src/SqlLab/components/AiAgentPanel/index.tsx) | `test_app.py::test_health_*` |
+| 24 | **Memory decay: per-scope example cap (evict oldest) (RV4a)** | [`memory_store.py`](semantic_layer/memory_store.py) `max_examples` + `_evict_old`; [`config.py`](config.py) `wren_memory_max_examples` (default 200) | `test_memory_store.py::test_*_decay_*` (2) |
+| 25 | **Deeper cube semantics: granularity + hierarchy-level resolution (RM1a)** | [`mdl_validator.py`](semantic_layer/mdl_validator.py) `_validate_cube_semantics` (warning-only) | `test_mdl_validator.py::test_cube_*granularity*` / `*hierarchy*` (4) |
+| 26 | **Engine correction loop in the conversation graph (1.4, symmetric)** | [`conversation_graph.py`](conversation_graph.py) `_correct_semantic_sql` + `correct_semantic_sql` node; gated by `wren_engine_max_correction_retries` (default 0) | `test_seam_wiring.py::test_conversation_engine_correction_*` (2) |
+
+### ⏳ Pending / deferred (with tracking ID)
+
+These four remaining items are **larger/structural or stretch** and warrant a
+scoping decision before being picked up (the functional parity surface is
+complete; these are refactors, optional installs, or experiments):
+
+| # | Item | Status | Tracking / note |
+| --- | --- | --- | --- |
+| A | Seams package consolidation + `SeamBundle` factory (0.1–0.2, 0.4) | `[TODO]` | **Structural/refactor, zero behavior change.** The six bindings exist and work under `engine/`, `schema_retriever.py`, `memory_store.py`, `llm/embeddings.py`; consolidating into `semantic_layer/seams/` is cosmetic and risks churn for no functional gain. Lowest value. |
+| D | Full graph→pipeline **drafting inversion** (graphs become thin callers) | `[TODO]` | **Large refactor, real drift risk.** RO2a — the `SemanticPipeline` facade exists (#15) but takes semantic SQL as input; inverting the LangGraph drafting loop into the pipeline is a multi-day rework of the keystone graphs. |
+| E | LangChain / Pydantic-AI framework adapters (4.4) | `[TODO]` | **Stretch / optional install.** RO2b — thin tool wrappers around the pipeline; out of the default install. Value depends on whether external framework embedding is a real requirement. |
+| I | Throwaway A/B spike vs. upstream Wren mesh | `[TODO]` | **Experiment, not shippable code.** De-risking exercise; a one-off comparison, not an implementation task. |
+
+The deeper LanceDB-backed **persistent vector index (RV2a)** also remains a TODO
+— an optional optimization over the working in-memory cosine retrieval; it only
+matters at very wide-schema scale and adds an optional dependency.
+
+### ⚠️ Known limitation (new finding)
+
+- **RE1b** — wren-core 0.7.1 in embedded mode (no registered data source) raises
+  an internal `CSV error: No such file or directory` on **relationship-traversal**
+  auto-joins (a calculated column like `customer.region` the LLM references
+  without writing the join). Explicit multi-model joins **do** rewrite (golden
+  test #12); the engine degrades closed on the error. Re-verify on a wren-core
+  upgrade. Source: [`semantic_layer/engine/wren_core_engine.py`](semantic_layer/engine/wren_core_engine.py)
+  `_degraded`; characterized in `test_semantic_engine.py`.
+
+### Open decision
+
+- **OQ1** — semantic-SQL authoring rollout (engine-on by default vs. per-project
+  opt-in). Recommendation stands: ship behind `wren_engine`, flip per-project
+  after the golden tests + a real-schema A/B. See [Phase 1](#phase-1--semanticengine-the-keystone).
+
+---
+
 ## How to use this document
 
 1. Work **top-down by phase**. Phase 0 unblocks everything; do not start a later
@@ -218,14 +298,23 @@ manifest), so **Phase 0 makes DB-backed semantic persistence the baseline**
 | 0 | Seam refactor + default bindings (0.1–0.2, 0.4) | `[TODO]` |
 | 1 | SemanticEngine seam (protocol + passthrough + wren-core scaffold) | `[COMPLETE]` (2026-06-22) |
 | 1 | SemanticEngine graph wiring + audit (both graphs) | `[COMPLETE]` (2026-06-22) |
-| 1 | Semantic-SQL prompt mode + engine-feedback correction loop | `[COMPLETE]` (2026-06-22) |
-| 1 | Semantic-SQL prompt + correction loop | `[TODO]` |
+| 1 | Semantic-SQL prompt mode (1.3) | `[COMPLETE]` (2026-06-22) |
+| 1 | Engine-feedback correction loop, both graphs (1.4) | `[COMPLETE]` (2026-06-23, gated, default off) |
 | 2 | Embedder + Retriever seam (keyword default, embedding optional) | `[COMPLETE]` (2026-06-22) |
+| 2 | Retriever seam consumed by both graphs (RV2) | `[COMPLETE]` (2026-06-23) |
 | 2 | Memory learning loop (NL→SQL examples) | `[COMPLETE]` (2026-06-22) |
+| 2 | Conversation-graph memory write-back + recall (RV4) | `[COMPLETE]` (2026-06-23) |
 | 3 | MDL completeness (cubes/metrics) | `[COMPLETE]` (2026-06-22) |
-| 3 | wren-core deep-validation CI job | `[TODO]` (RE1) |
+| 3 | Metric/cube structural validation (RM1) | `[COMPLETE]` (2026-06-23) |
+| 3 | Cube dimension/hierarchy shape + granularity/level semantics (RM1a) | `[COMPLETE]` (2026-06-23) |
+| 3 | wren-core deep-validation CI job (RE1) | `[COMPLETE]` (2026-06-23) |
 | 4 | Intent classification + Skills | `[COMPLETE]` (2026-06-22) |
-| 4 | SemanticPipeline facade + framework adapters | `[TODO]` (deferred) |
+| 4 | Intent classifier wired into conversation graph (RO1, gated hint) | `[COMPLETE]` (2026-06-23) |
+| 4 | Intent routing short-circuit, conversation graph (RO1a, gated) | `[COMPLETE]` (2026-06-23) |
+| 4 | SemanticPipeline facade (4.1, deterministic core) | `[COMPLETE]` (2026-06-23) |
+| 4 | Framework adapters (4.4, LangChain/Pydantic-AI) | `[TODO]` (deferred) |
+| 2 | Memory dedup + decay (RV4a) | `[COMPLETE]` (2026-06-23) |
+| Cross | Frontend surfacing: engine + semantic/native SQL + retrieval mode + memory badge + persistence warning (RV3) | `[COMPLETE]` (2026-06-23) |
 
 ---
 
@@ -570,10 +659,19 @@ instead. Functionally equivalent and simpler, but a reviewer expecting a prompt
 file diff won't find one. Effective only with `wren_engine=wren_core` (RE1), so
 unverified end-to-end against a live model writing real semantic SQL.
 
-**Residual risk RG4:** 1.4 feedback is best-effort — engine rewrite failures
-*degrade to passthrough* (no hard error), so `engine_warnings` carries the
-soft-gate/degrade reasons, not a wren-core validation error (that arrives only
-once RE1 lands and `plan_sql` can surface a hard failure).
+**~~Residual risk RG4~~ — ADDRESSED for the one-shot graph (2026-06-23):** a
+gated engine-feedback correction loop now exists. `plan_semantic_sql_step` splits
+the **correctable** hallucination-gate warning (unknown model/table) from
+non-correctable degrade reasons (`PlanStepResult.correctable_warnings`); when
+`wren_engine_max_correction_retries > 0`, [`graph.py`](graph.py)'s
+`_route_after_validation` routes a *valid* draft that references a hallucinated
+table to `_correct_semantic_sql` (bounded re-draft, per-attempt trace event)
+before executing. **Dev-intent divergences:** (a) default is **0 (off)**, not the
+plan's 2 — the gate is best-effort (RE2 over/under-reporting), so opt-in avoids
+spurious re-drafts; (b) implemented in the **one-shot graph only** — the
+conversation graph keeps its result-driven reflection loop; (c) it never fires
+without a materialized MDL (empty manifest → no gate). Tests:
+`test_graph_semantic_engine.py::test_engine_correction_*`.
 
 #### Original 1.3 spec (retained)
 
@@ -672,21 +770,47 @@ and (b) memory recall is **token-overlap**, not vector similarity (RV1b). LanceD
 is the deferred optimization for wide schemas / semantic recall; the seams accept
 it as a drop-in.
 
-**Residual risk RV2 (parity gap):** the **Retriever seam is not yet consumed by
-the graphs** — `fetch_context`/`_load_wren_context` still use the older
-`retrieval.py` keyword path for the prompt context. The new `Retriever` is wired
-and tested in isolation but not yet swapped into the live context-load step;
-that swap is a follow-up so the richer chunking reaches the prompt.
+**~~Residual risk RV2~~ — RESOLVED (2026-06-23):** the `Retriever` seam is now
+consumed by **both graphs**. `retrieve_mdl_context`
+([`schema_retriever.py`](semantic_layer/schema_retriever.py); named to avoid
+collision with the legacy dataset-ranking `retrieval.retrieve_schema_context`)
+compiles the project's active MDL → `SchemaItem` chunks → ranks with the
+configured retriever and appends the top-k to `WrenContextArtifact.context_items`
+(plus a `retrieval_mode` stamp) in `_load_wren_context` of [`graph.py`](graph.py)
+and [`conversation_graph.py`](conversation_graph.py). Degrades closed (no project /
+no store / no active MDL / any error → `[]`), so the legacy `retrieval.py`
+keyword context path is untouched when the retriever has nothing to add. The
+older `retrieval.py` overlay still also runs; the two are additive.
+Tests: [`test_seam_wiring.py`](../tests/unit_tests/superset_ai_agent/test_seam_wiring.py)
+(`test_retrieve_mdl_context_*`). **Residual RV2a:** the embedding path still
+recomputes embeddings per request (no persistent LanceDB index — see RV1a).
 
-**Residual risk RV3 (UI gap):** nothing surfaces retrieval mode or "answered from
-a learned example" in the UI (Phase 4 follow-on); users can't see the learning
-loop working.
+**~~Residual risk RV3~~ — partially RESOLVED (2026-06-23):** the AI panel audit
+collapsible now surfaces an `Engine: …` badge, friendly `Semantic SQL`/`Native
+SQL` labels, and a `Retrieval: …` badge (from `WrenContextArtifact.retrieval_mode`)
+— [`AuditInfoPanel.tsx`](../superset-frontend/src/SqlLab/components/AiAgentPanel/AuditInfoPanel.tsx),
+typed in [`api.ts`](../superset-frontend/src/SqlLab/components/AiAgentPanel/api.ts),
+test `AuditInfoPanel.test.tsx`. **Still open:** a "answered from a learned
+example" memory badge — the backend exposes no per-response recall-reuse flag, so
+there is nothing for the UI to bind to yet.
 
-**Residual risk RV4:** memory write-back fires for **every** successful execution
-(one-shot graph) and is **not yet wired into the conversation graph**. There is
-no dedup/decay, and one-shot `execute=true` auto-confirms — a noisier signal than
-Wren's explicit confirmation. Conversation-graph write-back + dedup is a
-follow-up.
+**~~Residual risk RV4~~ — RESOLVED for conversation-graph write-back
+(2026-06-23):** memory write-back is now wired into the **conversation graph**
+([`conversation_graph.py`](conversation_graph.py)`::_execute_sql`) and recall
+into the draft prompt (`_draft_response` → `recalled_examples` in the payload),
+mirroring the one-shot graph. Approved-SQL turns are excluded from write-back
+(their message is not a natural-language question). Tests:
+[`test_seam_wiring.py`](../tests/unit_tests/superset_ai_agent/test_seam_wiring.py)
+(`test_conversation_memory_writeback_and_recall_round_trip`). **~~Residual RV4a~~
+— dedup RESOLVED (2026-06-23):** write-back now dedups on the normalized
+(question, native_sql) key — a repeat refreshes the existing example in place
+rather than accumulating (`memory_store.py::_dedup_key`; both stores; +3 tests).
+**Decay (2026-06-23):** a per-scope **count cap** now evicts the oldest examples
+past `wren_memory_max_examples` (default 200) in both stores (`max_examples` +
+`_evict_old`; +2 tests). **Still open:** (a) cap is count-based, not age/TTL-based;
+(b) successful auto-execute turns still auto-confirm (a noisier signal than Wren's
+explicit confirmation); (c) the SqlAlchemy dedup/evict scans recent rows per write
+(bounded, single-worker-scale per R-C).
 
 ### 2.1 Embedder seam
 
@@ -812,18 +936,39 @@ measures/dimensions/timeDimensions/hierarchies; `MdlManifest.metrics`/`cubes`);
 `test_compile_manifest_maps_metrics_and_cubes`. Suite: **225 passed, 2 skipped**;
 `ruff` clean.
 
-**Residual risk RM1 (gap):** the structural **validator** was not extended to
-enforce metric/cube shape (base_object resolves, measure expressions present) —
-the manifest is `extra="allow"`, so malformed metrics/cubes pass structural
-validation and would only be caught by wren-core deep validation (RE1). Add
-metric/cube structural checks in `mdl_validator` as a follow-up.
+**~~Residual risk RM1~~ — RESOLVED (2026-06-23):** the structural **validator**
+now enforces metric/cube shape ([`mdl_validator.py`](semantic_layer/mdl_validator.py)
+`_validate_metrics` / `_validate_cubes`): duplicate metric/cube names are errors;
+`base_object` resolution against models/views/cubes is a per-file warning and a
+project-manifest error (mirroring relationship resolution); metrics without an
+expression/measures and cubes without measures (or measures without an
+expression) warn. A metric/cube-only file is no longer `empty_root`. Tests:
+[`test_mdl_validator.py`](../tests/unit_tests/superset_ai_agent/test_mdl_validator.py)
+(7 new). **~~Residual RM1a~~ — partially RESOLVED (2026-06-23):** cube
+dimensions/time-dimensions/hierarchies must now each be **named mappings**
+(`_validate_named_entries`; codes `cube_entry_without_name`/`cube_invalid_entries`;
++3 tests). **Still open:** deeper semantics — time-dimension granularity values
+and hierarchy levels resolving to real dimensions — remain `extra="allow"`, left
+to wren-core deep validation.
 
 **Residual risk RM2:** the camelCase metric/cube shapes
 (`baseObject`/`timeDimensions`) are **unverified against a live wren-core**
 (RE1/R16). Re-verify before enabling deep validation.
 
-The deep-validation **CI job** (install wren-core, run the skipif'd tests) remains
-`[TODO]`, gated on the wren-core packaging decision (RE1).
+**~~Deep-validation CI job~~ — RESOLVED (2026-06-23):** a dedicated workflow
+[`.github/workflows/superset-ai-agent.yml`](../.github/workflows/superset-ai-agent.yml)
+installs `requirements-ai-agent.txt` (which carries `wren-core-py`), asserts
+`import wren_core` succeeds, then runs the AI-agent suite — so the wren-core-gated
+rewrite/deep-validation tests (skipped locally when the wheel is absent) actually
+execute in CI. New golden test
+[`test_semantic_engine.py`](../tests/unit_tests/superset_ai_agent/test_semantic_engine.py)::
+`test_wren_core_rewrites_multi_model_join` asserts a two-model join expands into
+native CTEs + `INNER JOIN sales.deals/sales.customers`. **New finding RE1b:**
+wren-core 0.7.1 in embedded mode (no registered data source) raises an internal
+"CSV error: No such file or directory" on **relationship-traversal** auto-joins
+(a calculated column like `customer.region` that the LLM references without
+writing the join), so that specific litmus is unmet; explicit multi-model joins
+do rewrite. The engine degrades closed on the error (SQL preserved + warning).
 
 **Parity target:** Wren MDL includes cubes (measures/dimensions/time
 dimensions/hierarchies) and first-class metrics; engine deep-validates manifests.
@@ -857,17 +1002,44 @@ loader). Tests:
 (6 — each intent, fail-closed on error/bad-JSON, skill listing/loading, unknown
 skill). Suite: **231 passed, 2 skipped**; `ruff` clean.
 
-**Residual risk RO1 (gap vs intent):** `classify_intent` is **not yet wired into
-the graphs** — it is a tested utility, but the conversation graph still routes
-answer-vs-SQL inside `_draft_response`. Wiring it as a pre-node (short-circuit
-`general`/`clarify`) is a follow-up; the existing routing already covers the
-common case.
+**~~Residual risk RO1~~ — RESOLVED as a gated hint (2026-06-23):**
+`classify_intent` is now wired into the **conversation graph** as a `classify_intent`
+pre-node (after `load_conversation`, before `load_context`), gated by
+`wren_intent_classification_enabled` (default **off** — adds one LLM call/turn).
+When on, it stamps `state["intent"]`, emits a `classify_intent` trace event, and
+passes the label to the conversation model as a hint in the draft payload.
+Approved-SQL turns and the disabled path are no-ops; fails closed to
+`text_to_sql`. Tests:
+[`test_seam_wiring.py`](../tests/unit_tests/superset_ai_agent/test_seam_wiring.py)
+(`test_intent_classification_runs_when_enabled` / `_off_by_default`).
+**~~Residual RO1a~~ — RESOLVED (2026-06-23):** a true routing short-circuit now
+exists, gated by `wren_intent_routing_enabled` (default off, requires
+classification on). When a turn is classified `general`/`clarify`,
+[`conversation_graph.py`](conversation_graph.py)'s `_route_after_intent` routes to
+`_answer_directly`, which answers from conversation history + the intent label and
+**skips context-load + MDL materialization + the entire SQL path** (no execution).
+Tests: `test_seam_wiring.py::test_intent_routing_*`. **Risk (inherent):** a
+misclassified data question labeled `general`/`clarify` gets a non-answer; mitigated
+by gating off-by-default and failing closed to `text_to_sql` on classifier error,
+but a *confident* wrong classification still short-circuits. One-shot graph is
+intentionally excluded (its contract is text-to-SQL).
 
-**Residual risk RO2 (deferred):** the **SemanticPipeline facade (4.1)** and
-**LangChain/Pydantic-AI adapters (4.4)** are not implemented. The six seams are
-individually usable and tested, but there is no single importable
-"plan-and-execute" object yet, and no framework tool wrappers. These are the
-"embed beyond Wren" surface and the recommended next build once the seams settle.
+**~~Residual risk RO2~~ — PARTIALLY RESOLVED (2026-06-23):** the
+**SemanticPipeline facade (4.1)** now exists
+([`semantic_layer/pipeline.py`](semantic_layer/pipeline.py)) as a single
+importable object composing the deterministic seams (Retriever, SemanticEngine,
+Executor, Memory) + the intent classifier:
+`classify_intent → retrieve_context → plan_and_execute (rewrite → validate →
+execute → store)`. It reuses the exact shared steps the graphs use
+(`plan_semantic_sql_step`, `validate_read_only_sql`, the Superset executor) so it
+cannot drift. Tests:
+[`test_semantic_pipeline.py`](../tests/unit_tests/superset_ai_agent/test_semantic_pipeline.py)
+(3). **Residual RO2a:** the facade takes **semantic SQL as input** — the LLM
+drafting/orchestration loop still lives in the LangGraph graphs, so the full
+inversion (graphs become thin callers of the pipeline) is **not** done; the
+pipeline is the embeddable deterministic core, not yet the drafting orchestrator.
+**Residual RO2b:** the **LangChain/Pydantic-AI adapters (4.4)** are still not
+implemented (no framework tool wrappers).
 
 **Residual risk RO3 (UI gap):** skills are backend-only; nothing surfaces them in
 the UI, and intent classification has no UI affordance.
@@ -915,15 +1087,17 @@ load.
 
 | Key | Default | Purpose |
 | --- | --- | --- |
-| `wren_engine` | `passthrough` | `passthrough` \| `wren_core` |
+| `wren_engine` | `wren_core` | `passthrough` \| `wren_core` (default flipped to `wren_core` in Milestone B) |
 | `wren_semantic_sql_enabled` | `false` | semantic-SQL prompt mode |
-| `wren_engine_max_correction_retries` | `2` | engine-error correction loop |
+| `wren_engine_max_correction_retries` | `0` | engine hallucination-feedback correction loop (one-shot graph; default off — see RG4) |
 | `wren_retriever` | `keyword` | `keyword` \| `embedding` |
 | `wren_lancedb_path` | `{storage}/lancedb` | vector index root |
 | `embedder_*` (`AI_AGENT_EMBEDDER_*`) | see [2.1](#21-embedder-seam) | embedder — full env-var table in Phase 2 |
 | `wren_memory_store` | `none` | `none` \| `sqlalchemy` \| `lancedb` |
 | `wren_memory_learning_enabled` | `true` | write-back on confirmed success |
 | `wren_memory_recall_k` | `3` | few-shot count |
+| `wren_intent_classification_enabled` | `false` | gated intent pre-node (conversation graph, RO1) |
+| `wren_intent_routing_enabled` | `false` | route general/clarify to a direct answer (RO1a; needs classification on) |
 
 Keep `WREN_EXECUTION_ENABLED` rejected at startup. Existing
 `wren_core_validation_enabled` is subsumed by `wren_engine=wren_core` (keep as an
@@ -931,16 +1105,17 @@ alias for one release).
 
 ### Dependencies (all optional, import-guarded)
 
-- [ ] `wren-core` (Phase 1) — uncomment in
-      [`requirements-ai-agent.txt`](../requirements-ai-agent.txt); CI installs it.
-- [ ] `lancedb` (Phase 2) — optional extra; absent → keyword retrieval + sqla
-      memory.
-- [ ] embeddings provider SDK reuse (Phase 2) — reuse existing provider deps
-      (`openai` is already present and covers embeddings) where possible.
-- [ ] **`psycopg` (Phase 0, prod)** — required for Postgres-backed persistence;
-      only `sqlite` works out of the box today. Add to a deployment requirements
-      file (per [`wren.md`](wren.md) Agent-Owned Database). Not needed for dev
-      (sqlite default).
+- [x] `wren-core` (Phase 1) — a **hard dependency** in
+      [`requirements-ai-agent.txt`](../requirements-ai-agent.txt); the AI-agent CI
+      job installs it ([`superset-ai-agent.yml`](../.github/workflows/superset-ai-agent.yml)).
+- [ ] `lancedb` (Phase 2) — optional extra (commented); absent → keyword
+      retrieval + sqla memory.
+- [x] embeddings provider SDK reuse (Phase 2) — `openai` is already present and
+      covers embeddings.
+- [x] **`psycopg` (Phase 0, prod)** — documented as an optional (commented)
+      production dependency in
+      [`requirements-ai-agent.txt`](../requirements-ai-agent.txt); only `sqlite`
+      works out of the box today. Not needed for dev (sqlite default).
 
 ### Migrations
 
@@ -952,23 +1127,35 @@ alias for one release).
 Baseline UI is already substantial and modeling-ready — `SemanticLayerEditor`
 (onboarding/enrich/materialize/import wired). Parity adds surfacing only:
 
-- [ ] Surface engine status (`engine=wren_core|passthrough`) and the
-      semantic-vs-native SQL in the AI panel audit collapsible
-      ([`AuditInfoPanel.tsx`](../superset-frontend/src/SqlLab/components/AiAgentPanel/AuditInfoPanel.tsx)).
-- [ ] Surface retrieval mode (keyword/embedding) and whether a query reused a
-      learned example (memory badge).
-- [ ] Surface persistence mode + a "models are not persisted" warning when the
-      service runs in `semantic_layer_store=memory` (dev), so users don't model
-      against an ephemeral store unaware.
+- [x] Surface engine status (`engine`) and the semantic-vs-native SQL in the AI
+      panel audit collapsible — done (2026-06-23):
+      [`AuditInfoPanel.tsx`](../superset-frontend/src/SqlLab/components/AiAgentPanel/AuditInfoPanel.tsx)
+      now renders an `Engine: …` badge + friendly `Semantic SQL`/`Native SQL`
+      labels; [`api.ts`](../superset-frontend/src/SqlLab/components/AiAgentPanel/api.ts)
+      types `AuditInfo.engine/semantic_sql/native_sql`. Test: `AuditInfoPanel.test.tsx`.
+- [x] Surface retrieval mode (keyword/embedding) and a "reused a learned
+      example" badge — done (2026-06-23): a `Retrieval: …` badge from
+      `WrenContextArtifact.retrieval_mode` and a `Reused N learned example(s)`
+      badge from `WrenContextArtifact.recalled_example_count` (stamped in both
+      graphs' draft nodes). Test: `AuditInfoPanel.test.tsx`.
+- [x] Surface a "models are not persisted" warning when the service runs in
+      `semantic_layer_store=memory` — done (2026-06-23):
+      `HealthResponse.semantic_layer_persistent` ([`app.py`](app.py)/[`schemas.py`](schemas.py))
+      drives a warning `Alert` in
+      [`index.tsx`](../superset-frontend/src/SqlLab/components/AiAgentPanel/index.tsx).
+      Test: `test_app.py::test_health_and_models_use_injected_ollama_client`.
 
 ---
 
 ## Overall Acceptance — "Full Parity" Definition of Done
 
-**Status (2026-06-22):** all six seams have a working binding with tests; the
-remaining gaps are wren-core live verification (RE1) and the consume/wire + UI
-follow-ups noted per phase. Backend suite: **231 passed, 2 skipped**; zero new
-ruff errors vs master.
+**Status (2026-06-23):** all six seams have a working binding with tests, are
+wired into the live graphs (RV2 retriever, RV4 conversation memory, RO1 intent
+hint), and now have a wren-core CI engine job (RE1), metric/cube structural
+validation (RM1), and a SemanticPipeline facade (4.1). The remaining gaps are the
+persistent vector index / dedup optimizations, the full graph→pipeline inversion
++ framework adapters (RO2a/b), and the UI surfacing. Backend suite: **253 passed,
+2 skipped**; `ruff` clean on changed files.
 
 - [x] **Persistence:** MDL, projects, and the materialized manifest are durable
       (survive restart) under `semantic_layer_store=sqlalchemy`; parity features
@@ -978,9 +1165,9 @@ ruff errors vs master.
       Superset only. *(verified live: `test_semantic_engine.py` model→physical +
       calculated-column rewrites; default-on; degrades to passthrough on
       unsupported dialects like sqlite.)*
-- [~] **Retrieval:** embedding retrieval ranks by cosine and degrades to keyword.
-      *(seam verified in isolation; not yet swapped into the live context-load —
-      RV2.)*
+- [x] **Retrieval:** embedding retrieval ranks by cosine and degrades to keyword,
+      and is now consumed by both graphs' context-load (RV2). *(verified:
+      `test_seam_wiring.py`; persistent LanceDB index still deferred — RV2a.)*
 - [x] **Memory:** a previously-confirmed question is recalled as few-shot.
       *(verified: `test_memory_store.py` + graph round-trip.)*
 - [x] **Modeler:** onboarding + doc enrichment produce activatable draft MDL
@@ -988,12 +1175,16 @@ ruff errors vs master.
 - [x] **Executor:** every execution is Superset-only, read-only-validated, and
       audited with semantic+native SQL. *(verified: graph engine tests.)*
 - [~] **Orchestrator/Skills:** intent classifier + skills exist and are tested;
-      not yet wired as a graph pre-node (RO1); SemanticPipeline facade +
-      framework adapters deferred (RO2).
+      the classifier is wired into the conversation graph as a gated pre-node hint
+      (RO1), and the **SemanticPipeline facade (4.1) now composes the deterministic
+      seams** (RO2). A true intent routing short-circuit (RO1a), the full
+      graph→pipeline drafting inversion (RO2a), and framework adapters (RO2b/4.4)
+      remain deferred.
 - [ ] Throwaway **A/B spike** vs. a full upstream Wren mesh (de-risking).
-- [~] `pre-commit run --all-files` / CI: backend unit suite green, ruff clean on
-      changed files; the **wren-core CI engine job** (RE1) remains the gating
-      item for engine parity.
+- [x] **CI:** backend unit suite green (**253 passed, 2 skipped**), ruff clean on
+      changed files; the **wren-core CI engine job** (RE1) now installs the wheel
+      and runs the engine-present tests
+      ([`superset-ai-agent.yml`](../.github/workflows/superset-ai-agent.yml)).
 
 Legend: `[x]` done & verified · `[~]` core done, follow-up/gated · `[ ]` not started.
 

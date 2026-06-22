@@ -26,14 +26,21 @@ embedder is unavailable (governance: degrade closed).
 
 from __future__ import annotations
 
+import logging
 import math
-from typing import Protocol
+from typing import Any, Protocol
 
 from pydantic import BaseModel
 
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.llm.embeddings import Embedder, NullEmbedder
-from superset_ai_agent.semantic_layer.mdl_compile import CompiledManifest
+from superset_ai_agent.semantic_layer.mdl_compile import (
+    compile_manifest,
+    CompiledManifest,
+)
+from superset_ai_agent.semantic_layer.mdl_files import MdlFileStore
+
+logger = logging.getLogger(__name__)
 
 
 class SchemaItem(BaseModel):
@@ -177,3 +184,58 @@ def create_retriever(
         if active.is_available():
             return EmbeddingRetriever(active)
     return KeywordRetriever()
+
+
+def retrieve_mdl_context(
+    *,
+    config: AgentConfig,
+    retriever: Retriever,
+    question: str,
+    project_id: str | None,
+    owner_id: str,
+    mdl_file_store: MdlFileStore | None,
+) -> list[dict[str, Any]]:
+    """Rank a project's active MDL into prompt context-item dicts for a question.
+
+    Distinct from [`retrieval.retrieve_schema_context`](retrieval.py), which ranks
+    physical Superset *datasets*; this ranks compiled *MDL* schema items (models/
+    columns/relationships) via the configured `Retriever` seam.
+
+    Compiles the project's active MDL files, chunks them into ``SchemaItem``s
+    (Wren ``schema_items`` parity), ranks them with the configured retriever, and
+    returns the top-k as ``context_items`` dicts the SQL prompt already consumes.
+
+    Degrades closed: returns ``[]`` when there is no project, no MDL file store,
+    no active MDL, or on any error — so the existing keyword context path is
+    never disrupted when the retriever has nothing to add.
+    """
+
+    if project_id is None or mdl_file_store is None:
+        return []
+    try:
+        active_files = [
+            file
+            for file in mdl_file_store.list(project_id, owner_id=owner_id)
+            if file.status == "active" and file.deleted_at is None
+        ]
+        if not active_files:
+            return []
+        manifest = compile_manifest(active_files)
+        items = manifest_to_schema_items(manifest)
+        if not items:
+            return []
+        top = retriever.retrieve(question, items, config.wren_context_limit)
+        return [
+            {
+                "source": "retriever",
+                "retriever": retriever.name,
+                "kind": item.kind,
+                "name": item.name,
+                "model": item.model,
+                "text": item.text,
+            }
+            for item in top
+        ]
+    except Exception as ex:  # pylint: disable=broad-except - retrieval is best-effort
+        logger.warning("Schema retrieval failed; using keyword context only: %s", ex)
+        return []

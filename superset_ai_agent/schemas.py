@@ -155,6 +155,10 @@ class WrenContextArtifact(BaseModel):
     semantic_layer_version: str | None = None
     indexing_status: str | None = None
     context_items: list[dict[str, Any]] = Field(default_factory=list)
+    retrieval_mode: str | None = None
+    #: How many confirmed NL->SQL examples the memory seam recalled into the
+    #: prompt for this turn (0 when learning is off). Surfaced as a UI badge.
+    recalled_example_count: int = 0
     retrieval: WrenRetrievalArtifact | None = None
     dry_plan: dict[str, Any] | None = None
     warnings: list[str] = Field(default_factory=list)
@@ -214,3 +218,6 @@ class HealthResponse(BaseModel):
     reachable: bool
     ollama_base_url: str | None = None
     ollama_reachable: bool | None = None
+    #: False when the semantic layer runs in-memory (models lost on restart), so
+    #: the UI can warn before users model against an ephemeral store.
+    semantic_layer_persistent: bool = True

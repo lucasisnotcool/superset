@@ -39,3 +39,9 @@ wren-core-py>=0.7,<0.8
 # optimization). Embedding retrieval works without it (in-memory cosine over the
 # configured embedder); install only to scale to very wide schemas.
 # lancedb>=0.13
+#
+# Optional (production): PostgreSQL driver for durable agent persistence
+# (AI_AGENT_DATABASE_URL=postgresql+psycopg://...). The default
+# sqlite:///./.data/ai_agent.db needs no driver; install this only when pointing
+# conversation/semantic stores at Postgres for multi-worker deployments.
+# psycopg[binary]>=3.1,<4.0

@@ -291,6 +291,7 @@ def create_app(  # noqa: C901
             semantic_layer_store=active_semantic_layer_store,
             semantic_project_store=active_semantic_project_store,
             mdl_file_store=active_mdl_file_store,
+            memory=active_memory,
         )
 
     api = FastAPI(title=app_config.app_name, version="0.1.0")
@@ -367,6 +368,7 @@ def create_app(  # noqa: C901
             semantic_layer_store=active_semantic_layer_store,
             semantic_project_store=active_semantic_project_store,
             mdl_file_store=active_mdl_file_store,
+            memory=active_memory,
         )
 
     def build_semantic_access_service(
@@ -463,6 +465,7 @@ def create_app(  # noqa: C901
             ollama_reachable=(
                 reachable if app_config.model_provider == "ollama" else None
             ),
+            semantic_layer_persistent=app_config.semantic_layer_store != "memory",
         )
 
     @api.get("/models", response_model=list[ModelInfo])

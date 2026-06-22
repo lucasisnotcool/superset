@@ -1149,6 +1149,17 @@ const AiAgentPanel = () => {
           {queryEditor?.selectedText && <Chip>{t('Selection')}</Chip>}
           <SemanticLayerStateBadge state={semanticLayerState} />
         </ContextChips>
+        {health?.semantic_layer_persistent === false && (
+          <Alert
+            type="warning"
+            closable={false}
+            message={t(
+              'Semantic models are not persisted — they are kept in memory and ' +
+                'lost on restart. Set the semantic layer store to a database to ' +
+                'keep them.',
+            )}
+          />
+        )}
         <DatasetSelect
           databaseId={databaseId}
           schema={queryEditor?.schema}
@@ -1245,6 +1256,7 @@ const AiAgentPanel = () => {
                   />
                   <AuditInfoPanel
                     audit={artifact.audit || artifact.execution_result?.audit}
+                    wrenContext={artifact.wren_context}
                   />
                   <Flex gap="small" wrap="wrap">
                     <Button

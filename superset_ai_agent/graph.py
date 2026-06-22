@@ -34,6 +34,7 @@ from superset_ai_agent.conversations.store import DEFAULT_OWNER_ID
 from superset_ai_agent.integrations.superset.client import AgentContext, SupersetClient
 from superset_ai_agent.integrations.wren.client import DisabledWrenClient, WrenClient
 from superset_ai_agent.llm.base import ChatMessage, ModelClient
+from superset_ai_agent.llm.embeddings import create_embedder
 from superset_ai_agent.prompts.registry import get_prompt
 from superset_ai_agent.schemas import (
     AgentQueryRequest,
@@ -60,6 +61,11 @@ from superset_ai_agent.semantic_layer.mdl_files import MdlFileStore
 from superset_ai_agent.semantic_layer.memory_store import Memory, NullMemory
 from superset_ai_agent.semantic_layer.projects import SemanticProjectStore
 from superset_ai_agent.semantic_layer.runtime import merge_indexed_semantic_context
+from superset_ai_agent.semantic_layer.schema_retriever import (
+    create_retriever,
+    retrieve_mdl_context,
+    Retriever,
+)
 from superset_ai_agent.semantic_layer.schemas import WrenMaterializationResult
 from superset_ai_agent.semantic_layer.store import scope_hash, SemanticLayerStore
 from superset_ai_agent.semantic_layer.wren_runtime import (
@@ -110,6 +116,8 @@ class AgentState(TypedDict, total=False):
     native_sql: str | None
     engine: str | None
     engine_warnings: list[str]
+    engine_correctable_warnings: list[str]
+    engine_correction_attempts: int
     recalled_examples: list[dict[str, Any]]
     trace: list[TraceEvent]
     repair_attempts: int
@@ -132,6 +140,7 @@ class TextToSqlGraph:
         mdl_file_store: MdlFileStore | None = None,
         semantic_engine: SemanticEngine | None = None,
         memory: Memory | None = None,
+        retriever: Retriever | None = None,
     ):
         self.config = config
         self.model_client = model_client
@@ -143,6 +152,7 @@ class TextToSqlGraph:
         self.mdl_file_store = mdl_file_store
         self.semantic_engine = semantic_engine or create_semantic_engine(config)
         self.memory = memory or NullMemory()
+        self.retriever = retriever or create_retriever(config, create_embedder(config))
         self.graph = self._compile_graph()
 
     def run(
@@ -156,6 +166,7 @@ class TextToSqlGraph:
             "request": request,
             "trace": [],
             "repair_attempts": 0,
+            "engine_correction_attempts": 0,
             "execution_result": None,
             "answer_summary": None,
             "insight_cards": [],
@@ -213,6 +224,7 @@ class TextToSqlGraph:
         graph.add_node("plan_semantic_sql", self._plan_semantic_sql)
         graph.add_node("validate_sql", self._validate_sql)
         graph.add_node("repair_sql", self._repair_sql)
+        graph.add_node("correct_semantic_sql", self._correct_semantic_sql)
         graph.add_node("execute_sql", self._execute_sql)
         graph.add_node("build_artifacts", self._build_artifacts)
 
@@ -227,12 +239,15 @@ class TextToSqlGraph:
             self._route_after_validation,
             {
                 "repair": "repair_sql",
+                "correct": "correct_semantic_sql",
                 "execute": "execute_sql",
                 "end": END,
             },
         )
-        # Repaired drafts are re-planned through the engine before validation.
+        # Repaired/corrected drafts are re-planned through the engine before
+        # validation, so the engine rewrite + hallucination gate run again.
         graph.add_edge("repair_sql", "plan_semantic_sql")
+        graph.add_edge("correct_semantic_sql", "plan_semantic_sql")
         graph.add_edge("execute_sql", "build_artifacts")
         graph.add_edge("build_artifacts", END)
         return graph.compile()
@@ -343,6 +358,24 @@ class TextToSqlGraph:
                     "warnings": warnings,
                 }
             )
+        retrieved_items = retrieve_mdl_context(
+            config=self.config,
+            retriever=self.retriever,
+            question=request.question,
+            project_id=project_id,
+            owner_id=state.get("owner_id", DEFAULT_OWNER_ID),
+            mdl_file_store=self.mdl_file_store,
+        )
+        if retrieved_items:
+            wren_context = wren_context.model_copy(
+                update={
+                    "context_items": [
+                        *wren_context.context_items,
+                        *retrieved_items,
+                    ],
+                    "retrieval_mode": self.retriever.name,
+                }
+            )
         retrieval_artifact = state.get("wren_retrieval")
         if retrieval_artifact is not None and project_id is not None:
             retrieval_artifact = retrieval_artifact.model_copy(
@@ -402,11 +435,18 @@ class TextToSqlGraph:
             validation_errors=[],
             recalled_examples=recalled,
         )
+        # Stamp how many learned examples were recalled so the UI can badge it.
+        wren_context = state.get("wren_context")
+        if wren_context is not None:
+            wren_context = wren_context.model_copy(
+                update={"recalled_example_count": len(recalled)}
+            )
         return {
             **state,
             "sql": draft.sql,
             "explanation": draft.explanation,
             "recalled_examples": recalled,
+            "wren_context": wren_context,
             "trace": [
                 *state.get("trace", []),
                 TraceEvent(
@@ -489,6 +529,7 @@ class TextToSqlGraph:
             "native_sql": result.native_sql,
             "engine": result.engine,
             "engine_warnings": result.warnings,
+            "engine_correctable_warnings": result.correctable_warnings,
             "trace": [
                 *state.get("trace", []),
                 TraceEvent(
@@ -679,10 +720,57 @@ class TextToSqlGraph:
         request = state["request"]
         validation = state["validation"]
         if validation.is_valid:
+            # Engine-feedback correction (1.4): valid native SQL can still
+            # reference a hallucinated model the gate flagged; re-draft if a
+            # correction budget remains. Default budget 0 → straight to execute.
+            if (
+                state.get("engine_correctable_warnings")
+                and state.get("engine_correction_attempts", 0)
+                < self.config.wren_engine_max_correction_retries
+            ):
+                return "correct"
             return "execute" if request.execute else "end"
         if state.get("repair_attempts", 0) < self.config.max_repair_attempts:
             return "repair"
         return "end"
+
+    def _correct_semantic_sql(self, state: AgentState) -> AgentState:
+        """Re-draft semantic SQL using the engine's hallucination feedback (1.4).
+
+        Distinct from ``_repair_sql`` (which fixes *invalid* SQL): here validation
+        passed but the engine flagged unknown models/tables. Bounded by
+        ``wren_engine_max_correction_retries``; re-planned before re-validation.
+        """
+
+        request = state["request"]
+        context = state["context"]
+        warnings = state.get("engine_correctable_warnings", [])
+        attempt = state.get("engine_correction_attempts", 0) + 1
+        draft = self._call_sql_model(
+            request=request,
+            context=context,
+            wren_context=state.get("wren_context"),
+            validation_errors=warnings,
+            recalled_examples=state.get("recalled_examples", []),
+        )
+        return {
+            **state,
+            "sql": draft.sql,
+            "explanation": draft.explanation,
+            "engine_correction_attempts": attempt,
+            "trace": [
+                *state.get("trace", []),
+                TraceEvent(
+                    step="correct_semantic_sql",
+                    status="warning",
+                    summary=(
+                        f"Re-drafted semantic SQL (correction attempt {attempt}) "
+                        "from engine feedback."
+                    ),
+                    details={"warnings": warnings, "attempt": attempt},
+                ),
+            ],
+        }
 
     def _call_sql_model(
         self,

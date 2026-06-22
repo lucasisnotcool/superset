@@ -142,10 +142,27 @@ class AgentConfig:
     # sqlalchemy), enforced at startup.
     wren_engine: WrenEngineMode = "wren_core"
     wren_semantic_sql_enabled: bool = False
+    # Engine-feedback correction loop (1.4): when > 0 and the semantic engine
+    # flags a hallucinated model/table the draft SQL cannot resolve, re-draft up
+    # to this many times before executing. Default 0 (off) — the hallucination
+    # gate is best-effort, so correction is opt-in to avoid spurious re-drafts.
+    wren_engine_max_correction_retries: int = 0
     wren_retriever: WrenRetrieverMode = "keyword"
     wren_memory_store: WrenMemoryStoreMode = "none"
     wren_memory_learning_enabled: bool = True
     wren_memory_recall_k: int = 3
+    # Decay/aging: cap confirmed examples retained per owner+scope; the oldest are
+    # evicted past this bound so the store does not grow unbounded. 0 = unlimited.
+    wren_memory_max_examples: int = 200
+    # Classify question intent (text_to_sql | general | clarify) before drafting a
+    # conversation turn, and pass the label to the model as a hint. Off by default
+    # (adds one LLM call/turn); the model already routes answer-vs-SQL well.
+    wren_intent_classification_enabled: bool = False
+    # Routing short-circuit (RO1a): when on (requires classification on), a
+    # `general`/`clarify` intent answers directly and skips context-load + the SQL
+    # machinery. Off by default — a misclassified data question would get a
+    # non-answer, so this is opt-in beyond the hint-only RO1 default.
+    wren_intent_routing_enabled: bool = False
     wren_lancedb_path: str | None = None
     embedder_provider: str | None = None
     embedder_model: str = "text-embedding-3-small"
@@ -456,6 +473,12 @@ class AgentConfig:
                 "WREN_SEMANTIC_SQL_ENABLED",
                 cls.wren_semantic_sql_enabled,
             ),
+            wren_engine_max_correction_retries=int(
+                os.getenv(
+                    "WREN_ENGINE_MAX_CORRECTION_RETRIES",
+                    str(cls.wren_engine_max_correction_retries),
+                )
+            ),
             wren_retriever=cast(
                 WrenRetrieverMode,
                 os.getenv("WREN_RETRIEVER", cls.wren_retriever).strip().lower(),
@@ -470,6 +493,19 @@ class AgentConfig:
             ),
             wren_memory_recall_k=int(
                 os.getenv("WREN_MEMORY_RECALL_K", str(cls.wren_memory_recall_k))
+            ),
+            wren_memory_max_examples=int(
+                os.getenv(
+                    "WREN_MEMORY_MAX_EXAMPLES", str(cls.wren_memory_max_examples)
+                )
+            ),
+            wren_intent_classification_enabled=_env_bool(
+                "WREN_INTENT_CLASSIFICATION_ENABLED",
+                cls.wren_intent_classification_enabled,
+            ),
+            wren_intent_routing_enabled=_env_bool(
+                "WREN_INTENT_ROUTING_ENABLED",
+                cls.wren_intent_routing_enabled,
             ),
             wren_lancedb_path=os.getenv("WREN_LANCEDB_PATH") or cls.wren_lancedb_path,
             embedder_provider=(

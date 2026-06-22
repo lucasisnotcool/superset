@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json  # noqa: TID251 - keep the standalone agent independent of Superset
+import logging
 from collections.abc import Generator, Iterator
 from typing import Any, Literal, TypedDict
 from uuid import uuid4
@@ -49,7 +50,9 @@ from superset_ai_agent.integrations.superset.client import (
     SupersetClient,
 )
 from superset_ai_agent.integrations.wren.client import DisabledWrenClient, WrenClient
+from superset_ai_agent.intent import classify_intent
 from superset_ai_agent.llm.base import ChatMessage, ModelClient
+from superset_ai_agent.llm.embeddings import create_embedder
 from superset_ai_agent.prompts.registry import get_prompt
 from superset_ai_agent.schemas import (
     AgentQueryRequest,
@@ -72,14 +75,22 @@ from superset_ai_agent.semantic_layer.engine.planning import (
     with_engine_provenance,
 )
 from superset_ai_agent.semantic_layer.mdl_files import MdlFileStore
+from superset_ai_agent.semantic_layer.memory_store import Memory, NullMemory
 from superset_ai_agent.semantic_layer.projects import SemanticProjectStore
 from superset_ai_agent.semantic_layer.runtime import merge_indexed_semantic_context
+from superset_ai_agent.semantic_layer.schema_retriever import (
+    create_retriever,
+    retrieve_mdl_context,
+    Retriever,
+)
 from superset_ai_agent.semantic_layer.schemas import WrenMaterializationResult
-from superset_ai_agent.semantic_layer.store import SemanticLayerStore
+from superset_ai_agent.semantic_layer.store import scope_hash, SemanticLayerStore
 from superset_ai_agent.semantic_layer.wren_runtime import (
     materialize_request_semantic_project,
 )
 from superset_ai_agent.tools.sql import validate_read_only_sql
+
+logger = logging.getLogger(__name__)
 
 #: Authoring guidance injected when semantic-SQL mode is active (engine rewrites
 #: model-qualified SQL into native SQL). See wren_full.md Phase 1.3.
@@ -150,6 +161,10 @@ class ConversationState(TypedDict, total=False):
     native_sql: str | None
     engine: str | None
     engine_warnings: list[str]
+    engine_correctable_warnings: list[str]
+    engine_correction_attempts: int
+    recalled_examples: list[dict[str, Any]]
+    intent: str | None
     sql_iterations: int
     sql_observations: list[dict[str, Any]]
     attempted_sql: list[str]
@@ -176,6 +191,8 @@ class ConversationGraph:
         semantic_project_store: SemanticProjectStore | None = None,
         mdl_file_store: MdlFileStore | None = None,
         semantic_engine: SemanticEngine | None = None,
+        memory: Memory | None = None,
+        retriever: Retriever | None = None,
     ):
         self.config = config
         self.model_client = model_client
@@ -187,6 +204,8 @@ class ConversationGraph:
         self.semantic_project_store = semantic_project_store
         self.mdl_file_store = mdl_file_store
         self.semantic_engine = semantic_engine or create_semantic_engine(config)
+        self.memory = memory or NullMemory()
+        self.retriever = retriever or create_retriever(config, create_embedder(config))
         self.graph = self._compile_graph()
 
     def run(
@@ -395,6 +414,7 @@ class ConversationGraph:
             "request": request,
             "trace": [],
             "repair_attempts": 0,
+            "engine_correction_attempts": 0,
             "execution_result": None,
             "answer_summary": None,
             "insight_cards": [],
@@ -406,6 +426,8 @@ class ConversationGraph:
             "wren_retrieval": None,
             "wren_materialization": None,
             "wren_mdl_path": None,
+            "recalled_examples": [],
+            "intent": None,
             "artifacts": [],
             "pending_artifact": None,
             "sql_iterations": 0,
@@ -560,6 +582,8 @@ class ConversationGraph:
     def _compile_graph(self) -> Any:
         graph = StateGraph(ConversationState)
         graph.add_node("load_conversation", self._load_conversation)
+        graph.add_node("classify_intent", self._classify_intent)
+        graph.add_node("answer_directly", self._answer_directly)
         graph.add_node("load_context", self._load_context)
         graph.add_node("load_wren_context", self._load_wren_context)
         graph.add_node("draft_response", self._draft_response)
@@ -567,12 +591,24 @@ class ConversationGraph:
         graph.add_node("plan_semantic_sql", self._plan_semantic_sql)
         graph.add_node("validate_sql", self._validate_sql)
         graph.add_node("repair_sql", self._repair_sql)
+        graph.add_node("correct_semantic_sql", self._correct_semantic_sql)
         graph.add_node("execute_sql", self._execute_sql)
         graph.add_node("build_artifacts", self._build_artifacts)
         graph.add_node("reflect_sql_outcome", self._reflect_sql_outcome)
 
         graph.set_entry_point("load_conversation")
-        graph.add_edge("load_conversation", "load_context")
+        graph.add_edge("load_conversation", "classify_intent")
+        # Intent routing short-circuit (RO1a, gated): general/clarify answers
+        # directly and skips context-load + the SQL path. Default routes through.
+        graph.add_conditional_edges(
+            "classify_intent",
+            self._route_after_intent,
+            {
+                "answer": "answer_directly",
+                "continue": "load_context",
+            },
+        )
+        graph.add_edge("answer_directly", END)
         graph.add_edge("load_context", "load_wren_context")
         graph.add_edge("load_wren_context", "draft_response")
         graph.add_conditional_edges(
@@ -590,11 +626,13 @@ class ConversationGraph:
             self._route_after_validation,
             {
                 "repair": "repair_sql",
+                "correct": "correct_semantic_sql",
                 "execute": "execute_sql",
                 "end": END,
             },
         )
         graph.add_edge("repair_sql", "plan_semantic_sql")
+        graph.add_edge("correct_semantic_sql", "plan_semantic_sql")
         graph.add_conditional_edges(
             "execute_sql",
             self._route_after_execution,
@@ -633,6 +671,116 @@ class ConversationGraph:
                 ),
             ],
         }
+
+    def _classify_intent(self, state: ConversationState) -> ConversationState:
+        """Classify question intent and stash it as a model hint (gated, RO1).
+
+        Off by default; when enabled, the label is passed to the conversation
+        model as a hint (see ``_call_conversation_model``). Approved-SQL turns and
+        the disabled path are no-ops. Fails closed to ``text_to_sql``.
+        """
+
+        request = state["request"]
+        if not self.config.wren_intent_classification_enabled or request.approved_sql:
+            return state
+        result = classify_intent(self.model_client, request.message)
+        return {
+            **state,
+            "intent": result.intent,
+            "trace": [
+                *state.get("trace", []),
+                TraceEvent(
+                    step="classify_intent",
+                    summary=f"Classified intent as {result.intent}.",
+                    details={"intent": result.intent, "reason": result.reason},
+                ),
+            ],
+        }
+
+    def _route_after_intent(self, state: ConversationState) -> str:
+        """Route a classified non-SQL intent to a direct answer (RO1a, gated)."""
+
+        if (
+            self.config.wren_intent_routing_enabled
+            and not state["request"].approved_sql
+            and state.get("intent") in {"general", "clarify"}
+        ):
+            return "answer"
+        return "continue"
+
+    def _answer_directly(self, state: ConversationState) -> ConversationState:
+        """Answer a general/clarify turn without loading schema context or SQL.
+
+        Uses only the conversation history + the intent label, so the expensive
+        context-load + MDL materialization + SQL machinery are skipped entirely.
+        """
+
+        request = state["request"]
+        intent = state.get("intent") or "general"
+        conversation = state["conversation"]
+        prompt = get_prompt("conversation")
+        payload = {
+            "user_message": request.message,
+            "intent": intent,
+            "direct_answer_mode": True,
+            "instruction": (
+                f"This message was classified as '{intent}'. Respond directly "
+                "without SQL: answer the general/capability question, or ask one "
+                "concise clarifying question. Do not generate or reference SQL."
+            ),
+            "conversation": _conversation_payload(
+                conversation,
+                max_history_messages=self.config.max_history_messages,
+                max_prompt_result_rows=self.config.max_prompt_result_rows,
+            ),
+        }
+        draft = self._direct_answer_draft(request, payload, prompt)
+        return {
+            **state,
+            "draft": draft,
+            "validation": None,
+            "execution_result": None,
+            "pending_artifact": None,
+            "trace": [
+                *state.get("trace", []),
+                TraceEvent(
+                    step="answer_directly",
+                    summary=f"Answered {intent} intent directly (no SQL).",
+                    details={"intent": intent},
+                ),
+            ],
+        }
+
+    def _direct_answer_draft(
+        self,
+        request: ConversationTurnRequest,
+        payload: dict[str, Any],
+        prompt: str,
+    ) -> ConversationDraft:
+        result = self.model_client.chat(
+            [
+                ChatMessage(role="system", content=prompt),
+                ChatMessage(
+                    role="user",
+                    content=(
+                        "Answer this conversation turn directly without SQL.\n"
+                        f"{json.dumps(payload, default=str)}"
+                    ),
+                ),
+            ],
+            model=request.model,
+            format_schema=ConversationDraft.model_json_schema(),
+        )
+        try:
+            draft = ConversationDraft.model_validate(json.loads(result.content))
+        except Exception:  # pylint: disable=broad-except
+            return ConversationDraft(
+                response_type="answer",
+                message=result.content or "Could you clarify what you need?",
+                sql="",
+            )
+        # Force an answer shape — this path never executes SQL.
+        return draft.model_copy(update={"response_type": "answer", "sql": ""})
 
     def _load_context(self, state: ConversationState) -> ConversationState:
         request = state["request"]
@@ -745,6 +893,24 @@ class ConversationGraph:
                     "warnings": warnings,
                 }
             )
+        retrieved_items = retrieve_mdl_context(
+            config=self.config,
+            retriever=self.retriever,
+            question=request.message,
+            project_id=project_id,
+            owner_id=state["owner_id"],
+            mdl_file_store=self.mdl_file_store,
+        )
+        if retrieved_items:
+            wren_context = wren_context.model_copy(
+                update={
+                    "context_items": [
+                        *wren_context.context_items,
+                        *retrieved_items,
+                    ],
+                    "retrieval_mode": self.retriever.name,
+                }
+            )
         retrieval_artifact = state.get("wren_retrieval")
         if retrieval_artifact is not None and project_id is not None:
             retrieval_artifact = retrieval_artifact.model_copy(
@@ -804,10 +970,30 @@ class ConversationGraph:
                 ],
             }
 
-        draft = self._call_conversation_model(state=state, validation_errors=[])
+        recalled = state.get("recalled_examples") or [
+            pair.model_dump()
+            for pair in self.memory.recall_examples(
+                request.message,
+                scope_hash=scope_hash(request.scope),
+                owner_id=state.get("owner_id", DEFAULT_OWNER_ID),
+                k=self.config.wren_memory_recall_k,
+            )
+        ]
+        draft = self._call_conversation_model(
+            state={**state, "recalled_examples": recalled},
+            validation_errors=[],
+        )
+        # Stamp how many learned examples were recalled so the UI can badge it.
+        wren_context = state.get("wren_context")
+        if wren_context is not None:
+            wren_context = wren_context.model_copy(
+                update={"recalled_example_count": len(recalled)}
+            )
         return {
             **state,
             "draft": draft,
+            "recalled_examples": recalled,
+            "wren_context": wren_context,
             "validation": None,
             "execution_result": None,
             "pending_artifact": None,
@@ -882,6 +1068,7 @@ class ConversationGraph:
                 "semantic_sql": sql,
                 "native_sql": sql,
                 "engine": self.semantic_engine.name if not is_approved else "approved",
+                "engine_correctable_warnings": [],
             }
 
         result = plan_semantic_sql_step(
@@ -902,6 +1089,7 @@ class ConversationGraph:
             "native_sql": result.native_sql,
             "engine": result.engine,
             "engine_warnings": result.warnings,
+            "engine_correctable_warnings": result.correctable_warnings,
             "trace": [
                 *state.get("trace", []),
                 TraceEvent(
@@ -1178,6 +1366,23 @@ class ConversationGraph:
                 update={"execution_result": result, "trace": trace}
             )
 
+        # Learning loop: store the confirmed NL->SQL pair for future recall. Skip
+        # approved-SQL turns — their message ("Execute selected SQL.") is not a
+        # natural-language question and would pollute recall (RV4).
+        if not request.approved_sql:
+            try:
+                self.memory.store_confirmed(
+                    question=request.message,
+                    semantic_sql=state.get("semantic_sql") or sql,
+                    native_sql=state.get("native_sql") or sql,
+                    scope_hash=scope_hash(request.scope),
+                    owner_id=state.get("owner_id", DEFAULT_OWNER_ID),
+                    project_id=getattr(state.get("wren_context"), "project_id", None),
+                    result_meta={"row_count": result.row_count},
+                )
+            except Exception as ex:  # pylint: disable=broad-except - best-effort
+                logger.warning("Failed to store learning-loop example: %s", ex)
+
         return {
             **state,
             "execution_result": result,
@@ -1206,12 +1411,51 @@ class ConversationGraph:
     def _route_after_validation(self, state: ConversationState) -> str:
         validation = state["validation"]
         if validation and validation.is_valid:
+            # Engine-feedback correction (1.4, symmetric with the one-shot graph):
+            # valid native SQL can still reference a hallucinated model the gate
+            # flagged; re-draft if a correction budget remains. Default 0 → execute.
+            if (
+                not state["request"].approved_sql
+                and state.get("engine_correctable_warnings")
+                and state.get("engine_correction_attempts", 0)
+                < self.config.wren_engine_max_correction_retries
+            ):
+                return "correct"
             return "execute" if self._can_execute_sql(state) else "end"
         if state["request"].approved_sql:
             return "end"
         if state.get("repair_attempts", 0) < self.config.max_repair_attempts:
             return "repair"
         return "end"
+
+    def _correct_semantic_sql(self, state: ConversationState) -> ConversationState:
+        """Re-draft on the engine's hallucination feedback (1.4), then re-plan.
+
+        Distinct from ``_repair_sql`` (invalid SQL): validation passed but the
+        engine flagged unknown models/tables. Bounded by
+        ``wren_engine_max_correction_retries``.
+        """
+
+        warnings = state.get("engine_correctable_warnings", [])
+        attempt = state.get("engine_correction_attempts", 0) + 1
+        draft = self._call_conversation_model(state=state, validation_errors=warnings)
+        return {
+            **state,
+            "draft": draft,
+            "engine_correction_attempts": attempt,
+            "trace": [
+                *state.get("trace", []),
+                TraceEvent(
+                    step="correct_semantic_sql",
+                    status="warning",
+                    summary=(
+                        f"Re-drafted semantic SQL (correction attempt {attempt}) "
+                        "from engine feedback."
+                    ),
+                    details={"warnings": warnings, "attempt": attempt},
+                ),
+            ],
+        }
 
     def _reflect_sql_outcome(self, state: ConversationState) -> ConversationState:
         reflection = self._call_sql_reflection_model(state=state)
@@ -1334,6 +1578,8 @@ class ConversationGraph:
             ),
             "scope": request.scope.model_dump(),
             "validation_errors_to_fix": validation_errors,
+            "recalled_examples": state.get("recalled_examples", []),
+            "intent": state.get("intent"),
         }
         schema = ConversationDraft.model_json_schema()
         result = self.model_client.chat(

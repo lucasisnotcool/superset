@@ -62,6 +62,97 @@ def test_recall_is_owner_and_scope_isolated() -> None:
     assert memory.recall_examples("q", scope_hash="s2", owner_id="u1", k=3) == []
 
 
+def test_in_memory_dedups_repeated_example() -> None:
+    memory = InMemoryMemory()
+    for _ in range(3):
+        memory.store_confirmed(
+            question="Top names",  # casing/whitespace variants normalize equal
+            semantic_sql="SELECT 1",
+            native_sql="SELECT 1 ",
+            scope_hash="s1",
+            owner_id="u1",
+        )
+    recalled = memory.recall_examples("top names", scope_hash="s1", owner_id="u1", k=9)
+    assert len(recalled) == 1
+
+
+def test_in_memory_keeps_distinct_sql_for_same_question() -> None:
+    memory = InMemoryMemory()
+    memory.store_confirmed(
+        question="top names", semantic_sql="a", native_sql="SELECT 1",
+        scope_hash="s1", owner_id="u1",
+    )
+    memory.store_confirmed(
+        question="top names", semantic_sql="b", native_sql="SELECT 2",
+        scope_hash="s1", owner_id="u1",
+    )
+    recalled = memory.recall_examples("top names", scope_hash="s1", owner_id="u1", k=9)
+    assert len(recalled) == 2
+
+
+def test_sqlalchemy_memory_dedups_repeated_example(tmp_path) -> None:
+    config = AgentConfig(
+        agent_database_url=f"sqlite+pysqlite:///{tmp_path / 'agent.db'}",
+    )
+    run_migrations(config)
+    memory = SqlAlchemyMemory(create_session_factory(create_engine_from_config(config)))
+    for meta in ({"rows": 1}, {"rows": 2}):
+        memory.store_confirmed(
+            question="revenue by region",
+            semantic_sql="SELECT region FROM sales",
+            native_sql="SELECT region FROM public.sales",
+            scope_hash="scope-1",
+            owner_id="owner-1",
+            result_meta=meta,
+        )
+    recalled = memory.recall_examples(
+        "revenue by region", scope_hash="scope-1", owner_id="owner-1", k=9
+    )
+    assert len(recalled) == 1
+    # The refreshed row carries the latest result metadata.
+    assert recalled[0].result_meta == {"rows": 2}
+
+
+def test_in_memory_decay_evicts_oldest_past_cap() -> None:
+    memory = InMemoryMemory(max_examples=2)
+    for i in range(4):
+        memory.store_confirmed(
+            question=f"q{i}",
+            semantic_sql=f"s{i}",
+            native_sql=f"SELECT {i}",
+            scope_hash="s1",
+            owner_id="u1",
+        )
+    recalled = memory.recall_examples("q", scope_hash="s1", owner_id="u1", k=9)
+    questions = {pair.question for pair in recalled}
+    # Only the two most recent survive; the oldest two were evicted.
+    assert questions == {"q2", "q3"}
+
+
+def test_sqlalchemy_memory_decay_evicts_oldest(tmp_path) -> None:
+    config = AgentConfig(
+        agent_database_url=f"sqlite+pysqlite:///{tmp_path / 'agent.db'}",
+    )
+    run_migrations(config)
+    memory = SqlAlchemyMemory(
+        create_session_factory(create_engine_from_config(config)), max_examples=2
+    )
+    for i in range(4):
+        memory.store_confirmed(
+            question=f"q{i}",
+            semantic_sql=f"s{i}",
+            native_sql=f"SELECT {i}",
+            scope_hash="scope-1",
+            owner_id="owner-1",
+        )
+    recalled = memory.recall_examples(
+        "q", scope_hash="scope-1", owner_id="owner-1", k=9
+    )
+    # Exactly the cap survives (which survive depends on created_at ordering,
+    # which can tie under rapid inserts — so assert the count, not identity).
+    assert len(recalled) == 2
+
+
 def test_null_memory_is_inert() -> None:
     memory = NullMemory()
     memory.store_confirmed(

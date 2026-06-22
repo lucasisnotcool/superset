@@ -52,6 +52,21 @@ def _tokens(text: str) -> set[str]:
     return {token for token in normalized.split() if token}
 
 
+def _normalize(text: str) -> str:
+    return " ".join((text or "").lower().split())
+
+
+def _dedup_key(question: str, native_sql: str) -> tuple[str, str]:
+    """Identity of a confirmed example for write-back dedup (RV4a).
+
+    Two stores of the same normalized question + native SQL are the same example
+    (e.g. the user re-ran an auto-execute turn), so the later one refreshes the
+    earlier rather than accumulating a duplicate.
+    """
+
+    return (_normalize(question), _normalize(native_sql))
+
+
 def _rank(question: str, pairs: list[NlSqlPair], k: int) -> list[NlSqlPair]:
     q_tokens = _tokens(question)
     if not q_tokens:
@@ -98,9 +113,10 @@ class NullMemory:
 class InMemoryMemory:
     """Process-local memory store (tests/dev)."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_examples: int = 0) -> None:
         # keyed by (owner_id, scope_hash)
         self._pairs: dict[tuple[str, str], list[NlSqlPair]] = {}
+        self.max_examples = max_examples
 
     def recall_examples(
         self, question: str, *, scope_hash: str, owner_id: str, k: int
@@ -125,14 +141,26 @@ class InMemoryMemory:
             native_sql=native_sql,
             result_meta=result_meta or {},
         )
-        self._pairs.setdefault((owner_id, scope_hash), []).append(pair)
+        bucket = self._pairs.setdefault((owner_id, scope_hash), [])
+        key = _dedup_key(question, native_sql)
+        for index, existing in enumerate(bucket):
+            if _dedup_key(existing.question, existing.native_sql) == key:
+                bucket[index] = pair  # refresh the existing example in place
+                return
+        bucket.append(pair)
+        # Decay: keep only the most recent ``max_examples`` (oldest evicted).
+        if self.max_examples > 0 and len(bucket) > self.max_examples:
+            del bucket[: len(bucket) - self.max_examples]
 
 
 class SqlAlchemyMemory:
     """Durable, cross-worker memory store."""
 
-    def __init__(self, session_factory: sessionmaker[Session]) -> None:
+    def __init__(
+        self, session_factory: sessionmaker[Session], max_examples: int = 0
+    ) -> None:
         self.session_factory = session_factory
+        self.max_examples = max_examples
 
     def recall_examples(
         self, question: str, *, scope_hash: str, owner_id: str, k: int
@@ -170,7 +198,27 @@ class SqlAlchemyMemory:
         project_id: str | None = None,
         result_meta: dict[str, Any] | None = None,
     ) -> None:
+        key = _dedup_key(question, native_sql)
         with self.session_factory() as session:
+            # Dedup against recent examples for this owner+scope (RV4a). The scan
+            # is bounded; the store is single-worker-scale (see R-C).
+            recent = session.scalars(
+                select(AiAgentNlSqlExample)
+                .where(
+                    AiAgentNlSqlExample.owner_id == owner_id,
+                    AiAgentNlSqlExample.scope_hash == scope_hash,
+                )
+                .order_by(AiAgentNlSqlExample.created_at.desc())
+                .limit(500)
+            ).all()
+            for row in recent:
+                if _dedup_key(row.question, row.native_sql) == key:
+                    # Refresh recency + latest result metadata in place.
+                    row.created_at = datetime.now(timezone.utc)
+                    row.semantic_sql = semantic_sql
+                    row.result_meta = result_meta or {}
+                    session.commit()
+                    return
             session.add(
                 AiAgentNlSqlExample(
                     id=uuid.uuid4().hex,
@@ -185,6 +233,27 @@ class SqlAlchemyMemory:
                 )
             )
             session.commit()
+            self._evict_old(session, owner_id, scope_hash)
+
+    def _evict_old(self, session: Session, owner_id: str, scope_hash: str) -> None:
+        """Decay: delete examples for this owner+scope past ``max_examples``."""
+
+        if self.max_examples <= 0:
+            return
+        stale = session.scalars(
+            select(AiAgentNlSqlExample)
+            .where(
+                AiAgentNlSqlExample.owner_id == owner_id,
+                AiAgentNlSqlExample.scope_hash == scope_hash,
+            )
+            .order_by(AiAgentNlSqlExample.created_at.desc())
+            .offset(self.max_examples)
+        ).all()
+        if not stale:
+            return
+        for row in stale:
+            session.delete(row)
+        session.commit()
 
 
 def create_memory(
@@ -201,5 +270,7 @@ def create_memory(
         # lands, durable recall uses the SQLAlchemy store (RV1).
         if session_factory is None:
             raise ValueError("Durable memory store requires a database.")
-        return SqlAlchemyMemory(session_factory)
+        return SqlAlchemyMemory(
+            session_factory, max_examples=config.wren_memory_max_examples
+        )
     return NullMemory()

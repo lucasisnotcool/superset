@@ -18,7 +18,7 @@
  */
 import { t } from '@apache-superset/core/translation';
 import { css, styled } from '@apache-superset/core/theme';
-import type { AuditInfo } from './api';
+import type { AuditInfo, WrenContextArtifact } from './api';
 
 const Details = styled.details`
   ${({ theme }) => css`
@@ -30,6 +30,41 @@ const Details = styled.details`
     }
   `}
 `;
+
+const Badges = styled.div`
+  ${({ theme }) => css`
+    display: flex;
+    flex-wrap: wrap;
+    gap: ${theme.sizeUnit}px;
+    margin-bottom: ${theme.sizeUnit}px;
+  `}
+`;
+
+const Badge = styled.span`
+  ${({ theme }) => css`
+    display: inline-flex;
+    align-items: center;
+    height: 22px;
+    padding: 0 ${theme.sizeUnit * 2}px;
+    border: 1px solid ${theme.colorBorder};
+    border-radius: ${theme.borderRadius}px;
+    color: ${theme.colorTextSecondary};
+    background: ${theme.colorBgContainer};
+    font-size: ${theme.fontSizeSM}px;
+    white-space: nowrap;
+  `}
+`;
+
+// Friendly labels for the audit keys parity work surfaces; unknown keys fall
+// back to their raw name so new backend fields still render.
+const FIELD_LABELS: Record<string, string> = {
+  engine: t('Engine'),
+  semantic_sql: t('Semantic SQL'),
+  native_sql: t('Native SQL'),
+  executed_sql: t('Executed SQL'),
+  row_limit: t('Row limit'),
+  adapter: t('Adapter'),
+};
 
 const List = styled.dl`
   ${({ theme }) => css`
@@ -51,25 +86,46 @@ const List = styled.dl`
 
 export interface AuditInfoPanelProps {
   audit?: AuditInfo | null;
+  wrenContext?: WrenContextArtifact | null;
 }
 
-export default function AuditInfoPanel({ audit }: AuditInfoPanelProps) {
+export default function AuditInfoPanel({
+  audit,
+  wrenContext,
+}: AuditInfoPanelProps) {
   if (!audit) {
     return null;
   }
   const entries = Object.entries(audit).filter(
     ([, value]) => value !== null && value !== undefined && value !== '',
   );
-  if (entries.length === 0) {
+  // At-a-glance provenance: which engine rewrote the SQL and which retriever
+  // produced the context (wren_full.md RV2/RV3 surfacing).
+  const engine = audit.engine;
+  const retrievalMode = wrenContext?.retrieval_mode;
+  const recalledCount = wrenContext?.recalled_example_count ?? 0;
+  const hasBadges = Boolean(engine || retrievalMode || recalledCount > 0);
+  if (entries.length === 0 && !hasBadges) {
     return null;
   }
   return (
     <Details>
       <summary>{t('Audit')}</summary>
+      {hasBadges ? (
+        <Badges>
+          {engine ? <Badge>{t('Engine: %s', engine)}</Badge> : null}
+          {retrievalMode ? (
+            <Badge>{t('Retrieval: %s', retrievalMode)}</Badge>
+          ) : null}
+          {recalledCount > 0 ? (
+            <Badge>{t('Reused %s learned example(s)', recalledCount)}</Badge>
+          ) : null}
+        </Badges>
+      ) : null}
       <List>
         {entries.map(([key, value]) => (
           <div key={key}>
-            <dt>{key}</dt>
+            <dt>{FIELD_LABELS[key] ?? key}</dt>
             <dd>{String(value)}</dd>
           </div>
         ))}

@@ -74,6 +74,11 @@ export interface AuditInfo {
   tab?: string | null;
   source_hash?: string | null;
   source?: string | null;
+  // Semantic-engine provenance (wren_full.md Phase 1.5): the LLM-authored
+  // semantic SQL, the engine-rewritten native SQL, and which engine rewrote it.
+  engine?: string | null;
+  semantic_sql?: string | null;
+  native_sql?: string | null;
 }
 
 export interface WrenRetrievalArtifact {
@@ -103,6 +108,12 @@ export interface WrenContextArtifact {
   semantic_layer_version?: string | null;
   indexing_status?: string | null;
   context_items: Record<string, unknown>[];
+  // Which retriever produced the context items (keyword | embedding), stamped
+  // when the Retriever seam contributes context (wren_full.md RV2).
+  retrieval_mode?: string | null;
+  // How many confirmed NL->SQL examples the memory seam recalled for this turn
+  // (0 when learning is off); surfaced as a UI badge (wren_full.md RV3).
+  recalled_example_count?: number | null;
   retrieval?: WrenRetrievalArtifact | null;
   dry_plan?: Record<string, unknown> | null;
   warnings: string[];
@@ -317,6 +328,9 @@ export interface AgentHealthResponse {
   reachable: boolean;
   ollama_base_url?: string | null;
   ollama_reachable?: boolean | null;
+  // False when the semantic layer runs in-memory (models lost on restart), so
+  // the UI can warn before users model against an ephemeral store (RV3).
+  semantic_layer_persistent?: boolean;
 }
 
 export type SemanticProjectVisibility = 'private' | 'db_access' | 'custom';

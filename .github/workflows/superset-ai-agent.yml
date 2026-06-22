@@ -1,0 +1,76 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Runs the standalone AI agent unit suite with the AI-agent requirements
+# installed. Because `wren-core-py` is a hard dependency there, the semantic
+# engine is *present* in this job, so the wren-core-gated rewrite/deep-validation
+# tests (skipped locally when the wheel is absent) actually execute here. This is
+# the engine-parity gating job (wren_full.md RE1).
+name: AI Agent Unit Tests
+
+on:
+  push:
+    branches:
+      - "master"
+      - "[0-9].[0-9]*"
+    paths:
+      - "superset_ai_agent/**"
+      - "tests/unit_tests/superset_ai_agent/**"
+      - "requirements-ai-agent.txt"
+      - ".github/workflows/superset-ai-agent.yml"
+  pull_request:
+    types: [synchronize, opened, reopened, ready_for_review]
+    paths:
+      - "superset_ai_agent/**"
+      - "tests/unit_tests/superset_ai_agent/**"
+      - "requirements-ai-agent.txt"
+      - ".github/workflows/superset-ai-agent.yml"
+
+permissions:
+  contents: read
+
+# cancel previous workflow jobs for PRs
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  test-ai-agent:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Setup Python
+        uses: ./.github/actions/setup-backend/
+        with:
+          python-version: current
+          requirements-type: dev
+
+      - name: Install AI agent requirements (includes wren-core)
+        run: uv pip install --system -r requirements-ai-agent.txt
+
+      - name: Assert wren-core is importable
+        # Guards the gating contract: if the wheel ever fails to install, the
+        # engine-present tests would silently skip instead of running. Fail loud.
+        run: python -c "import wren_core; print('wren-core present')"
+
+      - name: Run AI agent unit tests
+        run: pytest tests/unit_tests/superset_ai_agent -q --tb=short
