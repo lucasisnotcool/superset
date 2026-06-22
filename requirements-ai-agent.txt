@@ -34,3 +34,8 @@ uvicorn>=0.30,<1.0
 # WREN_CORE_VALIDATION_ENABLED=true to enable wren-core deep validation; the
 # code import-guards its absence and falls back to structural validation.
 # wren-core>=0.1
+#
+# Optional: LanceDB-backed persistent embedding index (Phase 2 retrieval scale
+# optimization). Embedding retrieval works without it (in-memory cosine over the
+# configured embedder); install only to scale to very wide schemas.
+# lancedb>=0.13

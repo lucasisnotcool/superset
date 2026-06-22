@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json  # noqa: TID251 - keep the standalone agent independent of Superset
+import logging
 from typing import Any, Literal, TypedDict
 from uuid import uuid4
 
@@ -56,14 +57,17 @@ from superset_ai_agent.semantic_layer.engine.planning import (
     with_engine_provenance,
 )
 from superset_ai_agent.semantic_layer.mdl_files import MdlFileStore
+from superset_ai_agent.semantic_layer.memory_store import Memory, NullMemory
 from superset_ai_agent.semantic_layer.projects import SemanticProjectStore
 from superset_ai_agent.semantic_layer.runtime import merge_indexed_semantic_context
 from superset_ai_agent.semantic_layer.schemas import WrenMaterializationResult
-from superset_ai_agent.semantic_layer.store import SemanticLayerStore
+from superset_ai_agent.semantic_layer.store import scope_hash, SemanticLayerStore
 from superset_ai_agent.semantic_layer.wren_runtime import (
     materialize_request_semantic_project,
 )
 from superset_ai_agent.tools.sql import validate_read_only_sql
+
+logger = logging.getLogger(__name__)
 
 #: Authoring guidance injected when semantic-SQL mode is active (engine rewrites
 #: model-qualified SQL into native SQL). See wren_full.md Phase 1.3.
@@ -106,6 +110,7 @@ class AgentState(TypedDict, total=False):
     native_sql: str | None
     engine: str | None
     engine_warnings: list[str]
+    recalled_examples: list[dict[str, Any]]
     trace: list[TraceEvent]
     repair_attempts: int
     error: str | None
@@ -126,6 +131,7 @@ class TextToSqlGraph:
         semantic_project_store: SemanticProjectStore | None = None,
         mdl_file_store: MdlFileStore | None = None,
         semantic_engine: SemanticEngine | None = None,
+        memory: Memory | None = None,
     ):
         self.config = config
         self.model_client = model_client
@@ -136,6 +142,7 @@ class TextToSqlGraph:
         self.semantic_project_store = semantic_project_store
         self.mdl_file_store = mdl_file_store
         self.semantic_engine = semantic_engine or create_semantic_engine(config)
+        self.memory = memory or NullMemory()
         self.graph = self._compile_graph()
 
     def run(
@@ -366,19 +373,40 @@ class TextToSqlGraph:
             ],
         }
 
+    def _request_scope_hash(self, request: AgentQueryRequest) -> str:
+        return scope_hash(
+            ConversationScope(
+                database_id=request.database_id,
+                catalog_name=request.catalog_name,
+                schema_name=request.schema_name,
+                dataset_ids=request.dataset_ids,
+            )
+        )
+
     def _draft_sql(self, state: AgentState) -> AgentState:
         request = state["request"]
         context = state["context"]
+        recalled = [
+            pair.model_dump()
+            for pair in self.memory.recall_examples(
+                request.question,
+                scope_hash=self._request_scope_hash(request),
+                owner_id=state.get("owner_id", DEFAULT_OWNER_ID),
+                k=self.config.wren_memory_recall_k,
+            )
+        ]
         draft = self._call_sql_model(
             request=request,
             context=context,
             wren_context=state.get("wren_context"),
             validation_errors=[],
+            recalled_examples=recalled,
         )
         return {
             **state,
             "sql": draft.sql,
             "explanation": draft.explanation,
+            "recalled_examples": recalled,
             "trace": [
                 *state.get("trace", []),
                 TraceEvent(
@@ -524,6 +552,7 @@ class TextToSqlGraph:
             context=context,
             wren_context=state.get("wren_context"),
             validation_errors=repair_errors,
+            recalled_examples=state.get("recalled_examples", []),
         )
         return {
             **state,
@@ -572,6 +601,19 @@ class TextToSqlGraph:
                     ),
                 ],
             }
+
+        # Learning loop: store the confirmed NL->SQL pair for future recall.
+        try:
+            self.memory.store_confirmed(
+                question=request.question,
+                semantic_sql=state.get("semantic_sql") or validation.normalized_sql,
+                native_sql=state.get("native_sql") or validation.normalized_sql,
+                scope_hash=self._request_scope_hash(request),
+                owner_id=state.get("owner_id", DEFAULT_OWNER_ID),
+                result_meta={"row_count": result.row_count},
+            )
+        except Exception as ex:  # pylint: disable=broad-except - memory is best-effort
+            logger.warning("Failed to store learning-loop example: %s", ex)
 
         return {
             **state,
@@ -649,6 +691,7 @@ class TextToSqlGraph:
         context: AgentContext,
         wren_context: WrenContextArtifact | None,
         validation_errors: list[str],
+        recalled_examples: list[dict[str, Any]] | None = None,
     ) -> SqlDraft:
         prompt = get_prompt("text_to_sql")
         semantic_sql_mode = (
@@ -667,6 +710,7 @@ class TextToSqlGraph:
             "semantic_sql_instructions": (
                 _SEMANTIC_SQL_GUIDANCE if semantic_sql_mode else None
             ),
+            "recalled_examples": recalled_examples or [],
         }
         schema = SqlDraft.model_json_schema()
         result = self.model_client.chat(

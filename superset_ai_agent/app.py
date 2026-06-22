@@ -108,6 +108,7 @@ from superset_ai_agent.semantic_layer.mdl_validator import (
     validate_project_manifest,
 )
 from superset_ai_agent.semantic_layer.memory import InMemorySemanticLayerStore
+from superset_ai_agent.semantic_layer.memory_store import create_memory
 from superset_ai_agent.semantic_layer.onboarding import onboard_schema_project
 from superset_ai_agent.semantic_layer.projects import (
     InMemorySemanticProjectStore,
@@ -245,6 +246,7 @@ def create_app(  # noqa: C901
             session_factory=session_factory,
         )
     )
+    active_memory = create_memory(app_config, session_factory=session_factory)
 
     app_superset_client = (
         superset_client
@@ -277,6 +279,7 @@ def create_app(  # noqa: C901
             semantic_layer_store=active_semantic_layer_store,
             semantic_project_store=active_semantic_project_store,
             mdl_file_store=active_mdl_file_store,
+            memory=active_memory,
         )
         service_conversation_graph = conversation_graph or ConversationGraph(
             config=app_config,
@@ -343,6 +346,7 @@ def create_app(  # noqa: C901
             semantic_layer_store=active_semantic_layer_store,
             semantic_project_store=active_semantic_project_store,
             mdl_file_store=active_mdl_file_store,
+            memory=active_memory,
         )
 
     def build_conversation_graph(request: Request) -> Any:

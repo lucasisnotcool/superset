@@ -141,6 +141,13 @@ class AgentConfig:
     wren_memory_store: WrenMemoryStoreMode = "none"
     wren_memory_learning_enabled: bool = True
     wren_memory_recall_k: int = 3
+    wren_lancedb_path: str | None = None
+    embedder_provider: str | None = None
+    embedder_model: str = "text-embedding-3-small"
+    embedder_dimensions: int = 1536
+    embedder_api_key: str | None = None
+    embedder_base_url: str | None = None
+    embedder_batch_size: int = 128
     superset_agent_adapter: SupersetAdapterMode = "rest"
     superset_auth_mode: SupersetAuthMode = "user_session"
     superset_base_url: str = "http://localhost:8091"
@@ -458,6 +465,23 @@ class AgentConfig:
             ),
             wren_memory_recall_k=int(
                 os.getenv("WREN_MEMORY_RECALL_K", str(cls.wren_memory_recall_k))
+            ),
+            wren_lancedb_path=os.getenv("WREN_LANCEDB_PATH") or cls.wren_lancedb_path,
+            embedder_provider=(
+                os.getenv("AI_AGENT_EMBEDDER_PROVIDER") or cls.embedder_provider
+            ),
+            embedder_model=os.getenv("AI_AGENT_EMBEDDER_MODEL", cls.embedder_model),
+            embedder_dimensions=int(
+                os.getenv("AI_AGENT_EMBEDDER_DIMENSIONS", str(cls.embedder_dimensions))
+            ),
+            embedder_api_key=(
+                os.getenv("AI_AGENT_EMBEDDER_API_KEY") or cls.embedder_api_key
+            ),
+            embedder_base_url=(
+                os.getenv("AI_AGENT_EMBEDDER_BASE_URL") or cls.embedder_base_url
+            ),
+            embedder_batch_size=int(
+                os.getenv("AI_AGENT_EMBEDDER_BATCH_SIZE", str(cls.embedder_batch_size))
             ),
             superset_agent_adapter=cast(
                 SupersetAdapterMode,

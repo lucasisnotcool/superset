@@ -200,8 +200,8 @@ manifest), so **Phase 0 makes DB-backed semantic persistence the baseline**
 | 1 | SemanticEngine graph wiring + audit (both graphs) | `[COMPLETE]` (2026-06-22) |
 | 1 | Semantic-SQL prompt mode + engine-feedback correction loop | `[COMPLETE]` (2026-06-22) |
 | 1 | Semantic-SQL prompt + correction loop | `[TODO]` |
-| 2 | Embedder + EmbeddingRetriever (LanceDB) | `[TODO]` |
-| 2 | Memory learning loop | `[TODO]` |
+| 2 | Embedder + Retriever seam (keyword default, embedding optional) | `[COMPLETE]` (2026-06-22) |
+| 2 | Memory learning loop (NL→SQL examples) | `[COMPLETE]` (2026-06-22) |
 | 3 | MDL completeness (cubes/metrics) + deep-validation CI | `[TODO]` |
 | 4 | Orchestrator/Skills + intent classification + SDK facade | `[TODO]` |
 
@@ -598,6 +598,66 @@ by the engine, not the LLM — verified end to end through Superset.
 ---
 
 ## Phase 2 — Retrieval (embeddings) + Memory (learning loop)
+
+### Phase 2 status — `[COMPLETE]` (2026-06-22)
+
+**Embedder + Retriever seams + Memory learning loop landed.** Default bindings
+(keyword retrieval, null/in-memory) keep the service unchanged; the embedding
+and durable-memory paths are config-gated and degrade closed.
+
+Source:
+- [`llm/embeddings.py`](llm/embeddings.py) — `Embedder` protocol, `NullEmbedder`,
+  `OpenAiEmbedder` (reuses `OPENAI_*`), `create_embedder`.
+- [`semantic_layer/schema_retriever.py`](semantic_layer/schema_retriever.py) —
+  `Retriever` protocol, `manifest_to_schema_items` (model/column/relationship
+  chunks ≈ Wren `schema_items`), `KeywordRetriever` (default), `EmbeddingRetriever`
+  (in-memory cosine over the embedder, degrades to keyword), `create_retriever`.
+- [`semantic_layer/memory_store.py`](semantic_layer/memory_store.py) — `Memory`
+  protocol, `NlSqlPair`, `NullMemory`/`InMemoryMemory`/`SqlAlchemyMemory`,
+  `create_memory`; owner+scope isolation; recall = token-overlap rank.
+- [`persistence/models.py`](persistence/models.py)::`AiAgentNlSqlExample` +
+  migration [`0003_nl_sql_examples`](persistence/migrations/versions/0003_nl_sql_examples.py).
+- Graph wiring: [`graph.py`](graph.py) recalls examples into the prompt
+  (`_draft_sql`/`_call_sql_model`) and writes back confirmed pairs on successful
+  execution (`_execute_sql`); [`app.py`](app.py) builds the memory store via
+  `create_memory(..., session_factory)` and injects it.
+- Config/env: `wren_retriever`, `embedder_*` (`AI_AGENT_EMBEDDER_*`),
+  `wren_memory_store`, `wren_memory_learning_enabled`, `wren_memory_recall_k`,
+  `wren_lancedb_path`; [`.env.example`](.env.example); commented `lancedb` dep.
+
+Tests: [`test_schema_retriever.py`](../tests/unit_tests/superset_ai_agent/test_schema_retriever.py)
+(9 — chunking, keyword/embedding ranking, degrade-closed, factories),
+[`test_memory_store.py`](../tests/unit_tests/superset_ai_agent/test_memory_store.py)
+(6 — store/recall, **owner+scope isolation**, **cross-instance persistence via
+migration**, factory gating),
+[`test_graph_semantic_engine.py`](../tests/unit_tests/superset_ai_agent/test_graph_semantic_engine.py)::
+`test_memory_writeback_and_recall_round_trip` (execute → store → recall into the
+next prompt). Suite: **224 passed, 2 skipped**; `ruff` clean.
+
+**Residual risk RV1 (dev expectation vs impl):** the plan specified **LanceDB**
+for both retrieval and memory; the implementation uses **in-memory cosine** for
+embedding retrieval and the **SQLAlchemy** table for durable memory. Functionally
+equivalent at small/medium scale and dependency-free, but: (a) embedding
+retrieval recomputes embeddings per request (no persistent vector index — RV1a),
+and (b) memory recall is **token-overlap**, not vector similarity (RV1b). LanceDB
+is the deferred optimization for wide schemas / semantic recall; the seams accept
+it as a drop-in.
+
+**Residual risk RV2 (parity gap):** the **Retriever seam is not yet consumed by
+the graphs** — `fetch_context`/`_load_wren_context` still use the older
+`retrieval.py` keyword path for the prompt context. The new `Retriever` is wired
+and tested in isolation but not yet swapped into the live context-load step;
+that swap is a follow-up so the richer chunking reaches the prompt.
+
+**Residual risk RV3 (UI gap):** nothing surfaces retrieval mode or "answered from
+a learned example" in the UI (Phase 4 follow-on); users can't see the learning
+loop working.
+
+**Residual risk RV4:** memory write-back fires for **every** successful execution
+(one-shot graph) and is **not yet wired into the conversation graph**. There is
+no dedup/decay, and one-shot `execute=true` auto-confirms — a noisier signal than
+Wren's explicit confirmation. Conversation-graph write-back + dedup is a
+follow-up.
 
 ### 2.1 Embedder seam
 

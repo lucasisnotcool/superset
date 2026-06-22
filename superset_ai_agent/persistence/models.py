@@ -392,3 +392,19 @@ class AiAgentSemanticMdlFile(Base):
     created_at = Column(DateTime(timezone=True), nullable=False)
     updated_at = Column(DateTime(timezone=True), nullable=False)
     deleted_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class AiAgentNlSqlExample(Base):
+    """A confirmed NL->SQL pair recalled as few-shot (memory learning loop)."""
+
+    __tablename__ = "ai_agent_nl_sql_examples"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(String(255), index=True, nullable=False)
+    project_id = Column(String(36), index=True, nullable=True)
+    scope_hash = Column(String(128), index=True, nullable=False)
+    question = Column(Text, nullable=False)
+    semantic_sql = Column(Text, nullable=False)
+    native_sql = Column(Text, nullable=False)
+    result_meta = Column(JSON, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)

@@ -209,3 +209,31 @@ def test_semantic_sql_mode_off_by_default() -> None:
     )
     graph.run(_request())
     assert not any("Semantic-SQL mode is ON" in payload for payload in model.payloads)
+
+
+def test_memory_writeback_and_recall_round_trip() -> None:
+    from superset_ai_agent.semantic_layer.memory_store import InMemoryMemory
+
+    memory = InMemoryMemory()
+    graph = TextToSqlGraph(
+        config=AgentConfig(),
+        model_client=_FakeModelClient(_SEMANTIC_SQL),
+        context_provider=_FakeContextProvider(),
+        superset_client=_RecordingSupersetClient(),
+        memory=memory,
+    )
+    # First run executes and stores the confirmed pair.
+    graph.run(_request())
+
+    capturing = _CapturingModelClient(_SEMANTIC_SQL)
+    graph2 = TextToSqlGraph(
+        config=AgentConfig(),
+        model_client=capturing,
+        context_provider=_FakeContextProvider(),
+        superset_client=_RecordingSupersetClient(),
+        memory=memory,
+    )
+    graph2.run(_request())
+    # The second run recalls the stored example into the prompt payload.
+    assert any("top names" in payload for payload in capturing.payloads)
+    assert any("recalled_examples" in payload for payload in capturing.payloads)
