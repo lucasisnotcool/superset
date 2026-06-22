@@ -1,0 +1,715 @@
+<!--
+Licensed to the Apache Software Foundation (ASF) under one or more
+contributor license agreements.  See the NOTICE file distributed with
+this work for additional information regarding copyright ownership.
+The ASF licenses this file to You under the Apache License, Version 2.0
+(the "License"); you may not use this file except in compliance with
+the License.  You may obtain a copy of the License at
+
+   http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
+# Wren Full-Parity Implementation Plan
+
+This is the **execution checklist** for bringing full Wren feature parity (or
+governed equivalents) to `superset_ai_agent`, structured so any later session
+can pick it up as a checklist. It is the successor to [`wren.md`](wren.md)
+(design/governance) and [`wren_model.md`](wren_model.md) (the first modeling
+increment). Where they conflict, the **governance invariants below win**, then
+this document, then the earlier two.
+
+Status legend: `[TODO]` not started · `[WIP]` in progress · `[COMPLETE]`
+source-backed and test-verified · `[BLOCKED]` waiting on a decision/dependency.
+
+## How to use this document
+
+1. Work **top-down by phase**. Phase 0 unblocks everything; do not start a later
+   phase before its predecessor's acceptance criteria pass.
+2. Each workstream has: **Parity target** (what Wren does), **Requirements**,
+   **Design spec** (protocols + files), **Config**, **Tests**, **Acceptance**.
+3. Tick the checklist boxes as you land each item. Update the Status table at the
+   top of each workstream and the roll-up table in
+   [Implementation Status](#implementation-status).
+4. Keep every new Python file ASF-licensed and type-hinted; run
+   `pre-commit run --all-files` before pushing (mypy/ruff/pylint/eslint/prettier).
+
+---
+
+## Locked Decisions (do not relitigate without sign-off)
+
+These were decided with the product owner and frame the entire plan:
+
+1. **Execution boundary = Superset-only.** wren-core *rewrites* semantic SQL into
+   native SQL; **Superset SQL Lab REST remains the only executor**, behind
+   `validate_read_only_sql` and Superset RBAC/RLS/audit. We do **not** adopt
+   `ibis-server` or Wren connectors.
+2. **Coupling = embed wren-core, reimplement the rest behind seams.** We depend
+   on `wren-core` (PyPI) for the semantic engine — the one cleanly separable,
+   high-value Wren component — and reimplement retrieval/memory/modeler/
+   orchestrator over our own seams, borrowing **building-block libraries**
+   (LanceDB for vectors/memory) rather than wrapping Wren's bundled
+   `/v1/asks` pipeline or the `wrenai` SDK (which assume Wren-owned execution and
+   would re-introduce the governance tension).
+
+Rationale and the full Wren analysis live in the conversation that produced this
+plan; the short version: Wren only exposes **one** cleanly-wrappable API
+(`wren-core`); everything else exists only inside a bundled pipeline that owns
+execution. So we borrow the engine and own the glue.
+
+---
+
+## Governance Invariants (carry-over + new)
+
+Carried from [`wren.md`](wren.md) and [`wren_model.md`](wren_model.md):
+
+- [ ] `SupersetClient.execute_sql` is the **only** SQL execution boundary used by
+      the agent graphs. No seam may execute SQL.
+- [ ] No Wren execution method on any client; `WREN_EXECUTION_ENABLED=true` still
+      fails startup ([`integrations/wren/factory.py`](integrations/wren/factory.py)).
+- [ ] Generated/onboarded/enriched MDL is written `status="draft"`; never
+      auto-activated, never auto-materialized.
+- [ ] Documents, MDL, retrieval results, and memory examples are **context, not
+      permission sources**; Superset RBAC via `SemanticAccessService` stays
+      authoritative.
+- [ ] All generated SQL — semantic or native — still passes
+      `validate_read_only_sql` before execution.
+
+New invariants introduced by this plan:
+
+- [ ] **The engine rewrites; Superset executes.** `SemanticEngine.plan_sql`
+      output (native SQL) is the *only* thing handed to the executor; the raw
+      LLM "semantic SQL" is never executed directly when the engine is active.
+- [ ] **Every seam degrades closed.** Absent `wren-core` → passthrough engine +
+      structural validation only. Absent embedder/LanceDB → keyword retrieval.
+      Absent memory store → no few-shot, never an error.
+- [ ] **Physical references must resolve in Superset.** A manifest
+      `tableReference` must map to objects the requesting user can see in
+      Superset; the engine rewrite is validated against the permission-filtered
+      `SchemaIndex` before execution.
+- [ ] **Audit records both SQLs.** `AuditInfo` carries `semantic_sql`,
+      `native_sql`, and `engine` so every executed query is traceable to the
+      model that wrote it and the engine that rewrote it.
+
+---
+
+## Target Architecture: Six Seams
+
+Decompose today's coarse `WrenClient` protocol
+([`integrations/wren/client.py`](integrations/wren/client.py)) into six narrow,
+independently-swappable seams that mirror Wren's real component boundaries. Each
+seam has a zero-dependency default binding (so the service always starts) and a
+parity binding.
+
+```
+   NL question
+        │
+        ▼
+ ┌─────────────────────────────────────────────────────────────────┐
+ │  Orchestrator  (graph.py today → SemanticPipeline + Skills)       │
+ │   intent → retrieve → context → draft semantic SQL → plan → exec  │
+ └─────────────────────────────────────────────────────────────────┘
+     │          │            │             │           │          │
+ ┌───▼───┐ ┌────▼────┐ ┌─────▼─────┐ ┌─────▼────┐ ┌────▼────┐ ┌───▼─────┐
+ │Retriev│ │Modeler  │ │Semantic   │ │Executor  │ │Memory   │ │Embedder │
+ │er     │ │(LLM MDL)│ │Engine     │ │(Superset)│ │(history)│ │(vectors)│
+ │       │ │         │ │(wren-core)│ │          │ │         │ │         │
+ │keyword│ │LlmModel-│ │WrenCore / │ │Superset- │ │Sqla /   │ │OpenAI / │
+ │/embed │ │er       │ │passthrough│ │RestClient│ │LanceDB  │ │none     │
+ └───────┘ └─────────┘ └───────────┘ └──────────┘ └─────────┘ └─────────┘
+```
+
+| Seam | Parity target (Wren) | Default binding | Parity binding | New? |
+| --- | --- | --- | --- | --- |
+| **SemanticEngine** | `wren-core.transform_sql` | `PassthroughEngine` | `WrenCoreEngine` | mostly new |
+| **Retriever** | LanceDB `schema_items` embedding search | `KeywordRetriever` (exists) | `EmbeddingRetriever` | extend |
+| **Memory** | LanceDB `query_history` learning loop | `NullMemory` | `SqlAlchemyMemory` / `LanceDbMemory` | new |
+| **Modeler** | `generate-mdl` + `semantics-description` | `DeterministicModeler` | `LlmModeler` (exists) | refactor |
+| **Executor** | ibis-server connectors | `SupersetRestClient` (exists) | same | formalize |
+| **Embedder** | provider embedders | `NullEmbedder` | `OpenAi/Azure/OllamaEmbedder` | new |
+
+---
+
+## Current-State Baseline (verified 2026-06-22)
+
+What exists today, per seam, so later sessions know what they are refactoring vs.
+building.
+
+| Seam | Today | Source |
+| --- | --- | --- |
+| Engine | wren-core used for **validation only**; import-guarded, off by default; snake→camelCase mapping exists | [`semantic_layer/wren_core_validator.py`](semantic_layer/wren_core_validator.py) |
+| Engine (manifest) | hand-rolled snake_case MDL spec + structural/physical validator | [`semantic_layer/mdl_schema.py`](semantic_layer/mdl_schema.py), [`semantic_layer/mdl_validator.py`](semantic_layer/mdl_validator.py) |
+| Retriever | keyword token-overlap scoring + token-budget trim | [`semantic_layer/retrieval.py`](semantic_layer/retrieval.py), [`integrations/wren/llm_client.py`](integrations/wren/llm_client.py)`::fetch_context` |
+| Memory | read-only `recall_examples` over a static `memory.json`; **no write-back** | [`integrations/wren/client.py`](integrations/wren/client.py)`::FileWrenClient.recall_examples` |
+| Modeler | LLM onboarding + doc enrichment, deterministic fallback | [`integrations/wren/llm_client.py`](integrations/wren/llm_client.py) |
+| Executor | Superset SQL Lab REST, read-only validated | [`integrations/superset/rest.py`](integrations/superset/rest.py), [`tools/sql.py`](tools/sql.py) |
+| Embedder | **none** — `ModelClient` exposes `chat` only | [`llm/base.py`](llm/base.py) |
+| Orchestrator | LangGraph one-shot + conversation graphs; injects MDL context into the SQL prompt | [`graph.py`](graph.py), [`conversation_graph.py`](conversation_graph.py) |
+| Materialize | merge active YAML → project `mdl.json` (camelCase envelope) | [`semantic_layer/wren_materializer.py`](semantic_layer/wren_materializer.py) |
+| Client selection | adapter factory (`llm`/`http`/`file`/disabled) | [`integrations/wren/factory.py`](integrations/wren/factory.py) |
+
+**Key constraints discovered:**
+
+- `ModelClient` has **no embedding method** → an `Embedder` seam must be added and
+  retrieval must degrade to keyword when none is configured.
+- MDL is **snake_case internally** but the engine needs **camelCase**; this is the
+  R9/R16 seam. The plan canonicalizes by treating YAML as authoring source and
+  compiling to a camelCase `mdl.json` manifest (exactly Wren's model).
+- The LLM currently writes **raw physical SQL**; the engine needs **semantic SQL**
+  written against MDL logical models. This is the one behavioral change with a
+  real fallback story (see Workstream 1, OQ1).
+
+### Supporting Infrastructure Readiness (verified 2026-06-22)
+
+Non-Wren, Wren-*supporting* infrastructure — checked before building so parity
+work doesn't sit on ephemeral foundations.
+
+| Area | State | Detail |
+| --- | --- | --- |
+| MDL DB persistence | **Present but OFF by default** | `AiAgentSemanticMdlFile` table + `SqlAlchemyMdlFileStore` exist; default `semantic_layer_store="memory"` ([`config.py`](config.py)) means MDL is **in-memory, lost on restart**. |
+| Project/doc/version/snapshot persistence | Present but OFF by default | One flag governs **all** semantic stores (`_create_semantic_layer_store` / `_create_semantic_project_store` / `_create_mdl_file_store` / `_create_schema_snapshot_store` in [`app.py`](app.py) all branch on `semantic_layer_store`). |
+| ORM models | **Complete** | [`persistence/models.py`](persistence/models.py): conversations, messages, artifacts, documents, updates, versions, wren-context cache, events, projects, grants, access proofs, schema snapshots, jobs, **MDL files**. |
+| Migrations | **Complete to date** | `0001_initial_agent_tables`, `0002_schema_snapshots_and_jobs` ([`persistence/migrations/versions/`](persistence/migrations/versions/)). |
+| DB engine/session/bootstrap | Present | `agent_database_url` (default `sqlite:///./.data/ai_agent.db`), `agent_run_migrations=True`, `_requires_agent_database` builds the engine only in `sqlalchemy` mode. |
+| Identity guard | Present | `_validate_identity_persistence_config` rejects DB persistence with static identity unless explicitly overridden — flipping to `sqlalchemy` requires a real identity provider. |
+| Requirements (DB) | Present | `SQLAlchemy`, `alembic`, `boto3` (S3 docs) in [`requirements-ai-agent.txt`](../requirements-ai-agent.txt). **Missing for prod Postgres:** a driver (`psycopg`). |
+| Requirements (parity deps) | Missing | `wren-core` (commented), `lancedb`, embedder provider — added per phase below. |
+| UI | **Substantial, modeling-ready** | `SemanticLayerEditor/index.tsx` (~46KB), `api.ts` (~27KB), `SemanticLayerImportDialog`, onboarding/enrich/materialize wired ([`SemanticLayerEditor/`](../superset-frontend/src/SqlLab/components/AiAgentPanel/SemanticLayerEditor/)). **Missing:** engine status, semantic-vs-native SQL, retrieval-mode + memory surfacing (Phase 4 follow-on). |
+
+**Conclusion:** the DB layer is built and tested; the gap is purely that
+persistence is **opt-in and off by default**. Parity features depend on durable
+MDL (engine cache, retrieval index, and memory loop all key off the materialized
+manifest), so **Phase 0 makes DB-backed semantic persistence the baseline**
+(0.0 below) before any seam work.
+
+---
+
+## Implementation Status
+
+| Phase | Workstream | Status |
+| --- | --- | --- |
+| 0 | Durable semantic persistence baseline (MDL in DB) | `[TODO]` |
+| 0 | Seam refactor + MDL compile canonicalization | `[TODO]` |
+| 1 | SemanticEngine (wren-core rewrite) — **keystone** | `[TODO]` |
+| 1 | Semantic-SQL prompt + correction loop | `[TODO]` |
+| 2 | Embedder + EmbeddingRetriever (LanceDB) | `[TODO]` |
+| 2 | Memory learning loop | `[TODO]` |
+| 3 | MDL completeness (cubes/metrics) + deep-validation CI | `[TODO]` |
+| 4 | Orchestrator/Skills + intent classification + SDK facade | `[TODO]` |
+
+---
+
+## Phase 0 — Seam Refactor + MDL Compile Canonicalization
+
+**Goal:** make semantic state durable, then introduce the six protocols and
+rebind current behavior to them with **zero behavior change**, and split MDL into
+*authoring YAML* (snake_case, human) vs *compiled manifest* (camelCase,
+engine-ready). Unblocks every later phase.
+
+### 0.0 Durable semantic persistence baseline (do first)
+
+**Why first:** MDL is in-memory by default (`semantic_layer_store="memory"`), so
+models vanish on restart. Every parity seam keys off a **durable, materialized
+manifest** — the engine's compiled-`SessionContext` cache (1.1), the LanceDB
+retrieval index (2.2), and the memory learning loop (2.3) all become meaningless
+if MDL is ephemeral. The DB layer already exists; this workstream makes it the
+baseline. No new tables for *existing* state — wiring + defaults only.
+
+- [ ] Default `semantic_layer_store` to `sqlalchemy` for any deployment using
+      Wren parity features. Options (pick per `app.py`/config review): (a) flip
+      the default to `sqlalchemy`; or (b) keep `memory` as the dev default but
+      **hard-require** `sqlalchemy` whenever `wren_engine != passthrough` or
+      `wren_memory_learning_enabled` — fail startup with a clear message
+      otherwise. Recommendation: (b) — explicit, no silent ephemerality.
+- [ ] Confirm the single `semantic_layer_store` flag covers **all** semantic
+      stores (it does today: layer/project/mdl-file/snapshot). If any parity seam
+      adds state (memory, retrieval-index metadata), route it through the same
+      flag + `session_factory` so one switch governs durability.
+- [ ] Verify migrations cover the MDL-file + project + snapshot tables end-to-end
+      against a fresh `sqlite` and (in CI) a Postgres DB; add the `psycopg`
+      driver to a deployment requirements file for Postgres (see Dependencies).
+- [ ] Respect the identity guard: DB persistence + static identity is rejected by
+      `_validate_identity_persistence_config`. Document that enabling persistence
+      requires `superset_session` or `signed_header` identity (already enforced).
+- [ ] Add a startup log line stating the effective persistence mode + DB URL so
+      operators can see whether MDL is durable.
+- [ ] **MDL durability test:** create → activate → materialize an MDL file with
+      `semantic_layer_store=sqlalchemy`, restart the app (new process / new store
+      instance on the same DB), and assert the file + project + materialized
+      manifest survive.
+
+### 0.1 Seam protocols
+
+- [ ] Create `superset_ai_agent/semantic_layer/seams/__init__.py` exporting the
+      six protocols. Suggested module layout:
+  ```text
+  semantic_layer/seams/engine.py      # SemanticEngine, CompiledManifest, PlannedSql
+  semantic_layer/seams/retriever.py   # Retriever, SchemaItem
+  semantic_layer/seams/memory.py      # Memory, NlSqlPair
+  semantic_layer/seams/modeler.py     # Modeler
+  semantic_layer/seams/executor.py    # Executor (thin alias over SupersetClient)
+  llm/embeddings.py                   # Embedder, NullEmbedder
+  ```
+- [ ] Define protocols (signatures are the contract; keep them minimal):
+  ```python
+  class SemanticEngine(Protocol):
+      def compile(self, mdl_files: list[MdlFile]) -> CompiledManifest: ...
+      def validate(self, manifest: CompiledManifest, *, deep: bool = False,
+                   schema_index: SchemaIndex | None = None) -> MdlValidationResult: ...
+      def plan_sql(self, semantic_sql: str, manifest: CompiledManifest, *,
+                   dialect: str) -> PlannedSql: ...        # native_sql + referenced_tables
+
+  class Retriever(Protocol):
+      def index(self, manifest: CompiledManifest, *, scope_key: str) -> None: ...
+      def retrieve(self, question: str, *, scope_key: str,
+                   k: int) -> list[SchemaItem]: ...
+
+  class Memory(Protocol):
+      def recall_examples(self, question: str, *, scope_key: str,
+                          owner_id: str, k: int) -> list[NlSqlPair]: ...
+      def store_confirmed(self, *, question: str, semantic_sql: str,
+                          native_sql: str, scope_key: str, owner_id: str,
+                          result_meta: dict[str, Any]) -> None: ...
+
+  class Modeler(Protocol):
+      def generate_base_model(self, *, project, superset_context
+                              ) -> list[MdlEnrichmentProposal]: ...
+      def propose_mdl_from_document(self, *, project, document
+                              ) -> MdlEnrichmentProposal: ...
+
+  class Embedder(Protocol):
+      def embed(self, texts: list[str]) -> list[list[float]]: ...
+      def dimensions(self) -> int: ...
+  ```
+- [ ] `CompiledManifest`, `PlannedSql`, `SchemaItem`, `NlSqlPair` as Pydantic
+      models in the seam modules.
+- [ ] **Back-compat:** keep `WrenClient` as a deprecated facade that delegates to
+      the new seams (so `graph.py`/`app.py` keep working during migration); mark
+      with a `# DEPRECATED: decomposed into seams` comment and a follow-up ticket
+      to remove. Do **not** delete `integrations/wren/` in Phase 0.
+
+### 0.2 Default bindings (no behavior change)
+
+- [ ] `PassthroughEngine` (`seams/engine.py`): `compile` = call the existing
+      materializer/compile step; `validate` = delegate to
+      `mdl_validator.validate_project_manifest`; `plan_sql` = return
+      `PlannedSql(native_sql=semantic_sql, referenced_tables=...)` **unchanged**
+      with an `info` warning "semantic rewrite skipped (engine=passthrough)".
+- [ ] `KeywordRetriever` (`seams/retriever.py`): wrap the logic in
+      [`retrieval.py`](semantic_layer/retrieval.py) + `llm_client._rank_models`.
+- [ ] `NullMemory`, `NullEmbedder`: no-ops returning `[]` / raising on `embed`.
+- [ ] `DeterministicModeler` / `LlmModeler`: lift the methods out of
+      `FileWrenClient`/`LlmWrenClient` unchanged.
+- [ ] `SupersetExecutor`: thin Protocol alias documenting that execution stays in
+      `SupersetClient.execute_sql`.
+
+### 0.3 MDL compile canonicalization (closes R9/R16)
+
+- [ ] Treat MDL files as **authoring YAML** (snake_case, unchanged on disk).
+- [ ] Add `semantic_layer/mdl_compile.py::compile_manifest(mdl_files) ->
+      CompiledManifest` that emits the **canonical camelCase engine manifest**
+      (`tableReference`, `joinType`, `isCalculated`, `refSql`, `primaryKey`),
+      reusing the mapping in
+      [`wren_core_validator.py`](semantic_layer/wren_core_validator.py)`::to_wren_core_manifest`.
+      This becomes the single source of camelCase truth.
+- [ ] Refactor [`wren_materializer.py`](semantic_layer/wren_materializer.py) to
+      delegate its `mdl.json` envelope to `compile_manifest` (one casing, one
+      place). Keep the checksum + sidecar behavior.
+- [ ] Fix the `mdl_exporter` envelope mismatch (R9) by routing it through the
+      same compile step.
+
+### 0.4 Factory + wiring
+
+- [ ] New `semantic_layer/seams/factory.py::build_seams(config, *, model_client,
+      embedder, session_factory, mdl_file_store) -> SeamBundle` returning all six
+      bindings chosen by config, degrading closed.
+- [ ] `app.py::create_app` constructs the `SeamBundle` once and injects it into
+      `TextToSqlGraph` and `ConversationGraph` (replacing the
+      `create_wren_client(...)` call site).
+
+**Config (0):** `wren_engine: Literal["passthrough","wren_core"] = "passthrough"`;
+`wren_retriever: Literal["keyword","embedding"] = "keyword"`;
+`wren_memory_store: Literal["none","sqlalchemy","lancedb"] = "none"`.
+
+**Tests (0):** seam protocol conformance tests; `compile_manifest` golden
+(snake→camel) test; assert graphs produce identical output to pre-refactor on a
+fixture (snapshot). **Acceptance:** full existing suite green, no behavior change.
+
+---
+
+## Phase 1 — SemanticEngine (the keystone)
+
+**Parity target:** `wren-core` parses the MDL manifest and `transform_sql`
+expands models into CTEs, resolves calculated columns, and turns relationships
+into real joins — producing native SQL the source DB runs. This is the single
+highest-value piece of Wren and the line between *Wren-shaped* and *Wren-grade*.
+
+### 1.1 `WrenCoreEngine`
+
+- [ ] `semantic_layer/engine/wren_core_engine.py::WrenCoreEngine(SemanticEngine)`:
+  ```python
+  manifest = to_manifest(base64(json(compiled_manifest)))   # already proven in wren_core_validator
+  ctx = SessionContext(manifest, [])
+  native_sql = ctx.transform_sql(semantic_sql)              # ← the parity unlock
+  ```
+- [ ] `validate` delegates to the existing deep path
+      ([`wren_core_validator.validate_with_wren_core`](semantic_layer/wren_core_validator.py))
+      **merged with** the always-on structural/physical validator.
+- [ ] `plan_sql` returns `PlannedSql(native_sql, referenced_tables, warnings)`;
+      extract `referenced_tables` for the physical-resolution check (invariant).
+- [ ] Cache compiled `SessionContext` per `(project_id, materialized_checksum)`
+      to avoid recompiling per request (addresses R7-style cost).
+- [ ] **Dialect:** map `project.database_backend` → wren-core source/dialect and
+      thread it into the manifest `dataSource` so `transform_sql` targets the
+      right native dialect (Postgres/BigQuery/Snowflake/…). Maintain an explicit
+      `BACKEND_TO_WREN_DIALECT` table; unknown backend → passthrough + warning.
+
+### 1.2 Graph wiring (engine in the execution path)
+
+- [ ] Add a node `plan_semantic_sql` between `draft_sql` and `validate_sql` in
+      [`graph.py`](graph.py)`::_compile_graph` (and the conversation graph):
+      `semantic_sql → engine.plan_sql → native_sql`.
+- [ ] Feed `native_sql` into the **existing** `validate_read_only_sql` then the
+      Superset executor — **unchanged**. (Invariant: engine rewrites, Superset
+      executes.)
+- [ ] Validate `PlannedSql.referenced_tables` against the request's
+      `SchemaIndex` (reuse `SchemaIndex.from_agent_context` /
+      `from_snapshot`); a reference Superset can't see → fail before execution
+      with a clear error (not a Superset 500).
+- [ ] On engine error, route to the correction loop (1.4); if `engine ==
+      passthrough`, behave exactly as today.
+
+### 1.3 Semantic-SQL prompt
+
+- [ ] Update [`prompts/text_to_sql.md`](prompts/text_to_sql.md) and
+      `prompts/conversation.md`: instruct the model to write SQL **against MDL
+      logical models/columns** (referencing relationship-qualified and calculated
+      columns by their MDL names), not physical tables, when the engine is
+      active. Provide the model/column catalog from the retriever.
+- [ ] Provide a flag-driven prompt variant: when `engine == passthrough`, keep the
+      current physical-SQL instructions (models map 1:1 to tables, so logical ≈
+      physical and nothing breaks).
+
+### 1.4 SQL correction loop (parity with Wren's dry-run → correction)
+
+- [ ] On `plan_sql` / `validate` failure, feed the engine error back to the model
+      (bounded retries, reuse the conversation graph's reflection machinery) to
+      regenerate semantic SQL. Mirrors Wren's `sql_correction` pipeline.
+- [ ] Cap retries via existing retry config; emit `TraceEvent`s for each attempt.
+
+### 1.5 Audit
+
+- [ ] Extend `AuditInfo` ([`schemas.py`](schemas.py)) with `semantic_sql`,
+      `native_sql`, `engine` and populate them in `_execute_sql`.
+
+**Config (1):** `wren_engine="wren_core"` to enable; `wren_semantic_sql_enabled`
+(prompt mode); `wren_engine_max_correction_retries: int = 2`. Add `wren-core` to
+[`requirements-ai-agent.txt`](../requirements-ai-agent.txt) (currently commented).
+
+**Tests (1):**
+- [ ] Golden manifest: two models + a `MANY_TO_ONE` relationship + a calculated
+      metric → assert `transform_sql` output **contains the join** the LLM never
+      wrote. (`skipif` wren-core absent.)
+- [ ] **CI job that installs `wren-core`** and runs the engine-present tests
+      against a golden manifest (closes R16 — the unverified-manifest risk).
+- [ ] Passthrough fallback parity (engine off → identical to Phase 0).
+- [ ] `referenced_tables` physical-resolution failure → pre-execution error.
+- [ ] Correction loop repairs an intentionally-bad first draft.
+
+**Acceptance (parity litmus):** a question requiring a cross-model join + a
+calculated metric produces an **executed** native SQL whose joins were generated
+by the engine, not the LLM — verified end to end through Superset.
+
+> **OQ1 (open):** semantic-SQL authoring is the one behavioral change. Decide the
+> rollout: (a) engine-on by default once parity tests pass, or (b) per-project
+> opt-in while models are still mostly 1:1 table mappings. Recommendation: ship
+> behind `wren_engine` flag, default `passthrough`, flip per-project after the
+> golden tests + a real-schema A/B.
+
+---
+
+## Phase 2 — Retrieval (embeddings) + Memory (learning loop)
+
+### 2.1 Embedder seam
+
+**Parity target:** Wren embeds schema chunks and questions with a configurable
+embedder.
+
+- [ ] `llm/embeddings.py::Embedder` (Protocol) + provider impls mirroring the
+      existing LLM providers ([`llm/`](llm/)): `OpenAiEmbedder`, `AzureEmbedder`,
+      `OllamaEmbedder`, `NullEmbedder`.
+- [ ] `llm/factory.py` (or a sibling) builds the embedder from config; missing
+      config → `NullEmbedder` and the retriever factory falls back to keyword.
+- [ ] Validate `embedder_model` ↔ `embedder_dimensions` consistency at startup;
+      `dimensions` is baked into the LanceDB table at index creation, so a
+      mismatch (or a model change) must trigger a **reindex**, not a silent error.
+
+**Config / env vars (assume OpenAI).** Naming follows the existing convention:
+vendor creds use bare `OPENAI_*` (reused), agent-owned config uses `AI_AGENT_*`,
+toggles use `WREN_*`. Minimal OpenAI setup is three vars
+(`WREN_RETRIEVER=embedding`, `AI_AGENT_EMBEDDER_PROVIDER=openai`,
+`OPENAI_API_KEY=…`); everything else defaults.
+
+_Required to enable embedding retrieval:_
+
+| Env var | Config field | Default | Purpose |
+| --- | --- | --- | --- |
+| `WREN_RETRIEVER` | `wren_retriever` | `keyword` | Set `embedding` to activate the embedder + LanceDB. |
+| `AI_AGENT_EMBEDDER_PROVIDER` | `embedder_provider` | _unset_ | Set `openai`. Unset → `NullEmbedder` → auto-fallback to keyword. |
+| `OPENAI_API_KEY` | `openai_api_key` (reused) | _unset_ | **Required.** Embedder falls back to this when `AI_AGENT_EMBEDDER_API_KEY` is unset. |
+
+_Embedder tuning (optional, sane defaults):_
+
+| Env var | Config field | Default | Purpose |
+| --- | --- | --- | --- |
+| `AI_AGENT_EMBEDDER_MODEL` | `embedder_model` | `text-embedding-3-small` | OpenAI embedding model. |
+| `AI_AGENT_EMBEDDER_DIMENSIONS` | `embedder_dimensions` | `1536` | Vector size — **must match the model + LanceDB table**. `3-small`=1536, `3-large`=3072. |
+| `AI_AGENT_EMBEDDER_API_KEY` | `embedder_api_key` | falls back to `OPENAI_API_KEY` | Override only if embeddings use a different key. |
+| `AI_AGENT_EMBEDDER_BASE_URL` | `embedder_base_url` | falls back to `OPENAI_BASE_URL` | Override for Azure/proxy/self-hosted gateways. |
+| `AI_AGENT_EMBEDDER_BATCH_SIZE` | `embedder_batch_size` | `128` | Batch size when indexing the manifest. |
+
+_Supporting (index storage — needed when the retriever is on):_
+
+| Env var | Config field | Default | Purpose |
+| --- | --- | --- | --- |
+| `WREN_LANCEDB_PATH` | `wren_lancedb_path` | `{AI_AGENT_STORAGE_DIR}/lancedb` | Where the vector index lives. |
+
+- [ ] **Update `.env` examples:** add all of the above to
+      [`superset_ai_agent/.env.example`](.env.example) (and any deployment
+      `.envrc`/compose env templates) with the OpenAI defaults commented, so the
+      embedding path is discoverable without reading this plan. This is a
+      required sub-task of the Embedder seam, not a follow-on.
+
+### 2.2 EmbeddingRetriever (LanceDB)
+
+**Parity target:** LanceDB `schema_items` collection; embed question → top-k
+relevant models/columns/relationships.
+
+- [ ] `semantic_layer/retrieval/lancedb_retriever.py::EmbeddingRetriever(Retriever)`.
+- [ ] `index(manifest, scope_key)`: chunk the **compiled manifest** into
+      `SchemaItem`s (one per model, per column, per relationship — mirrors Wren's
+      chunking), embed, upsert into a LanceDB table at
+      `{agent_storage_dir}/lancedb/{scope_key}`.
+- [ ] `retrieve(question, scope_key, k)`: embed question, vector-search, return
+      `SchemaItem`s; feed into `WrenContextArtifact.context_items` (same shape the
+      prompt already consumes — see `merge_indexed_semantic_context` in
+      [`runtime.py`](semantic_layer/runtime.py)).
+- [ ] **Index lifecycle:** rebuild on materialization, keyed by
+      `materialized_checksum`; wire into the existing
+      [`indexer.py`](semantic_layer/indexer.py)`::rebuild_index` + materializer so
+      activation refreshes the index. Stale-checksum → lazy reindex.
+- [ ] Keep `KeywordRetriever` as the default and the automatic fallback.
+
+**Config:** `wren_retriever="embedding"`; `wren_lancedb_path` (default
+`{agent_storage_dir}/lancedb`); reuse `wren_context_limit` /
+`wren_schema_context_token_budget`.
+
+**Tests:** chunking shape; index+retrieve round-trip (fake embedder with
+deterministic vectors); fallback to keyword when embedder is `Null`; checksum
+reindex.
+
+### 2.3 Memory learning loop
+
+**Parity target:** Wren's `query_history` collection — confirmed NL→SQL pairs
+recalled as few-shot, improving over time.
+
+- [ ] New table `ai_agent_nl_sql_examples` in
+      [`persistence/models.py`](persistence/models.py) (owner-scoped, project/
+      scope-scoped; columns: id, owner_id, project_id, scope_hash, question,
+      semantic_sql, native_sql, result_meta JSON, created_at). Migration
+      **`0003_nl_sql_examples`**.
+- [ ] `SqlAlchemyMemory(Memory)` (+ `InMemoryMemory` for tests); optional
+      `LanceDbMemory` for **semantic** recall (embed question, vector-search the
+      examples) — gated on the embedder, else fall back to keyword recall.
+- [ ] **Write-back hook:** after a successful, user-confirmed execution in
+      `graph.py` / `conversation_graph.py`, call `memory.store_confirmed(...)`.
+      Gate on execution success (and, for conversation mode, user acceptance);
+      never store failed or unconfirmed SQL.
+- [ ] **Recall:** inject top-k pairs as few-shot into the SQL prompt; replaces the
+      vestigial `recall_examples`/`memory.json` path.
+
+**Config:** `wren_memory_store="sqlalchemy"|"lancedb"`;
+`wren_memory_learning_enabled: bool = True`; `wren_memory_recall_k: int = 3`.
+
+**Governance:** examples are owner+scope scoped, are **context not permission**,
+and must be excluded from cross-owner recall (filter by `owner_id` + `scope_hash`
+like the existing stores).
+
+**Tests:** store→recall round-trip; cross-owner isolation; learning improves a
+fixture question's few-shot; write-back fires only on confirmed success.
+
+---
+
+## Phase 3 — MDL Completeness + Deep-Validation Hardening
+
+**Parity target:** Wren MDL includes cubes (measures/dimensions/time
+dimensions/hierarchies) and first-class metrics; engine deep-validates manifests.
+
+- [ ] Extend [`mdl_schema.py`](semantic_layer/mdl_schema.py) with `MdlMetric` and
+      `MdlCube` (measures, dimensions, time dimensions, hierarchies) as
+      first-class objects; extend `MdlManifest` containers.
+- [ ] Extend `compile_manifest` + `to_wren_core_manifest` to emit the camelCase
+      cube/metric shapes wren-core expects; extend the validator
+      ([`mdl_validator.py`](semantic_layer/mdl_validator.py)) accordingly.
+- [ ] Teach the Modeler (Phase 4 prompts) to propose metrics/cubes where the
+      source supports them.
+- [ ] Make `validate` run wren-core deep validation in CI on every manifest
+      change (extends the Phase-1 CI job).
+
+**Tests:** cube/metric round-trip compile + validate; deep-validation rejects a
+semantically inconsistent manifest.
+
+---
+
+## Phase 4 — Orchestrator / Skills + Embeddable Surface
+
+**Parity target:** Wren's plan-and-execute SDK, Markdown **skills** that guide
+agents, intent classification, and framework adapters (LangChain/Pydantic-AI).
+This is the "extend beyond Wren / future agentic" seam.
+
+### 4.1 SemanticPipeline facade (the `wrenai`-SDK equivalent)
+
+- [ ] `semantic_layer/pipeline.py::SemanticPipeline` composing the seams:
+      `intent → retrieve → modeler-context → draft semantic SQL →
+      engine.plan_sql → validate → execute (Superset) → memory.store`. The graphs
+      become thin callers; the pipeline is the reusable, embeddable unit.
+
+### 4.2 Intent classification (parity gap #6)
+
+- [ ] Lightweight pre-node classifying `text_to_sql | general | clarify |
+      misleading` (reuse `model_client.chat` with a small prompt). Short-circuit
+      non-SQL intents to a direct answer / clarification instead of forcing SQL.
+
+### 4.3 Skills
+
+- [ ] Adopt Wren's Markdown-skill pattern under `superset_ai_agent/skills/`:
+      `onboarding.md`, `generate-mdl.md`, `enrich-context.md`, `usage.md`.
+      Register via [`prompts/registry.py`](prompts/registry.py); these encode
+      safe procedures ("build MDL before querying", "fetch context before SQL",
+      "store confirmed example after success") and are the human-readable seam for
+      future agentic workflows.
+
+### 4.4 Embeddable / framework adapters (stretch)
+
+- [ ] Expose the pipeline as a tool-callable interface; provide thin LangChain /
+      Pydantic-AI adapters as references (mirrors `wren-langchain` /
+      `wren-pydantic`). Keep optional and out of the default install.
+
+**Tests:** intent routing; pipeline end-to-end with all seams; skill registry
+load.
+
+---
+
+## Cross-Cutting
+
+### Config surface (new keys, all env-overridable, all default-safe)
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `wren_engine` | `passthrough` | `passthrough` \| `wren_core` |
+| `wren_semantic_sql_enabled` | `false` | semantic-SQL prompt mode |
+| `wren_engine_max_correction_retries` | `2` | engine-error correction loop |
+| `wren_retriever` | `keyword` | `keyword` \| `embedding` |
+| `wren_lancedb_path` | `{storage}/lancedb` | vector index root |
+| `embedder_*` (`AI_AGENT_EMBEDDER_*`) | see [2.1](#21-embedder-seam) | embedder — full env-var table in Phase 2 |
+| `wren_memory_store` | `none` | `none` \| `sqlalchemy` \| `lancedb` |
+| `wren_memory_learning_enabled` | `true` | write-back on confirmed success |
+| `wren_memory_recall_k` | `3` | few-shot count |
+
+Keep `WREN_EXECUTION_ENABLED` rejected at startup. Existing
+`wren_core_validation_enabled` is subsumed by `wren_engine=wren_core` (keep as an
+alias for one release).
+
+### Dependencies (all optional, import-guarded)
+
+- [ ] `wren-core` (Phase 1) — uncomment in
+      [`requirements-ai-agent.txt`](../requirements-ai-agent.txt); CI installs it.
+- [ ] `lancedb` (Phase 2) — optional extra; absent → keyword retrieval + sqla
+      memory.
+- [ ] embeddings provider SDK reuse (Phase 2) — reuse existing provider deps
+      (`openai` is already present and covers embeddings) where possible.
+- [ ] **`psycopg` (Phase 0, prod)** — required for Postgres-backed persistence;
+      only `sqlite` works out of the box today. Add to a deployment requirements
+      file (per [`wren.md`](wren.md) Agent-Owned Database). Not needed for dev
+      (sqlite default).
+
+### Migrations
+
+- [ ] `0003_nl_sql_examples` (Phase 2). Follow the `0001`/`0002` pattern in
+      [`persistence/migrations/versions/`](persistence/migrations/versions/).
+
+### Frontend (follow-on, not blocking parity)
+
+Baseline UI is already substantial and modeling-ready — `SemanticLayerEditor`
+(onboarding/enrich/materialize/import wired). Parity adds surfacing only:
+
+- [ ] Surface engine status (`engine=wren_core|passthrough`) and the
+      semantic-vs-native SQL in the AI panel audit collapsible
+      ([`AuditInfoPanel.tsx`](../superset-frontend/src/SqlLab/components/AiAgentPanel/AuditInfoPanel.tsx)).
+- [ ] Surface retrieval mode (keyword/embedding) and whether a query reused a
+      learned example (memory badge).
+- [ ] Surface persistence mode + a "models are not persisted" warning when the
+      service runs in `semantic_layer_store=memory` (dev), so users don't model
+      against an ephemeral store unaware.
+
+---
+
+## Overall Acceptance — "Full Parity" Definition of Done
+
+Parity is achieved when **all six seams** have their parity binding passing and:
+
+- [ ] **Persistence:** MDL, projects, and the materialized manifest are durable
+      (survive restart) under `semantic_layer_store=sqlalchemy`; parity features
+      refuse to run silently against an in-memory store (0.0).
+- [ ] **Engine:** cross-model join + calculated metric question → executed native
+      SQL with engine-generated joins (Phase 1 litmus), through Superset only.
+- [ ] **Retrieval:** on a wide schema, embedding retrieval surfaces the relevant
+      models a keyword scan misses (fixture A/B).
+- [ ] **Memory:** a previously-confirmed question is answered using its own stored
+      pair as few-shot (learning loop demonstrated).
+- [ ] **Modeler:** onboarding + doc enrichment produce activatable draft MDL
+      validated against the live schema (existing tests + cube/metric coverage).
+- [ ] **Executor:** every execution is Superset-only, read-only-validated, and
+      audited with semantic+native SQL.
+- [ ] **Orchestrator/Skills:** intent routing works; the pipeline is importable
+      and skill-guided.
+- [ ] Throwaway **A/B spike** vs. a full upstream Wren mesh shows comparable
+      end-to-end SQL quality on the dev fixtures (de-risking, not a build target).
+- [ ] `pre-commit run --all-files` green; new CI engine job green.
+
+---
+
+## Open Questions & Risks
+
+- **OQ1 — Semantic-SQL rollout.** See Phase 1; default `passthrough`, flip
+  per-project after golden + real-schema A/B.
+- **OQ2 — Embedder provenance.** Which embedder is the supported default
+  (OpenAI/Azure/self-hosted)? Affects LanceDB dimensions and offline story.
+- **OQ3 — Memory governance.** Confirm owner+scope isolation is sufficient, or
+  whether learned examples need an explicit opt-in/retention policy per the
+  Superset security model.
+- **R-A — wren-core version drift.** `transform_sql`/manifest shape can change
+  across wren-core releases; the CI engine job + pinned dep mitigate (supersedes
+  R16). Re-verify `BACKEND_TO_WREN_DIALECT` on upgrades.
+- **R-B — dialect coverage.** Not every Superset backend maps to a wren-core
+  dialect; unknown → passthrough + warning (no silent wrong-dialect SQL).
+- **R-C — index/memory are process-local until backed by LanceDB-on-shared-store
+  or DB.** Mirrors the existing R14/R18 job-runner caveat; fine for single-worker,
+  revisit for multi-worker prod.
+- **R-D — physical drift.** Engine `referenced_tables` validated against the
+  permission-filtered `SchemaIndex` (live or snapshot per R12); a dropped column
+  during an outage can mis-flag until the next live fetch (inherits R17).
+
+## Pre-flight (every phase)
+
+- [ ] `pre-commit run --all-files` green (mypy/ruff/pylint/eslint/prettier).
+- [ ] New Python files carry the ASF header + type hints.
+- [ ] New optional deps are import-guarded and degrade closed.
+- [ ] **Any new env var is reflected in [`.env.example`](.env.example)** (and
+      deployment env/compose templates) with a sane default commented in.
+- [ ] Update the [Implementation Status](#implementation-status) table.
