@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json  # noqa: TID251 - keep the standalone agent independent of Superset
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -198,6 +199,15 @@ def create_app(  # noqa: C901
     )
     active_identity_provider = identity_provider or create_identity_provider(app_config)
     _validate_identity_persistence_config(app_config)
+    _validate_semantic_persistence_config(app_config)
+    logger.info(
+        "AI agent persistence: semantic_layer_store=%s conversation_store=%s "
+        "db=%s parity_features=%s",
+        app_config.semantic_layer_store,
+        app_config.conversation_store,
+        app_config.agent_database_url if _requires_agent_database(app_config) else "-",
+        _parity_features_enabled(app_config),
+    )
 
     session_factory = None
     if _requires_agent_database(app_config):
@@ -1928,10 +1938,47 @@ def _append_semantic_event(
     )
 
 
+logger = logging.getLogger(__name__)
+
+
 def _requires_agent_database(config: AgentConfig) -> bool:
     return (
         config.conversation_store == "sqlalchemy"
         or config.semantic_layer_store == "sqlalchemy"
+        or config.wren_memory_store == "sqlalchemy"
+    )
+
+
+def _parity_features_enabled(config: AgentConfig) -> bool:
+    """Return whether any Wren full-parity seam needs a durable manifest.
+
+    The engine's compiled-context cache, the embedding retrieval index, and the
+    memory learning loop all key off a durable, materialized MDL manifest; an
+    in-memory semantic store would silently lose that state on restart.
+    """
+
+    return (
+        config.wren_engine != "passthrough"
+        or config.wren_retriever != "keyword"
+        or config.wren_memory_store != "none"
+    )
+
+
+def _validate_semantic_persistence_config(config: AgentConfig) -> None:
+    """Fail closed if a parity feature is enabled without durable persistence."""
+
+    if not _parity_features_enabled(config):
+        return
+    if config.semantic_layer_store == "sqlalchemy":
+        return
+    raise ValueError(
+        "Wren parity features require durable semantic persistence. One of "
+        f"wren_engine={config.wren_engine!r}, wren_retriever="
+        f"{config.wren_retriever!r}, or wren_memory_store="
+        f"{config.wren_memory_store!r} is enabled, but "
+        f"semantic_layer_store={config.semantic_layer_store!r}. Set "
+        "AI_AGENT_SEMANTIC_LAYER_STORE=sqlalchemy so models, the materialized "
+        "manifest, and learned examples survive restarts."
     )
 
 

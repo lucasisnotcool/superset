@@ -193,7 +193,7 @@ manifest), so **Phase 0 makes DB-backed semantic persistence the baseline**
 
 | Phase | Workstream | Status |
 | --- | --- | --- |
-| 0 | Durable semantic persistence baseline (MDL in DB) | `[TODO]` |
+| 0 | Durable semantic persistence baseline (MDL in DB) | `[COMPLETE]` (2026-06-22) |
 | 0 | Seam refactor + MDL compile canonicalization | `[TODO]` |
 | 1 | SemanticEngine (wren-core rewrite) — **keystone** | `[TODO]` |
 | 1 | Semantic-SQL prompt + correction loop | `[TODO]` |
@@ -211,7 +211,29 @@ rebind current behavior to them with **zero behavior change**, and split MDL int
 *authoring YAML* (snake_case, human) vs *compiled manifest* (camelCase,
 engine-ready). Unblocks every later phase.
 
-### 0.0 Durable semantic persistence baseline (do first)
+### 0.0 Durable semantic persistence baseline (do first) — `[COMPLETE]` (2026-06-22)
+
+**Resolved.** Parity seams now fail closed unless durable persistence is on, and
+MDL is proven to survive a restart. Source:
+[`config.py`](config.py) (`wren_engine` / `wren_retriever` / `wren_memory_store` /
+`wren_memory_learning_enabled` + env wiring `WREN_ENGINE` / `WREN_RETRIEVER` /
+`WREN_MEMORY_STORE` / `WREN_MEMORY_LEARNING_ENABLED`);
+[`app.py`](app.py) (`_parity_features_enabled`, `_validate_semantic_persistence_config`
+called in `create_app`, `_requires_agent_database` now also triggers on
+`wren_memory_store="sqlalchemy"`, plus a startup `logger.info` of the effective
+persistence mode); [`.env.example`](.env.example) (new keys + embedder block).
+Tests: [`test_persistence_baseline.py`](../tests/unit_tests/superset_ai_agent/test_persistence_baseline.py)
+(7) — defaults legal; each parity feature rejects `memory`; allowed with
+`sqlalchemy`; memory-store triggers the DB; **MDL create→activate→reopen-DB
+survives restart**. Suite: **190 passed, 1 skipped**; `ruff` clean.
+
+**Residual risk RP1:** enforcement is **config-based**, not instance-based —
+`_validate_semantic_persistence_config` keys off `semantic_layer_store`, so a
+caller that injects a durable store object into `create_app(...)` while leaving
+`semantic_layer_store="memory"` would still be rejected (and vice-versa, an
+injected in-memory store with `=sqlalchemy` would pass). This is intentional
+(config is the operator contract) but is a dev-expectation gap worth a docstring
+note when the seam factory lands in 0.4.
 
 **Why first:** MDL is in-memory by default (`semantic_layer_store="memory"`), so
 models vanish on restart. Every parity seam keys off a **durable, materialized

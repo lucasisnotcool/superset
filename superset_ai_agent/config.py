@@ -23,6 +23,9 @@ from typing import cast, Literal
 
 SupersetAdapterMode = Literal["local", "rest", "mcp"]
 WrenAdapterMode = Literal["file", "http", "llm"]
+WrenEngineMode = Literal["passthrough", "wren_core"]
+WrenRetrieverMode = Literal["keyword", "embedding"]
+WrenMemoryStoreMode = Literal["none", "sqlalchemy", "lancedb"]
 ConversationStoreMode = Literal["memory", "sqlalchemy"]
 SemanticLayerStoreMode = Literal["memory", "sqlalchemy"]
 DocumentStorageMode = Literal["local", "s3"]
@@ -128,6 +131,14 @@ class AgentConfig:
     semantic_full_access_grants_write: bool = False
     semantic_activation_requires_live_schema: bool = False
     wren_core_validation_enabled: bool = False
+    # Wren full-parity seams (see wren_full.md). All default to the
+    # zero-dependency binding so the service starts unchanged; turning any of
+    # these on requires durable semantic persistence (semantic_layer_store=
+    # sqlalchemy), enforced at startup.
+    wren_engine: WrenEngineMode = "passthrough"
+    wren_retriever: WrenRetrieverMode = "keyword"
+    wren_memory_store: WrenMemoryStoreMode = "none"
+    wren_memory_learning_enabled: bool = True
     superset_agent_adapter: SupersetAdapterMode = "rest"
     superset_auth_mode: SupersetAuthMode = "user_session"
     superset_base_url: str = "http://localhost:8091"
@@ -422,6 +433,22 @@ class AgentConfig:
             wren_core_validation_enabled=_env_bool(
                 "WREN_CORE_VALIDATION_ENABLED",
                 cls.wren_core_validation_enabled,
+            ),
+            wren_engine=cast(
+                WrenEngineMode,
+                os.getenv("WREN_ENGINE", cls.wren_engine).strip().lower(),
+            ),
+            wren_retriever=cast(
+                WrenRetrieverMode,
+                os.getenv("WREN_RETRIEVER", cls.wren_retriever).strip().lower(),
+            ),
+            wren_memory_store=cast(
+                WrenMemoryStoreMode,
+                os.getenv("WREN_MEMORY_STORE", cls.wren_memory_store).strip().lower(),
+            ),
+            wren_memory_learning_enabled=_env_bool(
+                "WREN_MEMORY_LEARNING_ENABLED",
+                cls.wren_memory_learning_enabled,
             ),
             superset_agent_adapter=cast(
                 SupersetAdapterMode,
