@@ -889,3 +889,76 @@ def test_conversation_graph_returns_error_turn_when_context_fails() -> None:
         "user",
         "assistant",
     ]
+
+
+class _RewriteEngine:
+    """Stand-in SemanticEngine that rewrites a model name to a physical table."""
+
+    name = "fake"
+
+    def is_available(self) -> bool:
+        return True
+
+    def compile(self, mdl_files):
+        from superset_ai_agent.semantic_layer.mdl_compile import compile_manifest
+
+        return compile_manifest(mdl_files)
+
+    def validate(self, manifest, *, deep=False, schema_index=None):
+        from superset_ai_agent.semantic_layer.schemas import MdlValidationResult
+
+        return MdlValidationResult(valid=True)
+
+    def plan_sql(self, semantic_sql, manifest, *, dialect=None):
+        from superset_ai_agent.semantic_layer.engine import PlannedSql
+
+        return PlannedSql(
+            native_sql=semantic_sql.replace("birth_names", "main.birth_names"),
+            engine=self.name,
+            rewritten=True,
+            referenced_tables=["birth_names"],
+        )
+
+
+def test_conversation_graph_engine_rewrite_reaches_execution_and_audit() -> None:
+    store = InMemoryConversationStore()
+    scope = ConversationScope(database_id=1, dataset_ids=[16])
+    conversation = store.create(scope)
+    superset = FakeSupersetClient()
+    graph = ConversationGraph(
+        config=AgentConfig(default_sql_limit=25),
+        model_client=FakeModelClient(
+            {
+                "response_type": "sql",
+                "message": "Drafted SQL.",
+                "sql": (
+                    "SELECT name, SUM(num) AS total_births "
+                    "FROM birth_names GROUP BY name"
+                ),
+                "explanation": "Groups names.",
+            }
+        ),
+        context_provider=FakeContextProvider(),
+        superset_client=superset,
+        conversation_store=store,
+        semantic_engine=_RewriteEngine(),
+    )
+
+    response = graph.run(
+        conversation_id=conversation.id,
+        request=ConversationTurnRequest(
+            message="Show top names",
+            scope=scope,
+            execution_mode="auto",
+        ),
+    )
+
+    # The engine-rewritten native SQL is what Superset executed.
+    assert superset.executed_sql
+    assert "main.birth_names" in superset.executed_sql[0]
+    # The artifact audit carries engine provenance.
+    artifact = response.artifacts[0]
+    assert artifact.audit is not None
+    assert artifact.audit.engine == "fake"
+    assert "main.birth_names" in (artifact.audit.native_sql or "")
+    assert "birth_names" in (artifact.audit.semantic_sql or "")

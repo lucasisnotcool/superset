@@ -197,7 +197,8 @@ manifest), so **Phase 0 makes DB-backed semantic persistence the baseline**
 | 0 | MDL compile canonicalization (0.3) | `[COMPLETE]` (2026-06-22) |
 | 0 | Seam refactor + default bindings (0.1–0.2, 0.4) | `[TODO]` |
 | 1 | SemanticEngine seam (protocol + passthrough + wren-core scaffold) | `[COMPLETE]` (2026-06-22) |
-| 1 | SemanticEngine graph wiring + prompt + correction loop + audit | `[TODO]` |
+| 1 | SemanticEngine graph wiring + audit (both graphs) | `[COMPLETE]` (2026-06-22) |
+| 1 | Semantic-SQL prompt mode + engine-feedback correction loop | `[TODO]` |
 | 1 | Semantic-SQL prompt + correction loop | `[TODO]` |
 | 2 | Embedder + EmbeddingRetriever (LanceDB) | `[TODO]` |
 | 2 | Memory learning loop | `[TODO]` |
@@ -462,9 +463,49 @@ The detailed sub-tasks below remain the spec for the graph-wiring work (1.2+):
       right native dialect (Postgres/BigQuery/Snowflake/…). Maintain an explicit
       `BACKEND_TO_WREN_DIALECT` table; unknown backend → passthrough + warning.
 
-### 1.2 Graph wiring (engine in the execution path)
+### 1.2 Graph wiring (engine in the execution path) — `[COMPLETE]` (2026-06-22)
 
-- [ ] Add a node `plan_semantic_sql` between `draft_sql` and `validate_sql` in
+**Resolved (both graphs).** The engine is wired into the live query path of the
+one-shot and conversation graphs; passthrough (default) is a verified no-op, and
+a fake rewriting engine proves native SQL reaches Superset execution + audit.
+
+Source:
+- [`semantic_layer/engine/planning.py`](semantic_layer/engine/planning.py) —
+  shared `plan_semantic_sql_step` (rewrite + soft hallucination gate) and
+  `with_engine_provenance` (audit stamping), so both graphs use one tested path.
+- [`graph.py`](graph.py) — `plan_semantic_sql` node between `dry_plan_with_wren`
+  and `validate_sql`; `repair_sql → plan_semantic_sql` re-plans repaired drafts;
+  `semantic_engine` ctor arg (defaults from `create_semantic_engine(config)`);
+  audit provenance in `_build_artifacts`.
+- [`conversation_graph.py`](conversation_graph.py) — same node/edges; rewrites
+  `draft.sql` in place; audit provenance applied to both the artifact copy and
+  state.
+- [`schemas.py`](schemas.py) — `AuditInfo.semantic_sql` / `native_sql` / `engine`.
+
+Tests:
+[`test_graph_semantic_engine.py`](../tests/unit_tests/superset_ai_agent/test_graph_semantic_engine.py)
+(2 — rewrite reaches execution + audit; passthrough no-op) and
+[`test_conversation_graph.py`](../tests/unit_tests/superset_ai_agent/test_conversation_graph.py)::
+`test_conversation_graph_engine_rewrite_reaches_execution_and_audit`. Suite:
+**206 passed, 2 skipped**; `ruff` clean.
+
+**Residual risk RG1 (gap vs. plan intent):** the physical-resolution gate is a
+**soft warning, not a hard pre-execution block.** The plan called for failing
+before execution on an unknown table; because wren-core's rewritten SQL is full
+of CTE names (false positives) and the engine isn't live-verified, the gate runs
+on the **semantic** SQL against known model + dataset names and only *warns*.
+Hardening to a block is deferred until the wren-core CI job (RE1) lands and we
+can distinguish physical tables from expanded CTEs.
+
+**Residual risk RG2 (dev-expectation gap):** the engine rewrite is only
+meaningful once the LLM writes **semantic** SQL against MDL models — that prompt
+change is **1.3 (still TODO)**. With the default passthrough engine and today's
+physical-SQL prompt, this wiring is inert by design (zero behavior change). The
+rewrite path is proven only via a fake engine + skipif'd wren-core test.
+
+#### Original 1.2 spec (retained)
+
+- [x] Add a node `plan_semantic_sql` between `draft_sql` and `validate_sql` in
       [`graph.py`](graph.py)`::_compile_graph` (and the conversation graph):
       `semantic_sql → engine.plan_sql → native_sql`.
 - [ ] Feed `native_sql` into the **existing** `validate_read_only_sql` then the
@@ -495,10 +536,12 @@ The detailed sub-tasks below remain the spec for the graph-wiring work (1.2+):
       regenerate semantic SQL. Mirrors Wren's `sql_correction` pipeline.
 - [ ] Cap retries via existing retry config; emit `TraceEvent`s for each attempt.
 
-### 1.5 Audit
+### 1.5 Audit — `[COMPLETE]` (2026-06-22)
 
-- [ ] Extend `AuditInfo` ([`schemas.py`](schemas.py)) with `semantic_sql`,
-      `native_sql`, `engine` and populate them in `_execute_sql`.
+- [x] Extended `AuditInfo` ([`schemas.py`](schemas.py)) with `semantic_sql`,
+      `native_sql`, `engine`; populated via `with_engine_provenance` in both
+      graphs' `_build_artifacts`. (Stamped at artifact-build time, not
+      `_execute_sql`, so the provenance rides the same record the UI reads.)
 
 **Config (1):** `wren_engine="wren_core"` to enable; `wren_semantic_sql_enabled`
 (prompt mode); `wren_engine_max_correction_retries: int = 2`. Add `wren-core` to

@@ -101,6 +101,11 @@ class AuditInfo(BaseModel):
     tab: str | None = None
     source_hash: str | None = None
     source: str | None = None
+    # Semantic-engine provenance (wren_full.md Phase 1.2): the SQL the model
+    # wrote vs. what the engine rewrote and Superset executed.
+    semantic_sql: str | None = None
+    native_sql: str | None = None
+    engine: str | None = None
 
 
 class SqlExecutionSource(BaseModel):

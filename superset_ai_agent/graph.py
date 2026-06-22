@@ -47,6 +47,14 @@ from superset_ai_agent.schemas import (
     WrenContextArtifact,
     WrenRetrievalArtifact,
 )
+from superset_ai_agent.semantic_layer.engine import (
+    create_semantic_engine,
+    SemanticEngine,
+)
+from superset_ai_agent.semantic_layer.engine.planning import (
+    plan_semantic_sql_step,
+    with_engine_provenance,
+)
 from superset_ai_agent.semantic_layer.mdl_files import MdlFileStore
 from superset_ai_agent.semantic_layer.projects import SemanticProjectStore
 from superset_ai_agent.semantic_layer.runtime import merge_indexed_semantic_context
@@ -83,6 +91,9 @@ class AgentState(TypedDict, total=False):
     wren_retrieval: WrenRetrievalArtifact | None
     wren_materialization: WrenMaterializationResult | None
     wren_mdl_path: str | None
+    semantic_sql: str | None
+    native_sql: str | None
+    engine: str | None
     trace: list[TraceEvent]
     repair_attempts: int
     error: str | None
@@ -102,6 +113,7 @@ class TextToSqlGraph:
         semantic_layer_store: SemanticLayerStore | None = None,
         semantic_project_store: SemanticProjectStore | None = None,
         mdl_file_store: MdlFileStore | None = None,
+        semantic_engine: SemanticEngine | None = None,
     ):
         self.config = config
         self.model_client = model_client
@@ -111,6 +123,7 @@ class TextToSqlGraph:
         self.semantic_layer_store = semantic_layer_store
         self.semantic_project_store = semantic_project_store
         self.mdl_file_store = mdl_file_store
+        self.semantic_engine = semantic_engine or create_semantic_engine(config)
         self.graph = self._compile_graph()
 
     def run(
@@ -178,6 +191,7 @@ class TextToSqlGraph:
         graph.add_node("load_wren_context", self._load_wren_context)
         graph.add_node("draft_sql", self._draft_sql)
         graph.add_node("dry_plan_with_wren", self._dry_plan_with_wren)
+        graph.add_node("plan_semantic_sql", self._plan_semantic_sql)
         graph.add_node("validate_sql", self._validate_sql)
         graph.add_node("repair_sql", self._repair_sql)
         graph.add_node("execute_sql", self._execute_sql)
@@ -187,7 +201,8 @@ class TextToSqlGraph:
         graph.add_edge("load_context", "load_wren_context")
         graph.add_edge("load_wren_context", "draft_sql")
         graph.add_edge("draft_sql", "dry_plan_with_wren")
-        graph.add_edge("dry_plan_with_wren", "validate_sql")
+        graph.add_edge("dry_plan_with_wren", "plan_semantic_sql")
+        graph.add_edge("plan_semantic_sql", "validate_sql")
         graph.add_conditional_edges(
             "validate_sql",
             self._route_after_validation,
@@ -197,7 +212,8 @@ class TextToSqlGraph:
                 "end": END,
             },
         )
-        graph.add_edge("repair_sql", "validate_sql")
+        # Repaired drafts are re-planned through the engine before validation.
+        graph.add_edge("repair_sql", "plan_semantic_sql")
         graph.add_edge("execute_sql", "build_artifacts")
         graph.add_edge("build_artifacts", END)
         return graph.compile()
@@ -397,6 +413,61 @@ class TextToSqlGraph:
             ],
         }
 
+    def _plan_semantic_sql(self, state: AgentState) -> AgentState:
+        """Rewrite semantic SQL into native SQL via the engine (never executes).
+
+        The engine output replaces ``state['sql']`` so validation + Superset
+        execution operate on native SQL. The passthrough engine returns SQL
+        unchanged, so this is a no-op when ``wren_engine=passthrough``.
+        """
+
+        sql = state.get("sql") or ""
+        if self.semantic_engine.name == "passthrough":
+            # Record provenance for audit; no rewrite, no extra trace event.
+            return {
+                **state,
+                "semantic_sql": sql,
+                "native_sql": sql,
+                "engine": self.semantic_engine.name,
+            }
+
+        result = plan_semantic_sql_step(
+            self.semantic_engine,
+            sql=sql,
+            context=state["context"],
+            owner_id=state.get("owner_id", DEFAULT_OWNER_ID),
+            project_id=getattr(state.get("wren_context"), "project_id", None),
+            mdl_file_store=self.mdl_file_store,
+        )
+        status: Literal["ok", "warning", "error"] = (
+            "warning" if result.warnings else "ok"
+        )
+        return {
+            **state,
+            "sql": result.native_sql,
+            "semantic_sql": result.semantic_sql,
+            "native_sql": result.native_sql,
+            "engine": result.engine,
+            "trace": [
+                *state.get("trace", []),
+                TraceEvent(
+                    step="plan_semantic_sql",
+                    status=status,
+                    summary=(
+                        "Rewrote semantic SQL to native SQL."
+                        if result.rewritten
+                        else "Semantic engine returned SQL unchanged."
+                    ),
+                    details={
+                        "engine": result.engine,
+                        "rewritten": result.rewritten,
+                        "referenced_tables": result.referenced_tables,
+                        "warnings": result.warnings,
+                    },
+                ),
+            ],
+        }
+
     def _validate_sql(self, state: AgentState) -> AgentState:
         request = state["request"]
         sql = state.get("sql") or ""
@@ -520,13 +591,19 @@ class TextToSqlGraph:
             result=result,
             analysis=analysis,
         )
+        audit = with_engine_provenance(
+            result.audit,
+            engine=state.get("engine"),
+            semantic_sql=state.get("semantic_sql"),
+            native_sql=state.get("native_sql"),
+        )
         return {
             **state,
             "answer_summary": bundle.answer_summary,
             "insight_cards": bundle.insight_cards,
             "chart_spec": chart_spec,
             "data_preview": bundle.data_preview,
-            "audit": result.audit,
+            "audit": audit,
             "recommended_followups": bundle.recommended_followups,
             "trace": [
                 *state.get("trace", []),
