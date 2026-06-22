@@ -28,3 +28,9 @@ boto3>=1.34,<2.0
 python-multipart>=0.0.9,<1.0
 sqlglot>=30.8.0,<31.0
 uvicorn>=0.30,<1.0
+
+# Optional: deep MDL validation via Wren's Rust semantic engine (PyO3 wheel).
+# Left commented because it is a native, opt-in dependency. Install it and set
+# WREN_CORE_VALIDATION_ENABLED=true to enable wren-core deep validation; the
+# code import-guards its absence and falls back to structural validation.
+# wren-core>=0.1

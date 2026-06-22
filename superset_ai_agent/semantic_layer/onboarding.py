@@ -83,6 +83,7 @@ def onboard_schema_project(
                     source_type="onboarding",
                 ),
                 owner_id=owner_id,
+                validation=validation,
             )
         except ValueError as ex:
             warnings.append(f"Skipped {proposal.proposed_path}: {ex}")

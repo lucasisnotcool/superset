@@ -32,6 +32,9 @@ import threading
 from datetime import datetime, timezone
 from typing import Callable, Protocol
 
+from sqlalchemy.orm import Session, sessionmaker
+
+from superset_ai_agent.persistence.models import AiAgentJob
 from superset_ai_agent.semantic_layer.schemas import OnboardingResult, SemanticJob
 
 
@@ -99,6 +102,84 @@ class InMemoryJobStore:
             )
             self._jobs[job_id] = updated
             return updated.model_copy(deep=True)
+
+
+class SqlAlchemyJobStore:
+    """SQLAlchemy-backed job store so jobs are visible across workers."""
+
+    def __init__(self, session_factory: sessionmaker[Session]):
+        self.session_factory = session_factory
+
+    def create(self, *, kind: str, project_id: str | None) -> SemanticJob:
+        job = SemanticJob(kind=kind, project_id=project_id, status="running")
+        with self.session_factory() as session:
+            session.add(_to_model(job))
+            session.commit()
+        return job.model_copy(deep=True)
+
+    def get(self, job_id: str) -> SemanticJob:
+        with self.session_factory() as session:
+            model = session.get(AiAgentJob, job_id)
+            if model is None:
+                raise JobNotFoundError(job_id)
+            return _from_model(model)
+
+    def complete(self, job_id: str, result: OnboardingResult) -> SemanticJob:
+        return self._update(job_id, status="completed", result=result)
+
+    def fail(self, job_id: str, error: str) -> SemanticJob:
+        return self._update(job_id, status="failed", error=error)
+
+    def _update(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        result: OnboardingResult | None = None,
+        error: str | None = None,
+    ) -> SemanticJob:
+        with self.session_factory() as session:
+            model = session.get(AiAgentJob, job_id)
+            if model is None:
+                raise JobNotFoundError(job_id)
+            model.status = status
+            model.result = (
+                result.model_dump(mode="json") if result is not None else None
+            )
+            model.error = error
+            model.updated_at = datetime.now(timezone.utc)
+            session.commit()
+            return _from_model(model)
+
+
+def _to_model(job: SemanticJob) -> AiAgentJob:
+    return AiAgentJob(
+        id=job.id,
+        kind=job.kind,
+        status=job.status,
+        project_id=job.project_id,
+        result=job.result.model_dump(mode="json") if job.result is not None else None,
+        error=job.error,
+        created_at=job.created_at,
+        updated_at=job.updated_at,
+    )
+
+
+def _from_model(model: AiAgentJob) -> SemanticJob:
+    return SemanticJob(
+        id=model.id,
+        kind=model.kind,
+        status=model.status,  # type: ignore[arg-type]
+        project_id=model.project_id,
+        result=(
+            OnboardingResult.model_validate(model.result)
+            if model.result is not None
+            else None
+        ),
+        error=model.error,
+        created_at=model.created_at,
+        updated_at=model.updated_at,
+    )
 
 
 class JobRunner(Protocol):

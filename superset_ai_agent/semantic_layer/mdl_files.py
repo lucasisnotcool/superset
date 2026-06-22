@@ -93,8 +93,13 @@ class MdlFileStore(Protocol):
         request: MdlFileCreateRequest,
         *,
         owner_id: str = DEFAULT_OWNER_ID,
+        validation: MdlValidationResult | None = None,
     ) -> MdlFile:
-        """Create an MDL YAML file."""
+        """Create an MDL YAML file.
+
+        ``validation`` overrides the structural-only check with a precomputed
+        (e.g. schema-aware) result so physical findings are persisted.
+        """
 
     def update(
         self,
@@ -102,6 +107,7 @@ class MdlFileStore(Protocol):
         request: MdlFileUpdateRequest,
         *,
         owner_id: str = DEFAULT_OWNER_ID,
+        validation: MdlValidationResult | None = None,
     ) -> MdlFile:
         """Update one MDL YAML file."""
 
@@ -166,6 +172,7 @@ class InMemoryMdlFileStore:
         request: MdlFileCreateRequest,
         *,
         owner_id: str = DEFAULT_OWNER_ID,
+        validation: MdlValidationResult | None = None,
     ) -> MdlFile:
         path = normalize_mdl_path(request.path)
         existing = self._find_by_path(project_id, path, owner_id=owner_id)
@@ -176,6 +183,7 @@ class InMemoryMdlFileStore:
             path=path,
             request=request,
             owner_id=owner_id,
+            validation=validation,
         )
         self._files[file.id] = (owner_id, file)
         return file.model_copy(deep=True)
@@ -186,6 +194,7 @@ class InMemoryMdlFileStore:
         request: MdlFileUpdateRequest,
         *,
         owner_id: str = DEFAULT_OWNER_ID,
+        validation: MdlValidationResult | None = None,
     ) -> MdlFile:
         file = self.get(file_id, owner_id=owner_id)
         updates: dict[str, object] = {
@@ -202,7 +211,13 @@ class InMemoryMdlFileStore:
         if request.content is not None:
             updates["content"] = request.content
             updates["checksum"] = _checksum(request.content)
-            updates["validation"] = validate_mdl_yaml(request.content)
+            updates["validation"] = (
+                validation
+                if validation is not None
+                else validate_mdl_yaml(request.content)
+            )
+        elif validation is not None:
+            updates["validation"] = validation
         if request.status is not None:
             updates["status"] = request.status
         _assert_activatable(
@@ -307,6 +322,7 @@ class SqlAlchemyMdlFileStore:
         request: MdlFileCreateRequest,
         *,
         owner_id: str = DEFAULT_OWNER_ID,
+        validation: MdlValidationResult | None = None,
     ) -> MdlFile:
         path = normalize_mdl_path(request.path)
         with self.session_factory() as session:
@@ -324,6 +340,7 @@ class SqlAlchemyMdlFileStore:
                 path=path,
                 request=request,
                 owner_id=owner_id,
+                validation=validation,
             )
             if existing is not None:
                 _apply_file_to_model(existing, file)
@@ -341,6 +358,7 @@ class SqlAlchemyMdlFileStore:
         request: MdlFileUpdateRequest,
         *,
         owner_id: str = DEFAULT_OWNER_ID,
+        validation: MdlValidationResult | None = None,
     ) -> MdlFile:
         with self.session_factory() as session:
             model = self._get_model(session, file_id, owner_id=owner_id)
@@ -360,9 +378,14 @@ class SqlAlchemyMdlFileStore:
             if request.content is not None:
                 model.content = request.content
                 model.checksum = _checksum(request.content)
-                model.validation = validate_mdl_yaml(request.content).model_dump(
-                    mode="json"
+                effective = (
+                    validation
+                    if validation is not None
+                    else validate_mdl_yaml(request.content)
                 )
+                model.validation = effective.model_dump(mode="json")
+            elif validation is not None:
+                model.validation = validation.model_dump(mode="json")
             if request.status is not None:
                 model.status = request.status
             _assert_activatable(request.status, model.content)
@@ -457,8 +480,10 @@ def _new_file(
     path: str,
     request: MdlFileCreateRequest,
     owner_id: str,
+    validation: MdlValidationResult | None = None,
 ) -> MdlFile:
-    validation = validate_mdl_yaml(request.content)
+    if validation is None:
+        validation = validate_mdl_yaml(request.content)
     return MdlFile(
         project_id=project_id,
         path=path,

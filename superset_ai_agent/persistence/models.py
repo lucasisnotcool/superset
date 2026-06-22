@@ -327,6 +327,42 @@ class AiAgentSemanticAccessProof(Base):
     created_at = Column(DateTime(timezone=True), nullable=False)
 
 
+class AiAgentSchemaSnapshot(Base):
+    """Last-known permission-filtered schema for outage-resilient validation."""
+
+    __tablename__ = "ai_agent_schema_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            name="uq_ai_agent_schema_snapshot_project",
+        ),
+    )
+
+    id = Column(String(36), primary_key=True)
+    project_id = Column(String(36), index=True, nullable=False)
+    database_uri_fingerprint = Column(String(128), nullable=True)
+    catalog_name = Column(String(255), nullable=True)
+    schema_name = Column(String(255), nullable=True)
+    tables = Column(JSON, nullable=False)
+    captured_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class AiAgentJob(Base):
+    """Async semantic-layer job (e.g. onboarding) durable across workers."""
+
+    __tablename__ = "ai_agent_jobs"
+
+    id = Column(String(36), primary_key=True)
+    kind = Column(String(64), nullable=False)
+    status = Column(String(32), index=True, nullable=False)
+    project_id = Column(String(36), index=True, nullable=True)
+    owner_id = Column(String(255), index=True, nullable=True)
+    result = Column(JSON, nullable=True)
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+
 class AiAgentSemanticMdlFile(Base):
     """YAML MDL file belonging to a semantic project."""
 

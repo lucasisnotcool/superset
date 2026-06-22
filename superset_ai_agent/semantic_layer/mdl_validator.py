@@ -60,6 +60,20 @@ class SchemaIndex:
             }
         return cls(tables=tables)
 
+    @classmethod
+    def from_snapshot(cls, tables: dict[str, list[str]]) -> "SchemaIndex":
+        return cls(
+            tables={
+                str(table).lower(): {str(column).lower() for column in columns}
+                for table, columns in tables.items()
+            }
+        )
+
+    def to_tables(self) -> dict[str, list[str]]:
+        """Serialize for persistence (sets become sorted lists)."""
+
+        return {table: sorted(columns) for table, columns in self.tables.items()}
+
     def has_table(self, table: str) -> bool:
         return table.lower() in self.tables
 
@@ -126,11 +140,13 @@ def validate_project_manifest(
     contents: list[str],
     *,
     schema_index: SchemaIndex | None = None,
+    deep_validate: bool = False,
 ) -> MdlValidationResult:
     """Validate a merged set of MDL files as one project manifest.
 
     Relationship resolution is strict here because every referenced model should
-    be present once all project files are combined.
+    be present once all project files are combined. ``deep_validate`` additionally
+    runs the optional wren-core engine and merges its findings.
     """
 
     merged_models: list[Any] = []
@@ -153,10 +169,26 @@ def validate_project_manifest(
         sort_keys=False,
         allow_unicode=False,
     )
-    return validate_mdl(
+    result = validate_mdl(
         merged_yaml,
         schema_index=schema_index,
         strict_relationships=True,
+    )
+    if not deep_validate:
+        return result
+    # Imported lazily so the optional wren-core import guard only runs on demand.
+    from superset_ai_agent.semantic_layer.wren_core_validator import (
+        validate_with_wren_core,
+    )
+
+    deep = validate_with_wren_core(
+        [model for model in merged_models if isinstance(model, dict)],
+        [rel for rel in merged_relationships if isinstance(rel, dict)],
+    )
+    merged_messages = [*result.messages, *deep.messages]
+    return MdlValidationResult(
+        valid=result.valid and deep.valid,
+        messages=merged_messages,
     )
 
 

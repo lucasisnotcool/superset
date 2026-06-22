@@ -91,6 +91,7 @@ from superset_ai_agent.semantic_layer.jobs import (
     JobNotFoundError,
     JobRunner,
     JobStore,
+    SqlAlchemyJobStore,
     ThreadJobRunner,
 )
 from superset_ai_agent.semantic_layer.mdl_files import (
@@ -114,6 +115,12 @@ from superset_ai_agent.semantic_layer.projects import (
     SqlAlchemySemanticProjectStore,
 )
 from superset_ai_agent.semantic_layer.review import apply_review
+from superset_ai_agent.semantic_layer.schema_snapshot import (
+    InMemorySchemaSnapshotStore,
+    SchemaSnapshot,
+    SchemaSnapshotStore,
+    SqlAlchemySchemaSnapshotStore,
+)
 from superset_ai_agent.semantic_layer.schemas import (
     MdlEnrichmentProposal,
     MdlFile,
@@ -178,6 +185,7 @@ def create_app(  # noqa: C901
     identity_provider: Any | None = None,
     job_store: JobStore | None = None,
     job_runner: JobRunner | None = None,
+    schema_snapshot_store: SchemaSnapshotStore | None = None,
 ) -> FastAPI:
     """Create the standalone AI agent API.
 
@@ -216,8 +224,17 @@ def create_app(  # noqa: C901
     )
     active_document_storage = document_storage or _create_document_storage(app_config)
     active_document_extractor = document_extractor or CompositeDocumentExtractor()
-    active_job_store = job_store or InMemoryJobStore()
+    active_job_store = job_store or _create_job_store(
+        app_config,
+        session_factory=session_factory,
+    )
     active_job_runner = job_runner or ThreadJobRunner()
+    active_schema_snapshot_store = schema_snapshot_store or (
+        _create_schema_snapshot_store(
+            app_config,
+            session_factory=session_factory,
+        )
+    )
 
     app_superset_client = (
         superset_client
@@ -870,7 +887,7 @@ def create_app(  # noqa: C901
     ) -> MdlFile:
         """Create an MDL YAML file in a governed semantic project."""
 
-        authorize_semantic_project(
+        project = authorize_semantic_project(
             fastapi_request,
             project_id,
             owner_id=identity.owner_id,
@@ -881,6 +898,10 @@ def create_app(  # noqa: C901
                 project_id,
                 request,
                 owner_id=identity.owner_id,
+                validation=validate_mdl(
+                    request.content,
+                    schema_index=_schema_index_for_project(project, fastapi_request),
+                ),
             )
         except ValueError as ex:
             raise HTTPException(status_code=400, detail=str(ex)) from ex
@@ -915,10 +936,12 @@ def create_app(  # noqa: C901
         project: SemanticProject,
         fastapi_request: Request,
     ) -> SchemaIndex | None:
-        """Best-effort physical schema index for activation/generation checks.
+        """Physical schema index for activation/generation checks.
 
-        A Superset outage degrades to structural-only validation rather than
-        blocking activation entirely.
+        On a successful live fetch the schema is snapshotted for the project; on
+        a Superset outage the last snapshot is used so physical validation keeps
+        catching hallucinated columns instead of degrading to structural-only.
+        Returns ``None`` only when neither a live fetch nor a snapshot exists.
         """
 
         if project.default_database_id is None:
@@ -934,8 +957,25 @@ def create_app(  # noqa: C901
                 )
             )
         except Exception:  # pylint: disable=broad-except
-            return None
-        return SchemaIndex.from_agent_context(context)
+            snapshot = active_schema_snapshot_store.get(project.id)
+            if snapshot is None:
+                return None
+            return SchemaIndex.from_snapshot(snapshot.tables)
+        index = SchemaIndex.from_agent_context(context)
+        try:
+            active_schema_snapshot_store.upsert(
+                SchemaSnapshot(
+                    project_id=project.id,
+                    database_uri_fingerprint=project.database_uri_fingerprint,
+                    catalog_name=project.catalog_name,
+                    schema_name=project.schema_name,
+                    tables=index.to_tables(),
+                )
+            )
+        except Exception:  # noqa: S110  # pylint: disable=broad-except
+            # Snapshotting is best-effort; never block validation on it.
+            pass
+        return index
 
     def _enforce_activation(
         *,
@@ -952,9 +992,19 @@ def create_app(  # noqa: C901
             for file in active_mdl_file_store.list(project.id, owner_id=owner_id)
             if file.id != file_id and file.status == "active"
         ]
+        schema_index = _schema_index_for_project(project, fastapi_request)
+        if schema_index is None and app_config.semantic_activation_requires_live_schema:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Schema metadata is unavailable; activation requires live "
+                    "schema validation."
+                ),
+            )
         validation = validate_project_manifest(
             [*siblings, new_content],
-            schema_index=_schema_index_for_project(project, fastapi_request),
+            schema_index=schema_index,
+            deep_validate=app_config.wren_core_validation_enabled,
         )
         if not validation.valid:
             raise HTTPException(
@@ -1003,10 +1053,19 @@ def create_app(  # noqa: C901
                         else existing.content
                     ),
                 )
+            file_validation = (
+                validate_mdl(
+                    request.content,
+                    schema_index=_schema_index_for_project(project, fastapi_request),
+                )
+                if request.content is not None
+                else None
+            )
             return active_mdl_file_store.update(
                 file_id,
                 request,
                 owner_id=identity.owner_id,
+                validation=file_validation,
             )
         except MdlFileNotFoundError as ex:
             raise HTTPException(status_code=404, detail="MDL file not found.") from ex
@@ -1738,6 +1797,40 @@ def _create_mdl_file_store(
         if session_factory is None:
             raise ValueError("SQLAlchemy MDL file store requires a database.")
         return SqlAlchemyMdlFileStore(session_factory)
+    raise ValueError(
+        "Unsupported AI_AGENT_SEMANTIC_LAYER_STORE value "
+        f"{config.semantic_layer_store!r}. Expected one of: memory, sqlalchemy."
+    )
+
+
+def _create_schema_snapshot_store(
+    config: AgentConfig,
+    *,
+    session_factory: Any | None = None,
+) -> SchemaSnapshotStore:
+    if config.semantic_layer_store == "memory":
+        return InMemorySchemaSnapshotStore()
+    if config.semantic_layer_store == "sqlalchemy":
+        if session_factory is None:
+            raise ValueError("SQLAlchemy schema snapshot store requires a database.")
+        return SqlAlchemySchemaSnapshotStore(session_factory)
+    raise ValueError(
+        "Unsupported AI_AGENT_SEMANTIC_LAYER_STORE value "
+        f"{config.semantic_layer_store!r}. Expected one of: memory, sqlalchemy."
+    )
+
+
+def _create_job_store(
+    config: AgentConfig,
+    *,
+    session_factory: Any | None = None,
+) -> JobStore:
+    if config.semantic_layer_store == "memory":
+        return InMemoryJobStore()
+    if config.semantic_layer_store == "sqlalchemy":
+        if session_factory is None:
+            raise ValueError("SQLAlchemy job store requires a database.")
+        return SqlAlchemyJobStore(session_factory)
     raise ValueError(
         "Unsupported AI_AGENT_SEMANTIC_LAYER_STORE value "
         f"{config.semantic_layer_store!r}. Expected one of: memory, sqlalchemy."

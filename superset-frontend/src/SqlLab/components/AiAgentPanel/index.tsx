@@ -43,10 +43,7 @@ import { Icons } from '@superset-ui/core/components/Icons';
 import { extendedDayjs } from '@superset-ui/core/utils/dates';
 import { useAppDispatch } from 'src/SqlLab/hooks/useAppDispatch';
 import type { QueryEditor, SqlLabRootState } from 'src/SqlLab/types';
-import {
-  openSemanticLayerEditor,
-  queryEditorSetSql,
-} from 'src/SqlLab/actions/sqlLab';
+import { queryEditorSetSql } from 'src/SqlLab/actions/sqlLab';
 import {
   addDangerToast,
   addInfoToast,
@@ -384,9 +381,15 @@ const Composer = styled.div`
   `}
 `;
 
-const rotateGlow = keyframes`
-  to {
-    transform: rotate(1turn);
+const pulseGlow = keyframes`
+  0% {
+    opacity: 0.9;
+  }
+  50% {
+    opacity: 0.25;
+  }
+  100% {
+    opacity: 0.9;
   }
 `;
 
@@ -395,24 +398,19 @@ const ComposerInput = styled.div<{ 'data-loading'?: boolean }>`
     position: relative;
     border-radius: ${theme.borderRadius}px;
 
-    /* A rotating gradient ring shown only while the agent is working, to signal
-       activity the same way a spinner does. The textarea sits on top with an
-       opaque background, so only the 2px overhang reads as a glowing border. */
+    /* A soft glowing ring shown only while the agent is working. Rather than
+       spinning, the glow pulses its opacity (high -> low -> high). The textarea
+       sits on top with an opaque background, so only the 2px overhang reads as a
+       glowing border. */
     &::before {
       content: '';
       position: absolute;
       inset: -2px;
       border-radius: ${theme.borderRadius + 2}px;
-      background: conic-gradient(
-        from 0deg,
-        ${theme.colorPrimary},
-        ${theme.colorBgBase} 35%,
-        ${theme.colorPrimary} 50%,
-        ${theme.colorBgBase} 85%,
-        ${theme.colorPrimary}
-      );
-      opacity: ${loading ? 1 : 0};
-      animation: ${rotateGlow} 1.4s linear infinite;
+      background: ${theme.colorPrimary};
+      filter: blur(2px);
+      opacity: ${loading ? 0.9 : 0};
+      animation: ${pulseGlow} 1.6s ease-in-out infinite;
       animation-play-state: ${loading ? 'running' : 'paused'};
       transition: opacity 0.2s ease;
       pointer-events: none;
@@ -491,10 +489,19 @@ const getActiveQueryEditor = ({
   },
 }: SqlLabRootState): Partial<QueryEditor> | undefined => {
   const activeId = lastUpdatedActiveTab || tabHistory.slice(-1)[0];
-  return (
-    queryEditors.find(queryEditor => queryEditor.id === activeId) ||
-    (unsavedQueryEditor.id === activeId ? unsavedQueryEditor : undefined)
+  const persisted = queryEditors.find(
+    queryEditor => queryEditor.id === activeId,
   );
+  // Schema/catalog/sql edits (e.g. the left-bar schema switcher) are written to
+  // `unsavedQueryEditor` before they are flushed to `queryEditors`. Merge the
+  // pending edits over the persisted editor so the AI panel's scope follows the
+  // currently selected schema instead of a stale one.
+  const pending =
+    unsavedQueryEditor.id === activeId ? unsavedQueryEditor : undefined;
+  if (!persisted) {
+    return pending;
+  }
+  return pending ? { ...persisted, ...pending } : persisted;
 };
 
 const buildConversationScope = (
@@ -1117,25 +1124,6 @@ const AiAgentPanel = () => {
             buttonStyle="tertiary"
             onClick={() => setIsHistoryOpen(!isHistoryOpen)}
             icon={<Icons.HistoryOutlined iconSize="m" />}
-          />
-          <Button
-            aria-label={t('Semantic layer')}
-            tooltip={t('Semantic layer')}
-            buttonSize="small"
-            buttonStyle="tertiary"
-            disabled={!currentScope?.schema_name}
-            onClick={() => {
-              if (typeof databaseId === 'number' && currentScope?.schema_name) {
-                dispatch(
-                  openSemanticLayerEditor(
-                    databaseId,
-                    currentScope.catalog_name,
-                    currentScope.schema_name,
-                  ),
-                );
-              }
-            }}
-            icon={<Icons.DatabaseOutlined iconSize="m" />}
           />
           <Button
             aria-label={t('Delete conversation')}

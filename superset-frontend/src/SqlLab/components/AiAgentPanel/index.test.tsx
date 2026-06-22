@@ -26,14 +26,8 @@ import {
   userEvent,
   waitFor,
 } from 'spec/helpers/testing-library';
-import type { Store } from 'redux';
 import { initialState } from 'src/SqlLab/fixtures';
-import { buildSemanticLayerEditorId } from 'src/SqlLab/actions/sqlLab';
-import type { SqlLabRootState } from 'src/SqlLab/types';
 import AiAgentPanel from '.';
-
-const getSqlLabState = (store: Store) =>
-  (store.getState() as unknown as { sqlLab: SqlLabRootState['sqlLab'] }).sqlLab;
 
 const originalAgentUrl = process.env.SUPERSET_AI_AGENT_URL;
 
@@ -291,7 +285,11 @@ test('sends a conversation message and renders SQL artifact', async () => {
   });
 });
 
-test('Semantic layer button opens a semantic-layer tab for the current scope', async () => {
+test('chat scope follows pending schema edits in unsavedQueryEditor', async () => {
+  // The left-bar schema switcher writes to `unsavedQueryEditor` before the
+  // change is flushed to `queryEditors`. The panel must merge it so the chat
+  // follows the currently selected schema (issue #5).
+  const activeEditor = initialState.sqlLab.queryEditors[0];
   const scopedState = {
     ...initialState,
     sqlLab: {
@@ -299,8 +297,13 @@ test('Semantic layer button opens a semantic-layer tab for the current scope', a
       queryEditors: initialState.sqlLab.queryEditors.map(queryEditor => ({
         ...queryEditor,
         catalog: 'prod',
-        schema: 'main',
+        schema: 'old_schema',
       })),
+      unsavedQueryEditor: {
+        id: activeEditor.id,
+        catalog: 'prod',
+        schema: 'main',
+      },
     },
   };
   const project = {
@@ -354,24 +357,15 @@ test('Semantic layer button opens a semantic-layer tab for the current scope', a
   const [resolveCall] = fetchMock.callHistory.calls(
     'http://agent.local/agent/semantic-layer/projects/resolve',
   );
+  // The badge resolves using the pending schema ("main"), not the stale one.
   expect(JSON.parse(String(resolveCall.options.body))).toMatchObject({
     create_if_missing: false,
+    schema_name: 'main',
   });
 
-  await userEvent.click(screen.getByRole('button', { name: 'Semantic layer' }));
-
-  const expectedId = buildSemanticLayerEditorId(1, 'prod', 'main');
-  await waitFor(() => {
-    expect(getSqlLabState(store).semanticLayerEditors).toEqual([
-      {
-        id: expectedId,
-        databaseId: 1,
-        catalogName: 'prod',
-        schemaName: 'main',
-      },
-    ]);
-  });
-  expect(getSqlLabState(store).activeSemanticLayerEditorId).toEqual(expectedId);
+  // The context chip reflects the pending schema, not the stale "old_schema".
+  expect(screen.getByText('main')).toBeInTheDocument();
+  expect(screen.queryByText('old_schema')).not.toBeInTheDocument();
 });
 
 const deferred = <T,>() => {

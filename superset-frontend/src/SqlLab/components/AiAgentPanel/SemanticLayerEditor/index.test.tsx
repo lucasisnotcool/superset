@@ -46,18 +46,29 @@ const project = {
   updated_at: '2026-06-19T00:00:00Z',
 };
 
-const mockBaseRoutes = () => {
+const mdlFile = (id: string, path: string) => ({
+  id,
+  project_id: 'project-1',
+  path,
+  filename: path.split('/').pop(),
+  content: `models:\n  - name: ${id}\n`,
+  content_type: 'application/x-yaml',
+  source_type: 'manual',
+  status: 'active',
+  validation: { valid: true, messages: [] },
+  checksum: id,
+  created_at: '2026-06-19T00:00:00Z',
+  updated_at: '2026-06-19T00:00:00Z',
+});
+
+const mockBaseRoutes = (files: unknown[] = []) => {
   fetchMock.post(
     'http://agent.local/agent/semantic-layer/projects/resolve',
     project,
   );
   fetchMock.get(
     'http://agent.local/agent/semantic-layer/projects/project-1/mdl-files',
-    [],
-  );
-  fetchMock.get(
-    'http://agent.local/agent/semantic-layer/documents?database_id=1&schema_name=main&catalog_name=prod',
-    [],
+    files,
   );
   fetchMock.get(
     'http://agent.local/agent/semantic-layer/projects/project-1/state',
@@ -77,108 +88,7 @@ const mockBaseRoutes = () => {
   );
 };
 
-test('resolves the project for the given scope and uploads a document', async () => {
-  fetchMock.post(
-    'http://agent.local/agent/semantic-layer/projects/resolve',
-    project,
-  );
-  fetchMock.get(
-    'http://agent.local/agent/semantic-layer/projects/project-1/mdl-files',
-    [],
-  );
-  fetchMock.get(
-    'http://agent.local/agent/semantic-layer/documents?database_id=1&schema_name=main&catalog_name=prod',
-    [],
-  );
-  fetchMock.get(
-    'http://agent.local/agent/semantic-layer/projects/project-1/state',
-    {
-      project_id: 'project-1',
-      database_id: 1,
-      catalog_name: 'prod',
-      schema_name: 'main',
-      dataset_ids: [],
-      document_count: 0,
-      approved_document_count: 0,
-      indexed_document_count: 0,
-      semantic_layer_version: null,
-      indexing_status: 'idle',
-      last_error: null,
-    },
-  );
-  fetchMock.post(
-    'http://agent.local/agent/semantic-layer/projects/project-1/documents',
-    {
-      id: 'document-1',
-      project_id: 'project-1',
-      filename: 'notes.md',
-      content_type: 'text/markdown',
-      size_bytes: 12,
-      status: 'needs_review',
-      scope: {
-        database_id: 1,
-        catalog_name: 'prod',
-        schema_name: 'main',
-        dataset_ids: [],
-      },
-      checksum: 'abc',
-      storage_uri: 'file:///tmp/notes.md',
-      proposed_updates: [],
-      warnings: [],
-      created_at: '2026-06-19T00:00:00Z',
-      updated_at: '2026-06-19T00:00:00Z',
-    },
-  );
-  fetchMock.post(
-    'http://agent.local/agent/semantic-layer/projects/project-1/documents/document-1/enrich',
-    {
-      source_document_id: 'document-1',
-      proposed_path: 'models/notes.yaml',
-      proposed_yaml: 'models:\n  - name: notes\n',
-      validation: { valid: true, messages: [] },
-      warnings: [],
-    },
-  );
-
-  const { container } = render(
-    <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="main" />,
-  );
-
-  await waitFor(() => {
-    expect(screen.getByText('Database 1.prod.main')).toBeInTheDocument();
-  });
-
-  const [resolveCall] = fetchMock.callHistory.calls(
-    'http://agent.local/agent/semantic-layer/projects/resolve',
-  );
-  expect(JSON.parse(String(resolveCall.options.body))).toMatchObject({
-    database_id: 1,
-    catalog_name: 'prod',
-    schema_name: 'main',
-    create_if_missing: true,
-  });
-
-  const inputs =
-    container.querySelectorAll<HTMLInputElement>('input[type="file"]');
-  expect(inputs).toHaveLength(2);
-  await userEvent.upload(
-    inputs[1],
-    new File(['Metric gross_moves = count moves'], 'notes.md', {
-      type: 'text/markdown',
-    }),
-  );
-
-  await waitFor(() => {
-    expect(
-      fetchMock.callHistory.calls(
-        'http://agent.local/agent/semantic-layer/projects/project-1/documents',
-      ),
-    ).toHaveLength(1);
-  });
-});
-
-test('onboards the schema into draft models and surfaces warnings', async () => {
-  mockBaseRoutes();
+const mockOnboard = (warnings: string[] = []) => {
   fetchMock.post(
     'http://agent.local/agent/semantic-layer/projects/project-1/onboard',
     {
@@ -191,25 +101,82 @@ test('onboards the schema into draft models and surfaces warnings', async () => 
       result: {
         project_id: 'project-1',
         model_count: 1,
-        warnings: ['models/moves.yaml cannot be activated until fixed: bad'],
-        files: [
-          {
-            id: 'file-1',
-            project_id: 'project-1',
-            path: 'models/moves.yaml',
-            filename: 'moves.yaml',
-            content: 'models:\n  - name: moves\n',
-            content_type: 'application/x-yaml',
-            source_type: 'onboarding',
-            status: 'draft',
-            checksum: 'abc',
-            created_at: '2026-06-19T00:00:00Z',
-            updated_at: '2026-06-19T00:00:00Z',
-          },
-        ],
+        warnings,
+        files: [mdlFile('moves', 'models/moves.yaml')],
       },
     },
   );
+};
+
+test('loads the project once per scope without re-fetch loops', async () => {
+  mockBaseRoutes([mdlFile('a', 'models/a.yaml'), mdlFile('b', 'models/b.yaml')]);
+
+  render(
+    <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="main" />,
+  );
+
+  await waitFor(() => {
+    expect(screen.getByText('Database 1.prod.main')).toBeInTheDocument();
+  });
+
+  // Selecting the first file must not re-trigger the load effect: the project
+  // is resolved and listed exactly once for the scope.
+  await new Promise(resolve => {
+    setTimeout(resolve, 50);
+  });
+  expect(
+    fetchMock.callHistory.calls(
+      'http://agent.local/agent/semantic-layer/projects/resolve',
+    ),
+  ).toHaveLength(1);
+  expect(
+    fetchMock.callHistory.calls(
+      'http://agent.local/agent/semantic-layer/projects/project-1/mdl-files',
+    ),
+  ).toHaveLength(1);
+});
+
+test('eagerly onboards an empty schema and surfaces warnings', async () => {
+  mockBaseRoutes([]);
+  mockOnboard(['models/moves.yaml cannot be activated until fixed: bad']);
+
+  render(
+    <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="main" />,
+  );
+
+  await waitFor(() => {
+    expect(
+      fetchMock.callHistory.calls(
+        'http://agent.local/agent/semantic-layer/projects/project-1/onboard',
+      ),
+    ).toHaveLength(1);
+  });
+  await waitFor(() => {
+    expect(screen.getByTestId('onboarding-warnings')).toBeInTheDocument();
+  });
+});
+
+test('opens the Add dialog with a drop zone', async () => {
+  mockBaseRoutes([mdlFile('a', 'models/a.yaml')]);
+
+  render(
+    <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="main" />,
+  );
+
+  await waitFor(() => {
+    expect(screen.getByText('Database 1.prod.main')).toBeInTheDocument();
+  });
+
+  await userEvent.click(screen.getByRole('button', { name: /Add/i }));
+
+  await waitFor(() => {
+    expect(screen.getByTestId('semantic-import-dropzone')).toBeInTheDocument();
+  });
+});
+
+test('manual Onboard button triggers onboarding', async () => {
+  mockBaseRoutes([mdlFile('a', 'models/a.yaml')]);
+  mockOnboard();
 
   render(
     <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="main" />,
@@ -225,75 +192,6 @@ test('onboards the schema into draft models and surfaces warnings', async () => 
     expect(
       fetchMock.callHistory.calls(
         'http://agent.local/agent/semantic-layer/projects/project-1/onboard',
-      ),
-    ).toHaveLength(1);
-  });
-  await waitFor(() => {
-    expect(screen.getByTestId('onboarding-warnings')).toBeInTheDocument();
-  });
-});
-
-test('enriches the model from pasted markdown text', async () => {
-  mockBaseRoutes();
-  fetchMock.post(
-    'http://agent.local/agent/semantic-layer/projects/project-1/documents/text',
-    {
-      id: 'document-2',
-      project_id: 'project-1',
-      filename: 'document.md',
-      content_type: 'text/markdown',
-      size_bytes: 20,
-      status: 'needs_review',
-      scope: {
-        database_id: 1,
-        catalog_name: 'prod',
-        schema_name: 'main',
-        dataset_ids: [],
-      },
-      checksum: 'abc',
-      storage_uri: 'mem://document.md',
-      proposed_updates: [],
-      warnings: [],
-      created_at: '2026-06-19T00:00:00Z',
-      updated_at: '2026-06-19T00:00:00Z',
-    },
-  );
-  fetchMock.post(
-    'http://agent.local/agent/semantic-layer/projects/project-1/documents/document-2/enrich',
-    {
-      source_document_id: 'document-2',
-      proposed_path: 'models/enriched.yaml',
-      proposed_yaml: 'models:\n  - name: enriched\n',
-      validation: { valid: true, messages: [] },
-      warnings: [],
-    },
-  );
-
-  render(
-    <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="main" />,
-  );
-
-  await waitFor(() => {
-    expect(screen.getByText('Database 1.prod.main')).toBeInTheDocument();
-  });
-
-  await userEvent.type(
-    screen.getByTestId('semantic-layer-raw-text'),
-    'Gross moves count opportunities by stage.',
-  );
-  await userEvent.click(screen.getByRole('button', { name: /Enrich text/i }));
-
-  await waitFor(() => {
-    expect(
-      fetchMock.callHistory.calls(
-        'http://agent.local/agent/semantic-layer/projects/project-1/documents/text',
-      ),
-    ).toHaveLength(1);
-  });
-  await waitFor(() => {
-    expect(
-      fetchMock.callHistory.calls(
-        'http://agent.local/agent/semantic-layer/projects/project-1/documents/document-2/enrich',
       ),
     ).toHaveLength(1);
   });

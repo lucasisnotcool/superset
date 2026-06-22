@@ -126,6 +126,8 @@ class AgentConfig:
     )
     semantic_access_mode: SemanticAccessMode = "superset_or_uri"
     semantic_full_access_grants_write: bool = False
+    semantic_activation_requires_live_schema: bool = False
+    wren_core_validation_enabled: bool = False
     superset_agent_adapter: SupersetAdapterMode = "rest"
     superset_auth_mode: SupersetAuthMode = "user_session"
     superset_base_url: str = "http://localhost:8091"
@@ -412,6 +414,14 @@ class AgentConfig:
             semantic_full_access_grants_write=_env_bool(
                 "AI_AGENT_SEMANTIC_FULL_ACCESS_GRANTS_WRITE",
                 cls.semantic_full_access_grants_write,
+            ),
+            semantic_activation_requires_live_schema=_env_bool(
+                "AI_AGENT_SEMANTIC_ACTIVATION_REQUIRES_LIVE_SCHEMA",
+                cls.semantic_activation_requires_live_schema,
+            ),
+            wren_core_validation_enabled=_env_bool(
+                "WREN_CORE_VALIDATION_ENABLED",
+                cls.wren_core_validation_enabled,
             ),
             superset_agent_adapter=cast(
                 SupersetAdapterMode,

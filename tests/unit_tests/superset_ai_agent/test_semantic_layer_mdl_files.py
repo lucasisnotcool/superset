@@ -28,6 +28,8 @@ from superset_ai_agent.semantic_layer.mdl_validation import validate_mdl_yaml
 from superset_ai_agent.semantic_layer.schemas import (
     MdlFileCreateRequest,
     MdlFileUpdateRequest,
+    MdlValidationMessage,
+    MdlValidationResult,
 )
 
 
@@ -94,6 +96,35 @@ def test_cannot_activate_structurally_invalid_mdl_file() -> None:
             MdlFileUpdateRequest(status="active"),
             owner_id="owner",
         )
+
+
+def test_create_persists_validation_override() -> None:
+    store = InMemoryMdlFileStore()
+    physical = MdlValidationResult(
+        valid=False,
+        messages=[
+            MdlValidationMessage(message="bad column", code="unknown_column"),
+        ],
+    )
+    file = store.create(
+        "project-1",
+        MdlFileCreateRequest(
+            path="models/a.yaml",
+            content=(
+                "models:\n"
+                "  - name: a\n"
+                "    table_reference:\n"
+                "      table: a\n"
+                "    columns:\n"
+                "      - name: c\n"
+            ),
+        ),
+        owner_id="owner",
+        validation=physical,
+    )
+    assert file.validation is not None
+    assert file.validation.valid is False
+    assert file.validation.messages[0].code == "unknown_column"
 
 
 def test_normalize_mdl_path_rejects_unsafe_paths() -> None:

@@ -26,6 +26,7 @@ from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.conversations.memory import InMemoryConversationStore
 from superset_ai_agent.integrations.superset.client import (
     AgentContext,
+    ColumnSummary,
     DatabaseSummary,
     DatasetMetadata,
     SupersetAuthError,
@@ -78,6 +79,34 @@ class StaticContextProvider:
 class AuthRaisingContextProvider:
     def get_context(self, request: AgentQueryRequest) -> AgentContext:
         raise SupersetAuthError("Superset session expired.", status_code=401)
+
+
+class ToggleContextProvider:
+    """Returns a fixed schema until ``fail`` is set.
+
+    When failing, only the validation-time schema fetch raises (authorization
+    proofs are assumed cached/session-backed in a real deployment), isolating
+    the snapshot-fallback path in ``_schema_index_for_project``.
+    """
+
+    def __init__(self) -> None:
+        self.fail = False
+
+    def get_context(self, request: AgentQueryRequest) -> AgentContext:
+        if self.fail and request.question == "semantic layer validation":
+            raise SupersetAuthError("Superset outage.", status_code=503)
+        return AgentContext(
+            database=DatabaseSummary(id=request.database_id, name="examples"),
+            datasets=[
+                DatasetMetadata(
+                    id=99,
+                    table_name="moves",
+                    database_id=request.database_id,
+                    columns=[ColumnSummary(name="stage")],
+                    metrics=[],
+                )
+            ],
+        )
 
 
 def _local_config(**overrides) -> AgentConfig:
@@ -413,6 +442,97 @@ def test_enrich_flags_hallucinated_columns(tmp_path) -> None:
         message["code"] == "unknown_column"
         for message in proposal["validation"]["messages"]
     )
+
+
+def test_activation_uses_schema_snapshot_during_outage(tmp_path) -> None:
+    context_provider = ToggleContextProvider()
+    app = create_app(
+        config=_local_config(agent_storage_dir=str(tmp_path)),
+        model_client=FakeModelClient(),
+        text_to_sql_graph=object(),
+        conversation_graph=object(),
+        conversation_store=InMemoryConversationStore(),
+        semantic_layer_store=InMemorySemanticLayerStore(),
+        document_storage=LocalDocumentStorage(str(tmp_path)),
+        context_provider=context_provider,
+        job_runner=InlineJobRunner(),
+    )
+    client = TestClient(app)
+    project = _resolve_project(client)
+
+    # A valid activation captures a schema snapshot ({moves: [stage]}).
+    valid = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/mdl-files",
+        json={
+            "path": "models/moves.yaml",
+            "content": (
+                "models:\n"
+                "  - name: moves\n"
+                "    table_reference:\n"
+                "      table: moves\n"
+                "    columns:\n"
+                "      - name: stage\n"
+            ),
+        },
+    ).json()
+    activate_valid = client.patch(
+        f"/agent/semantic-layer/projects/{project['id']}/mdl-files/{valid['id']}",
+        json={"status": "active"},
+    )
+    assert activate_valid.status_code == 200
+
+    # Simulate a Superset outage; physical validation must still work via the
+    # snapshot rather than degrading to structural-only.
+    context_provider.fail = True
+    hallucinated = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/mdl-files",
+        json={
+            "path": "models/ghosts.yaml",
+            "content": (
+                "models:\n"
+                "  - name: ghosts\n"
+                "    table_reference:\n"
+                "      table: moves\n"
+                "    columns:\n"
+                "      - name: phantom\n"
+            ),
+        },
+    ).json()
+    blocked = client.patch(
+        f"/agent/semantic-layer/projects/{project['id']}/mdl-files/{hallucinated['id']}",
+        json={"status": "active"},
+    )
+    assert blocked.status_code == 422
+    assert any(
+        message["code"] == "unknown_column"
+        for message in blocked.json()["detail"]["validation"]["messages"]
+    )
+
+
+def test_create_persists_physical_validation(tmp_path) -> None:
+    # The created draft's stored validation reflects physical schema findings
+    # immediately, not just at activation time (R15).
+    client, _ = _client(tmp_path)
+    project = _resolve_project(client)
+
+    response = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/mdl-files",
+        json={
+            "path": "models/moves.yaml",
+            "content": (
+                "models:\n"
+                "  - name: moves\n"
+                "    table_reference:\n"
+                "      table: moves\n"
+                "    columns:\n"
+                "      - name: ghost_metric\n"
+            ),
+        },
+    )
+    assert response.status_code == 200
+    validation = response.json()["validation"]
+    assert validation["valid"] is False
+    assert any(m["code"] == "unknown_column" for m in validation["messages"])
 
 
 def test_activation_blocked_for_hallucinated_column(tmp_path) -> None:

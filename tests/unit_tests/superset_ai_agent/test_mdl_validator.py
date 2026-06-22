@@ -161,6 +161,23 @@ def test_physical_validation_allows_calculated_column() -> None:
     assert result.valid is True
 
 
+def test_schema_index_from_snapshot_validates_like_live() -> None:
+    index = _schema_index()
+    snapshot_index = SchemaIndex.from_snapshot(index.to_tables())
+
+    result = validate_mdl(
+        "models:\n"
+        "  - name: deals\n"
+        "    table_reference:\n"
+        "      table: deals\n"
+        "    columns:\n"
+        "      - name: ghost\n",
+        schema_index=snapshot_index,
+    )
+    assert result.valid is False
+    assert any(m.code == "unknown_column" for m in result.messages)
+
+
 def test_relationship_unresolved_is_warning_per_file_error_in_project() -> None:
     deals = (
         "models:\n"

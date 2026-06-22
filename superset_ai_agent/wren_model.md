@@ -24,14 +24,18 @@ conflict, the governance invariants in `wren.md` win.
 
 ## Implementation Status — 2026-06-22
 
-All five workstreams (A–E) plus the critical hardening risks **R1, R3, R8** are
-**`[COMPLETE]`**, source-backed and test-verified. Verification run on
-2026-06-22:
+All five workstreams (A–E) plus the hardening risks **R1, R3, R8** and the
+follow-up hardening **R11–R15** are **`[COMPLETE]`**, source-backed and
+test-verified. Verification run on 2026-06-22:
 
-- Backend: `pytest tests/unit_tests/superset_ai_agent/` → **172 passed**.
-- Frontend: `jest` for `SemanticLayerEditor` + `api` → **12 passed**.
+- Backend: `pytest tests/unit_tests/superset_ai_agent/` → **183 passed,
+  1 skipped** (the skipped test is the `wren-core`-installed deep-validation
+  path, exercised only when the optional engine is present).
+- Frontend: `jest` for `SemanticLayerEditor` + `api` → **13 passed**.
 - Lint: `ruff check` clean on all new/changed agent files (json imports carry
   the established `# noqa: TID251` standalone-agent convention).
+- DB: Alembic migration **`0002_schema_snapshots_and_jobs`** adds the schema
+  snapshot and async job tables.
 
 **R1/R3/R8 hardening (2026-06-22):** real schema-aware MDL validation
 (`mdl_schema.py`, `mdl_validator.py`) with a code-enforced activation gate
@@ -473,40 +477,91 @@ the manifest shape.
 Types were written to be annotation-complete, but CI `pre-commit run mypy` is the
 authoritative gate and was **not** executed here. **Action:** run it before push.
 
-## New Residual Risks introduced by R1/R3/R8 (2026-06-22)
+## R11–R15 Hardening — `[COMPLETE]` (2026-06-22)
 
-### R11. Validation is hand-rolled, not `wren-core`
-`mdl_validator.py` reimplements MDL grammar checks. It can drift from the real
-Wren spec (e.g. cube/metric grammar, advanced relationship conditions are not
-deeply validated). **Impact:** low–medium. **Fix:** adopt `wren-core` as the
-Phase-2 deep validator and reconcile the camelCase manifest envelope (R9).
+Second hardening pass. Verification: backend **183 passed, 1 skipped**
+(`wren-core` deep-path test skipped when the optional engine is absent);
+frontend **13 passed**; `ruff` clean on new/changed files. Migration **`0002`**
+adds the snapshot + jobs tables.
 
-### R12. Activation physical-check degrades on Superset outage
-`_enforce_activation` builds the `SchemaIndex` best-effort; if Superset metadata
-can't be fetched, it falls back to **structural-only** validation so activation
-isn't blocked by an outage. A hallucinated column could then be activated during
-a Superset outage. **Impact:** low (narrow window). **Fix:** persist the last
-known schema fingerprint/columns and validate against that when live fetch
-fails, or make physical validation strict with an explicit override.
+### R11. wren-core deep validation — `[COMPLETE]`
+Optional `wren-core` engine augments (never replaces) the always-on
+structural/physical validator.
+- Source: `semantic_layer/wren_core_validator.py` (import-guarded `wren_core`;
+  `validate_with_wren_core`; `to_wren_core_manifest` snake→camelCase mapping);
+  `mdl_validator.validate_project_manifest(deep_validate=...)` merges findings;
+  activation gate passes `deep_validate=config.wren_core_validation_enabled`;
+  config flag `wren_core_validation_enabled` (+ `WREN_CORE_VALIDATION_ENABLED`);
+  `requirements-ai-agent.txt` carries the commented opt-in dep.
+- Tests: `test_wren_core_validator.py` (mapping, unavailable no-op, deep flag
+  safe without the engine; engine-present test `skipif` not installed).
+- **Residual → R16.**
 
-### R13. Enrichment "diff" is before/after text, not a real diff
-The review panel shows the previous content in a collapsible block beside the
-proposed YAML in the editor; there is no line-level diff highlighting.
-**Impact:** low (UX). **Fix:** integrate a diff viewer component.
+### R12. Outage-resilient physical validation — `[COMPLETE]`
+A successful schema fetch is snapshotted per project; on a Superset outage the
+snapshot is used so hallucinated columns are still caught at activation.
+- Source: `persistence/models.py::AiAgentSchemaSnapshot` (+ migration `0002`);
+  `semantic_layer/schema_snapshot.py` (in-memory + SQLAlchemy stores);
+  `SchemaIndex.from_snapshot`/`to_tables`; `app.py::_schema_index_for_project`
+  (upsert on success, load snapshot on failure); strict mode
+  `semantic_activation_requires_live_schema` → `409` when no schema available.
+- Tests: `test_schema_snapshot.py`;
+  `test_mdl_validator.py::test_schema_index_from_snapshot_validates_like_live`;
+  `test_semantic_layer_api.py::test_activation_uses_schema_snapshot_during_outage`.
+- **Residual → R17.**
 
-### R14. Job store + runner are process-local
-`InMemoryJobStore` + `ThreadJobRunner` do not survive a restart and are not
-shared across workers; a multi-worker deployment would not find a job created on
-another worker. The in-memory semantic-layer event store is likewise written
-from a background thread (not guaranteed thread-safe for the dev store).
-**Impact:** medium for multi-worker prod. **Fix:** back jobs with the agent DB
-or a task queue (Celery); use the SQLAlchemy stores in prod (already the
-default when persistence is configured).
+### R13. Real diff viewer — `[COMPLETE]`
+The enrichment `proposal-review` panel renders a line-level split diff
+(`react-diff-viewer-continued`, already a repo dependency) of current vs proposed
+MDL.
+- Source: `SemanticLayerEditor/index.tsx` (`proposal-diff` block).
+- Test: `SemanticLayerEditor/index.test.tsx` (renders diff when a proposal
+  replaces an existing file).
 
-### R15. Generation-time file validation is structural-only in storage
-Onboarding/enrich write drafts whose **persisted** `MdlFile.validation` is
-structural-only (physical findings are surfaced via warnings and re-checked at
-the activation gate, but not stored on the file). A draft can therefore look
-"valid" in a raw file listing yet still be blocked at activation. **Impact:**
-low (the gate is authoritative). **Fix:** thread the schema-aware validation
-result into the store on create/update.
+### R14. DB-backed jobs (cross-worker) — `[COMPLETE]` (Phase 1)
+- Source: `persistence/models.py::AiAgentJob` (+ migration `0002`);
+  `semantic_layer/jobs.py::SqlAlchemyJobStore`; `app.py::_create_job_store`
+  (selected by persistence mode).
+- Tests: `test_job_store.py` (in-memory lifecycle; **cross-instance visibility**
+  proving a job created by one "worker" is pollable by another; failure path).
+- **Residual → R18** (Phase 2 Celery for execution durability).
+
+### R15. Persisted physical validation — `[COMPLETE]`
+A draft's stored `MdlFile.validation` now reflects schema-aware findings.
+- Source: `mdl_files.py` `create`/`update`/`_new_file` accept a `validation`
+  override; `onboarding.py` and the `POST`/`PATCH` mdl-file routes compute
+  schema-aware validation (cheap via the R12 snapshot) and pass it in.
+- Tests: `test_semantic_layer_mdl_files.py::test_create_persists_validation_override`;
+  `test_semantic_layer_api.py::test_create_persists_physical_validation`.
+
+## New Residual Risks introduced by R11–R15 (2026-06-22)
+
+### R16. wren-core manifest shape is unverified against a live engine
+`to_wren_core_manifest` targets the `wren-core-base` camelCase serde shape but
+was **not** validated against an installed `wren-core` (the package is not in the
+working venv; the engine-present test is `skipif`-skipped). Field-name drift
+across wren-core versions could make deep validation reject valid manifests.
+**Impact:** medium **when the flag is enabled**; zero by default (flag off /
+engine absent → no-op). **Fix:** a CI job that installs `wren-core` and runs the
+skipped test against a golden manifest; reconcile R9 envelope casing.
+
+### R17. Schema snapshots can be stale
+The snapshot is refreshed only on a successful live fetch. If a table/column is
+dropped or renamed in Superset during an outage, validation against the stale
+snapshot can over- or under-flag until the next successful fetch. **Impact:**
+low. **Fix:** TTL the snapshot, or fall to strict mode
+(`semantic_activation_requires_live_schema`) for high-governance deployments.
+
+### R18. Job execution is still in-process (Phase-1)
+`SqlAlchemyJobStore` makes jobs **visible** across workers, but `ThreadJobRunner`
+still executes on the submitting worker; a worker dying mid-onboarding leaves an
+orphaned `running` job (no result). **Impact:** medium for multi-worker prod.
+**Fix:** Phase-2 `CeleryJobRunner` (deferred) plus a stale-`running` sweep with a
+`started_at` heartbeat.
+
+### R19. Per-save schema fetch cost
+R15 computes schema-aware validation on every MDL create/update, adding a
+Superset metadata fetch per save (snapshot only short-circuits the *outage*
+path, not the happy path). **Impact:** low–medium (extra round-trip on an
+interactive save). **Fix:** cache the live `SchemaIndex` per request/short TTL,
+or reuse the snapshot within a freshness window.

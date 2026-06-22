@@ -16,7 +16,14 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  ChangeEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import { t } from '@apache-superset/core/translation';
 import { css, styled } from '@apache-superset/core/theme';
 import { Alert } from '@apache-superset/core/components';
@@ -26,27 +33,19 @@ import { EditorHost } from 'src/core/editors';
 import {
   ConversationScope,
   createMdlFile,
-  createProjectDocumentFromText,
   deleteMdlFile,
-  enrichProjectDocument,
   getProjectSemanticLayerState,
   listMdlFiles,
-  listSemanticDocuments,
-  materializeSemanticProject,
-  MdlEnrichmentProposal,
   MdlFile,
   MdlFileStatus,
   resolveSemanticProject,
   runOnboarding,
-  SemanticDocument,
   SemanticLayerState,
   SemanticProject,
   updateMdlFile,
-  uploadMdlFile,
-  uploadProjectSourceDocument,
-  WrenMaterializationResult,
 } from '../api';
 import SemanticLayerStateBadge from '../SemanticLayerStateBadge';
+import SemanticLayerImportDialog from './SemanticLayerImportDialog';
 
 const EditorRoot = styled.div`
   ${({ theme }) => css`
@@ -132,25 +131,11 @@ const FileButton = styled.button<{ 'data-active': boolean }>`
   `}
 `;
 
-const HiddenFileInput = styled.input`
-  display: none;
-`;
-
 const StyledEditorHost = styled(EditorHost)`
   &.ace_editor {
     border: 1px solid ${({ theme }) => theme.colorBorder};
     border-radius: ${({ theme }) => theme.borderRadius}px;
   }
-`;
-
-const SourceDocumentItem = styled.div`
-  ${({ theme }) => css`
-    display: flex;
-    flex-direction: column;
-    gap: ${theme.sizeUnit}px;
-    padding: ${theme.sizeUnit * 2}px 0;
-    border-top: 1px solid ${theme.colorBorderSecondary};
-  `}
 `;
 
 const defaultYaml = `models:
@@ -181,21 +166,22 @@ export default function SemanticLayerEditor({
 
   const [project, setProject] = useState<SemanticProject | null>(null);
   const [mdlFiles, setMdlFiles] = useState<MdlFile[]>([]);
-  const [documents, setDocuments] = useState<SemanticDocument[]>([]);
   const [state, setState] = useState<SemanticLayerState | null>(null);
   const [activeFileId, setActiveFileId] = useState<string | null>(null);
   const [editorPath, setEditorPath] = useState('models/new_model.yaml');
   const [editorValue, setEditorValue] = useState(defaultYaml);
-  const [proposal, setProposal] = useState<MdlEnrichmentProposal | null>(null);
-  const [materialization, setMaterialization] =
-    useState<WrenMaterializationResult | null>(null);
-  const [rawText, setRawText] = useState('');
   const [onboardingWarnings, setOnboardingWarnings] = useState<string[]>([]);
-  const [proposalBefore, setProposalBefore] = useState<string | null>(null);
+  const [showImportDialog, setShowImportDialog] = useState(false);
+  const [isOnboarding, setIsOnboarding] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
-  const mdlInputRef = useRef<HTMLInputElement | null>(null);
-  const sourceInputRef = useRef<HTMLInputElement | null>(null);
+  const onboardedProjectsRef = useRef<Set<string>>(new Set());
+  // Mirror the active file id in a ref so `refresh` can read the current
+  // selection without depending on it (which would re-create the callback and
+  // re-trigger the load effect — the cause of the autoscroll + dataset GET
+  // storm). Synced on every render so it always holds the latest value.
+  const activeFileIdRef = useRef<string | null>(null);
+  activeFileIdRef.current = activeFileId;
 
   const activeFile = mdlFiles.find(file => file.id === activeFileId) || null;
   const canWrite =
@@ -205,7 +191,6 @@ export default function SemanticLayerEditor({
     if (!scope.schema_name) {
       setProject(null);
       setMdlFiles([]);
-      setDocuments([]);
       setState(null);
       return;
     }
@@ -215,23 +200,28 @@ export default function SemanticLayerEditor({
       schema_name: scope.schema_name,
       create_if_missing: true,
     });
-    const [nextFiles, nextDocuments, nextState] = await Promise.all([
+    const [nextFiles, nextState] = await Promise.all([
       listMdlFiles(nextProject.id),
-      listSemanticDocuments(scope),
       getProjectSemanticLayerState(nextProject.id),
     ]);
     setProject(nextProject);
     setMdlFiles(nextFiles);
-    setDocuments(nextDocuments);
     setState(nextState);
-    const selectedFile =
-      nextFiles.find(file => file.id === activeFileId) || nextFiles[0] || null;
-    if (selectedFile) {
-      setActiveFileId(selectedFile.id);
-      setEditorPath(selectedFile.path);
-      setEditorValue(selectedFile.content);
+    // Initialize the selection only when nothing valid is selected yet; never
+    // override the user's current file/edits on a background refresh.
+    const current = activeFileIdRef.current;
+    const stillSelected =
+      current && nextFiles.some(file => file.id === current);
+    if (!stillSelected) {
+      const firstFile = nextFiles[0] || null;
+      activeFileIdRef.current = firstFile?.id ?? null;
+      setActiveFileId(firstFile?.id ?? null);
+      if (firstFile) {
+        setEditorPath(firstFile.path);
+        setEditorValue(firstFile.content);
+      }
     }
-  }, [activeFileId, scope]);
+  }, [scope]);
 
   useEffect(() => {
     refresh().catch(ex => {
@@ -254,10 +244,17 @@ export default function SemanticLayerEditor({
   };
 
   const selectFile = (file: MdlFile) => {
+    activeFileIdRef.current = file.id;
     setActiveFileId(file.id);
     setEditorPath(file.path);
     setEditorValue(file.content);
-    setProposal(null);
+  };
+
+  const startNewFile = () => {
+    activeFileIdRef.current = null;
+    setActiveFileId(null);
+    setEditorPath('models/new_model.yaml');
+    setEditorValue(defaultYaml);
   };
 
   const saveFile = (status?: MdlFileStatus) =>
@@ -280,6 +277,7 @@ export default function SemanticLayerEditor({
       if (!activeFile && status) {
         savedFile = await updateMdlFile(project.id, savedFile.id, { status });
       }
+      activeFileIdRef.current = savedFile.id;
       setActiveFileId(savedFile.id);
       setEditorPath(savedFile.path);
       setEditorValue(savedFile.content);
@@ -292,91 +290,52 @@ export default function SemanticLayerEditor({
         return;
       }
       await deleteMdlFile(project.id, file.id);
-      setActiveFileId(null);
-      setEditorPath('models/new_model.yaml');
-      setEditorValue(defaultYaml);
+      startNewFile();
       await refresh();
     }, t('Unable to delete MDL file'));
 
-  const uploadMdl = (event: ChangeEvent<HTMLInputElement>) =>
-    withLoading(async () => {
-      const file = event.target.files?.[0];
-      if (!file || !project) {
-        return;
+  const runOnboard = useCallback(
+    async (targetProjectId: string) => {
+      setIsOnboarding(true);
+      setError(null);
+      try {
+        const job = await runOnboarding(targetProjectId);
+        if (job.status === 'failed') {
+          throw new Error(job.error || t('Onboarding failed'));
+        }
+        setOnboardingWarnings(job.result?.warnings ?? []);
+        await refresh();
+      } catch (ex) {
+        setError(
+          ex instanceof Error ? ex.message : t('Unable to onboard schema'),
+        );
+      } finally {
+        setIsOnboarding(false);
       }
-      const uploaded = await uploadMdlFile(project.id, file);
-      setActiveFileId(uploaded.id);
-      setEditorPath(uploaded.path);
-      setEditorValue(uploaded.content);
-      event.target.value = '';
-      await refresh();
-    }, t('MDL upload failed'));
+    },
+    [refresh],
+  );
 
-  const uploadSourceDocument = (event: ChangeEvent<HTMLInputElement>) =>
-    withLoading(async () => {
-      const file = event.target.files?.[0];
-      if (!file || !project) {
-        return;
-      }
-      const document = await uploadProjectSourceDocument(project.id, file);
-      if (file.name.toLowerCase().endsWith('.md')) {
-        showProposal(await enrichProjectDocument(project.id, document.id));
-      }
-      event.target.value = '';
-      await refresh();
-    }, t('Source document upload failed'));
-
-  const materializeProject = () =>
-    withLoading(async () => {
-      if (!project) {
-        return;
-      }
-      setMaterialization(await materializeSemanticProject(project.id));
-      await refresh();
-    }, t('Unable to materialize Wren project'));
-
-  const onboardProject = () =>
-    withLoading(async () => {
-      if (!project) {
-        return;
-      }
-      const job = await runOnboarding(project.id);
-      if (job.status === 'failed') {
-        throw new Error(job.error || t('Onboarding failed'));
-      }
-      setOnboardingWarnings(job.result?.warnings ?? []);
-      await refresh();
-      const firstFile = job.result?.files?.[0];
-      if (firstFile) {
-        setActiveFileId(firstFile.id);
-        setEditorPath(firstFile.path);
-        setEditorValue(firstFile.content);
-        setProposal(null);
-      }
-    }, t('Unable to onboard schema'));
-
-  const showProposal = (nextProposal: MdlEnrichmentProposal) => {
-    setProposalBefore(
-      mdlFiles.find(file => file.path === nextProposal.proposed_path)?.content ??
-        null,
-    );
-    setProposal(nextProposal);
-    setActiveFileId(null);
-    setEditorPath(nextProposal.proposed_path);
-    setEditorValue(nextProposal.proposed_yaml);
+  const onboardProject = () => {
+    if (project) {
+      runOnboard(project.id);
+    }
   };
 
-  const enrichRawText = () =>
-    withLoading(async () => {
-      if (!project || !rawText.trim()) {
-        return;
-      }
-      const document = await createProjectDocumentFromText(project.id, rawText);
-      const nextProposal = await enrichProjectDocument(project.id, document.id);
-      showProposal(nextProposal);
-      setRawText('');
-      await refresh();
-    }, t('Unable to enrich text'));
+  // Eagerly onboard a schema that has no MDL yet so the user lands on a
+  // populated semantic layer. Fires at most once per project.
+  useEffect(() => {
+    if (
+      project &&
+      canWrite &&
+      mdlFiles.length === 0 &&
+      !isOnboarding &&
+      !onboardedProjectsRef.current.has(project.id)
+    ) {
+      onboardedProjectsRef.current.add(project.id);
+      runOnboard(project.id);
+    }
+  }, [project, canWrite, mdlFiles.length, isOnboarding, runOnboard]);
 
   return (
     <EditorRoot data-test="semantic-layer-editor">
@@ -392,7 +351,10 @@ export default function SemanticLayerEditor({
         <BrowserPane>
           {error && <Alert type="warning" message={error} />}
           {!scope.schema_name && (
-            <Alert type="warning" message={t('Select a database and schema.')} />
+            <Alert
+              type="warning"
+              message={t('Select a database and schema.')}
+            />
           )}
           <Flex gap="small" wrap="wrap">
             <Button
@@ -406,12 +368,7 @@ export default function SemanticLayerEditor({
             <Button
               buttonStyle="tertiary"
               disabled={!project || !canWrite || isLoading}
-              onClick={() => {
-                setActiveFileId(null);
-                setEditorPath('models/new_model.yaml');
-                setEditorValue(defaultYaml);
-                setProposal(null);
-              }}
+              onClick={startNewFile}
               icon={<Icons.PlusOutlined iconSize="m" />}
             >
               {t('New')}
@@ -426,7 +383,9 @@ export default function SemanticLayerEditor({
                 onClick={() => selectFile(file)}
               >
                 <span>{file.path}</span>
-                <Typography.Text type="secondary">{file.status}</Typography.Text>
+                <Typography.Text type="secondary">
+                  {file.status}
+                </Typography.Text>
               </FileButton>
             ))}
           </ScrollList>
@@ -434,96 +393,21 @@ export default function SemanticLayerEditor({
             <Button
               buttonStyle="tertiary"
               disabled={!project || !canWrite || isLoading}
-              onClick={() => mdlInputRef.current?.click()}
+              onClick={() => setShowImportDialog(true)}
               icon={<Icons.UploadOutlined iconSize="m" />}
             >
-              {t('MDL')}
+              {t('Add…')}
             </Button>
             <Button
               buttonStyle="tertiary"
-              disabled={!project || !canWrite || isLoading}
-              onClick={() => sourceInputRef.current?.click()}
-              icon={<Icons.FileTextOutlined iconSize="m" />}
-            >
-              {t('Document')}
-            </Button>
-            <Button
-              buttonStyle="tertiary"
-              disabled={!project || !canWrite || isLoading}
+              loading={isOnboarding}
+              disabled={!project || !canWrite || isLoading || isOnboarding}
               onClick={onboardProject}
               icon={<Icons.DatabaseOutlined iconSize="m" />}
             >
-              {t('Onboard')}
-            </Button>
-            <Button
-              buttonStyle="tertiary"
-              disabled={!project || isLoading}
-              onClick={materializeProject}
-              icon={<Icons.SyncOutlined iconSize="m" />}
-            >
-              {t('Materialize')}
+              {isOnboarding ? t('Onboarding…') : t('Onboard')}
             </Button>
           </Flex>
-          <HiddenFileInput
-            ref={mdlInputRef}
-            type="file"
-            accept=".yaml,.yml,text/yaml,application/x-yaml"
-            onChange={uploadMdl}
-          />
-          <HiddenFileInput
-            ref={sourceInputRef}
-            type="file"
-            accept=".md,.txt,text/markdown,text/plain"
-            onChange={uploadSourceDocument}
-          />
-          <Input.TextArea
-            data-test="semantic-layer-raw-text"
-            value={rawText}
-            disabled={!project || !canWrite || isLoading}
-            placeholder={t('Paste BI markdown to enrich the model…')}
-            autoSize={{ minRows: 2, maxRows: 6 }}
-            onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
-              setRawText(event.target.value)
-            }
-          />
-          <Button
-            buttonStyle="tertiary"
-            buttonSize="small"
-            disabled={!project || !canWrite || isLoading || !rawText.trim()}
-            onClick={enrichRawText}
-            icon={<Icons.FunctionOutlined iconSize="m" />}
-          >
-            {t('Enrich text')}
-          </Button>
-          {documents.map(document => (
-            <SourceDocumentItem key={document.id}>
-              <Typography.Text strong>{document.filename}</Typography.Text>
-              <Typography.Text type="secondary">
-                {document.status}
-              </Typography.Text>
-              {document.summary && (
-                <Typography.Paragraph>{document.summary}</Typography.Paragraph>
-              )}
-              <Button
-                buttonStyle="tertiary"
-                buttonSize="small"
-                disabled={!project || !canWrite || isLoading}
-                onClick={() =>
-                  withLoading(async () => {
-                    if (!project) {
-                      return;
-                    }
-                    showProposal(
-                      await enrichProjectDocument(project.id, document.id),
-                    );
-                  }, t('Unable to enrich document'))
-                }
-                icon={<Icons.FunctionOutlined iconSize="m" />}
-              >
-                {t('Enrich')}
-              </Button>
-            </SourceDocumentItem>
-          ))}
         </BrowserPane>
         <EditorPane>
           {onboardingWarnings.length > 0 && (
@@ -540,59 +424,6 @@ export default function SemanticLayerEditor({
               }
               closable
               onClose={() => setOnboardingWarnings([])}
-            />
-          )}
-          {proposal && (
-            <Alert
-              type={proposal.validation.valid ? 'info' : 'error'}
-              data-test="proposal-review"
-              message={
-                proposal.validation.valid
-                  ? t('Review proposed MDL before saving.')
-                  : t('Proposed MDL has validation errors and cannot be activated.')
-              }
-              description={
-                <>
-                  {proposal.warnings.length > 0 && (
-                    <Typography.Paragraph>
-                      {proposal.warnings.join(' ')}
-                    </Typography.Paragraph>
-                  )}
-                  {!proposal.validation.valid && (
-                    <ul>
-                      {proposal.validation.messages
-                        .filter(message => message.severity === 'error')
-                        .map(message => (
-                          <li key={message.message}>{message.message}</li>
-                        ))}
-                    </ul>
-                  )}
-                  {proposalBefore != null && (
-                    <details data-test="proposal-diff-before">
-                      <summary>{t('Previous content')}</summary>
-                      <pre>{proposalBefore}</pre>
-                    </details>
-                  )}
-                </>
-              }
-            />
-          )}
-          {materialization && (
-            <Alert
-              type={materialization.warnings.length > 0 ? 'warning' : 'success'}
-              message={t('Wren project materialized')}
-              description={
-                <>
-                  {t('%s active file(s)', materialization.file_count)}
-                  {materialization.warnings.length > 0 && (
-                    <ul>
-                      {materialization.warnings.map(warning => (
-                        <li key={warning}>{warning}</li>
-                      ))}
-                    </ul>
-                  )}
-                </>
-              }
             />
           )}
           <Input
@@ -649,6 +480,14 @@ export default function SemanticLayerEditor({
           </Flex>
         </EditorPane>
       </EditorBody>
+      <SemanticLayerImportDialog
+        show={showImportDialog}
+        onHide={() => setShowImportDialog(false)}
+        projectId={project?.id ?? null}
+        existingFiles={mdlFiles}
+        canWrite={canWrite}
+        onApplied={refresh}
+      />
     </EditorRoot>
   );
 }
