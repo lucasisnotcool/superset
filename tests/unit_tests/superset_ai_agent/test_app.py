@@ -288,6 +288,23 @@ def _signed_identity_header(owner_id: str) -> dict[str, str]:
     }
 
 
+def test_retriever_is_built_once_per_app(monkeypatch) -> None:
+    # C4: the embedder + retriever are constructed a single time in create_app and
+    # injected into every graph, rather than rebuilt per request/graph.
+    import superset_ai_agent.app as app_module
+
+    calls = {"n": 0}
+    real = app_module.create_retriever
+
+    def _counting(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(app_module, "create_retriever", _counting)
+    _create_test_app()
+    assert calls["n"] == 1
+
+
 def test_health_and_models_use_injected_ollama_client() -> None:
     app = _create_test_app()
     client = TestClient(app)
@@ -298,6 +315,8 @@ def test_health_and_models_use_injected_ollama_client() -> None:
     assert health["ollama_reachable"] is True
     # Test config uses semantic_layer_store="memory" → flagged non-persistent.
     assert health["semantic_layer_persistent"] is False
+    # Default keyword retriever → in-process memory index (C1 health signal).
+    assert health["vector_index"] == "memory"
     assert client.get("/models").json()[0]["name"] == "qwen2.5-coder:7b"
 
 

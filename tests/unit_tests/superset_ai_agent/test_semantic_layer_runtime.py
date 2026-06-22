@@ -20,9 +20,35 @@ from __future__ import annotations
 from superset_ai_agent.conversations.schemas import ConversationScope
 from superset_ai_agent.schemas import WrenContextArtifact
 from superset_ai_agent.semantic_layer.memory import InMemorySemanticLayerStore
-from superset_ai_agent.semantic_layer.runtime import merge_indexed_semantic_context
+from superset_ai_agent.semantic_layer.runtime import (
+    cap_context_items,
+    merge_indexed_semantic_context,
+)
 from superset_ai_agent.semantic_layer.schemas import SemanticLayerVersion
 from superset_ai_agent.semantic_layer.store import scope_hash
+
+
+def test_cap_context_items_dedups_and_prioritizes_retriever_chunks() -> None:
+    items = [
+        {"source": "fetch", "text": "a"},
+        {"source": "fetch", "text": "a"},  # exact duplicate → deduped
+        {"source": "doc", "text": "b"},
+        {"source": "retriever", "text": "r1"},
+        {"source": "retriever", "text": "r2"},
+    ]
+    # Generous cap: only dedup, order preserved.
+    assert cap_context_items(items, 0) == [
+        {"source": "fetch", "text": "a"},
+        {"source": "doc", "text": "b"},
+        {"source": "retriever", "text": "r1"},
+        {"source": "retriever", "text": "r2"},
+    ]
+    # Tight cap: retrieval-ranked chunks win, others fill the remainder.
+    capped = cap_context_items(items, 2)
+    assert capped == [
+        {"source": "retriever", "text": "r1"},
+        {"source": "retriever", "text": "r2"},
+    ]
 
 
 def test_merge_indexed_semantic_context_combines_runtime_and_indexed_items() -> None:

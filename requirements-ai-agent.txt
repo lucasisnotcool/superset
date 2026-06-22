@@ -35,10 +35,11 @@ uvicorn>=0.30,<1.0
 # is required for full Wren parity and is installed by default.
 wren-core-py>=0.7,<0.8
 #
-# Optional: LanceDB-backed persistent embedding index (Phase 2 retrieval scale
-# optimization). Embedding retrieval works without it (in-memory cosine over the
-# configured embedder); install only to scale to very wide schemas.
-# lancedb>=0.13
+# LanceDB-backed persistent embedding index (WREN_VECTOR_INDEX=lancedb). Survives
+# restarts/workers; reads use pyarrow (a lancedb dep) — `to_pandas()` would also
+# need the separate `pylance` package, so the code uses `to_arrow()`. Embedding
+# retrieval degrades to the in-process index when this is absent.
+lancedb>=0.13,<1.0
 #
 # Optional (production): PostgreSQL driver for durable agent persistence
 # (AI_AGENT_DATABASE_URL=postgresql+psycopg://...). The default

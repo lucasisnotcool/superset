@@ -103,6 +103,7 @@ export default function AuditInfoPanel({
   // produced the context (wren_full.md RV2/RV3 surfacing).
   const engine = audit.engine;
   const retrievalMode = wrenContext?.retrieval_mode;
+  const retrievedCount = wrenContext?.retrieved_item_count ?? 0;
   const recalledCount = wrenContext?.recalled_example_count ?? 0;
   const hasBadges = Boolean(engine || retrievalMode || recalledCount > 0);
   if (entries.length === 0 && !hasBadges) {
@@ -115,7 +116,11 @@ export default function AuditInfoPanel({
         <Badges>
           {engine ? <Badge>{t('Engine: %s', engine)}</Badge> : null}
           {retrievalMode ? (
-            <Badge>{t('Retrieval: %s', retrievalMode)}</Badge>
+            <Badge>
+              {retrievedCount > 0
+                ? t('Retrieval: %s (%s chunks)', retrievalMode, retrievedCount)
+                : t('Retrieval: %s', retrievalMode)}
+            </Badge>
           ) : null}
           {recalledCount > 0 ? (
             <Badge>{t('Reused %s learned example(s)', recalledCount)}</Badge>

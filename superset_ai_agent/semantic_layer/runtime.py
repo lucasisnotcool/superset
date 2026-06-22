@@ -17,6 +17,9 @@
 
 from __future__ import annotations
 
+import json  # noqa: TID251 - standalone agent context-item dedup key
+from typing import Any
+
 from superset_ai_agent.conversations.schemas import ConversationScope
 from superset_ai_agent.conversations.store import DEFAULT_OWNER_ID
 from superset_ai_agent.schemas import WrenContextArtifact
@@ -38,7 +41,39 @@ def merge_indexed_semantic_context(
     if latest_version is None or latest_version.wren_context is None:
         return wren_context
 
-    indexed_context = latest_version.wren_context
+    return _merge(wren_context, latest_version.wren_context)
+
+
+def cap_context_items(
+    items: list[dict[str, Any]], max_items: int
+) -> list[dict[str, Any]]:
+    """Dedup + bound merged prompt context items (wren_full.md R-RET-E).
+
+    The three context sources (doc overlay, MDL retriever chunks, ``fetch_context``)
+    concatenate with no combined budget, so a wide schema could inflate the prompt.
+    This dedups exact duplicates and, on overflow, keeps the **retrieval-ranked**
+    chunks (``source == "retriever"``) first since those are the most relevant.
+    ``max_items <= 0`` is unlimited.
+    """
+
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for item in items:
+        key = json.dumps(item, sort_keys=True, default=str)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    if max_items <= 0 or len(deduped) <= max_items:
+        return deduped
+    ranked = [item for item in deduped if item.get("source") == "retriever"]
+    other = [item for item in deduped if item.get("source") != "retriever"]
+    return (ranked + other)[:max_items]
+
+
+def _merge(
+    wren_context: WrenContextArtifact, indexed_context: WrenContextArtifact
+) -> WrenContextArtifact:
     return wren_context.model_copy(
         update={
             "enabled": wren_context.enabled or indexed_context.enabled,

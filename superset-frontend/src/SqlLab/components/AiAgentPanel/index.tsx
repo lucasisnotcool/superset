@@ -1160,6 +1160,17 @@ const AiAgentPanel = () => {
             )}
           />
         )}
+        {health?.vector_index === 'memory_fallback' && (
+          <Alert
+            type="warning"
+            closable={false}
+            message={t(
+              'LanceDB was requested but did not load — embedding retrieval is ' +
+                'running in memory and its index is not persisted. Install ' +
+                'lancedb or set the vector index to memory.',
+            )}
+          />
+        )}
         <DatasetSelect
           databaseId={databaseId}
           schema={queryEditor?.schema}

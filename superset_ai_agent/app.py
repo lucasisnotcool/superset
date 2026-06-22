@@ -56,6 +56,7 @@ from superset_ai_agent.integrations.superset.client import SupersetAuthError
 from superset_ai_agent.integrations.superset.factory import create_superset_client
 from superset_ai_agent.integrations.wren.client import WrenClient
 from superset_ai_agent.integrations.wren.factory import create_wren_client
+from superset_ai_agent.llm.embeddings import create_embedder
 from superset_ai_agent.llm.factory import create_model_client
 from superset_ai_agent.persistence.database import (
     create_engine_from_config,
@@ -117,6 +118,10 @@ from superset_ai_agent.semantic_layer.projects import (
     SqlAlchemySemanticProjectStore,
 )
 from superset_ai_agent.semantic_layer.review import apply_review
+from superset_ai_agent.semantic_layer.schema_retriever import (
+    create_retriever,
+    effective_vector_index,
+)
 from superset_ai_agent.semantic_layer.schema_snapshot import (
     InMemorySchemaSnapshotStore,
     SchemaSnapshot,
@@ -247,6 +252,18 @@ def create_app(  # noqa: C901
         )
     )
     active_memory = create_memory(app_config, session_factory=session_factory)
+    # Build the embedder + retriever once per app so the in-process vector index
+    # (and any LanceDB connection) is shared across requests/graphs in a worker
+    # — instead of a cold index per request (wren_full.md C4).
+    active_embedder = create_embedder(app_config)
+    active_retriever = create_retriever(app_config, active_embedder)
+    active_vector_index = effective_vector_index(app_config, active_retriever)
+    if active_vector_index == "memory_fallback":
+        logger.warning(
+            "WREN_VECTOR_INDEX=lancedb was requested but LanceDB did not "
+            "connect; embedding retrieval is running in-process and will NOT "
+            "survive a restart. Install `lancedb` or set WREN_VECTOR_INDEX=memory."
+        )
 
     app_superset_client = (
         superset_client
@@ -280,6 +297,7 @@ def create_app(  # noqa: C901
             semantic_project_store=active_semantic_project_store,
             mdl_file_store=active_mdl_file_store,
             memory=active_memory,
+            retriever=active_retriever,
         )
         service_conversation_graph = conversation_graph or ConversationGraph(
             config=app_config,
@@ -292,6 +310,7 @@ def create_app(  # noqa: C901
             semantic_project_store=active_semantic_project_store,
             mdl_file_store=active_mdl_file_store,
             memory=active_memory,
+            retriever=active_retriever,
         )
 
     api = FastAPI(title=app_config.app_name, version="0.1.0")
@@ -348,6 +367,7 @@ def create_app(  # noqa: C901
             semantic_project_store=active_semantic_project_store,
             mdl_file_store=active_mdl_file_store,
             memory=active_memory,
+            retriever=active_retriever,
         )
 
     def build_conversation_graph(request: Request) -> Any:
@@ -369,6 +389,7 @@ def create_app(  # noqa: C901
             semantic_project_store=active_semantic_project_store,
             mdl_file_store=active_mdl_file_store,
             memory=active_memory,
+            retriever=active_retriever,
         )
 
     def build_semantic_access_service(
@@ -466,6 +487,7 @@ def create_app(  # noqa: C901
                 reachable if app_config.model_provider == "ollama" else None
             ),
             semantic_layer_persistent=app_config.semantic_layer_store != "memory",
+            vector_index=active_vector_index,
         )
 
     @api.get("/models", response_model=list[ModelInfo])

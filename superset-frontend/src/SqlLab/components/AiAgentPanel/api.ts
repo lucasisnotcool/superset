@@ -111,6 +111,8 @@ export interface WrenContextArtifact {
   // Which retriever produced the context items (keyword | embedding), stamped
   // when the Retriever seam contributes context (wren_full.md RV2).
   retrieval_mode?: string | null;
+  // How many MDL schema chunks the retriever contributed this turn (RV3/G8).
+  retrieved_item_count?: number | null;
   // How many confirmed NL->SQL examples the memory seam recalled for this turn
   // (0 when learning is off); surfaced as a UI badge (wren_full.md RV3).
   recalled_example_count?: number | null;
@@ -331,6 +333,9 @@ export interface AgentHealthResponse {
   // False when the semantic layer runs in-memory (models lost on restart), so
   // the UI can warn before users model against an ephemeral store (RV3).
   semantic_layer_persistent?: boolean;
+  // Effective embedding vector index: 'memory' | 'lancedb' | 'memory_fallback'.
+  // 'memory_fallback' = LanceDB was configured but did not connect (C1).
+  vector_index?: string;
 }
 
 export type SemanticProjectVisibility = 'private' | 'db_access' | 'custom';

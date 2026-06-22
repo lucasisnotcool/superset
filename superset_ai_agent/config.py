@@ -25,6 +25,7 @@ SupersetAdapterMode = Literal["local", "rest", "mcp"]
 WrenAdapterMode = Literal["file", "http", "llm"]
 WrenEngineMode = Literal["passthrough", "wren_core"]
 WrenRetrieverMode = Literal["keyword", "embedding"]
+WrenVectorIndexMode = Literal["memory", "lancedb"]
 WrenMemoryStoreMode = Literal["none", "sqlalchemy", "lancedb"]
 ConversationStoreMode = Literal["memory", "sqlalchemy"]
 SemanticLayerStoreMode = Literal["memory", "sqlalchemy"]
@@ -148,6 +149,18 @@ class AgentConfig:
     # gate is best-effort, so correction is opt-in to avoid spurious re-drafts.
     wren_engine_max_correction_retries: int = 0
     wren_retriever: WrenRetrieverMode = "keyword"
+    # Where embedding-retrieval vectors live: in-process cache (default, rebuilt
+    # per worker) or a persistent LanceDB index that survives restarts/workers.
+    # LanceDB is import-guarded; absent → falls back to `memory` (wren_full.md R2).
+    wren_vector_index: WrenVectorIndexMode = "memory"
+    # Bound the in-process retriever index to the N most-recently-used scopes so a
+    # worker serving many projects/owners cannot grow unbounded. 0 = unlimited.
+    wren_retriever_cache_scopes: int = 64
+    # Total cap on prompt context_items after the three sources (doc overlay, MDL
+    # retriever chunks, fetch_context) are merged, so a wide schema cannot inflate
+    # the prompt (wren_full.md R-RET-E). Retrieval-ranked chunks win on overflow.
+    # 0 = unlimited.
+    wren_max_context_items: int = 40
     wren_memory_store: WrenMemoryStoreMode = "none"
     wren_memory_learning_enabled: bool = True
     wren_memory_recall_k: int = 3
@@ -482,6 +495,21 @@ class AgentConfig:
             wren_retriever=cast(
                 WrenRetrieverMode,
                 os.getenv("WREN_RETRIEVER", cls.wren_retriever).strip().lower(),
+            ),
+            wren_vector_index=cast(
+                WrenVectorIndexMode,
+                os.getenv("WREN_VECTOR_INDEX", cls.wren_vector_index).strip().lower(),
+            ),
+            wren_retriever_cache_scopes=int(
+                os.getenv(
+                    "WREN_RETRIEVER_CACHE_SCOPES",
+                    str(cls.wren_retriever_cache_scopes),
+                )
+            ),
+            wren_max_context_items=int(
+                os.getenv(
+                    "WREN_MAX_CONTEXT_ITEMS", str(cls.wren_max_context_items)
+                )
             ),
             wren_memory_store=cast(
                 WrenMemoryStoreMode,

@@ -63,6 +63,22 @@ test('shows the retrieval mode from the wren context', () => {
   expect(screen.getByText('Retrieval: embedding')).toBeInTheDocument();
 });
 
+test('shows retrieved chunk count alongside the retrieval mode', () => {
+  render(
+    <AuditInfoPanel
+      audit={{ engine: 'wren_core' }}
+      wrenContext={{
+        ...baseWrenContext,
+        retrieval_mode: 'embedding',
+        retrieved_item_count: 5,
+      }}
+    />,
+  );
+  expect(
+    screen.getByText('Retrieval: embedding (5 chunks)'),
+  ).toBeInTheDocument();
+});
+
 test('badges reused learned examples when recall fired', () => {
   render(
     <AuditInfoPanel

@@ -156,6 +156,10 @@ class WrenContextArtifact(BaseModel):
     indexing_status: str | None = None
     context_items: list[dict[str, Any]] = Field(default_factory=list)
     retrieval_mode: str | None = None
+    #: How many MDL schema chunks the Retriever seam contributed to the prompt
+    #: for this turn (0 when the retriever has nothing to add). Surfaced as a UI
+    #: badge so the embedding/keyword retrieval activity is visible (RV3/G8).
+    retrieved_item_count: int = 0
     #: How many confirmed NL->SQL examples the memory seam recalled into the
     #: prompt for this turn (0 when learning is off). Surfaced as a UI badge.
     recalled_example_count: int = 0
@@ -221,3 +225,6 @@ class HealthResponse(BaseModel):
     #: False when the semantic layer runs in-memory (models lost on restart), so
     #: the UI can warn before users model against an ephemeral store.
     semantic_layer_persistent: bool = True
+    #: Effective embedding vector index: "memory" | "lancedb" | "memory_fallback".
+    #: "memory_fallback" means LanceDB was configured but did not connect (C1).
+    vector_index: str = "memory"

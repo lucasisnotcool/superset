@@ -105,6 +105,24 @@ def test_retrieve_mdl_context_ranks_active_mdl_into_context_items() -> None:
     assert "customers" in texts
 
 
+def test_retrieve_mdl_context_stamps_effective_mode_on_fallback() -> None:
+    # G8a: an EmbeddingRetriever with no usable embedder silently uses keyword;
+    # the stamped retriever must reflect that, not the configured "embedding".
+    from superset_ai_agent.llm.embeddings import NullEmbedder
+    from superset_ai_agent.semantic_layer.schema_retriever import EmbeddingRetriever
+
+    items = retrieve_mdl_context(
+        config=AgentConfig(),
+        retriever=EmbeddingRetriever(NullEmbedder()),
+        question="customer region",
+        project_id="proj-1",
+        owner_id="owner-1",
+        mdl_file_store=_FakeMdlFileStore([_FakeMdlFile(_MODEL_YAML)]),
+    )
+    assert items
+    assert all(item["retriever"] == "keyword" for item in items)
+
+
 def test_retrieve_mdl_context_degrades_closed() -> None:
     cfg = AgentConfig()
     retriever = KeywordRetriever()

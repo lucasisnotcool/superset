@@ -33,9 +33,10 @@ source-backed and test-verified · `[BLOCKED]` waiting on a decision/dependency.
 
 Audit method: every "Completed" row below was re-verified against the working
 tree on this date — file/symbol existence, the cited test, and the suites:
-backend `pytest tests/unit_tests/superset_ai_agent` → **271 passed, 2 skipped**;
-frontend `jest src/SqlLab/components/AiAgentPanel` → **36 passed** (incl. 5
-`AuditInfoPanel` tests); `ruff` + `prettier` clean on changed files. (`oxlint` and
+backend `pytest tests/unit_tests/superset_ai_agent` → **281 passed, 3 skipped**
+(the 3rd skip is the LanceDB `importorskip` round-trip); frontend
+`jest src/SqlLab/components/AiAgentPanel` → **36 passed** (incl. 6 `AuditInfoPanel`
+tests); `ruff` + `prettier` clean on changed files. (`oxlint` and
 project `tsc` could not run in this environment — native-binding fault / full-repo
 cost — they run in CI.) Paths are relative to `superset_ai_agent/`; tests live
 under `../tests/unit_tests/superset_ai_agent/`. The detailed per-phase write-ups
@@ -85,9 +86,16 @@ complete; these are refactors, optional installs, or experiments):
 | E | LangChain / Pydantic-AI framework adapters (4.4) | `[TODO]` | **Stretch / optional install.** RO2b — thin tool wrappers around the pipeline; out of the default install. Value depends on whether external framework embedding is a real requirement. |
 | I | Throwaway A/B spike vs. upstream Wren mesh | `[TODO]` | **Experiment, not shippable code.** De-risking exercise; a one-off comparison, not an implementation task. |
 
-The deeper LanceDB-backed **persistent vector index (RV2a)** also remains a TODO
-— an optional optimization over the working in-memory cosine retrieval; it only
-matters at very wide-schema scale and adds an optional dependency.
+The **MDL retrieval & embedding system** reached full parity (R1–R4) on
+2026-06-23: items are embedded once per manifest checksum (warm queries embed only
+the question), an optional LanceDB persistent index degrades closed,
+`embedder_dimensions` is sent + validated, a model change forces a reindex, and the
+badge reflects the effective retriever + chunk count. See
+[Phase 2.4 — MDL Retrieval & Embedding Full Parity](#phase-24--mdl-retrieval--embedding-full-parity-plan-added-2026-06-23)
+for the gap closure table and residual risks (chiefly **R-RET-A**: the LanceDB
+native path is unverified locally and must be checked in CI, and **R-RET-B**:
+LanceDB persists vectors but does not yet do native ANN search). This subsumes the
+old RV2a "LanceDB vector index" TODO.
 
 ### ⚠️ Known limitation (new finding)
 
@@ -304,6 +312,7 @@ manifest), so **Phase 0 makes DB-backed semantic persistence the baseline**
 | 2 | Retriever seam consumed by both graphs (RV2) | `[COMPLETE]` (2026-06-23) |
 | 2 | Memory learning loop (NL→SQL examples) | `[COMPLETE]` (2026-06-22) |
 | 2 | Conversation-graph memory write-back + recall (RV4) | `[COMPLETE]` (2026-06-23) |
+| 2.4 | MDL retrieval & embedding full parity (R1–R4: index lifecycle, LanceDB, embedder hardening, observability) | `[COMPLETE]` (2026-06-23) |
 | 3 | MDL completeness (cubes/metrics) | `[COMPLETE]` (2026-06-22) |
 | 3 | Metric/cube structural validation (RM1) | `[COMPLETE]` (2026-06-23) |
 | 3 | Cube dimension/hierarchy shape + granularity/level semantics (RM1a) | `[COMPLETE]` (2026-06-23) |
@@ -919,6 +928,396 @@ like the existing stores).
 
 **Tests:** store→recall round-trip; cross-owner isolation; learning improves a
 fixture question's few-shot; write-back fires only on confirmed success.
+
+---
+
+## Phase 2.4 — MDL Retrieval & Embedding Full Parity (plan added 2026-06-23)
+
+The seams (Embedder + Retriever) ship and are consumed by the graphs, but the
+embedding path is **functional, not Wren-grade**: it re-embeds the whole schema
+on every request and has no persistent index. This workstream closes the gap to
+true parity. It supersedes the older [2.2](#22-embeddingretriever-lancedb) sketch.
+
+### Status — `[COMPLETE]` R1–R4 (2026-06-23)
+
+All four phases below landed. Source:
+[`schema_retriever.py`](semantic_layer/schema_retriever.py) (index-lifecycle
+`Retriever` protocol — `has_index`/`index`/`retrieve`/`effective_name`;
+`_IndexEntry` cache; `EmbeddingRetriever` embeds items once per
+`(scope_key, checksum#embedder-signature)`, query-only on warm path;
+`LanceDbRetriever` import-guarded, degrades to in-process; `_content_checksum`);
+[`llm/embeddings.py`](llm/embeddings.py) (`signature()`, `dimensions` passthrough
+for `text-embedding-3-*`, `OllamaEmbedder`, soft dimension-consistency warning);
+[`config.py`](config.py) (`wren_vector_index`); graphs stamp `retrieval_mode`
+(effective) + `retrieved_item_count`; UI badge in
+[`AuditInfoPanel.tsx`](../superset-frontend/src/SqlLab/components/AiAgentPanel/AuditInfoPanel.tsx).
+Tests: [`test_schema_retriever.py`](../tests/unit_tests/superset_ai_agent/test_schema_retriever.py)
+(20 + 1 LanceDB `importorskip`) + `AuditInfoPanel.test.tsx` (6). Suite: **281
+passed, 3 skipped**; `ruff`/`prettier` clean.
+
+| Gap | Resolution | Status |
+| --- | --- | --- |
+| G1 (re-embed per request) | items embedded once per checksum; warm queries embed **only the question** (verified by call-count test) | **Closed** |
+| G2 (no index lifecycle) | `has_index`/`index`/`retrieve` keyed by `(scope_key, checksum)`; reindex on change | **Closed** |
+| G3 (per-request recompile) | `has_index` skips recompile + chunking on a warm checksum | **Closed** |
+| G4 (`dimensions` inert) | sent to the API for `3-*` models; soft startup consistency warning | **Closed** |
+| G6 (OpenAI-only) | `OllamaEmbedder` added (Azure via `base_url`) | **Closed** |
+| G8 (no observability) | `retrieved_item_count` + effective `retrieval_mode` stamped + UI badge | **Closed** |
+| G8a (badge can lie) | badge stamps the **effective** retriever (`keyword` on silent fallback) | **Closed** |
+| R-RET4 (model-change corruption) | embedder `signature()` folded into the index key → forces reindex | **Closed** |
+| G5 (two retrieval systems) | documented as an **interim additive contract** (dataset-level `WrenRetrievalArtifact` + MDL-level `context_items`); unify is a follow-up | **Documented, not unified** |
+| G7 (embedder per request) | service-level graph caches across requests; per-request graph-build path is still cold (R2/LanceDB or an app singleton fixes) | **Partial** |
+
+**Residual risks after R1–R4:**
+- **~~R-RET-A — LanceDB native path unverified locally~~ — VERIFIED (2026-06-23).**
+  `lancedb>=0.13` is now a hard dependency and installed; the round-trip test
+  **runs and passes** against the real API. Verifying it immediately caught **two
+  real bugs** the degrade-on-error wrapping had hidden — an invalid table name
+  (`#`/`:` from the embedder signature) and `to_pandas()` needing `pylance` — both
+  fixed (hash the table id; read via `to_arrow()`). See C1 below. *Residual:*
+  confirm the wheel installs in CI, and add the loud-fallback `/health` signal so a
+  future install/connect failure is visible rather than a silent in-memory no-op.
+- **R-RET-B — LanceDB used as durable vector storage, not native ANN search.**
+  `retrieve` rehydrates all rows and ranks with in-process cosine (reuses tested
+  logic), so it avoids re-embedding after restart but does **not** realize
+  ANN-at-scale; very wide schemas still load all vectors into RAM. A follow-up can
+  switch cold retrieval to `table.search(qvec)`.
+- **R-RET-C — embedding API round-trips unverified.** The OpenAI `dimensions`
+  passthrough and Ollama path are tested via an injected fake client / construction
+  only (no network). Live behavior runs in deployments with creds.
+- **R-RET-D — in-process index is unbounded across scopes + cold per worker.** One
+  entry per `(scope_key)` (latest checksum), never evicted; multi-worker prod
+  re-embeds once per worker until LanceDB. Acceptable for single-worker; revisit
+  with an LRU + app-level singleton.
+
+**Dev-intent vs. actual-impl (resolved + residual):** the `Retriever` protocol now
+matches the index-lifecycle spec (was inline-only); `embedder_dimensions` is now
+load-bearing (was inert). Residual: "LanceDB" persists vectors but does not do
+native ANN search (R-RET-B).
+
+**User-intent vs. actual-UI:** the badge now reflects the **effective** retriever
+and the chunk count, so it no longer misreports a silent keyword fallback (G8a).
+Residual: no per-query embedding **cost** figure (only item count); index
+freshness is not surfaced because retrieval lazily reindexes to current MDL before
+every query, so a stale-index state is not user-visible by construction.
+
+### Risk & Gap Closure Plan (R1–R4 follow-up, planned 2026-06-23)
+
+Closes the residual risks above. **Ordering matters:** C1 gates C2 (don't build on
+an unverified LanceDB API). C3/C4 are independent; C5 needs a product decision.
+
+#### Implementation status — `[COMPLETE]` C1–C5 (2026-06-23)
+
+Sequenced C1 → C4 → C1-health → C3 → C2 → C5. Suite: **290 passed, 4 skipped**
+(2 wren-core inverse + lancedb-absent + opt-in live-smoke); `ruff`/`prettier`
+clean; frontend AiAgentPanel **10 passed**.
+
+| Item | Outcome | Source |
+| --- | --- | --- |
+| **C1** (R-RET-A) | lancedb installed + **hard dep**; round-trip runs; **caught 2 real bugs** (invalid `#`/`:` table name; `to_pandas` needs `pylance`) → fixed (hashed table id; `to_arrow`). | [`schema_retriever.py`](semantic_layer/schema_retriever.py), [`requirements-ai-agent.txt`](../requirements-ai-agent.txt) |
+| **C1-health** | `/health.vector_index` = `memory \| lancedb \| memory_fallback` + startup `WARNING` + UI `Alert` on fallback. | `effective_vector_index`; [`app.py`](app.py); [`schemas.py`](schemas.py); [`index.tsx`](../superset-frontend/src/SqlLab/components/AiAgentPanel/index.tsx) |
+| **C2** (R-RET-B) | cold path uses **native ANN** `table.search(qvec).metric("cosine").limit(k)` — no full rehydrate (verified `_mem` stays empty); cosine aligned with warm path. | `LanceDbRetriever.retrieve` |
+| **C3** (R-RET-C) | contract tests: `dimensions` sent for `3-*`, omitted for ada/ollama, one vector/input across batches, empty→no call; opt-in live smoke `skipif(not OPENAI_API_KEY)`. | `test_schema_retriever.py` |
+| **C4** (R-RET-D/G7) | embedder+retriever built **once in `create_app`**, injected into all 4 graph sites; in-process index is an **LRU** bounded by `wren_retriever_cache_scopes` (64); `get` race hardened. | [`app.py`](app.py); `_LruIndex` |
+| **C5** (R-RET-E) | `cap_context_items` dedups + bounds merged context (`wren_max_context_items`=40), retrieval-ranked chunks win on overflow. Applied in both graphs. | [`runtime.py`](semantic_layer/runtime.py) |
+
+**Residual / still-open after C1–C5:**
+- **C1 CI:** the round-trip passes **locally**; confirm the lancedb wheel resolves on
+  the CI runner (`ubuntu-24.04`) so it runs there too. A strict-fail mode
+  (`WREN_VECTOR_INDEX_STRICT`) was **not** added — fallback is loud (health + log +
+  UI) but still degrades rather than failing startup.
+- **C2 dev-intent shift:** ANN is **approximate** — the warm path (exact in-process
+  cosine) and cold path (LanceDB ANN) can rank differently for large indexes. Small
+  fixtures agree; at scale recall < 1.0.
+- **C4 thread-safety:** the shared LRU is mutated under request-thread concurrency;
+  ops are GIL-atomic and `index()` is idempotent per checksum, and the `get`/
+  `move_to_end` race is now guarded — but there is **no explicit lock**. Fine for
+  the current sync/threadpool model; revisit under heavy async.
+- **C5 is the *decision-free half* only:** the cap closes prompt-bloat (R-RET-E),
+  but the **full unification of the two retrieval systems** (dataset-level
+  `WrenRetrievalArtifact` vs MDL-level `context_items`) and a **token-based** (vs
+  item-count) budget remain **gated on a product decision** (does MDL retrieval
+  subsume dataset retrieval?). Dedup is exact-dict only, so cross-source *semantic*
+  duplicates (same column in two shapes) survive.
+
+#### C1 — Verify LanceDB + make the fallback loud (closes R-RET-A)
+
+**Status — `[DONE]` for local verification (2026-06-23); CI install + loud fallback
+still TODO.** `lancedb>=0.13` was installed and promoted to a **hard dependency**
+in [`requirements-ai-agent.txt`](../requirements-ai-agent.txt); the previously
+`importorskip`-skipped round-trip now **runs and passes** against the real API.
+
+> **This immediately validated R-RET-A.** Running the real round-trip caught **two
+> bugs the degrade-on-error wrapping had been silently hiding** (both would have
+> shipped as "lancedb configured but silently running in-memory"):
+> 1. **Invalid table name** — the table name embedded the effective checksum
+>    (`...#openai:model:1536`), but LanceDB rejects `#`/`:`; persist threw and
+>    degraded. Fixed: `_table_name` now hashes both scope + checksum to a safe id.
+> 2. **`to_pandas()` needs `pylance`** — rehydrate used `to_pandas()`, which needs
+>    the separate `pylance` package; it threw and degraded. Fixed: read via
+>    `to_arrow().to_pylist()` (pyarrow is a lancedb dep). Also switched table
+>    lookup from the deprecated `table_names()` to a direct `open_table` (raises on
+>    miss), verified against lancedb 0.33.
+
+*Remaining for C1:*
+
+- **CI:** ensure the CI job installs `requirements-ai-agent.txt` (now incl.
+  lancedb) so the round-trip runs there too
+  ([`superset-ai-agent.yml`](../.github/workflows/superset-ai-agent.yml) already
+  installs that file — confirm the wheel resolves on `ubuntu-24.04`).
+- **Loud fallback:** when `wren_vector_index="lancedb"` but lancedb import/connect
+  fails, log a startup `WARNING` and expose the effective index mode on `/health`
+  (`vector_index: "lancedb" | "memory_fallback"`); optional strict-fail mode.
+
+- **CI:** add `lancedb` (+ its `pandas`/`pyarrow` deps) to a job — either extend
+  [`superset-ai-agent.yml`](../.github/workflows/superset-ai-agent.yml) with an
+  `pip install lancedb` step, or a dedicated `test-ai-agent-extras` job — so the
+  `importorskip` round-trip in
+  [`test_schema_retriever.py`](../tests/unit_tests/superset_ai_agent/test_schema_retriever.py)
+  runs for real (persist → new instance → rehydrate → retrieve).
+- **Loud fallback:** when `wren_vector_index="lancedb"` but `lancedb` import/connect
+  fails, log a `WARNING` at startup (not just per-call) and expose the **effective**
+  index mode on `/health` (`vector_index: "lancedb" | "memory_fallback"`) so the UI
+  can warn (mirrors `semantic_layer_persistent`). Optionally add a strict mode
+  (`WREN_VECTOR_INDEX_STRICT=true`) that fails startup instead of degrading.
+- **Tests:** the CI round-trip (real lancedb); a unit test that the health field
+  reports `memory_fallback` when lancedb is absent.
+- **Prereq/risk:** LanceDB native wheels on `ubuntu-24.04` (R-RET1) — pin a known
+  wheel; if CI can't install it, keep the job `continue-on-error` + a tracking note
+  rather than a green check that proves nothing.
+
+#### C2 — Native ANN search (closes R-RET-B)
+
+*Today `retrieve` rehydrates **all** rows and ranks in-process — durable, but not
+ANN-at-scale.*
+
+- Change `LanceDbRetriever.retrieve` cold path to embed the question and call
+  `table.search(query_vector).limit(k).to_list()`, mapping rows → `SchemaItem`.
+  Keep the in-process cache for the warm path (small/medium schemas), use ANN for
+  cold/miss + wide schemas.
+- **Prereq:** C1 (verified API). **Risk / dev-intent shift:** ANN is *approximate*
+  — results can differ from exact cosine (recall < 1.0). Decide a threshold (e.g.,
+  only use ANN above N items; exact below) and document the behavior change so a
+  reviewer expecting identical keyword/embedding parity isn't surprised.
+- **Tests:** (lancedb-gated) ANN returns the planted top-k for a deterministic
+  fake-vector fixture; exact/ANN agree on a tiny fixture.
+
+#### C3 — Real embedding round-trip verification (closes R-RET-C)
+
+*The `dimensions` passthrough + Ollama path are tested via an injected fake client
+only.*
+
+- Add **contract tests** with a recorded/mocked HTTP layer (`respx` for the
+  httpx-based openai client, or `openai`'s test transport): assert the request body
+  carries `dimensions` for `text-embedding-3-*`, omits it for `ada-002`/ollama, and
+  the response parses to vectors of the expected length.
+- Add an **opt-in live smoke** test `skipif(not OPENAI_API_KEY)` for a one-row embed
+  (kept out of the default unit run; runs where creds exist).
+- **Prereq:** pick the recording lib (add to dev reqs). **Risk:** openai SDK
+  internals shift — pin the contract to the public request shape, not internals.
+
+#### C4 — Shared app-level retriever + bounded, thread-safe cache (closes R-RET-D / G7)
+
+*Each graph builds its own embedder/retriever; the per-request graph-build path is
+cold every request, and the in-process index never evicts scopes.*
+
+- **Singleton:** build the embedder + retriever **once in `create_app`** and inject
+  into both the service-level and per-request graph builders (like
+  `active_memory`), so a worker shares one warm index.
+- **LRU bound:** cap the in-process `_index` to the N most-recently-used scopes
+  (`wren_retriever_cache_scopes`, default e.g. 64); evict LRU. Stops unbounded
+  growth across many projects/owners.
+- **Thread-safety:** `index()`/`prime()` mutate a dict; assignment is atomic under
+  the GIL and `index()` is idempotent per checksum (a race rewrites identical
+  vectors), so it is **low-risk** today — but add a per-scope lock if the server
+  moves to heavy async/threaded concurrency.
+- **Multi-worker:** memory mode is per-worker **by design**; LanceDB (C1/C2) is the
+  cross-worker answer. Document it.
+- **Tests:** injected singleton is the same instance across two graph builds; LRU
+  evicts the oldest scope past the cap.
+
+#### C5 — Unify the two retrieval systems (closes G5) — *needs a product decision*
+
+*Legacy dataset-ranking (`retrieval.py` → `WrenRetrievalArtifact`) and MDL-chunk
+ranking (`schema_retriever.py` → `context_items`) run additively, with no shared
+token budget.*
+
+- **Incremental (recommended):** (b-first) populate `WrenRetrievalArtifact` from the
+  MDL path too — candidate model/column names + scores derived from the retrieved
+  chunks — so both surfaces are consistent; then add a **single token budget**
+  across the three `context_items` sources (doc overlay, MDL chunks, `fetch_context`)
+  to stop prompt bloat. (a-later) Fully unify behind one ranked+budgeted context.
+- **Latent gap this exposes:** the three context sources **concatenate today with no
+  combined budget** — a wide MDL + doc overlay can inflate the prompt. The unified
+  budget is the real fix; flag it as its own risk (**R-RET-E**, prompt-size
+  unbounded across sources).
+- **Prereq:** the dataset retriever runs in `_load_context` (context provider), the
+  MDL retriever in `_load_wren_context` — unifying means threading both through one
+  ranker; non-trivial. **Decision needed:** is dataset-level retrieval still wanted
+  once MDL retrieval is strong, or does MDL subsume it?
+- **Dev/UI mismatch:** "retrieval" means two different things in the artifact vs the
+  badge today; unifying changes the artifact contract and the panel surface.
+
+#### Cross-cutting follow-ups (lower priority)
+
+- **R-RET3 — per-file checksum deltas:** the index keys off the whole-project
+  `_content_checksum`, so any single-file edit reindexes everything. Add per-file
+  deltas only if projects get large.
+- **Cost surface:** stamp a per-turn embedding-call/token count onto the artifact so
+  operators can watch spend (extends G8); surface in the panel.
+
+#### Suggested sequencing
+
+1. **C1** (unblocks C2; makes the silent-fallback risk visible) — small.
+2. **C4** (prod-correctness: shared warm cache + bound) — small/medium, high value.
+3. **C3** (lock down the embedder contract) — small.
+4. **C2** (ANN search) — medium, gated on C1.
+5. **C5** (unify + shared token budget) — medium/large, needs sign-off.
+
+### Parity target (what Wren does)
+
+Wren embeds MDL `schema_items` **once at index time** into a LanceDB collection
+(one vector per model / column / relationship), persists the vectors, and at
+**query time embeds only the question** and vector-searches top-k. The index is
+rebuilt when the model changes, keyed by a manifest checksum. Cost per query:
+**1** embedding call (the question) + a vector search — independent of schema width.
+
+### Current-state audit (source-backed, verified 2026-06-23)
+
+| Component | State | Source |
+| --- | --- | --- |
+| Embedder seam | `Embedder` protocol + `NullEmbedder` (degrade-closed) + `OpenAiEmbedder` (batched, lazy client) + `create_embedder` reusing `OPENAI_*` | [`llm/embeddings.py`](llm/embeddings.py) |
+| Retriever seam | `SchemaItem`, `manifest_to_schema_items` (model/column/relationship chunks ≈ Wren `schema_items`), `KeywordRetriever`, `EmbeddingRetriever` (in-memory cosine, degrades to keyword), `create_retriever` | [`schema_retriever.py`](semantic_layer/schema_retriever.py) |
+| Consumption | `retrieve_mdl_context(...)` in both graphs' `_load_wren_context` + `SemanticPipeline`; appends top-k chunks to `WrenContextArtifact.context_items` + stamps `retrieval_mode` | [`graph.py`](graph.py), [`conversation_graph.py`](conversation_graph.py), [`pipeline.py`](semantic_layer/pipeline.py) |
+| Persistence guard | parity features (incl. `wren_retriever != keyword`) require `semantic_layer_store=sqlalchemy` | [`app.py`](app.py) `_parity_features_enabled` |
+| Tests | 9 in [`test_schema_retriever.py`](../tests/unit_tests/superset_ai_agent/test_schema_retriever.py) (chunking, keyword/embedding rank, degrade, factories) + the RV2 wiring tests | — |
+
+### Gap analysis (what "full parity" still needs)
+
+| ID | Gap | Severity | Evidence |
+| --- | --- | --- | --- |
+| **G1** | **No persistent vector index** — `EmbeddingRetriever.retrieve()` re-embeds **every schema item *and* the question on every request**, so cost is O(N) embedding calls per query for N items. Wren embeds items once and searches. | **High** (perf + cost + rate limits) | [`schema_retriever.py:156-157`](semantic_layer/schema_retriever.py#L156) |
+| **G2** | **No indexing lifecycle / `index()` seam** — the `Retriever` protocol is `retrieve(question, items, k)`; there is no `index(manifest, scope_key)`, no checksum keying, no reindex-on-materialize hook. The plan's [0.1](#01-seam-protocols) / 2.2 spec called for exactly that. | High | [`schema_retriever.py:55-61`](semantic_layer/schema_retriever.py#L55) (no `index`) |
+| **G3** | **Per-request MDL recompile** — `retrieve_mdl_context` runs `compile_manifest(active_files)` + `manifest_to_schema_items` every request (re-reads/parses YAML), even for keyword. | Medium | [`schema_retriever.py:223-224`](semantic_layer/schema_retriever.py#L223) |
+| **G4** | **`embedder_dimensions` is unused + unvalidated** — config carries it and passes it to `OpenAiEmbedder`, but `embed()` never sends `dimensions` to the API, and nothing validates model↔dimension or guards a dimension change against a persisted index. | Medium (latent corruption once G1 lands) | [`llm/embeddings.py:97-100`](llm/embeddings.py#L97) (no `dimensions=` arg) |
+| **G5** | **Two unreconciled retrieval systems** — legacy [`retrieval.py`](semantic_layer/retrieval.py) ranks physical *datasets* + populates `WrenRetrievalArtifact`; the new MDL retriever ranks *chunks* + appends to `context_items` but does **not** populate `WrenRetrievalArtifact`. Three `context_items` sources concatenate (doc overlay, MDL chunks, `fetch_context`) with no unified rank/budget. | Medium | [`runtime.py`](semantic_layer/runtime.py) + `retrieve_mdl_context` |
+| **G6** | **Only OpenAI embedder** — plan 2.1 listed Azure/Ollama. Azure works via `base_url`; Ollama/self-hosted not first-class. | Low | [`llm/embeddings.py`](llm/embeddings.py) |
+| **G7** | **Embedder rebuilt per graph/request** — each graph calls `create_embedder(config)`; the per-request graph-build path makes a fresh embedder (+ OpenAI client) per request. No app-level singleton or shared cache. | Low (compounds G1) | `graph.py`/`conversation_graph.py`/`pipeline.py` ctors |
+| **G8** | **No embedding-path observability** — `WrenRetrievalArtifact` is populated only by the legacy path; the MDL/embedding path exposes only `retrieval_mode` + `context_items`. No scores, embedded-item counts, or index freshness. | Low | [`schemas.py`](schemas.py) `WrenRetrievalArtifact` |
+| **G8a** | **UI badge can lie** — `EmbeddingRetriever.retrieve()` silently falls back to keyword (embedder unavailable / `embed` raises) but `retrieve_mdl_context` stamps `retriever.name = "embedding"`, so the panel shows `Retrieval: embedding` even when keyword was actually used. | Medium (user-trust) | [`schema_retriever.py:153-159`](semantic_layer/schema_retriever.py#L153) + badge in `AuditInfoPanel.tsx` |
+
+### Implementation plan (phased; each phase ships + is tested independently)
+
+**R1 — Index lifecycle seam (no new dependency).** *Closes G2, G3, and most of G1
+without LanceDB.*
+- Extend the `Retriever` protocol with `index(items, *, scope_key, checksum)` and
+  change `retrieve(question, *, scope_key, k)` to read a prebuilt index. Keep an
+  inline `retrieve(question, items, k)` overload for tests/back-compat or adapt
+  call sites.
+- `EmbeddingRetriever` holds an in-process cache `{(scope_key, checksum): (items, vectors)}`;
+  `index()` embeds items **once** per checksum; `retrieve()` embeds **only the
+  question**. So warm-path cost drops from O(N) to O(1) embedding calls.
+- `retrieve_mdl_context` computes a `scope_key` (owner+scope) + `checksum` (reuse
+  the materializer's `materialized_checksum`) and calls `index()` lazily on a
+  miss, then `retrieve()`. Skip the recompile when the checksum is unchanged (G3).
+- **Acceptance:** a fake embedder counts calls; second query on the same checksum
+  makes exactly **1** embedding call (question only); a checksum change triggers a
+  reindex.
+
+**R2 — Persistent LanceDB index (optional dependency).** *Closes G1 across
+restarts/workers (RV2a).*
+- Add `LanceDbRetriever(Retriever)` writing vectors to
+  `{wren_lancedb_path or agent_storage_dir/lancedb}/{scope_key}`; `index()` upserts,
+  `retrieve()` vector-searches. Import-guarded; absent → R1 in-process cache.
+- Wire reindex into the materializer / `indexer.rebuild_index` keyed by
+  `materialized_checksum`; stale checksum → lazy reindex.
+- **Config:** `wren_retriever="embedding"` already gates it; add
+  `wren_vector_index="memory"|"lancedb"` (default `memory`) so LanceDB is opt-in.
+- **Acceptance:** index survives a new store instance on the same path; reindex on
+  checksum change; degrades to in-memory when `lancedb` absent.
+
+**R3 — Embedder hardening.** *Closes G4, G6.*
+- Pass `dimensions` to the OpenAI embeddings API for `text-embedding-3-*`; validate
+  `embedder_dimensions` is consistent (and **bake it into the index**; a mismatch
+  vs. the persisted index forces a reindex, never a silent dimension clash).
+- Add `OllamaEmbedder` (+ document Azure via `base_url`); `create_embedder` selects
+  by `embedder_provider`.
+- **Acceptance:** dimension-mismatch test forces reindex; reduced-dimension request
+  round-trips; Ollama embedder builds from config.
+
+**R4 — Reconcile + observability.** *Closes G5, G8, G8a.*
+- Populate `WrenRetrievalArtifact` from the MDL path (candidate model/column names,
+  scores, `embedded_item_count`, `index_checksum`). Decide one of: (a) unify the
+  two retrievers behind one ranked+budgeted context, or (b) document them as
+  intentionally additive (dataset-level vs MDL-level) — recommend (a) long-term,
+  (b) as the interim contract.
+- **Fix G8a:** stamp the *effective* retriever (`"keyword"` when an
+  `EmbeddingRetriever` fell back), not the configured one, so the badge cannot lie.
+  Add an `index_fresh`/age signal for a future UI affordance.
+- **Acceptance:** fallback stamps `retrieval_mode="keyword"`; artifact carries the
+  embedded-item count + index checksum.
+
+### Config (new keys, all default-safe)
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `wren_vector_index` | `memory` | `memory` (R1 in-process) \| `lancedb` (R2 persistent) |
+| `embedder_dimensions` | `1536` | now **actually sent** to the API + baked into the index (R3) |
+| (existing) `wren_lancedb_path` | `{agent_storage_dir}/lancedb` | vector index root |
+
+### Risks / prerequisites / gaps
+
+**Prerequisites**
+- **Durable manifest + stable checksum.** R1/R2 key off `materialized_checksum`;
+  this requires `semantic_layer_store=sqlalchemy` (already enforced by
+  `_parity_features_enabled`) and that materialization runs before retrieval (it
+  does, in `_load_wren_context`). Without a project/MDL there is nothing to index —
+  the keyword path stays the contract.
+- **An embedder must be configured** (`AI_AGENT_EMBEDDER_PROVIDER=openai` +
+  `OPENAI_API_KEY`); absent → `NullEmbedder` → keyword (degrade closed, unchanged).
+
+**Risks**
+- **R-RET1 — LanceDB native wheels.** Like wren-core, LanceDB ships platform
+  wheels; CI/offline installs can break. Mitigation: optional dep, import-guarded,
+  R1 in-process fallback is always present.
+- **R-RET2 — index/embedder are process-local until R2.** R1's cache is per-worker
+  (inherits R-C/R14); multi-worker prod re-embeds once per worker until LanceDB.
+- **R-RET3 — checksum granularity.** `materialized_checksum` covers all active MDL;
+  any edit reindexes the whole project (acceptable; revisit per-file deltas only if
+  projects get large).
+- **R-RET4 — embedding drift on model change.** Changing `embedder_model`/dimensions
+  invalidates a persisted index; R3 must force a reindex, or recall silently
+  degrades. This is the main correctness hazard of G1→R2.
+
+**Dev-intent vs. actual-implementation gaps (today, pre-plan)**
+- The `Retriever` protocol **diverged** from the plan's [0.1](#01-seam-protocols)
+  spec (`index()` + scope keying) — it ranks inline with no index (G2). R1 realigns it.
+- `embedder_dimensions` reads as a supported knob but is **inert** (G4) — a config
+  that looks load-bearing but isn't. R3 makes it real.
+- "EmbeddingRetriever (LanceDB)" in [2.2](#22-embeddingretriever-lancedb) implies a
+  persistent vector store; the shipped binding is **in-memory cosine** (RV1) — the
+  name oversells the implementation until R2.
+
+**User-intent vs. actual-UI gaps**
+- **The `Retrieval: embedding` badge can be wrong (G8a):** users read it as "vectors
+  were used," but a silent keyword fallback still shows "embedding." R4 makes the
+  badge reflect the *effective* path. Until then, treat the badge as "configured,"
+  not "used."
+- **No index-freshness surface:** a user editing models expects retrieval to follow;
+  there is no UI signal that the index is stale/rebuilding (the engine/retrieval
+  badges show mode, not freshness). R4 adds the signal; a UI affordance is a
+  follow-on.
+- **No cost signal:** embedding retrieval makes API calls; nothing surfaces that it
+  ran or how many items were embedded — relevant for operators watching spend.
+
+### Acceptance (parity definition of done for this workstream)
+- A repeated question against an unchanged model makes **1** embedding call (not N).
+- The vector index survives a restart under `wren_vector_index=lancedb`.
+- A model edit (new `materialized_checksum`) triggers a reindex; an embedder model/
+  dimension change forces a reindex rather than corrupting recall.
+- The retrieval badge reflects the **effective** retriever; the artifact carries the
+  embedded-item count + index checksum.
+- Absent embedder/LanceDB → keyword + in-process, never an error.
 
 ---
 

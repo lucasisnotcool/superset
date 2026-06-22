@@ -60,7 +60,10 @@ from superset_ai_agent.semantic_layer.engine.planning import (
 from superset_ai_agent.semantic_layer.mdl_files import MdlFileStore
 from superset_ai_agent.semantic_layer.memory_store import Memory, NullMemory
 from superset_ai_agent.semantic_layer.projects import SemanticProjectStore
-from superset_ai_agent.semantic_layer.runtime import merge_indexed_semantic_context
+from superset_ai_agent.semantic_layer.runtime import (
+    cap_context_items,
+    merge_indexed_semantic_context,
+)
 from superset_ai_agent.semantic_layer.schema_retriever import (
     create_retriever,
     retrieve_mdl_context,
@@ -373,9 +376,18 @@ class TextToSqlGraph:
                         *wren_context.context_items,
                         *retrieved_items,
                     ],
-                    "retrieval_mode": self.retriever.name,
+                    "retrieval_mode": retrieved_items[0]["retriever"],
+                    "retrieved_item_count": len(retrieved_items),
                 }
             )
+        # Dedup + bound the merged context across all sources (R-RET-E).
+        wren_context = wren_context.model_copy(
+            update={
+                "context_items": cap_context_items(
+                    wren_context.context_items, self.config.wren_max_context_items
+                )
+            }
+        )
         retrieval_artifact = state.get("wren_retrieval")
         if retrieval_artifact is not None and project_id is not None:
             retrieval_artifact = retrieval_artifact.model_copy(

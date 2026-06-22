@@ -26,8 +26,12 @@ embedder is unavailable (governance: degrade closed).
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
+from collections import OrderedDict
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 from pydantic import BaseModel
@@ -38,7 +42,7 @@ from superset_ai_agent.semantic_layer.mdl_compile import (
     compile_manifest,
     CompiledManifest,
 )
-from superset_ai_agent.semantic_layer.mdl_files import MdlFileStore
+from superset_ai_agent.semantic_layer.mdl_files import MdlFile, MdlFileStore
 
 logger = logging.getLogger(__name__)
 
@@ -53,12 +57,31 @@ class SchemaItem(BaseModel):
 
 
 class Retriever(Protocol):
+    """Index-then-search retriever (Wren `schema_items` parity, wren_full.md R1).
+
+    The manifest's chunks are indexed **once** per ``(scope_key, checksum)``;
+    ``retrieve`` searches that index for a question. For the embedding binding this
+    means item vectors are computed at index time and only the *question* is
+    embedded per query — independent of schema width.
+    """
+
     name: str
 
+    def has_index(self, scope_key: str, checksum: str) -> bool:
+        """Whether this exact manifest version is already indexed."""
+
+    def index(
+        self, items: list[SchemaItem], *, scope_key: str, checksum: str
+    ) -> None:
+        """Build/refresh the index for a manifest version (idempotent per checksum)."""
+
     def retrieve(
-        self, question: str, items: list[SchemaItem], k: int
+        self, question: str, *, scope_key: str, checksum: str, k: int
     ) -> list[SchemaItem]:
-        """Return the top-k items most relevant to the question."""
+        """Return the top-k indexed items most relevant to the question."""
+
+    def effective_name(self, scope_key: str) -> str:
+        """The retriever actually used for ``scope_key`` (``keyword`` on fallback)."""
 
 
 def manifest_to_schema_items(manifest: CompiledManifest) -> list[SchemaItem]:
@@ -114,55 +137,190 @@ def _tokens(text: str) -> set[str]:
     return {token for token in normalized.split() if token}
 
 
+def _keyword_rank(
+    question: str, items: list[SchemaItem], k: int
+) -> list[SchemaItem]:
+    q_tokens = _tokens(question)
+    if not q_tokens:
+        return items[:k]
+    scored = sorted(
+        items,
+        key=lambda item: len(q_tokens & _tokens(f"{item.name} {item.text}")),
+        reverse=True,
+    )
+    return scored[:k]
+
+
+def _embedding_rank(
+    query_vector: list[float],
+    items: list[SchemaItem],
+    vectors: list[list[float]],
+    k: int,
+) -> list[SchemaItem]:
+    scored = sorted(
+        zip(items, vectors, strict=True),
+        key=lambda pair: _cosine(query_vector, pair[1]),
+        reverse=True,
+    )
+    return [item for item, _ in scored[:k]]
+
+
+@dataclass
+class _IndexEntry:
+    """One indexed manifest version for a scope (latest checksum wins)."""
+
+    checksum: str
+    items: list[SchemaItem]
+    #: Item vectors, parallel to ``items``; ``None`` when keyword-ranked or the
+    #: embedder was unavailable at index time (so retrieval falls back to keyword).
+    vectors: list[list[float]] | None = None
+
+
+def _index_checksum(checksum: str, embedder: Embedder) -> str:
+    """Fold the embedder identity into the index key (R3/R-RET4).
+
+    A model or dimension change shifts the signature, so the same MDL content
+    re-indexes rather than mixing vectors from different models.
+    """
+
+    return f"{checksum}#{embedder.signature()}"
+
+
+class _LruIndex:
+    """Per-scope index entries bounded to the N most-recently-used scopes (C4).
+
+    Stops the in-process retriever index from growing unbounded across many
+    projects/owners in a long-lived worker. ``max_scopes <= 0`` is unlimited.
+    """
+
+    def __init__(self, max_scopes: int = 0) -> None:
+        self._data: OrderedDict[str, _IndexEntry] = OrderedDict()
+        self.max_scopes = max_scopes
+
+    def get(self, scope_key: str) -> _IndexEntry | None:
+        entry = self._data.get(scope_key)
+        if entry is not None:
+            try:
+                self._data.move_to_end(scope_key)  # mark recently used
+            except KeyError:
+                # Concurrently evicted between get and move_to_end (the index is
+                # shared across request threads under C4); benign, return what we
+                # read. GIL keeps each op atomic; this guards the two-op gap.
+                pass
+        return entry
+
+    def set(self, scope_key: str, entry: _IndexEntry) -> None:
+        self._data[scope_key] = entry
+        self._data.move_to_end(scope_key)
+        while self.max_scopes > 0 and len(self._data) > self.max_scopes:
+            self._data.popitem(last=False)  # evict least-recently-used
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+
 class KeywordRetriever:
-    """Default retriever: rank by question/item token overlap."""
+    """Default retriever: rank by question/item token overlap, no embeddings."""
 
     name = "keyword"
 
+    def __init__(self, max_scopes: int = 0) -> None:
+        self._index = _LruIndex(max_scopes)
+
+    def has_index(self, scope_key: str, checksum: str) -> bool:
+        entry = self._index.get(scope_key)
+        return entry is not None and entry.checksum == checksum
+
+    def index(
+        self, items: list[SchemaItem], *, scope_key: str, checksum: str
+    ) -> None:
+        self._index.set(scope_key, _IndexEntry(checksum=checksum, items=items))
+
     def retrieve(
-        self, question: str, items: list[SchemaItem], k: int
+        self, question: str, *, scope_key: str, checksum: str, k: int
     ) -> list[SchemaItem]:
-        q_tokens = _tokens(question)
-        if not q_tokens:
-            return items[:k]
-        scored = sorted(
-            items,
-            key=lambda item: len(q_tokens & _tokens(f"{item.name} {item.text}")),
-            reverse=True,
-        )
-        return scored[:k]
+        entry = self._index.get(scope_key)
+        if entry is None or entry.checksum != checksum:
+            return []
+        return _keyword_rank(question, entry.items, k)
+
+    def effective_name(self, scope_key: str) -> str:
+        return "keyword"
 
 
 class EmbeddingRetriever:
-    """Embedding retriever: rank by cosine similarity over an Embedder.
+    """Embedding retriever: item vectors built once per checksum (wren_full.md R1).
 
-    Embeddings are computed in-memory per call; a LanceDB-backed persistent
-    index is an optional optimization (wren_full.md RV1). Falls back to keyword
-    when the embedder is unavailable.
+    Closes the per-request re-embedding gap (G1): ``index`` embeds the items once
+    and ``retrieve`` embeds only the question. Falls back to keyword for a scope
+    when the embedder is unavailable or embedding raises — and reports that via
+    ``effective_name`` so the UI badge cannot misreport (G8a).
     """
 
     name = "embedding"
 
-    def __init__(self, embedder: Embedder) -> None:
+    def __init__(self, embedder: Embedder, max_scopes: int = 0) -> None:
         self.embedder = embedder
-        self._keyword = KeywordRetriever()
+        self._index = _LruIndex(max_scopes)
+
+    def effective_checksum(self, checksum: str) -> str:
+        return _index_checksum(checksum, self.embedder)
+
+    def has_index(self, scope_key: str, checksum: str) -> bool:
+        entry = self._index.get(scope_key)
+        return entry is not None and entry.checksum == self.effective_checksum(checksum)
+
+    def index(
+        self, items: list[SchemaItem], *, scope_key: str, checksum: str
+    ) -> None:
+        eff = self.effective_checksum(checksum)
+        existing = self._index.get(scope_key)
+        if existing is not None and existing.checksum == eff:
+            return  # this manifest version + embedder is already indexed
+        vectors: list[list[float]] | None = None
+        if items and self.embedder.is_available():
+            try:
+                vectors = self.embedder.embed([item.text for item in items])
+            except Exception as ex:  # pylint: disable=broad-except
+                logger.warning("Embedding index build failed; keyword fallback: %s", ex)
+                vectors = None
+        self._index.set(
+            scope_key, _IndexEntry(checksum=eff, items=items, vectors=vectors)
+        )
 
     def retrieve(
-        self, question: str, items: list[SchemaItem], k: int
+        self, question: str, *, scope_key: str, checksum: str, k: int
     ) -> list[SchemaItem]:
-        if not items or not self.embedder.is_available():
-            return self._keyword.retrieve(question, items, k)
+        entry = self._index.get(scope_key)
+        if entry is None or entry.checksum != self.effective_checksum(checksum):
+            return []
+        if entry.vectors is None:
+            return _keyword_rank(question, entry.items, k)
         try:
-            vectors = self.embedder.embed([item.text for item in items])
             query_vector = self.embedder.embed([question])[0]
-        except Exception:  # pylint: disable=broad-except
-            return self._keyword.retrieve(question, items, k)
-        scored = sorted(
-            zip(items, vectors, strict=True),
-            key=lambda pair: _cosine(query_vector, pair[1]),
-            reverse=True,
+        except Exception as ex:  # pylint: disable=broad-except
+            logger.warning("Question embedding failed; keyword fallback: %s", ex)
+            return _keyword_rank(question, entry.items, k)
+        return _embedding_rank(query_vector, entry.items, entry.vectors, k)
+
+    def effective_name(self, scope_key: str) -> str:
+        entry = self._index.get(scope_key)
+        return "embedding" if entry is not None and entry.vectors is not None else (
+            "keyword"
         )
-        return [item for item, _ in scored[:k]]
+
+    def prime(
+        self,
+        scope_key: str,
+        checksum: str,
+        items: list[SchemaItem],
+        vectors: list[list[float]] | None,
+    ) -> None:
+        """Inject a prebuilt index entry (used to rehydrate from a durable store)."""
+
+        self._index.set(
+            scope_key, _IndexEntry(checksum=checksum, items=items, vectors=vectors)
+        )
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -174,16 +332,215 @@ def _cosine(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+def _table_name(scope_key: str, checksum: str) -> str:
+    # Hash both parts to a safe identifier — LanceDB table names allow only
+    # alphanumerics/underscore/hyphen/period, and the effective checksum carries
+    # the embedder signature (e.g. "...#openai:model:1536") with ':' and '#'.
+    scope = hashlib.sha1(scope_key.encode("utf-8")).hexdigest()[:16]  # noqa: S324
+    cksum = hashlib.sha1(checksum.encode("utf-8")).hexdigest()[:16]  # noqa: S324
+    return f"mdl_{scope}_{cksum}"
+
+
+class LanceDbRetriever:
+    """Persistent embedding retriever backed by LanceDB (wren_full.md R2).
+
+    Survives restarts/workers by persisting item vectors per ``(scope_key,
+    checksum)`` to a LanceDB table. All ranking reuses the in-process
+    `EmbeddingRetriever` (so logic is shared + tested); LanceDB is purely
+    persistence + cold-start rehydration. **Every** LanceDB call is wrapped — on
+    an import error, a connect error, or any API mismatch it degrades to the
+    in-process embedding index, so it can never crash the request path.
+    """
+
+    name = "embedding"
+
+    def __init__(self, embedder: Embedder, path: str, max_scopes: int = 0) -> None:
+        self.embedder = embedder
+        self.path = path
+        self._mem = EmbeddingRetriever(embedder, max_scopes)
+        self._db = self._connect()
+
+    def _connect(self) -> Any | None:
+        try:
+            import lancedb  # type: ignore  # lazy, optional dependency
+
+            return lancedb.connect(self.path)
+        except Exception as ex:  # pylint: disable=broad-except
+            logger.warning("LanceDB unavailable (%s); using in-process index.", ex)
+            return None
+
+    def is_persistent(self) -> bool:
+        """Whether the durable LanceDB backend connected (vs. in-process fallback)."""
+
+        return self._db is not None
+
+    def has_index(self, scope_key: str, checksum: str) -> bool:
+        if self._mem.has_index(scope_key, checksum):
+            return True
+        return self._table(scope_key, checksum) is not None
+
+    def index(
+        self, items: list[SchemaItem], *, scope_key: str, checksum: str
+    ) -> None:
+        if self.has_index(scope_key, checksum):
+            return
+        self._mem.index(items, scope_key=scope_key, checksum=checksum)
+        if self._db is None:
+            return
+        # Only persist when embedding actually produced vectors; LanceDB is
+        # vector-only, so a keyword fallback stays purely in-process.
+        if self._mem.effective_name(scope_key) != "embedding":
+            return
+        entry = self._mem._index.get(scope_key)  # pylint: disable=protected-access
+        if entry is None or entry.vectors is None:
+            return
+        try:
+            rows = [
+                {
+                    "name": item.name,
+                    "kind": item.kind,
+                    "model": item.model or "",
+                    "text": item.text,
+                    "vector": vector,
+                }
+                for item, vector in zip(entry.items, entry.vectors, strict=True)
+            ]
+            self._db.create_table(
+                _table_name(scope_key, self._mem.effective_checksum(checksum)),
+                data=rows,
+                mode="overwrite",
+            )
+        except Exception as ex:  # pylint: disable=broad-except
+            logger.warning("LanceDB index persist failed (%s); in-process only.", ex)
+
+    def retrieve(
+        self, question: str, *, scope_key: str, checksum: str, k: int
+    ) -> list[SchemaItem]:
+        # Warm (same process as index()) → in-process rank over cached vectors.
+        if self._mem.has_index(scope_key, checksum):
+            return self._mem.retrieve(
+                question, scope_key=scope_key, checksum=checksum, k=k
+            )
+        # Cold (restart/new worker) → native ANN search so we never load the
+        # whole corpus into memory (C2 / closes R-RET-B). Degrades to rehydrate +
+        # in-process rank when the embedder is unavailable or search raises.
+        table = self._table(scope_key, checksum)
+        if table is not None and self.embedder.is_available():
+            try:
+                query_vector = self.embedder.embed([question])[0]
+                # Use cosine to match the in-process path (lancedb defaults to L2,
+                # which would rank differently for non-normalized vectors).
+                rows = (
+                    table.search(query_vector)
+                    .metric("cosine")
+                    .limit(k)
+                    .to_arrow()
+                    .to_pylist()
+                )
+                return [
+                    SchemaItem(
+                        kind=row["kind"],
+                        name=row["name"],
+                        model=row["model"] or None,
+                        text=row["text"],
+                    )
+                    for row in rows
+                ]
+            except Exception as ex:  # pylint: disable=broad-except
+                logger.warning("LanceDB ANN search failed (%s); rehydrating.", ex)
+        self._rehydrate(scope_key, checksum)
+        return self._mem.retrieve(
+            question, scope_key=scope_key, checksum=checksum, k=k
+        )
+
+    def effective_name(self, scope_key: str) -> str:
+        entry = self._mem._index.get(scope_key)  # pylint: disable=protected-access
+        if entry is not None:
+            return self._mem.effective_name(scope_key)
+        # Cold ANN path doesn't populate the in-process index; a connected LanceDB
+        # means vectors were persisted, so the effective mode is embedding.
+        return "embedding" if self._db is not None else "keyword"
+
+    def _table(self, scope_key: str, checksum: str) -> Any | None:
+        if self._db is None:
+            return None
+        # open_table raises on a missing table; that is the expected "no index
+        # yet" signal, so a failure here simply means "not indexed".
+        try:
+            name = _table_name(scope_key, self._mem.effective_checksum(checksum))
+            return self._db.open_table(name)
+        except Exception:  # pylint: disable=broad-except
+            return None
+
+    def _rehydrate(self, scope_key: str, checksum: str) -> None:
+        table = self._table(scope_key, checksum)
+        if table is None:
+            return
+        try:
+            # to_arrow() needs only pyarrow (a lancedb dep); to_pandas() would
+            # additionally require the separate `pylance` package.
+            rows = table.to_arrow().to_pylist()
+            items = [
+                SchemaItem(
+                    kind=row["kind"],
+                    name=row["name"],
+                    model=row["model"] or None,
+                    text=row["text"],
+                )
+                for row in rows
+            ]
+            vectors = [list(row["vector"]) for row in rows]
+            self._mem.prime(
+                scope_key, self._mem.effective_checksum(checksum), items, vectors
+            )
+        except Exception as ex:  # pylint: disable=broad-except
+            logger.warning("LanceDB rehydrate failed (%s); in-process only.", ex)
+
+
 def create_retriever(
     config: AgentConfig, embedder: Embedder | None = None
 ) -> Retriever:
     """Build the configured retriever; degrade to keyword when embedding is off."""
 
+    max_scopes = config.wren_retriever_cache_scopes
     if config.wren_retriever == "embedding":
         active = embedder or NullEmbedder()
         if active.is_available():
-            return EmbeddingRetriever(active)
-    return KeywordRetriever()
+            if config.wren_vector_index == "lancedb":
+                return LanceDbRetriever(active, _lancedb_path(config), max_scopes)
+            return EmbeddingRetriever(active, max_scopes)
+    return KeywordRetriever(max_scopes)
+
+
+def _lancedb_path(config: AgentConfig) -> str:
+    if config.wren_lancedb_path:
+        return config.wren_lancedb_path
+    return str(Path(config.agent_storage_dir) / "lancedb")
+
+
+def effective_vector_index(config: AgentConfig, retriever: Retriever) -> str:
+    """Report the index actually in use (C1 loud fallback).
+
+    ``memory_fallback`` means LanceDB was requested but did not connect (e.g. the
+    wheel is absent), so the index silently runs in-process — surfaced so an
+    operator can see the misconfig instead of it degrading invisibly.
+    """
+
+    if config.wren_vector_index != "lancedb":
+        return "memory"
+    if isinstance(retriever, LanceDbRetriever) and retriever.is_persistent():
+        return "lancedb"
+    return "memory_fallback"
+
+
+def _content_checksum(files: list[MdlFile]) -> str:
+    """Stable checksum of a project's active MDL content (drives reindex)."""
+
+    digest = hashlib.sha256()
+    for file in files:
+        digest.update(file.content.encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def retrieve_mdl_context(
@@ -220,15 +577,30 @@ def retrieve_mdl_context(
         ]
         if not active_files:
             return []
-        manifest = compile_manifest(active_files)
-        items = manifest_to_schema_items(manifest)
-        if not items:
+        checksum = _content_checksum(active_files)
+        scope_key = f"{owner_id}:{project_id}"
+        # Recompile + (re)index only when the MDL content changed (G2/G3). On a
+        # warm checksum the embedding path embeds just the question (G1).
+        if not retriever.has_index(scope_key, checksum):
+            items = manifest_to_schema_items(compile_manifest(active_files))
+            if not items:
+                return []
+            retriever.index(items, scope_key=scope_key, checksum=checksum)
+        top = retriever.retrieve(
+            question,
+            scope_key=scope_key,
+            checksum=checksum,
+            k=config.wren_context_limit,
+        )
+        if not top:
             return []
-        top = retriever.retrieve(question, items, config.wren_context_limit)
+        # Stamp the *effective* retriever (keyword on a silent fallback) so the UI
+        # badge reflects what actually ran (G8a).
+        mode = retriever.effective_name(scope_key)
         return [
             {
                 "source": "retriever",
-                "retriever": retriever.name,
+                "retriever": mode,
                 "kind": item.kind,
                 "name": item.name,
                 "model": item.model,
