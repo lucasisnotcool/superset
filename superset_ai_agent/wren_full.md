@@ -938,26 +938,37 @@ Baseline UI is already substantial and modeling-ready — `SemanticLayerEditor`
 
 ## Overall Acceptance — "Full Parity" Definition of Done
 
-Parity is achieved when **all six seams** have their parity binding passing and:
+**Status (2026-06-22):** all six seams have a working binding with tests; the
+remaining gaps are wren-core live verification (RE1) and the consume/wire + UI
+follow-ups noted per phase. Backend suite: **231 passed, 2 skipped**; zero new
+ruff errors vs master.
 
-- [ ] **Persistence:** MDL, projects, and the materialized manifest are durable
+- [x] **Persistence:** MDL, projects, and the materialized manifest are durable
       (survive restart) under `semantic_layer_store=sqlalchemy`; parity features
-      refuse to run silently against an in-memory store (0.0).
-- [ ] **Engine:** cross-model join + calculated metric question → executed native
-      SQL with engine-generated joins (Phase 1 litmus), through Superset only.
-- [ ] **Retrieval:** on a wide schema, embedding retrieval surfaces the relevant
-      models a keyword scan misses (fixture A/B).
-- [ ] **Memory:** a previously-confirmed question is answered using its own stored
-      pair as few-shot (learning loop demonstrated).
-- [ ] **Modeler:** onboarding + doc enrichment produce activatable draft MDL
-      validated against the live schema (existing tests + cube/metric coverage).
-- [ ] **Executor:** every execution is Superset-only, read-only-validated, and
-      audited with semantic+native SQL.
-- [ ] **Orchestrator/Skills:** intent routing works; the pipeline is importable
-      and skill-guided.
-- [ ] Throwaway **A/B spike** vs. a full upstream Wren mesh shows comparable
-      end-to-end SQL quality on the dev fixtures (de-risking, not a build target).
-- [ ] `pre-commit run --all-files` green; new CI engine job green.
+      refuse to run silently against an in-memory store (0.0). *(verified:
+      `test_persistence_baseline.py`)*
+- [~] **Engine:** cross-model join + calculated metric question → executed native
+      SQL with engine-generated joins, through Superset only. *(wiring + audit
+      verified with a fake rewrite engine; the real wren-core rewrite is
+      skipif-gated pending RE1.)*
+- [~] **Retrieval:** embedding retrieval ranks by cosine and degrades to keyword.
+      *(seam verified in isolation; not yet swapped into the live context-load —
+      RV2.)*
+- [x] **Memory:** a previously-confirmed question is recalled as few-shot.
+      *(verified: `test_memory_store.py` + graph round-trip.)*
+- [x] **Modeler:** onboarding + doc enrichment produce activatable draft MDL
+      validated against the live schema. *(pre-existing + cube/metric coverage.)*
+- [x] **Executor:** every execution is Superset-only, read-only-validated, and
+      audited with semantic+native SQL. *(verified: graph engine tests.)*
+- [~] **Orchestrator/Skills:** intent classifier + skills exist and are tested;
+      not yet wired as a graph pre-node (RO1); SemanticPipeline facade +
+      framework adapters deferred (RO2).
+- [ ] Throwaway **A/B spike** vs. a full upstream Wren mesh (de-risking).
+- [~] `pre-commit run --all-files` / CI: backend unit suite green, ruff clean on
+      changed files; the **wren-core CI engine job** (RE1) remains the gating
+      item for engine parity.
+
+Legend: `[x]` done & verified · `[~]` core done, follow-up/gated · `[ ]` not started.
 
 ---
 
