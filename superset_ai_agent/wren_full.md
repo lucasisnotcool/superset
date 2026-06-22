@@ -196,7 +196,8 @@ manifest), so **Phase 0 makes DB-backed semantic persistence the baseline**
 | 0 | Durable semantic persistence baseline (MDL in DB) | `[COMPLETE]` (2026-06-22) |
 | 0 | MDL compile canonicalization (0.3) | `[COMPLETE]` (2026-06-22) |
 | 0 | Seam refactor + default bindings (0.1–0.2, 0.4) | `[TODO]` |
-| 1 | SemanticEngine (wren-core rewrite) — **keystone** | `[TODO]` |
+| 1 | SemanticEngine seam (protocol + passthrough + wren-core scaffold) | `[COMPLETE]` (2026-06-22) |
+| 1 | SemanticEngine graph wiring + prompt + correction loop + audit | `[TODO]` |
 | 1 | Semantic-SQL prompt + correction loop | `[TODO]` |
 | 2 | Embedder + EmbeddingRetriever (LanceDB) | `[TODO]` |
 | 2 | Memory learning loop | `[TODO]` |
@@ -398,9 +399,52 @@ expands models into CTEs, resolves calculated columns, and turns relationships
 into real joins — producing native SQL the source DB runs. This is the single
 highest-value piece of Wren and the line between *Wren-shaped* and *Wren-grade*.
 
-### 1.1 `WrenCoreEngine`
+### 1.1 `WrenCoreEngine` — `[COMPLETE]` (2026-06-22)
 
-- [ ] `semantic_layer/engine/wren_core_engine.py::WrenCoreEngine(SemanticEngine)`:
+**Resolved (seam + scaffold).** The `SemanticEngine` seam exists with both
+bindings; the wren-core rewrite path is implemented and degrades closed when the
+optional engine is absent. Graph wiring (1.2) and prompt/correction (1.3–1.5)
+remain `[TODO]`.
+
+Source:
+- [`semantic_layer/engine/base.py`](semantic_layer/engine/base.py) —
+  `SemanticEngine` Protocol, `PlannedSql`, `BACKEND_TO_WREN_DIALECT` +
+  `resolve_dialect`, `extract_referenced_tables` (sqlglot-based, best-effort, for
+  the physical-resolution gate).
+- [`semantic_layer/engine/passthrough.py`](semantic_layer/engine/passthrough.py)
+  — default binding: `compile` → `compile_manifest`; `plan_sql` returns SQL
+  unchanged + warning; no deep validation.
+- [`semantic_layer/engine/wren_core_engine.py`](semantic_layer/engine/wren_core_engine.py)
+  — `plan_sql` resolves dialect → injects `dataSource.type` → `to_manifest(
+  manifest.to_base64_json())` → `SessionContext.transform_sql`; **degrades to the
+  input SQL with a warning** when wren-core is absent, dialect is unknown, or the
+  rewrite raises. `validate(deep=True)` uses the new
+  `wren_core_validator.validate_engine_manifest` (operates on the already-compiled
+  camelCase manifest — fixes a snake/camel double-mapping bug).
+- [`semantic_layer/engine/factory.py`](semantic_layer/engine/factory.py) —
+  `create_semantic_engine(config)` selects by `wren_engine`.
+
+Tests: [`test_semantic_engine.py`](../tests/unit_tests/superset_ai_agent/test_semantic_engine.py)
+(8 + 1 skipif) — dialect map, table extraction (joins + bad SQL), factory
+defaults, passthrough no-rewrite, **wren-core absent-degrade**, unknown-dialect
+degrade; the real `transform_sql` rewrite is `skipif`-gated until wren-core is
+installed (1.2 CI job). Suite: **203 passed, 2 skipped**; `ruff` clean.
+
+**Residual risk RE1:** the real rewrite path (`transform_sql`, manifest serde,
+dialect tokens) is **unverified against a live wren-core** — the engine-present
+test is skipped. This is the Phase-1 CI-job gap (R-A/R16); do not flip
+`wren_engine=wren_core` in any environment until that job is green.
+
+**Residual risk RE2:** `extract_referenced_tables` is sqlglot best-effort; CTE
+aliases and quoted identifiers may under/over-report. It feeds a *gate* (fail
+toward structural-only on parse failure), not execution, so it cannot cause wrong
+SQL — only an over-strict or skipped physical check.
+
+The detailed sub-tasks below remain the spec for the graph-wiring work (1.2+):
+
+#### Original 1.1 spec (retained for the wiring work)
+
+- [x] `semantic_layer/engine/wren_core_engine.py::WrenCoreEngine(SemanticEngine)`:
   ```python
   manifest = to_manifest(base64(json(compiled_manifest)))   # already proven in wren_core_validator
   ctx = SessionContext(manifest, [])

@@ -74,6 +74,17 @@ def validate_with_wren_core(
     installed, so callers can merge this result unconditionally.
     """
 
+    return validate_engine_manifest(to_wren_core_manifest(models, relationships))
+
+
+def validate_engine_manifest(engine_manifest: dict[str, Any]) -> MdlValidationResult:
+    """Deep-validate an already-compiled (camelCase) engine manifest with wren-core.
+
+    Use this when the manifest is already in wren-core shape (e.g. from
+    ``CompiledManifest.to_engine_manifest``); ``validate_with_wren_core`` is the
+    snake_case-input wrapper that maps then delegates here.
+    """
+
     if not wren_core_available():
         return MdlValidationResult(
             valid=True,
@@ -86,9 +97,8 @@ def validate_with_wren_core(
             ],
         )
 
-    manifest_dict = to_wren_core_manifest(models, relationships)
     encoded = base64.b64encode(
-        json.dumps(manifest_dict).encode("utf-8")
+        json.dumps(engine_manifest).encode("utf-8")
     ).decode("ascii")
     try:
         manifest = to_manifest(encoded)  # type: ignore[misc]
