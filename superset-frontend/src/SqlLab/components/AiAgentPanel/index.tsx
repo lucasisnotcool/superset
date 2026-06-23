@@ -64,7 +64,7 @@ import {
   getConversation,
   getProjectSemanticLayerState,
   listConversations,
-  resolveSemanticProject,
+  listSemanticProjects,
   sendConversationMessage,
   streamConversationMessage,
   streamExecuteConversationSql,
@@ -717,17 +717,27 @@ const AiAgentPanel = () => {
       return undefined;
     }
     let isMounted = true;
-    resolveSemanticProject({
-      database_id: currentScope.database_id,
-      catalog_name: currentScope.catalog_name ?? null,
-      schema_name: currentScope.schema_name,
-      create_if_missing: false,
-    })
-      .then(project => getProjectSemanticLayerState(project.id))
-      .then(nextState => {
-        if (isMounted) {
-          setSemanticLayerState(nextState);
+    // Probe for an existing schema-scoped project without creating one. Using the
+    // listing endpoint (200 + possibly-empty array) instead of resolve avoids a
+    // spurious 404 in the console when no project exists yet for the schema.
+    listSemanticProjects(
+      currentScope.database_id,
+      currentScope.catalog_name ?? null,
+      currentScope.schema_name,
+    )
+      .then(projects => {
+        const project = projects[0];
+        if (!project) {
+          if (isMounted) {
+            setSemanticLayerState(null);
+          }
+          return undefined;
         }
+        return getProjectSemanticLayerState(project.id).then(nextState => {
+          if (isMounted) {
+            setSemanticLayerState(nextState);
+          }
+        });
       })
       .catch(() => {
         if (isMounted) {

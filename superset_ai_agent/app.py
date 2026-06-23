@@ -103,6 +103,7 @@ from superset_ai_agent.semantic_layer.mdl_files import (
     MdlFileValidationError,
     SqlAlchemyMdlFileStore,
 )
+from superset_ai_agent.semantic_layer.mdl_schema import MdlManifest
 from superset_ai_agent.semantic_layer.mdl_validator import (
     SchemaIndex,
     validate_mdl,
@@ -1724,6 +1725,21 @@ def create_app(  # noqa: C901
             scope,
             owner_id=identity.owner_id,
         )
+
+    @api.get("/agent/semantic-layer/mdl-schema")
+    def get_mdl_schema(
+        identity: AgentIdentity = identity_dependency,
+    ) -> dict[str, Any]:
+        """Return the native MDL manifest JSON Schema.
+
+        This is the same camelCase shape the engine enforces (derived from
+        ``MdlManifest``), exposed so the editor can validate as-you-type against
+        one source of truth (wren_full.md F2/DF2). It carries no scope-bound data
+        — only the structural contract — so it requires a valid agent identity but
+        no per-scope authorization.
+        """
+
+        return MdlManifest.model_json_schema(by_alias=True)
 
     @api.get("/agent/semantic-layer/events")
     def get_semantic_layer_events(

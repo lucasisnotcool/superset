@@ -40,6 +40,7 @@ from superset_ai_agent.schemas import (
     ModelInfo,
     SqlValidation,
 )
+from superset_ai_agent.semantic_layer.mdl_schema import MdlManifest
 
 
 class FakeOllamaClient:
@@ -303,6 +304,23 @@ def test_retriever_is_built_once_per_app(monkeypatch) -> None:
     monkeypatch.setattr(app_module, "create_retriever", _counting)
     _create_test_app()
     assert calls["n"] == 1
+
+
+def test_mdl_schema_endpoint_publishes_native_manifest_shape() -> None:
+    # F2: the editor (and any client) can fetch the native MDL JSON Schema from a
+    # single source of truth — the same shape the engine enforces.
+    app = _create_test_app()
+    client = TestClient(app)
+
+    response = client.get("/agent/semantic-layer/mdl-schema")
+    assert response.status_code == 200
+    body = response.json()
+    # Cannot fork from the model it is derived from.
+    assert body == MdlManifest.model_json_schema(by_alias=True)
+    # Native camelCase contract, not the snake_case dialect.
+    model_props = body["$defs"]["MdlModel"]["properties"]
+    assert "tableReference" in model_props
+    assert "table_reference" not in model_props
 
 
 def test_health_and_models_use_injected_ollama_client() -> None:

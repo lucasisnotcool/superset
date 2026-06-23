@@ -720,8 +720,18 @@ if (isDevMode) {
       logging: 'info', // Show HMR messages
       webSocketURL: {
         hostname: '0.0.0.0',
-        pathname: '/ws',
+        // Use a dedicated path so the HMR socket does not collide with the
+        // Superset async-query WebSocket server, which owns /ws behind nginx.
+        pathname: '/ws-hmr',
         port: 0,
+      },
+    },
+    // Match the dedicated HMR path above on the server side so the dev server
+    // listens where the client connects.
+    webSocketServer: {
+      type: 'ws',
+      options: {
+        path: '/ws-hmr',
       },
     },
     static: {

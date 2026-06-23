@@ -47,6 +47,16 @@ server {
         proxy_set_header Host $host;
     }
 
+    # Webpack dev-server hot-module-reload socket. Kept on a dedicated path so
+    # it does not collide with /ws (the Superset async-query WebSocket server).
+    location /ws-hmr {
+        proxy_pass http://superset_node;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host $host;
+    }
+
     location ${SUPERSET_STATIC_ASSETS_ROOT} {
         proxy_pass http://superset_node;
         proxy_http_version 1.1;

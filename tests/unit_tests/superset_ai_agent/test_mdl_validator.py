@@ -421,7 +421,32 @@ def test_cube_without_measures_is_warning() -> None:
     assert any(m.code == "cube_without_measures" for m in result.messages)
 
 
-def test_cube_measure_requires_expression() -> None:
+def test_cube_without_base_is_error() -> None:
+    # wren-core requires every cube to declare a baseObject (F4).
+    result = validate_mdl(
+        mdl(
+            models=[_DEALS],
+            cubes=[
+                {
+                    "name": "deal_cube",
+                    "measures": [
+                        {
+                            "name": "total",
+                            "type": "DOUBLE",
+                            "expression": "SUM(amount)",
+                        }
+                    ],
+                }
+            ],
+        )
+    )
+    assert result.valid is False
+    assert any(m.code == "cube_without_base" for m in result.messages)
+
+
+def test_cube_measure_requires_type_and_expression() -> None:
+    # A measure must carry {name, type, expression}; missing fields make the
+    # manifest unloadable by wren-core, so they are errors (not warnings).
     result = validate_mdl(
         mdl(
             models=[_DEALS],
@@ -434,8 +459,10 @@ def test_cube_measure_requires_expression() -> None:
             ],
         )
     )
-    assert result.valid is True
-    assert any(m.code == "cube_measure_without_expression" for m in result.messages)
+    assert result.valid is False
+    codes = {m.code for m in result.messages}
+    assert "cube_measure_without_type" in codes
+    assert "cube_measure_without_expression" in codes
 
 
 def test_cube_unresolved_base_is_error_in_project() -> None:
@@ -445,7 +472,9 @@ def test_cube_unresolved_base_is_error_in_project() -> None:
             {
                 "name": "deal_cube",
                 "baseObject": "ghost",
-                "measures": [{"name": "total", "expression": "SUM(amount)"}],
+                "measures": [
+                    {"name": "total", "type": "DOUBLE", "expression": "SUM(amount)"}
+                ],
             }
         ],
     )
@@ -461,10 +490,37 @@ def _cube(**extra: Any) -> dict[str, Any]:
     cube = {
         "name": "deal_cube",
         "baseObject": "deals",
-        "measures": [{"name": "total", "expression": "SUM(amount)"}],
+        "measures": [
+            {"name": "total", "type": "DOUBLE", "expression": "SUM(amount)"}
+        ],
     }
     cube.update(extra)
     return cube
+
+
+def test_valid_cube_passes_clean() -> None:
+    # A cube shaped exactly as wren-core requires raises no cube findings.
+    result = validate_mdl(
+        mdl(
+            models=[_DEALS],
+            cubes=[
+                _cube(
+                    dimensions=[
+                        {"name": "region", "type": "VARCHAR", "expression": "region"}
+                    ],
+                    timeDimensions=[
+                        {
+                            "name": "closed_at",
+                            "type": "DATE",
+                            "expression": "closed_at",
+                        }
+                    ],
+                )
+            ],
+        )
+    )
+    assert result.valid is True
+    assert not any(m.code.startswith("cube_") for m in result.messages)
 
 
 def test_cube_dimension_without_name_is_flagged() -> None:
@@ -477,71 +533,25 @@ def test_cube_dimension_without_name_is_flagged() -> None:
     assert any(m.code == "cube_entry_without_name" for m in result.messages)
 
 
-def test_cube_time_dimension_and_hierarchy_names_pass() -> None:
+def test_cube_dimension_requires_type_and_expression() -> None:
+    # wren-core dimensions carry {name, type, expression}; missing → error (F4).
     result = validate_mdl(
-        mdl(
-            models=[_DEALS],
-            cubes=[
-                _cube(
-                    timeDimensions=[{"name": "closed_at"}],
-                    hierarchies=[{"name": "geography", "levels": ["x"]}],
-                )
-            ],
-        )
+        mdl(models=[_DEALS], cubes=[_cube(dimensions=[{"name": "region"}])])
     )
-    assert not any(m.code == "cube_entry_without_name" for m in result.messages)
+    assert result.valid is False
+    codes = {m.code for m in result.messages}
+    assert "cube_entry_without_type" in codes
+    assert "cube_entry_without_expression" in codes
 
 
-def test_cube_unknown_granularity_is_warning() -> None:
+def test_cube_time_dimension_requires_type_and_expression() -> None:
     result = validate_mdl(
-        mdl(
-            models=[_DEALS],
-            cubes=[
-                _cube(
-                    timeDimensions=[{"name": "closed_at", "granularity": "fortnight"}]
-                )
-            ],
-        )
+        mdl(models=[_DEALS], cubes=[_cube(timeDimensions=[{"name": "closed_at"}])])
     )
-    assert result.valid is True
-    assert any(m.code == "cube_unknown_granularity" for m in result.messages)
-
-
-def test_cube_known_granularity_passes() -> None:
-    result = validate_mdl(
-        mdl(
-            models=[_DEALS],
-            cubes=[
-                _cube(timeDimensions=[{"name": "closed_at", "granularity": "Month"}])
-            ],
-        )
-    )
-    assert not any(m.code == "cube_unknown_granularity" for m in result.messages)
-
-
-def test_cube_hierarchy_level_must_resolve_to_a_dimension() -> None:
-    result = validate_mdl(
-        mdl(
-            models=[_DEALS],
-            cubes=[
-                _cube(
-                    dimensions=[{"name": "region"}],
-                    hierarchies=[{"name": "geo", "levels": ["region", "ghost_level"]}],
-                )
-            ],
-        )
-    )
-    codes = [m.code for m in result.messages]
-    assert "cube_hierarchy_unknown_level" in codes
-    unknown = [m for m in result.messages if m.code == "cube_hierarchy_unknown_level"]
-    assert all("ghost_level" in m.message for m in unknown)
-
-
-def test_cube_hierarchy_without_levels_is_warning() -> None:
-    result = validate_mdl(
-        mdl(models=[_DEALS], cubes=[_cube(hierarchies=[{"name": "geo"}])])
-    )
-    assert any(m.code == "cube_hierarchy_without_levels" for m in result.messages)
+    assert result.valid is False
+    codes = {m.code for m in result.messages}
+    assert "cube_entry_without_type" in codes
+    assert "cube_entry_without_expression" in codes
 
 
 def test_cube_dimensions_must_be_a_list() -> None:

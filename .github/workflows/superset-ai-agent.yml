@@ -72,5 +72,23 @@ jobs:
         # engine-present tests would silently skip instead of running. Fail loud.
         run: python -c "import wren_core; print('wren-core present')"
 
+      - name: Assert engine-gated tests actually run (no silent skip)
+        # The prior step guarantees wren-core is available, so every test marked
+        # `requires_wren_core` MUST run here. `--strict-markers` rejects a typo'd
+        # marker; `-W error::pytest.PytestUnknownMarkWarning` is redundant insurance.
+        # If any of these tests skip (e.g. a refactor drops the marker or breaks
+        # `wren_core_available()`), the engine contract is silently unverified —
+        # fail the job instead. (wren_full.md F1.)
+        run: |
+          pytest tests/unit_tests/superset_ai_agent -m requires_wren_core \
+            --strict-markers -rs -q --tb=short | tee gated.txt
+          # pytest only prints "skipped" in the summary when the count is > 0.
+          if grep -qi "skipped" gated.txt; then
+            echo "::error::wren-core-gated tests were skipped despite the engine being present"; exit 1
+          fi
+          if ! grep -qE "[1-9][0-9]* passed" gated.txt; then
+            echo "::error::no wren-core-gated tests ran (marker missing?)"; exit 1
+          fi
+
       - name: Run AI agent unit tests
-        run: pytest tests/unit_tests/superset_ai_agent -q --tb=short
+        run: pytest tests/unit_tests/superset_ai_agent -q --tb=short --strict-markers

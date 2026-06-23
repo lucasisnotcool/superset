@@ -55,6 +55,7 @@ interface StagedItem {
   validation: MdlValidationResult | null;
   status: StagedStatus;
   error?: string;
+  warnings?: string[];
 }
 
 const DropZone = styled.button`
@@ -216,6 +217,7 @@ export default function SemanticLayerImportDialog({
             content: proposal.proposed_content,
             kind: 'enrichment',
             validation: proposal.validation,
+            warnings: proposal.warnings,
             status: 'pending',
           });
         }
@@ -392,10 +394,10 @@ export default function SemanticLayerImportDialog({
       >
         <Icons.UploadOutlined iconSize="l" />
         <Typography.Text strong>
-          {t('Drop MDL YAML or Markdown files, or click to browse')}
+          {t('Drop MDL JSON or Markdown files, or click to browse')}
         </Typography.Text>
         <Typography.Text type="secondary">
-          {t('YAML is added as a new MDL file; Markdown is enriched.')}
+          {t('JSON is added as a new MDL file; Markdown is enriched.')}
         </Typography.Text>
       </DropZone>
       <HiddenInput
@@ -425,6 +427,13 @@ export default function SemanticLayerImportDialog({
               </StatusRow>
             </Flex>
             {item.error && <Alert type="error" message={item.error} />}
+            {item.warnings && item.warnings.length > 0 && (
+              <Alert
+                type="info"
+                data-test="semantic-import-warnings"
+                message={item.warnings.join('\n')}
+              />
+            )}
             {item.validation && !item.validation.valid && (
               <Alert
                 type="warning"

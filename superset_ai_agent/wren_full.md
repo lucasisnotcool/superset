@@ -108,7 +108,7 @@ spoke a different language.
 | --- | --- | --- | --- |
 | D1 | **One vocabulary: wren-core's native camelCase manifest, end-to-end.** Author, store, validate, and execute on the same shape. Delete the snake_case dialect and the `*_to_camel` translation layer. | A translation layer between two shapes is a second source of truth that drifts and where fields get dropped — it *caused* the missing-`type` failure. The native shape is already proven against wren-core 0.7.1 ([§2](#2-foundation-already-in-place)). Speaking it directly is "build the integration properly." | *Keep snake_case authoring, only flip YAML→JSON* (the prior plan's D3): retains the dialect, the translator, and the drift/drop risk. Explicitly reversed by this revision (promoting former DF1 to the spine). |
 | D2 | **JSON is the only serialization.** No dual YAML/JSON. | YAML's sole benefit was human editing, which a JSON+Schema editor does better (autocomplete, inline validation, real line/col). The engine wants JSON. | Dual support doubles the parse/merge/materialize surface and keeps the fragile path alive. |
-| D3 | **Abandon all existing MDL data.** No migration; reset stores. | Per the owner: nothing generated so far is critical; a backfill would carry dialect+YAML quirks into the new world for no value. | A YAML-snake→JSON-camel backfill — unjustified for throwaway data. |
+| D3 | **Abandon all existing MDL data.** ~~No migration;~~ reset stores. **(Updated:** a one-time *purge* migration `0004` and a manual script shipped after the fact — see [§8 risk #1](#8-implementation-outcomes--empirical-findings-2026-06-23). Not a backfill; it deletes legacy non-JSON rows + derived state so a deployed instance self-resets on upgrade.**)** | Per the owner: nothing generated so far is critical; a backfill would carry dialect+YAML quirks into the new world for no value. | A YAML-snake→JSON-camel backfill — unjustified for throwaway data. |
 | D4 | **LLM returns a typed Pydantic tree in native shape; we serialize to canonical JSON.** `type` required; `joinType` and granularity enums; `isCalculated`/`notNull` typed booleans. | Structured output is the right tool for "fill these fields"; emitting native field names means its output drops straight into storage with no mapping. Makes the colon and missing-`type` classes impossible at the source. | A free-text JSON string from the LLM — trades YAML fragility for JSON fragility (unescaped quotes, trailing commas). Must be a typed object. |
 | D5 | **Onboarding seeds structure deterministically from `SchemaIndex`; the LLM fills only semantics.** | Our ground truth is Superset's permission-filtered datasets — we already hold authoritative table/column/`type` in `SchemaIndex` ([`mdl_validator.py:53-88`](semantic_layer/mdl_validator.py#L53-L88)). This is how Wren avoids the class: structure from the catalog, semantics from the model. | LLM authors structure too — the failure mode we are removing. |
 | D6 | **Enrichment is a delta/patch contract, applied in place.** LLM returns only new/changed entities keyed by name; we update the target file. Merge-time dedup as a safety net. | Kills `duplicate_model` (no whole-document re-emission) and the `tableReference` loss (untouched models are not rewritten). | Whole-document rewrite — the current cause of the duplicate cascade. |
@@ -122,12 +122,19 @@ spoke a different language.
 **W1 is the spine** (the native-shape rebuild). W2–W4 depend on the canonical
 schema W1 establishes; W5 hardens; W6 removes the debt.
 
-> **Implementation status (2026-06-23): W1–W6 all `[DONE]`.** Backend
-> `pytest tests/unit_tests/superset_ai_agent` **305 passed, 4 skipped**; frontend
+> **Implementation status (audited 2026-06-23): W1–W6 all `[DONE]`.** Backend
+> `pytest tests/unit_tests/superset_ai_agent` **308 passed, 4 skipped** (re-run at
+> audit; +3 over the original 305 are the D2 purge tests); frontend
 > `jest src/SqlLab/components/AiAgentPanel` **37 passed**; ruff + prettier clean on
-> changed files; D7 golden contract green against wren-core 0.7.1. Grep gates
-> clean: zero `yaml`/`import yaml` and zero snake_case dialect keys in agent
-> source or frontend (non-test). The four field errors are now structurally
+> changed files; D7 golden contract green against wren-core 0.7.1. Grep gates:
+> zero `import yaml`/`yaml.safe_load`/`yaml.safe_dump` and zero YAML/`proposed_yaml`
+> in non-test source/frontend. **Precision note:** the "snake_case dialect" gate is
+> about *serialized/stored* keys — the JSON the engine eats is camelCase. Python
+> Pydantic field names in `mdl_schema.py`/`mdl_authoring.py` are idiomatic
+> snake_case but alias to camelCase via `alias_generator=to_camel`, so they match a
+> naive grep without being dialect leakage. One intentional `.yaml/.yml` literal
+> survives in `llm_client.py:447` — it *strips* legacy extensions and forces
+> `.json`, the opposite of YAML support. The four field errors are now structurally
 > impossible — see [§6](#6-acceptance-for-the-whole-rebuild). Residual risks in
 > [§5](#5-sequencing--risk); empirical findings appended at the end of this file.
 
@@ -263,33 +270,34 @@ and full `pytest tests/unit_tests/superset_ai_agent` green.
 
 ### 4.7 What gets deleted vs. flipped (rebuild checklist)
 
-Source: full-tree grep `2026-06-23`. `[ ]` = pending.
+Source: full-tree grep `2026-06-23`; boxes confirmed against source at audit
+(2026-06-23). `[x]` = done & verified.
 
 **Deleted outright (the dialect + translation layer)**
-- [ ] `mdl_compile.py` — `model_to_camel`, `column_to_camel`, `relationship_to_camel`, `view_to_camel`, `metric_to_camel`, `cube_to_camel`, `_drop_none` (W1)
-- [ ] `mdl_compile.py` — `_merge_yaml` snake-key collection; `MODEL_CONTAINER_KEYS` alias `semantic_models` (W1)
-- [ ] `wren_core_validator.py` — `to_wren_core_manifest` mapping body → pass-through; the "re-verify the mapping" prose note (W1/D7)
+- [x] `mdl_compile.py` — `model_to_camel`, `column_to_camel`, `relationship_to_camel`, `view_to_camel`, `metric_to_camel`, `cube_to_camel`, `_drop_none` (W1) — *grep-verified gone*
+- [x] `mdl_compile.py` — `_merge_yaml` snake-key collection; `MODEL_CONTAINER_KEYS` alias `semantic_models` (W1) — *now `("models",)` only, `mdl_schema.py:56`*
+- [x] `wren_core_validator.py` — `to_wren_core_manifest` mapping body → pass-through; the "re-verify the mapping" prose note (W1/D7)
 
 **Rewritten in place (snake→native, YAML→JSON)**
-- [ ] `mdl_schema.py` — typed spec to camelCase native (W1)
-- [ ] `mdl_validator.py` — all field reads + `_parse_yaml`→`_parse_json` + merge dump (W1/W5)
-- [ ] `mdl_validation.py` — re-export rename (W1)
-- [ ] `mdl_files.py` — `validate_mdl_yaml` calls ×4; `.yaml/.yml`→`.json` gate (W1)
-- [ ] `wren_materializer.py` — `_merge_mdl_yaml`→JSON native keys; per-file target `.json` (W1)
-- [ ] `onboarding.py` — `proposal.proposed_yaml`→`proposed_content` (W1)
-- [ ] `schemas.py` — `MdlContentType`, `MdlFile.content_type`, `MdlEnrichmentProposal` field, docstrings (W1)
-- [ ] `app.py` — `model.yaml` default (L1341), `proposal.proposed_yaml` (L1496) (W1/W4)
-- [ ] `integrations/wren/llm_client.py` — `_ProposedMdlFile`, `_active_mdl_yaml`, `.yaml` paths (W2/W3/W4)
-- [ ] `integrations/wren/client.py` — `import yaml`, `yaml.safe_dump` ×2, `.yaml` paths (W2)
-- [ ] `integrations/wren/mdl_exporter.py` — `export_agent_context_to_mdl` / `model_from_dataset` emit snake_case (`table_reference`, `is_calculated`); flip to native camelCase (W2; verified producer 2026-06-23)
-- [ ] `integrations/wren/http_client.py` — `proposed_yaml`/`yaml` keys, `.yaml` paths (W1/W2)
-- [ ] `persistence/models.py` — `content_type` default value only (data reset per D3) (W1)
+- [x] `mdl_schema.py` — typed spec to camelCase native via `alias_generator=to_camel` (W1)
+- [x] `mdl_validator.py` — all field reads camelCase + `_parse_json` + `column_without_type` (W1/W5)
+- [x] `mdl_validation.py` — re-export rename (W1)
+- [x] `mdl_files.py` — `validate_mdl` calls; `.json` gate (W1)
+- [x] `wren_materializer.py` — JSON native keys; per-file target `.json` (W1)
+- [x] `onboarding.py` — `proposal.proposed_content` (W1)
+- [x] `schemas.py` — `MdlContentType`, `MdlFile.content_type`, `MdlEnrichmentProposal.proposed_content`, docstrings (W1)
+- [x] `app.py` — `model.json` default, `proposal.proposed_content`, `dedup_models=True` (W1/W4)
+- [x] `integrations/wren/llm_client.py` — `_ProposedMdlFile`→`mdl_authoring`, `_active_mdl_json`, `.json` paths (W2/W3/W4)
+- [x] `integrations/wren/client.py` — `import yaml`/`yaml.safe_dump` removed, `.json` paths (W2)
+- [x] `integrations/wren/mdl_exporter.py` — `tableReference`/`isCalculated` native camelCase (W2)
+- [x] `integrations/wren/http_client.py` — `proposed_content`, `.json` paths (W1/W2)
+- [x] `persistence/models.py` — `content_type` default `application/json` (W1)
 
 **Frontend**
-- [ ] `api.ts` — `content_type` literal, `proposed_yaml` field (W6)
-- [ ] `SemanticLayerEditor/SemanticLayerImportDialog.tsx` — `accept`, path suffix, field, copy (W6)
-- [ ] `SemanticLayerEditor/index.tsx` + editor — Monaco mode `yaml`→`json` + JSON Schema (W6)
-- [ ] `AiAgentPanel/**/*.test.{ts,tsx}` — fixtures using `.yaml`/`x-yaml`/`proposed_yaml` (W6)
+- [x] `api.ts` — `content_type:'application/json'`, `proposed_content` field (W6)
+- [x] `SemanticLayerEditor/SemanticLayerImportDialog.tsx` — `accept`, path suffix, field, copy (W6)
+- [x] `SemanticLayerEditor/index.tsx` + editor — ACE mode `json` + JSON default template (W6; live JSON-Schema validation is DF2, see [§9](#9-df2--as-you-type-schema-validation-assessment--plan))
+- [x] `AiAgentPanel/**/*.test.{ts,tsx}` — fixtures migrated to JSON/`proposed_content` (W6)
 
 ---
 
@@ -326,9 +334,13 @@ tests, *and* the dialect is gone:
 4. `model_without_mapping` — impossible for seeded/untouched models: structure
    from `SchemaIndex`; untouched models never rewritten (W3/W4).
 
-Plus: **one vocabulary** — repo grep clean of YAML *and* of snake_case dialect
-keys (W6); the D7 golden test green against the pinned wren-core wheel; full
-backend + AiAgentPanel suites green; `.env.example` and docs updated.
+Plus: **one vocabulary** — repo grep clean of YAML usage (`import yaml`,
+`safe_load`/`safe_dump`, `proposed_yaml`) and of *serialized* snake_case dialect
+keys; the stored/engine JSON is camelCase (W6). (Python Pydantic field identifiers
+remain idiomatic snake_case but alias to camelCase, so they are out of scope for
+this gate — see the §4 precision note.) The D7 golden test is green against the
+pinned wren-core wheel; full backend + AiAgentPanel suites green; `.env.example`
+and docs updated.
 
 ---
 
@@ -336,8 +348,8 @@ backend + AiAgentPanel suites green; `.env.example` and docs updated.
 
 | ID | Option | Why deferred |
 | --- | --- | --- |
-| DF2 | Publish the native JSON Schema for Monaco live autocomplete/validation | UX win that JSON+native-shape enables; schedule after W6. |
-| DF3 | Regenerate-on-validation-failure loop in the modeling client (Wren-style) | After W2–W5, residual failures are rare; add only if telemetry shows need. |
+| DF2 | Publish the native JSON Schema for **ACE** (not Monaco — see [§9](#9-df2--as-you-type-schema-validation-assessment--plan)) as-you-type validation | UX win that JSON+native-shape enables; assessed in §9 (~1–1.5 days), not yet implemented. |
+| DF3 | Regenerate-on-validation-failure loop in the **modeling** client (Wren-style) | After W2–W5, residual MDL-authoring failures are rare; add only if telemetry shows need. (Note: a *SQL-planning* correction loop already exists, gated by `WREN_ENGINE_MAX_CORRECTION_RETRIES` — `graph.py:741`, `conversation_graph.py:1433`; DF3 is the distinct authoring-side analogue.) |
 
 *(Former DF1 — "author directly in camelCase, drop the compile hop" — is now the
 W1 spine and no longer deferred.)*
@@ -346,8 +358,9 @@ W1 spine and no longer deferred.)*
 
 ## 8. Implementation outcomes & empirical findings (2026-06-23)
 
-The rebuild (W1–W6) is implemented and test-verified. Suites:
-`pytest tests/unit_tests/superset_ai_agent` **305 passed, 4 skipped**;
+The rebuild (W1–W6) is implemented and test-verified. Suites (re-run at audit
+2026-06-23): `pytest tests/unit_tests/superset_ai_agent` **308 passed, 4 skipped**
+(was 305 before the +3 D2 purge tests);
 `jest src/SqlLab/components/AiAgentPanel` **37 passed**; ruff + prettier clean on
 changed files. The 4 skips are environment-gated (wren-core-absent inverse,
 lancedb-absent inverse, opt-in live smoke) — meaningful, not blind.
@@ -385,22 +398,56 @@ lancedb-absent inverse, opt-in live smoke) — meaningful, not blind.
    [`scripts/purge_legacy_mdl.py`](scripts/purge_legacy_mdl.py)
    (`python -m superset_ai_agent.scripts.purge_legacy_mdl [--apply]`). Tests:
    `test_purge_legacy_mdl.py`.
-2. **Weak-provider structured output:** the typed schema is deep (nested
-   manifest). Providers that don't honor `json_schema` well (some Ollama models)
-   will fail the typed parse and **silently fall back** to the deterministic
-   (seeded, description-only) proposal. Correctness holds; richness degrades. The
-   fallback is by design but the *gap between "rich LLM enrichment" intent and
-   "deterministic draft" reality* is provider-dependent and not surfaced in the UI.
-3. **Enrichment delta is light (W4):** in-place targeting triggers only when
-   exactly one active file exists; multi-file projects fall back to the model's
-   path + the activation dedup net. A true per-entity patch contract (DF-class)
-   is not implemented — the dedup safety net is what guarantees activatability.
-4. **`type` check vs. ANN/granularity warnings:** the new `column_without_type`
-   is an *error*; cube granularity/hierarchy checks remain *warnings* (the
-   camelCase cube shape is still not pinned to a live wren-core path — RM2).
-5. **CI:** the D7 golden + wren-core engine tests are skipif-gated; they only
-   prove the contract where the wheel installs. Confirm the wheel resolves on the
-   CI runner so the contract is actually exercised there, not just locally.
+2. **Weak-provider structured output — SURFACED (F5).** The typed schema is deep
+   (nested manifest); providers that don't honor `json_schema` well (some Ollama
+   models) fail the typed parse and fall back to the deterministic (seeded,
+   description-only) proposal. Correctness holds; richness degrades. The fallback
+   is by design, but it is **no longer silent**: when the model is invoked and
+   returns nothing usable, both `propose_mdl_from_document` and
+   `generate_base_model` attach `_PROVIDER_FALLBACK_WARNING` to the proposal, and
+   the import dialog renders proposal `warnings` as an info `Alert`
+   (`test_llm_wren_client::test_*_fallback_warning`, `SemanticLayerImportDialog`
+   test "surfaces enrichment proposal warnings"). The user now sees that a
+   deterministic draft was substituted and why.
+3. **Enrichment delta (W4) — STRENGTHENED to a per-entity patch (F6).** In-place
+   targeting no longer requires exactly one active file: `_patch_target`
+   (`integrations/wren/llm_client.py`) maps each overlay model to the active file
+   that owns it and **merges** the overlay into that file's full content
+   (`_merge_manifest_sections`, preserving the file's untouched models/relationships/
+   metrics/views/cubes), so a multi-file project is patched in the owning file
+   rather than spawning a colliding sibling. It also generalizes the single-file
+   case (a brand-new model is appended to the lone active file). Only a genuinely
+   ambiguous overlay — one that spans *several* files — falls back to the model's
+   path, where the activation dedup net still guarantees activatability. Tests:
+   `test_llm_wren_client::test_propose_mdl_patches_owning_file_among_many`,
+   `test_propose_mdl_falls_back_when_overlay_spans_files`,
+   `test_propose_mdl_appends_new_model_to_single_active_file`. The endpoint stays
+   single-proposal (no breaking API change); patching *across* multiple files in
+   one enrichment remains the only unhandled case, by design.
+4. **Cube/metric shape pinned to wren-core (RM2) — RESOLVED (F4).** The cube
+   model was originally built on a Cube.dev-style mental model (granularity,
+   hierarchy levels) that wren-core does not have. Verified against
+   wren-core-py 0.7.1, the engine's cube requires `baseObject` plus
+   measures/dimensions/timeDimensions each carrying `{name, type, expression}`
+   (`hierarchies` is an engine *map*, not a list). `MdlCube` now carries
+   `baseObject`, the structural validator promotes the engine's hard requirements
+   to **errors** (`cube_without_base`, `cube_measure_without_type/expression`,
+   `cube_entry_without_type/expression`) with readable messages, and the
+   speculative granularity/hierarchy-level checks were removed. Golden round-trips
+   pin a metric and a well-formed cube into a live `SessionContext`, and prove a
+   typeless cube measure is engine-rejected (`test_native_manifest_contract.py`).
+   The agent still does not *author* cubes; this hardens the path for hand-edited
+   MDL and replaces the engine's opaque serde byte-offset with a field-anchored
+   error before activation.
+5. **CI wren-core gate (F1) — HARDENED.** The D7 golden + engine tests are
+   skipif-gated locally but the AI-agent CI job
+   ([`superset-ai-agent.yml`](../.github/workflows/superset-ai-agent.yml)) installs
+   the wheel, asserts it imports, then runs `pytest -m requires_wren_core
+   --strict-markers` and **fails if any of those tests skip** — so a wheel that
+   stops resolving, or a refactor that drops the marker, breaks CI loudly instead
+   of silently dropping engine coverage. The gated tests carry a shared
+   `requires_wren_core` marker (`tests/unit_tests/superset_ai_agent/wren_core_markers.py`)
+   that stacks the marker + a local skipif so CI and dev stay in lockstep.
 6. **UI alignment:** the editor is now JSON (`language="json"`, JSON default
    template, `.json` upload), but it is **ACE, not Monaco** — so live JSON-Schema
    validation is not a built-in toggle. ACE shows JSON *well-formedness* errors
@@ -466,3 +513,86 @@ bundle-size cost for a feature ACE can deliver via annotations. Not worth it.
 **Deferred sub-option (DF2a):** schema-driven *autocomplete* (suggest field names
 / enum values) is a further step — ACE completers are workable but a bigger lift;
 validate-as-you-type is the high-value 80%.
+
+### Status (F3) — DEFERRED after a feasibility spike
+
+F3 (the implementation of DF2) was attempted and **deferred** per the agreed rule
+"defer entirely if precise per-line mapping isn't clean." The spike found:
+
+- The F2 prerequisite is **done**: `GET /agent/semantic-layer/mdl-schema` ships and
+  is the single source of truth.
+- `ajv` (8.20, has `dist/2020` for the draft-2020-12 schema Pydantic emits) and
+  `jsonc-parser` are both present in `node_modules` **but only transitively** —
+  neither is declared in `superset-frontend/package.json`. Importing them directly
+  for this feature means **adding two new direct frontend dependencies** (a
+  governance step) and, until then, tripping `import/no-extraneous-dependencies`.
+- The JSON-pointer→`{row,column}` mapping (the assessment's one "real fiddle")
+  still needs `jsonc-parser`'s position API; hand-rolling it to avoid the dep is
+  exactly the "not clean" path the deferral rule guards against.
+
+**Recommendation:** land F3 as its own change that (1) adds `ajv` + `jsonc-parser`
+as declared deps, (2) wires the debounced Ajv validate + pointer→position mapper
+behind the existing ACE `annotations` prop, (3) unit-tests the mapper. Everything
+upstream (schema endpoint, native shape) is ready, so it is a clean, self-contained
+follow-up rather than a rushed addition here.
+
+---
+
+## 10. Audit (2026-06-23) — what was checked, and what remains
+
+### 10.1 Audit result
+
+The rebuild claims were re-verified against source at audit. **The core claims
+hold:** the dialect + translation layer are gone (grep-verified), the four error
+classes are structurally closed by code that exists (`column_without_type`
+`mdl_validator.py:351`; `_friendly_engine_error` `wren_core_validator.py:109`;
+`_dedup_models_keep_last` `mdl_validator.py:732` + `app.py:1060` `dedup_models=True`;
+`SchemaIndex` seeding `llm_client.py:238` + `_overlay_model_semantics`), the D2
+purge migration `0004` + script exist, and the suites pass (308 backend / 37
+frontend). Corrections applied this pass: **test counts 305→308**, **D2 "no
+migration" → purge shipped**, **§4.7 checklist ticked**, **§7 DF2 "Monaco"→ACE**,
+and **grep-gate wording made precise** (Python snake_case field identifiers alias
+to camelCase and are not dialect leakage; one intentional `.yaml`-stripping line
+remains in `llm_client.py:447`).
+
+### 10.2 Feature status (implemented 2026-06-23)
+
+F1, F2, F4, F5, F6 are **done & test-verified**; F3 was **attempted then deferred**
+(see §9 "Status (F3)"); F7/F8 remain deferred per the owner's direction.
+
+| # | Item | Status |
+| --- | --- | --- |
+| F1 | CI proves the wren-core wheel resolves *and* the gated tests run (no silent skip) | **DONE** — `superset-ai-agent.yml` + `requires_wren_core` marker; see §8 #5 |
+| F2 | `GET /agent/semantic-layer/mdl-schema` (publishes `MdlManifest.model_json_schema(by_alias=True)`) | **DONE** — `app.py`; `test_app.py::test_mdl_schema_endpoint_publishes_native_manifest_shape` |
+| F3 | DF2 as-you-type schema validation in the ACE editor | **DEFERRED** after spike — `ajv`/`jsonc-parser` are undeclared (transitive-only) deps; per-line mapping not clean to land here. F2 prereq shipped. See §9. |
+| F4 | Cube/metric shape pinned to live wren-core (RM2) | **DONE** — `MdlCube.baseObject`, promoted cube errors, metric+cube golden round-trips; see §8 #4 |
+| F5 | Weak-provider fallback surfaced in the UI | **DONE** — `_PROVIDER_FALLBACK_WARNING` + import-dialog `Alert`; see §8 #2 |
+| F6 | Per-entity patch enrichment across multiple files | **DONE** — `_patch_target` + `_merge_manifest_sections`; see §8 #3 |
+| F7 | DF3 authoring-side regenerate-on-validation-failure loop | **DEFERRED** (owner) — SQL-planning analogue already exists via `WREN_ENGINE_MAX_CORRECTION_RETRIES` |
+| F8 | DF2a schema-driven autocomplete | **DEFERRED** (owner) — extends F3 |
+
+### 10.3 Verification (this implementation pass)
+
+- Backend `pytest tests/unit_tests/superset_ai_agent --strict-markers`: **315 passed,
+  4 skipped** (was 308; +7 net from F2/F4/F5/F6 tests, after F4 replaced the
+  speculative granularity/hierarchy tests).
+- Frontend `jest src/SqlLab/components/AiAgentPanel`: **38 passed** — green under
+  *both* parallel and `--runInBand`, after fixing a pre-existing stale test
+  (`index.test.tsx` "chat scope" still mocked the retired `resolveSemanticProject`
+  POST; the prior W6 work had migrated the source to `listSemanticProjects`, and
+  lucky parallel scheduling had masked it). This was a latent defect from the
+  earlier JSON migration, not from F1–F6.
+- `ruff` clean on all changed Python; `prettier` clean on all changed TS.
+  (`oxlint` could not run locally — native-binding load error in this environment;
+  pre-commit/CI covers it. Changed TS mirrors existing lint-clean patterns.)
+
+### 10.4 What remains after this pass
+
+- **F3 (DF2)** — ship as its own change that declares `ajv` + `jsonc-parser` and
+  wires the ACE annotations pipeline (§9 "Status (F3)").
+- **F7 / F8** — deferred by the owner; revisit only if telemetry/editor-friction
+  justifies.
+- **Cross-file enrichment** — a single enrichment whose models span *several*
+  existing files still falls back to the dedup net rather than patching each file
+  (F6 handles single-owner + new-model cases; the endpoint is single-proposal by
+  design).

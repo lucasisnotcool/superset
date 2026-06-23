@@ -28,6 +28,7 @@ from superset_ai_agent.semantic_layer.wren_core_validator import (
     validate_with_wren_core,
     wren_core_available,
 )
+from tests.unit_tests.superset_ai_agent.wren_core_markers import requires_wren_core
 
 
 def test_friendly_engine_error_maps_missing_type() -> None:
@@ -128,9 +129,7 @@ def test_incomplete_manifest_is_caught_structurally() -> None:
     assert any(m.code == "column_without_type" for m in result.messages)
 
 
-@pytest.mark.skipif(
-    not wren_core_available(), reason="wren-core not installed"
-)
+@requires_wren_core
 def test_wren_core_missing_field_is_mapped_friendly() -> None:
     # If a typeless column reaches the engine (deep validate), the serde error is
     # translated to a field-anchored message rather than a byte offset.

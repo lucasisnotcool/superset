@@ -31,12 +31,8 @@ import json  # noqa: TID251 - standalone agent JSON contract
 
 import pytest
 
-from superset_ai_agent.semantic_layer.engine.wren_core_engine import wren_core_available
 from superset_ai_agent.semantic_layer.mdl_compile import compile_manifest
-
-requires_wren_core = pytest.mark.skipif(
-    not wren_core_available(), reason="wren-core engine not installed"
-)
+from tests.unit_tests.superset_ai_agent.wren_core_markers import requires_wren_core
 
 # A representative native manifest: physical model with typed columns + a second
 # model joined by an explicit relationship (camelCase joinType / tableReference).
@@ -121,6 +117,70 @@ def test_missing_column_type_is_rejected_by_engine() -> None:
     broken = json.loads(json.dumps(NATIVE_MANIFEST))
     del broken["models"][0]["columns"][0]["type"]
     compiled = compile_manifest(json_contents=[json.dumps(broken)])
+
+    with pytest.raises(Exception, match="type"):
+        SessionContext(compiled.to_base64_json())
+
+
+# A metric and a cube in wren-core's native shape. Metrics are authored by the
+# agent; cubes are not, but both are pinned here so the structural validator's
+# shape (F4) stays in lockstep with what the engine actually accepts.
+_METRIC = {
+    "name": "total_amount",
+    "baseObject": "orders",
+    "expression": "sum(amount)",
+}
+_CUBE = {
+    "name": "sales",
+    "baseObject": "orders",
+    "measures": [{"name": "amt", "type": "double", "expression": "sum(amount)"}],
+    "dimensions": [{"name": "region", "type": "varchar", "expression": "region"}],
+}
+
+
+@requires_wren_core
+def test_native_metric_loads_into_engine() -> None:
+    """A metric in {name, baseObject, expression} shape loads into wren-core."""
+
+    from wren_core import SessionContext
+
+    manifest = json.loads(json.dumps(NATIVE_MANIFEST))
+    manifest["metrics"] = [_METRIC]
+    compiled = compile_manifest(json_contents=[json.dumps(manifest)])
+
+    # Constructing the context loads + validates the manifest; no raise == valid.
+    SessionContext(compiled.to_base64_json())
+
+
+@requires_wren_core
+def test_native_cube_loads_into_engine() -> None:
+    """A cube with baseObject + {name,type,expression} entries loads into wren-core.
+
+    Pins the F4 cube shape: ``cube_without_base`` / ``cube_measure_without_type`` /
+    ``cube_entry_without_expression`` exist because the engine *requires* those
+    fields — this proves the well-formed shape is accepted.
+    """
+
+    from wren_core import SessionContext
+
+    manifest = json.loads(json.dumps(NATIVE_MANIFEST))
+    manifest["cubes"] = [_CUBE]
+    compiled = compile_manifest(json_contents=[json.dumps(manifest)])
+
+    SessionContext(compiled.to_base64_json())
+
+
+@requires_wren_core
+def test_cube_missing_measure_type_is_rejected_by_engine() -> None:
+    """A cube measure without `type` is rejected — pins the F4 structural error."""
+
+    from wren_core import SessionContext
+
+    manifest = json.loads(json.dumps(NATIVE_MANIFEST))
+    broken_cube = json.loads(json.dumps(_CUBE))
+    del broken_cube["measures"][0]["type"]
+    manifest["cubes"] = [broken_cube]
+    compiled = compile_manifest(json_contents=[json.dumps(manifest)])
 
     with pytest.raises(Exception, match="type"):
         SessionContext(compiled.to_base64_json())

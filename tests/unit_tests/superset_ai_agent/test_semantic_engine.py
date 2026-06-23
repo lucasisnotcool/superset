@@ -34,6 +34,7 @@ from superset_ai_agent.semantic_layer.engine import (
 from superset_ai_agent.semantic_layer.engine.wren_core_engine import wren_core_available
 from superset_ai_agent.semantic_layer.mdl_compile import compile_manifest
 from superset_ai_agent.semantic_layer.schemas import MdlFile
+from tests.unit_tests.superset_ai_agent.wren_core_markers import requires_wren_core
 
 _MDL = json.dumps(
     {
@@ -130,9 +131,7 @@ def test_wren_core_unknown_dialect_degrades(monkeypatch) -> None:
     assert any("dialect" in w.lower() for w in planned.warnings)
 
 
-@pytest.mark.skipif(
-    not wren_core_available(), reason="wren-core engine not installed"
-)
+@requires_wren_core
 def test_wren_core_rewrites_model_to_physical_table() -> None:
     engine = WrenCoreEngine()
     planned = engine.plan_sql(_SQL, _manifest(), dialect="postgres")
@@ -163,9 +162,7 @@ _CALC_MDL = json.dumps(
 )
 
 
-@pytest.mark.skipif(
-    not wren_core_available(), reason="wren-core engine not installed"
-)
+@requires_wren_core
 def test_wren_core_computes_calculated_column() -> None:
     engine = WrenCoreEngine()
     planned = engine.plan_sql(
@@ -205,9 +202,7 @@ _MULTI_MODEL_MDL = json.dumps(
 )
 
 
-@pytest.mark.skipif(
-    not wren_core_available(), reason="wren-core engine not installed"
-)
+@requires_wren_core
 def test_wren_core_rewrites_multi_model_join() -> None:
     engine = WrenCoreEngine()
     planned = engine.plan_sql(

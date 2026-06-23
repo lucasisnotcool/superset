@@ -135,11 +135,18 @@ class MdlMetric(BaseModel):
 
 
 class MdlCube(BaseModel):
-    """A structured aggregation object (measures, dimensions, time dimensions)."""
+    """A structured aggregation object (measures, dimensions, time dimensions).
+
+    wren-core's cube struct requires a ``baseObject`` plus measures/dimensions/
+    time dimensions whose entries each carry ``{name, type, expression}`` (verified
+    against wren-core-py 0.7.1). ``hierarchies`` is an engine map, not a list; the
+    agent does not author cubes, so its shape is left to engine deep validation.
+    """
 
     model_config = _NATIVE_CONFIG
 
     name: str
+    base_object: str | None = None
     measures: list[dict[str, Any]] = Field(default_factory=list)
     dimensions: list[dict[str, Any]] = Field(default_factory=list)
     time_dimensions: list[dict[str, Any]] = Field(default_factory=list)

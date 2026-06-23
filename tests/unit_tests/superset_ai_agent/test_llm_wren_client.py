@@ -33,7 +33,11 @@ from superset_ai_agent.integrations.wren.factory import create_wren_client
 from superset_ai_agent.integrations.wren.llm_client import LlmWrenClient
 from superset_ai_agent.llm.base import ChatMessage, ModelResult
 from superset_ai_agent.schemas import ModelInfo
-from superset_ai_agent.semantic_layer.schemas import SemanticDocument, SemanticProject
+from superset_ai_agent.semantic_layer.schemas import (
+    MdlFile,
+    SemanticDocument,
+    SemanticProject,
+)
 
 
 class FakeModelClient:
@@ -252,6 +256,23 @@ def test_generate_base_model_falls_back_on_bad_output() -> None:
     assert len(proposals) == 1
     parsed = json.loads(proposals[0].proposed_content)
     assert parsed["models"][0]["tableReference"]["table"] == "deals"
+    # F5: the degradation (structure-only draft, no enrichment) is surfaced, not
+    # hidden — the provider likely didn't honor structured output.
+    assert any(
+        "structured" in warning.lower() for warning in proposals[0].warnings
+    )
+
+
+def test_propose_mdl_from_document_surfaces_fallback_warning() -> None:
+    # The model is invoked (there is document text) but returns unparseable
+    # output; the deterministic draft is returned with a visible degradation note.
+    client = LlmWrenClient(_config(), FakeModelClient("not json at all"))
+
+    proposal = client.propose_mdl_from_document(
+        project=_project(), document=_document()
+    )
+
+    assert any("structured" in warning.lower() for warning in proposal.warnings)
 
 
 def test_propose_mdl_from_document_uses_llm() -> None:
@@ -282,6 +303,114 @@ def test_propose_mdl_from_document_uses_llm() -> None:
     assert proposal.source_document_id == document.id
     assert proposal.validation.valid is True
     assert "enriched" in proposal.proposed_content
+
+
+class _FakeFileStore:
+    """Minimal MDL file store exposing only ``list`` (what targeting needs)."""
+
+    def __init__(self, files: list[MdlFile]) -> None:
+        self._files = files
+
+    def list(self, project_id: str, *, owner_id: str = "local") -> list[MdlFile]:
+        return list(self._files)
+
+
+def _active_file(path: str, models: list[dict[str, Any]]) -> MdlFile:
+    return MdlFile(
+        project_id="project-1",
+        path=path,
+        filename=path.split("/")[-1],
+        content=json.dumps({"models": models}),
+        checksum="c",
+        status="active",
+    )
+
+
+def _model(name: str, **extra: Any) -> dict[str, Any]:
+    model = {
+        "name": name,
+        "tableReference": {"table": name},
+        "columns": [{"name": "id", "type": "INT"}],
+    }
+    model.update(extra)
+    return model
+
+
+def _enrich_payload(models: list[dict[str, Any]]) -> str:
+    return json.dumps(
+        {"files": [{"path": "models/whatever.json", "manifest": {"models": models}}]}
+    )
+
+
+def test_propose_mdl_patches_owning_file_among_many() -> None:
+    # F6: two active files; enrichment touches a model that lives in the second.
+    store = _FakeFileStore(
+        [
+            _active_file("models/a.json", [_model("alpha")]),
+            _active_file("models/b.json", [_model("beta"), _model("gamma")]),
+        ]
+    )
+    client = LlmWrenClient(
+        _config(),
+        FakeModelClient(_enrich_payload([_model("beta", description="enriched")])),
+        mdl_file_store=store,
+    )
+
+    proposal = client.propose_mdl_from_document(
+        project=_project(), document=_document()
+    )
+
+    # Targets the owning file in place — not a colliding new sibling.
+    assert proposal.proposed_path == "models/b.json"
+    merged = json.loads(proposal.proposed_content)
+    names = [model["name"] for model in merged["models"]]
+    # gamma (untouched) is preserved; beta is enriched in place; alpha (other
+    # file) is not dragged in.
+    assert names == ["beta", "gamma"]
+    assert "alpha" not in names
+    beta = next(model for model in merged["models"] if model["name"] == "beta")
+    assert beta["description"] == "enriched"
+
+
+def test_propose_mdl_falls_back_when_overlay_spans_files() -> None:
+    # F6: the overlay touches models in two different files — no single owner, so
+    # it falls back to the model's path and lets the activation dedup net handle it.
+    store = _FakeFileStore(
+        [
+            _active_file("models/a.json", [_model("alpha")]),
+            _active_file("models/b.json", [_model("beta")]),
+        ]
+    )
+    client = LlmWrenClient(
+        _config(),
+        FakeModelClient(_enrich_payload([_model("alpha"), _model("beta")])),
+        mdl_file_store=store,
+    )
+
+    proposal = client.propose_mdl_from_document(
+        project=_project(), document=_document()
+    )
+
+    assert proposal.proposed_path == "models/whatever.json"
+
+
+def test_propose_mdl_appends_new_model_to_single_active_file() -> None:
+    # F6 generalizes W4: a brand-new model lands in the lone active file (merged,
+    # preserving the existing one) instead of a colliding sibling.
+    store = _FakeFileStore([_active_file("models/a.json", [_model("alpha")])])
+    client = LlmWrenClient(
+        _config(),
+        FakeModelClient(_enrich_payload([_model("delta")])),
+        mdl_file_store=store,
+    )
+
+    proposal = client.propose_mdl_from_document(
+        project=_project(), document=_document()
+    )
+
+    assert proposal.proposed_path == "models/a.json"
+    names = [model["name"] for model in json.loads(proposal.proposed_content)["models"]]
+    assert names == ["alpha", "delta"]
 
 
 def test_fetch_context_surfaces_materialized_mdl(tmp_path) -> None:

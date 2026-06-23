@@ -63,7 +63,7 @@ const renderDialog = () => {
   return { onApplied, fileInput };
 };
 
-test('stages a dropped YAML file as a new MDL draft with a diff', async () => {
+test('stages a dropped JSON file as a new MDL draft with a diff', async () => {
   const { fileInput } = renderDialog();
   fetchMock.post(
     'http://agent.local/agent/semantic-layer/projects/project-1/mdl-files',
@@ -156,4 +156,48 @@ test('routes a dropped Markdown file through the enrichment pipeline', async () 
       ),
     ).toHaveLength(1);
   });
+});
+
+test('surfaces enrichment proposal warnings (provider fallback)', async () => {
+  const { fileInput } = renderDialog();
+  fetchMock.post(
+    'http://agent.local/agent/semantic-layer/projects/project-1/documents/text',
+    {
+      id: 'document-9',
+      project_id: 'project-1',
+      filename: 'glossary.md',
+      content_type: 'text/markdown',
+      size_bytes: 5,
+      status: 'needs_review',
+      scope: { database_id: 1, schema_name: 'main', dataset_ids: [] },
+      checksum: 'c',
+      storage_uri: 'mem://glossary.md',
+      proposed_updates: [],
+      warnings: [],
+      created_at: '2026-06-19T00:00:00Z',
+      updated_at: '2026-06-19T00:00:00Z',
+    },
+  );
+  fetchMock.post(
+    'http://agent.local/agent/semantic-layer/projects/project-1/documents/document-9/enrich',
+    {
+      source_document_id: 'document-9',
+      proposed_path: 'models/enriched.json',
+      proposed_content: '{"models":[{"name":"enriched"}]}',
+      validation: { valid: true, messages: [] },
+      warnings: [
+        'The model did not return a valid structured MDL proposal, so a ' +
+          'deterministic draft is shown.',
+      ],
+    },
+  );
+
+  await userEvent.upload(
+    fileInput(),
+    makeFile('Gross moves glossary', 'glossary.md', 'text/markdown'),
+  );
+
+  // F5: the degradation note reaches the user instead of being dropped.
+  const warning = await screen.findByTestId('semantic-import-warnings');
+  expect(warning).toHaveTextContent('did not return a valid structured');
 });

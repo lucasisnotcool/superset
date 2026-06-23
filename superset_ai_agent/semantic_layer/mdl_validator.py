@@ -41,13 +41,6 @@ from superset_ai_agent.semantic_layer.schemas import (
     MdlValidationResult,
 )
 
-#: Time-dimension granularities Wren/cube semantics recognize. Used for a soft
-#: check only (warning) since the camelCase cube shape is unverified against a
-#: live wren-core (RM2) — never reject a manifest on this alone.
-_TIME_GRANULARITIES = frozenset(
-    {"year", "quarter", "month", "week", "day", "hour", "minute", "second"}
-)
-
 
 @dataclass
 class SchemaIndex:
@@ -542,7 +535,15 @@ def _validate_cubes(
         seen_names.add(name)
 
         base = cube.get("baseObject")
-        if base and base not in base_object_names:
+        if not base:
+            # wren-core requires every cube to declare its baseObject.
+            messages.append(
+                MdlValidationMessage(
+                    message=f"Cube {name} is missing a baseObject.",
+                    code="cube_without_base",
+                )
+            )
+        elif base not in base_object_names:
             messages.append(
                 MdlValidationMessage(
                     severity="error" if strict else "warning",
@@ -555,98 +556,31 @@ def _validate_cubes(
                 )
             )
         _validate_cube_measures(name, cube.get("measures"), messages)
-        # Dimensions, time dimensions, and hierarchies must each be named
-        # mappings. Their deeper semantics (granularity, levels) are left to
-        # wren-core deep validation; this only enforces the structural shape so a
-        # malformed entry is caught before activation (RM1a).
-        _validate_named_entries(
+        # wren-core requires each dimension / time dimension to carry
+        # {name, type, expression}. Enforce that structurally so a malformed
+        # entry fails with a readable message rather than the engine's opaque
+        # serde byte-offset at activation. (hierarchies is an engine map, not a
+        # list, and the agent does not author cubes — left to deep validation.)
+        _validate_cube_field_entries(
             name, "dimension", cube.get("dimensions"), messages
         )
-        _validate_named_entries(
+        _validate_cube_field_entries(
             name, "time dimension", cube.get("timeDimensions"), messages
         )
-        _validate_named_entries(
-            name, "hierarchy", cube.get("hierarchies"), messages
-        )
-        _validate_cube_semantics(name, cube, messages)
 
 
-def _validate_cube_semantics(
-    cube_name: str,
-    cube: dict[str, Any],
-    messages: list[MdlValidationMessage],
-) -> None:
-    """Soft (warning-only) checks of time-dimension granularity + hierarchy levels.
-
-    Deeper than the structural shape check: a time dimension's granularity should
-    be a recognized unit, and a hierarchy's levels should resolve to dimensions
-    defined on the same cube. Warnings only — the camelCase cube shape is
-    unverified against a live wren-core (RM2), so these never reject a manifest.
-    """
-
-    dimension_names = _names(cube.get("dimensions") or []) | _names(
-        cube.get("timeDimensions") or []
-    )
-    for time_dimension in cube.get("timeDimensions") or []:
-        if not isinstance(time_dimension, dict):
-            continue
-        granularity = time_dimension.get("granularity")
-        if (
-            granularity is not None
-            and str(granularity).lower() not in _TIME_GRANULARITIES
-        ):
-            messages.append(
-                MdlValidationMessage(
-                    severity="warning",
-                    message=(
-                        f"Cube {cube_name} time dimension "
-                        f"{time_dimension.get('name')} has unrecognized "
-                        f"granularity '{granularity}'."
-                    ),
-                    code="cube_unknown_granularity",
-                )
-            )
-    for hierarchy in cube.get("hierarchies") or []:
-        if not isinstance(hierarchy, dict):
-            continue
-        levels = hierarchy.get("levels")
-        if not levels:
-            messages.append(
-                MdlValidationMessage(
-                    severity="warning",
-                    message=(
-                        f"Cube {cube_name} hierarchy {hierarchy.get('name')} "
-                        "has no levels."
-                    ),
-                    code="cube_hierarchy_without_levels",
-                )
-            )
-            continue
-        if not isinstance(levels, list):
-            continue
-        for level in levels:
-            level_name = level.get("name") if isinstance(level, dict) else level
-            if isinstance(level_name, str) and level_name not in dimension_names:
-                messages.append(
-                    MdlValidationMessage(
-                        severity="warning",
-                        message=(
-                            f"Cube {cube_name} hierarchy "
-                            f"{hierarchy.get('name')} level '{level_name}' is "
-                            "not a defined dimension."
-                        ),
-                        code="cube_hierarchy_unknown_level",
-                    )
-                )
-
-
-def _validate_named_entries(
+def _validate_cube_field_entries(
     cube_name: str,
     kind: str,
     entries: Any,
     messages: list[MdlValidationMessage],
 ) -> None:
-    """Each entry of a cube sub-list must be a mapping carrying a name."""
+    """Validate a cube's dimensions / time dimensions against wren-core's shape.
+
+    wren-core requires each entry to be a mapping carrying ``{name, type,
+    expression}``. A missing field is an error (it makes the manifest unloadable),
+    surfaced with a readable message instead of the engine's serde byte offset.
+    """
 
     if entries is None:
         return
@@ -666,6 +600,27 @@ def _validate_named_entries(
                     code="cube_entry_without_name",
                 )
             )
+            continue
+        entry_name = entry["name"]
+        if not entry.get("type"):
+            messages.append(
+                MdlValidationMessage(
+                    message=(
+                        f"Cube {cube_name} {kind} {entry_name} is missing a type."
+                    ),
+                    code="cube_entry_without_type",
+                )
+            )
+        if not entry.get("expression"):
+            messages.append(
+                MdlValidationMessage(
+                    message=(
+                        f"Cube {cube_name} {kind} {entry_name} is missing an "
+                        "expression."
+                    ),
+                    code="cube_entry_without_expression",
+                )
+            )
 
 
 def _validate_cube_measures(
@@ -673,6 +628,13 @@ def _validate_cube_measures(
     measures: Any,
     messages: list[MdlValidationMessage],
 ) -> None:
+    """Validate a cube's measures against wren-core's shape.
+
+    An empty measure list is accepted by the engine (the cube computes nothing) so
+    it is a warning; a present measure must carry ``{name, type, expression}`` —
+    each missing field is an error, matching wren-core's hard requirement.
+    """
+
     if not isinstance(measures, list) or not measures:
         messages.append(
             MdlValidationMessage(
@@ -694,12 +656,21 @@ def _validate_cube_measures(
                 )
             )
             continue
-        if not measure.get("expression") and not measure.get("sql"):
+        if not measure.get("type"):
             messages.append(
                 MdlValidationMessage(
-                    severity="warning",
                     message=(
-                        f"Cube measure {cube_name}.{measure_name} requires an "
+                        f"Cube measure {cube_name}.{measure_name} is missing a "
+                        "type."
+                    ),
+                    code="cube_measure_without_type",
+                )
+            )
+        if not measure.get("expression"):
+            messages.append(
+                MdlValidationMessage(
+                    message=(
+                        f"Cube measure {cube_name}.{measure_name} is missing an "
                         "expression."
                     ),
                     code="cube_measure_without_expression",

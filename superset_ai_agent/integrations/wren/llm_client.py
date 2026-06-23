@@ -54,6 +54,18 @@ from superset_ai_agent.semantic_layer.schemas import (
     SemanticUpdate,
 )
 
+#: Surfaced to the UI when the model is invoked but returns no usable structured
+#: MDL, so the agent falls back to the deterministic (structure-only) draft. This
+#: makes the "rich enrichment vs. deterministic draft" degradation visible rather
+#: than silent — it usually means the configured provider/model does not honor
+#: structured JSON output well. (wren_full.md F5.)
+_PROVIDER_FALLBACK_WARNING = (
+    "The model did not return a valid structured MDL proposal, so a deterministic "
+    "draft (structure only, descriptions not enriched) is shown. If you expected "
+    "richer enrichment, the configured provider/model may not support structured "
+    "JSON output reliably."
+)
+
 
 class LlmWrenClient:
     """Read/planning-only Wren client backed by the agent's ``ModelClient``."""
@@ -174,17 +186,29 @@ class LlmWrenClient:
         }
         response = self._call_model("wren_enrichment", payload)
         if response is None or not response.files:
-            return deterministic_mdl_proposal(project=project, document=document)
+            # The model was invoked (there *is* document text) but returned no
+            # usable structured proposal — surface the degradation, don't hide it.
+            fallback = deterministic_mdl_proposal(project=project, document=document)
+            return fallback.model_copy(
+                update={"warnings": [*fallback.warnings, _PROVIDER_FALLBACK_WARNING]}
+            )
         first = response.files[0]
-        proposed_content = serialize_manifest(first.manifest)
-        # W4: when exactly one active file exists, target it in place so applying
-        # the enrichment updates that file rather than creating a sibling that
-        # collides on activation (the duplicate_model cascade). Otherwise fall back
-        # to the model's path or the schema default.
-        in_place = self._single_active_path(project)
-        proposed_path = in_place or _safe_relative_path(
-            first.path, default=f"models/{_safe_name(project.schema_name)}.json"
-        )
+        # F6: patch the enrichment into the file that owns its models — even when
+        # several active files exist — merging into that file's full content so its
+        # untouched entities survive. This generalizes the W4 single-file in-place
+        # targeting and kills the duplicate_model cascade for multi-file projects.
+        # When the overlay spans multiple files (no single owner), fall back to the
+        # model's path / schema default and let the activation dedup net guarantee
+        # activatability.
+        overlay = first.manifest.model_dump(by_alias=True, exclude_none=True)
+        patch = self._patch_target(project, overlay)
+        if patch is not None:
+            proposed_path, proposed_content = patch
+        else:
+            proposed_content = serialize_manifest(first.manifest)
+            proposed_path = _safe_relative_path(
+                first.path, default=f"models/{_safe_name(project.schema_name)}.json"
+            )
         return MdlEnrichmentProposal(
             source_document_id=document.id,
             proposed_path=proposed_path,
@@ -241,6 +265,10 @@ class LlmWrenClient:
         }
         response = self._call_model("wren_onboarding", payload)
         llm_models, warnings = _llm_models_by_name(response)
+        if response is None:
+            # Structure is still seeded deterministically (so the proposals are
+            # valid), but the semantic enrichment was skipped — tell the user.
+            warnings = [*warnings, _PROVIDER_FALLBACK_WARNING]
 
         proposals: list[MdlEnrichmentProposal] = []
         for name, seed in seeds.items():
@@ -261,17 +289,79 @@ class LlmWrenClient:
             )
         return proposals
 
-    def _single_active_path(self, project: SemanticProject) -> str | None:
-        """Return the lone active file's path, for in-place enrichment targeting."""
+    def _active_files_content(
+        self, project: SemanticProject
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """Return ``(path, parsed_content)`` for each active MDL file."""
 
         if self.mdl_file_store is None:
-            return None
+            return []
         try:
             files = self.mdl_file_store.list(project.id)
         except Exception:  # pylint: disable=broad-except
+            return []
+        out: list[tuple[str, dict[str, Any]]] = []
+        for file in files:
+            if file.status != "active":
+                continue
+            try:
+                payload = json.loads(file.content)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(payload, dict):
+                out.append((file.path, payload))
+        return out
+
+    def _patch_target(
+        self, project: SemanticProject, overlay: dict[str, Any]
+    ) -> tuple[str, str] | None:
+        """Route an enrichment overlay to the active file that owns its models (F6).
+
+        Returns ``(path, merged_json)`` when the overlay's models all belong to a
+        single existing file (or there is exactly one active file), having merged
+        the overlay into that file's full content so its untouched entities are
+        preserved. Returns ``None`` when the overlay spans multiple files or there
+        is no single clear target — leaving the caller's default-path plus the
+        activation-time dedup net in charge, which still guarantees activatability.
+        """
+
+        active = self._active_files_content(project)
+        if not active:
             return None
-        active = [file for file in files if file.status == "active"]
-        return active[0].path if len(active) == 1 else None
+
+        overlay_model_names = {
+            model["name"]
+            for model in overlay.get("models", [])
+            if isinstance(model, dict) and isinstance(model.get("name"), str)
+        }
+        owner_by_model: dict[str, str] = {}
+        for path, content in active:
+            for model in content.get("models", []) or []:
+                name = model.get("name") if isinstance(model, dict) else None
+                if isinstance(name, str):
+                    owner_by_model.setdefault(name, path)
+
+        owner_paths = {
+            owner_by_model[name]
+            for name in overlay_model_names
+            if name in owner_by_model
+        }
+        if len(owner_paths) > 1:
+            # The overlay touches models in several files; a single proposal
+            # cannot patch them all without losing data — fall back.
+            return None
+        if owner_paths:
+            target_path = next(iter(owner_paths))
+        elif len(active) == 1:
+            # All-new models with one active file: keep them with the existing
+            # file rather than spawning a colliding sibling.
+            target_path = active[0][0]
+        else:
+            return None
+
+        base = next(content for path, content in active if path == target_path)
+        merged = _merge_manifest_sections(base, overlay)
+        return target_path, json.dumps(merged, indent=2)
 
     def _active_mdl_json(self, project: SemanticProject) -> list[dict[str, Any]]:
         """Return the active models as native dicts — read-only enrichment context."""
@@ -401,6 +491,70 @@ def _llm_models_by_name(
             if isinstance(name, str) and name:
                 models[name] = model
     return models, list(response.warnings)
+
+
+#: Manifest sections merged entity-by-entity when patching an enrichment overlay
+#: into an existing file (F6).
+_MERGE_SECTIONS: tuple[str, ...] = (
+    "models",
+    "relationships",
+    "views",
+    "metrics",
+    "cubes",
+)
+
+
+def _merge_named(
+    base: list[Any], overlay: list[Any]
+) -> list[dict[str, Any]]:
+    """Merge two lists of ``{name: ...}`` mappings.
+
+    An overlay entry replaces the base entry of the same ``name`` in place;
+    entries with a new name are appended. Order of existing entries is preserved
+    so a patch never reshuffles the file.
+    """
+
+    result: list[dict[str, Any]] = [
+        dict(item) for item in base if isinstance(item, dict)
+    ]
+    index = {
+        item["name"]: pos
+        for pos, item in enumerate(result)
+        if isinstance(item.get("name"), str)
+    }
+    for item in overlay:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if isinstance(name, str) and name in index:
+            result[index[name]] = item
+        else:
+            result.append(item)
+            if isinstance(name, str):
+                index[name] = len(result) - 1
+    return result
+
+
+def _merge_manifest_sections(
+    base: dict[str, Any], overlay: dict[str, Any]
+) -> dict[str, Any]:
+    """Overlay a proposed manifest onto a target file's content, section by section.
+
+    The target file's other entities (and envelope keys like ``catalog``/
+    ``schema``) are preserved; only the overlay's named entities are added or
+    replaced. This is what makes an enrichment a *patch* of the owning file rather
+    than a wholesale overwrite that would drop its untouched models.
+    """
+
+    merged = dict(base)
+    for section in _MERGE_SECTIONS:
+        base_list = base.get(section)
+        overlay_list = overlay.get(section)
+        base_list = base_list if isinstance(base_list, list) else []
+        overlay_list = overlay_list if isinstance(overlay_list, list) else []
+        if base_list or overlay_list:
+            merged[section] = _merge_named(base_list, overlay_list)
+    return merged
 
 
 def _overlay_model_semantics(

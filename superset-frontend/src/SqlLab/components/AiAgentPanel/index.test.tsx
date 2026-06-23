@@ -320,10 +320,11 @@ test('chat scope follows pending schema edits in unsavedQueryEditor', async () =
     created_at: '2026-06-19T00:00:00Z',
     updated_at: '2026-06-19T00:00:00Z',
   };
-  fetchMock.post(
-    'http://agent.local/agent/semantic-layer/projects/resolve',
+  // The panel probes for an existing project via the listing endpoint (a passive
+  // GET that does not create one), not the resolve POST.
+  fetchMock.get('begin:http://agent.local/agent/semantic-layer/projects?', [
     project,
-  );
+  ]);
   fetchMock.get(
     'http://agent.local/agent/semantic-layer/projects/project-1/state',
     {
@@ -344,24 +345,21 @@ test('chat scope follows pending schema edits in unsavedQueryEditor', async () =
   const store = createStore(scopedState, reducerIndex);
   render(<AiAgentPanel />, { store });
 
-  // The status badge fetches project state in the background on mount,
-  // using create_if_missing: false since it's a passive read, not user
-  // intent to create a project.
+  // The status badge probes for a project in the background on mount via a
+  // passive listing GET, not a create.
   await waitFor(() => {
     expect(
       fetchMock.callHistory.calls(
-        'http://agent.local/agent/semantic-layer/projects/resolve',
+        'begin:http://agent.local/agent/semantic-layer/projects?',
       ),
     ).toHaveLength(1);
   });
-  const [resolveCall] = fetchMock.callHistory.calls(
-    'http://agent.local/agent/semantic-layer/projects/resolve',
+  const [listCall] = fetchMock.callHistory.calls(
+    'begin:http://agent.local/agent/semantic-layer/projects?',
   );
-  // The badge resolves using the pending schema ("main"), not the stale one.
-  expect(JSON.parse(String(resolveCall.options.body))).toMatchObject({
-    create_if_missing: false,
-    schema_name: 'main',
-  });
+  // The badge probes using the pending schema ("main"), not the stale one.
+  expect(listCall.url).toContain('schema_name=main');
+  expect(listCall.url).not.toContain('old_schema');
 
   // The context chip reflects the pending schema, not the stale "old_schema".
   expect(screen.getByText('main')).toBeInTheDocument();
