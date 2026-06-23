@@ -31,7 +31,7 @@ def _response_format(format_schema: dict[str, Any] | None) -> dict[str, Any] | N
     return {
         "type": "json_schema",
         "json_schema": {
-            "name": "sql_draft",
+            "name": "structured_response",
             "schema": to_strict_json_schema(format_schema),
             "strict": True,
         },

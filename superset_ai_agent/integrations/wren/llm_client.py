@@ -30,6 +30,7 @@ It never executes SQL. Generated MDL is always returned as a reviewable draft.
 from __future__ import annotations
 
 import json  # noqa: TID251 - keep the standalone agent independent of Superset
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -40,18 +41,23 @@ from superset_ai_agent.integrations.wren.mdl_exporter import model_from_dataset
 from superset_ai_agent.llm.base import ChatMessage, ModelClient
 from superset_ai_agent.prompts.registry import get_prompt
 from superset_ai_agent.schemas import WrenContextArtifact
+from superset_ai_agent.semantic_layer.document_chunks import select_relevant_sections
 from superset_ai_agent.semantic_layer.mdl_authoring import (
     MdlProposalResponse,
     proposal_response_schema,
-    serialize_manifest,
 )
 from superset_ai_agent.semantic_layer.mdl_files import MdlFileStore
-from superset_ai_agent.semantic_layer.mdl_validation import validate_mdl
+from superset_ai_agent.semantic_layer.mdl_validation import SchemaIndex, validate_mdl
 from superset_ai_agent.semantic_layer.schemas import (
     MdlEnrichmentProposal,
+    MdlValidationResult,
     SemanticDocument,
     SemanticProject,
     SemanticUpdate,
+)
+from superset_ai_agent.semantic_layer.wren_core_validator import (
+    validate_with_wren_core,
+    wren_core_available,
 )
 
 #: Surfaced to the UI when the model is invoked but returns no usable structured
@@ -166,6 +172,9 @@ class LlmWrenClient:
         *,
         project: SemanticProject,
         document: SemanticDocument,
+        schema: dict[str, list[str]] | None = None,
+        schema_types: dict[str, dict[str, str]] | None = None,
+        instructions: list[str] | None = None,
     ) -> MdlEnrichmentProposal:
         base_mdl = self._active_mdl_json(project)
         document_text = (
@@ -173,52 +182,176 @@ class LlmWrenClient:
         ).strip()
         if not document_text:
             return deterministic_mdl_proposal(project=project, document=document)
-        payload = {
+        base_payload: dict[str, Any] = {
             "project": {
                 "name": project.name,
                 "schema_name": project.schema_name,
                 "catalog_name": project.catalog_name,
                 "database_label": project.database_label,
             },
-            "current_mdl": base_mdl,
+            # E2: the model sees a *reference* of existing models (names, table
+            # refs, column names+types) — not full re-emittable bodies. The real
+            # file content is preserved by the merge, so trimming here only shapes
+            # context; it also resolves the wren_full.md W4 input-shape mismatch.
+            "current_mdl": _mdl_reference(base_mdl),
             "document_filename": document.filename,
-            "document_text": document_text[:20_000],
+            # C4: budget the document for the prompt by selecting the sections most
+            # relevant to the project's tables/columns/models, so a large document's
+            # late content about real tables survives instead of a blind head-cut.
+            "document_text": select_relevant_sections(
+                document_text,
+                terms=_schema_terms(schema, base_mdl),
+                budget=self.config.wren_document_prompt_char_budget,
+            ),
         }
-        response = self._call_model("wren_enrichment", payload)
-        if response is None or not response.files:
+        # E2: ground the model on the authoritative physical schema (real tables +
+        # columns) so it never references a column/table that does not exist. C3:
+        # when catalog types are available (live path), also carry them so the model
+        # types a brand-new column correctly, and the loop's SchemaIndex can reject a
+        # cross-family type mismatch.
+        schema_index = (
+            SchemaIndex.from_snapshot(schema, schema_types) if schema else None
+        )
+        if schema:
+            base_payload["physical_schema"] = schema
+            if schema_types:
+                base_payload["physical_schema_types"] = schema_types
+        # Operator guidance (Wren `instructions`) steers the enrichment.
+        if instructions:
+            base_payload["instructions"] = instructions
+        draft = self._draft_with_correction(
+            project, base_mdl, base_payload, schema_index=schema_index
+        )
+        if draft is None:
             # The model was invoked (there *is* document text) but returned no
             # usable structured proposal — surface the degradation, don't hide it.
             fallback = deterministic_mdl_proposal(project=project, document=document)
             return fallback.model_copy(
                 update={"warnings": [*fallback.warnings, _PROVIDER_FALLBACK_WARNING]}
             )
-        first = response.files[0]
-        # F6: patch the enrichment into the file that owns its models — even when
-        # several active files exist — merging into that file's full content so its
-        # untouched entities survive. This generalizes the W4 single-file in-place
-        # targeting and kills the duplicate_model cascade for multi-file projects.
-        # When the overlay spans multiple files (no single owner), fall back to the
-        # model's path / schema default and let the activation dedup net guarantee
-        # activatability.
-        overlay = first.manifest.model_dump(by_alias=True, exclude_none=True)
-        patch = self._patch_target(project, overlay)
-        if patch is not None:
-            proposed_path, proposed_content = patch
-        else:
-            proposed_content = serialize_manifest(first.manifest)
-            proposed_path = _safe_relative_path(
-                first.path, default=f"models/{_safe_name(project.schema_name)}.json"
-            )
+        proposed_path, proposed_content, validation, response_warnings = draft
+        # E5: defense-in-depth — if any base column is missing from the proposal,
+        # surface it rather than letting a structural regression pass silently.
+        dropped = _dropped_columns(base_mdl, proposed_content)
+        drop_warning = (
+            [
+                "Enrichment dropped existing column(s): "
+                + ", ".join(dropped)
+                + ". Review before activation."
+            ]
+            if dropped
+            else []
+        )
         return MdlEnrichmentProposal(
             source_document_id=document.id,
             proposed_path=proposed_path,
             proposed_content=proposed_content,
-            validation=validate_mdl(proposed_content),
+            validation=validation,
             warnings=[
-                *response.warnings,
+                *response_warnings,
+                *drop_warning,
                 "LLM-generated MDL draft. Review before activation.",
             ],
         )
+
+    def _draft_with_correction(
+        self,
+        project: SemanticProject,
+        base_mdl: list[dict[str, Any]],
+        base_payload: dict[str, Any],
+        *,
+        schema_index: SchemaIndex | None = None,
+    ) -> tuple[str, str, MdlValidationResult, list[str]] | None:
+        """Draft an enrichment, re-prompting on validation errors (E3).
+
+        Returns ``(path, content, validation, warnings)`` for the best draft, or
+        ``None`` when the provider never returned a usable structured proposal.
+        Each retry feeds the prior attempt's errors back to the model, bounded by
+        ``wren_modeling_max_correction_retries``. When ``schema_index`` is supplied
+        the validation is *physical* (E2/E3): invented columns/tables become errors
+        the loop corrects, not just structural issues. The structure-preserving
+        merge (E4) is applied on every attempt.
+        """
+
+        max_retries = max(0, self.config.wren_modeling_max_correction_retries)
+        best: tuple[str, str, MdlValidationResult, list[str]] | None = None
+        errors_feedback: list[str] | None = None
+        for _ in range(max_retries + 1):
+            payload = dict(base_payload)
+            if errors_feedback:
+                payload["previous_validation_errors"] = errors_feedback
+            response = self._call_model("wren_enrichment", payload)
+            if response is None or not response.files:
+                break
+            first = response.files[0]
+            # F6: patch the enrichment into the file that owns its models, merging
+            # into that file's full content so untouched entities survive; when the
+            # overlay spans files (no single owner), structure-preserve each touched
+            # model against the active base so a column it omits is not dropped (E4).
+            overlay = first.manifest.model_dump(by_alias=True, exclude_none=True)
+            patch = self._patch_target(project, overlay)
+            if patch is not None:
+                proposed_path, proposed_content = patch
+            else:
+                reconciled = _reconcile_overlay_with_base(base_mdl, overlay)
+                proposed_content = json.dumps(reconciled, indent=2)
+                proposed_path = _safe_relative_path(
+                    first.path,
+                    default=f"models/{_safe_name(project.schema_name)}.json",
+                )
+            validation = validate_mdl(proposed_content, schema_index=schema_index)
+            # C2.1: when structural+physical validation passes, optionally deep-
+            # validate with wren-core — but merge the overlay against the *full*
+            # active MDL first, because the engine compiles a whole manifest
+            # (relationships/calculated fields resolve across files). Folds engine
+            # expression errors into the same correction loop.
+            if validation.valid and self._deep_validation_enabled():
+                deep = self._deep_validate(base_mdl, proposed_content)
+                if not deep.valid:
+                    validation = MdlValidationResult(
+                        valid=False,
+                        messages=[*validation.messages, *deep.messages],
+                    )
+            best = (
+                proposed_path,
+                proposed_content,
+                validation,
+                list(response.warnings),
+            )
+            if validation.valid:
+                break
+            errors_feedback = [
+                message.message
+                for message in validation.messages
+                if message.severity == "error"
+            ]
+        return best
+
+    def _deep_validation_enabled(self) -> bool:
+        """Whether to run wren-core deep validation in the correction loop (C2.1)."""
+
+        return self.config.wren_modeling_deep_validation and wren_core_available()
+
+    def _deep_validate(
+        self, base_mdl: list[dict[str, Any]], proposed_content: str
+    ) -> MdlValidationResult:
+        """Deep-validate the proposed overlay against the full active manifest (C2.1).
+
+        wren-core compiles a *whole* manifest, so a partial overlay would fail on
+        cross-file references. Reconstruct the complete proposed manifest — the
+        proposed models win by name, every other active model is carried over — then
+        deep-validate. Degrades to ``valid=True`` when the content cannot be parsed
+        (the structural validator already ran) so this never falsely blocks a draft.
+        """
+
+        try:
+            proposed = json.loads(proposed_content)
+        except (ValueError, TypeError):
+            return MdlValidationResult(valid=True)
+        if not isinstance(proposed, dict):
+            return MdlValidationResult(valid=True)
+        models, relationships = _full_proposed_manifest(base_mdl, proposed)
+        return validate_with_wren_core(models, relationships)
 
     def validate_mdl_project(self, *, mdl_path: str) -> dict[str, Any]:
         path = Path(mdl_path)
@@ -504,14 +637,175 @@ _MERGE_SECTIONS: tuple[str, ...] = (
 )
 
 
+#: Column fields an enrichment may refine. Everything else on an existing column
+#: (notably ``type`` and the physical mapping) is authoritative and taken from the
+#: base column, so an enrichment can never drop or retype a column it touches (E4).
+_COLUMN_SEMANTIC_FIELDS: tuple[str, ...] = ("description",)
+
+
+def _merge_column_preserving_structure(
+    base_column: dict[str, Any], overlay_column: dict[str, Any]
+) -> dict[str, Any]:
+    """Overlay only semantic fields onto an existing column; keep its structure.
+
+    ``type``, ``expression``, ``relationship``, ``isCalculated``, ``notNull`` and
+    any physical mapping stay as authored on the base column. The overlay may only
+    refine ``description`` and additively merge ``properties`` (e.g. synonyms).
+    """
+
+    merged = dict(base_column)
+    for field in _COLUMN_SEMANTIC_FIELDS:
+        value = overlay_column.get(field)
+        if value:
+            merged[field] = value
+    overlay_props = overlay_column.get("properties")
+    if isinstance(overlay_props, dict) and overlay_props:
+        base_props = merged.get("properties")
+        base_props = base_props if isinstance(base_props, dict) else {}
+        merged["properties"] = {**base_props, **overlay_props}
+    return merged
+
+
+def _merge_model_preserving_structure(
+    base_model: dict[str, Any], overlay_model: dict[str, Any]
+) -> dict[str, Any]:
+    """Merge an enrichment overlay onto an existing model without losing structure.
+
+    Existing columns are preserved (only their semantics refined); a column the
+    overlay omits is kept; a genuinely new column the overlay introduces is
+    appended (and remains subject to physical validation downstream). The model's
+    ``tableReference``/``refSql``/``primaryKey`` are never replaced by the overlay.
+    This gives enrichment the same column-level structural authority that
+    onboarding already has via ``_overlay_model_semantics`` (E4).
+    """
+
+    merged = dict(base_model)
+    if overlay_model.get("description"):
+        merged["description"] = overlay_model["description"]
+    overlay_props = overlay_model.get("properties")
+    if isinstance(overlay_props, dict) and overlay_props:
+        base_props = merged.get("properties")
+        base_props = base_props if isinstance(base_props, dict) else {}
+        merged["properties"] = {**base_props, **overlay_props}
+
+    if "columns" in base_model or "columns" in overlay_model:
+        merged["columns"] = _merge_columns_preserving_structure(
+            base_model.get("columns", []) or [],
+            overlay_model.get("columns", []) or [],
+        )
+    return merged
+
+
+#: Cube sub-sections whose named entries must survive a patch (H5.1).
+_CUBE_ENTITY_SECTIONS: tuple[str, ...] = ("measures", "dimensions", "timeDimensions")
+
+
+def _merge_cube_preserving_structure(
+    base_cube: dict[str, Any], overlay_cube: dict[str, Any]
+) -> dict[str, Any]:
+    """Merge an overlay cube onto an existing cube without dropping entries (H5.1).
+
+    ``baseObject`` stays authoritative; measures/dimensions/timeDimensions the
+    overlay omits are preserved, and only colliding-by-name entries are replaced.
+    The agent does not author cubes today, so this defends hand-edited MDL that
+    passes through the enrichment merge.
+    """
+
+    merged = dict(base_cube)
+    if overlay_cube.get("description"):
+        merged["description"] = overlay_cube["description"]
+    if not merged.get("baseObject") and overlay_cube.get("baseObject"):
+        merged["baseObject"] = overlay_cube["baseObject"]
+    for section in _CUBE_ENTITY_SECTIONS:
+        if section in base_cube or section in overlay_cube:
+            merged[section] = _merge_named(
+                base_cube.get(section, []) or [],
+                overlay_cube.get(section, []) or [],
+            )
+    return merged
+
+
+def _mdl_reference(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Trim active models to a read-only reference for the prompt (E2 / W4).
+
+    Emits names, ``tableReference``, model/column descriptions, and column
+    names+types — enough for the model to know what exists and refine semantics,
+    but not the full re-emittable bodies (which the merge preserves anyway).
+    """
+
+    reference: list[dict[str, Any]] = []
+    for model in models:
+        if not isinstance(model, dict) or not isinstance(model.get("name"), str):
+            continue
+        ref: dict[str, Any] = {"name": model["name"]}
+        if model.get("tableReference"):
+            ref["tableReference"] = model["tableReference"]
+        if model.get("description"):
+            ref["description"] = model["description"]
+        columns: list[dict[str, Any]] = []
+        for column in model.get("columns", []) or []:
+            if not isinstance(column, dict) or not isinstance(column.get("name"), str):
+                continue
+            col_ref: dict[str, Any] = {"name": column["name"]}
+            if column.get("type"):
+                col_ref["type"] = column["type"]
+            if column.get("description"):
+                col_ref["description"] = column["description"]
+            columns.append(col_ref)
+        if columns:
+            ref["columns"] = columns
+        reference.append(ref)
+    return reference
+
+
+def _merge_columns_preserving_structure(
+    base_columns: list[Any], overlay_columns: list[Any]
+) -> list[dict[str, Any]]:
+    """Keep every base column (refining semantics); append only new overlay columns."""
+
+    overlay_by_name = {
+        col["name"]: col
+        for col in overlay_columns
+        if isinstance(col, dict) and isinstance(col.get("name"), str)
+    }
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for column in base_columns:
+        if not isinstance(column, dict):
+            continue
+        name = column.get("name")
+        if isinstance(name, str):
+            seen.add(name)
+            overlay_column = overlay_by_name.get(name)
+            if isinstance(overlay_column, dict):
+                column = _merge_column_preserving_structure(column, overlay_column)
+        result.append(dict(column))
+    for column in overlay_columns:
+        if not isinstance(column, dict):
+            continue
+        name = column.get("name")
+        if isinstance(name, str) and name not in seen:
+            seen.add(name)
+            result.append(dict(column))
+    return result
+
+
+_MergeEntry = Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
+
+
 def _merge_named(
-    base: list[Any], overlay: list[Any]
+    base: list[Any],
+    overlay: list[Any],
+    *,
+    merge_entry: _MergeEntry | None = None,
 ) -> list[dict[str, Any]]:
     """Merge two lists of ``{name: ...}`` mappings.
 
-    An overlay entry replaces the base entry of the same ``name`` in place;
-    entries with a new name are appended. Order of existing entries is preserved
-    so a patch never reshuffles the file.
+    When ``merge_entry`` is provided, an overlay entry colliding with a base entry
+    of the same ``name`` is combined via that callable (used to preserve column
+    structure on models, E4); otherwise the overlay entry replaces the base entry.
+    New-named entries are appended. Order of existing entries is preserved so a
+    patch never reshuffles the file.
     """
 
     result: list[dict[str, Any]] = [
@@ -527,12 +821,155 @@ def _merge_named(
             continue
         name = item.get("name")
         if isinstance(name, str) and name in index:
-            result[index[name]] = item
+            pos = index[name]
+            result[pos] = (
+                merge_entry(result[pos], item) if merge_entry is not None else item
+            )
         else:
             result.append(item)
             if isinstance(name, str):
                 index[name] = len(result) - 1
     return result
+
+
+def _schema_terms(
+    schema: dict[str, list[str]] | None, base_mdl: list[dict[str, Any]]
+) -> set[str]:
+    """Relevance vocabulary for C4 section selection: table/column/model names.
+
+    Sections of a large document that mention real tables, columns or existing model
+    names are the ones enrichment should keep within the prompt budget. Drawn from the
+    physical schema (when grounded) and the active MDL.
+    """
+
+    terms: set[str] = set()
+    for table, columns in (schema or {}).items():
+        terms.add(str(table))
+        terms.update(str(column) for column in columns)
+    for model in base_mdl:
+        if not isinstance(model, dict):
+            continue
+        name = model.get("name")
+        if isinstance(name, str):
+            terms.add(name)
+        for column in model.get("columns", []) or []:
+            if isinstance(column, dict) and isinstance(column.get("name"), str):
+                terms.add(column["name"])
+    return {term for term in terms if term}
+
+
+def _full_proposed_manifest(
+    base_mdl: list[dict[str, Any]], proposed: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Reconstruct the complete proposed manifest for deep validation (C2.1).
+
+    wren-core compiles a *whole* manifest, but the proposal only carries the
+    touched file's models. Union the proposed models with every other active model
+    (proposed wins by name), so a proposed relationship/calculated field can resolve
+    against models that live in untouched files — without that union, deep
+    validation would raise false errors on legitimate cross-file references.
+    Relationships come from the proposal (the base snapshot carries models only);
+    including only proposed relationships cannot create false positives because all
+    models are present.
+    """
+
+    proposed_models = [
+        model
+        for model in proposed.get("models", []) or []
+        if isinstance(model, dict)
+    ]
+    proposed_names = {
+        model.get("name")
+        for model in proposed_models
+        if isinstance(model.get("name"), str)
+    }
+    merged_models = [*proposed_models]
+    for model in base_mdl:
+        name = model.get("name") if isinstance(model, dict) else None
+        if isinstance(name, str) and name not in proposed_names:
+            merged_models.append(model)
+    relationships = [
+        rel
+        for rel in proposed.get("relationships", []) or []
+        if isinstance(rel, dict)
+    ]
+    return merged_models, relationships
+
+
+def _reconcile_overlay_with_base(
+    base_models: list[dict[str, Any]], overlay: dict[str, Any]
+) -> dict[str, Any]:
+    """Structure-preserve an overlay manifest against all active base models (E4).
+
+    Used on the multi-file fallback path, where there is no single owning file to
+    patch: each overlay model that matches an existing active model by name is
+    merged column-level so a touched model never loses columns; brand-new models
+    pass through unchanged.
+    """
+
+    base_by_name = {
+        model["name"]: model
+        for model in base_models
+        if isinstance(model, dict) and isinstance(model.get("name"), str)
+    }
+    merged_models: list[dict[str, Any]] = []
+    for model in overlay.get("models", []) or []:
+        if not isinstance(model, dict):
+            continue
+        base_model = base_by_name.get(model.get("name"))
+        if isinstance(base_model, dict):
+            merged_models.append(
+                _merge_model_preserving_structure(base_model, model)
+            )
+        else:
+            merged_models.append(dict(model))
+    out = dict(overlay)
+    out["models"] = merged_models
+    return out
+
+
+def _dropped_columns(
+    base_models: list[dict[str, Any]], proposed_content: str
+) -> list[str]:
+    """Return ``model.column`` for base columns missing from the proposal (E5).
+
+    Defense-in-depth: with the structure-preserving merge a touched model can no
+    longer drop a column, so a non-empty result signals a regression (or a
+    genuinely ambiguous case) and is surfaced as a proposal warning. Models that
+    are absent from the proposal entirely (they live in other files) are skipped,
+    not reported.
+    """
+
+    try:
+        proposed = json.loads(proposed_content)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(proposed, dict):
+        return []
+    proposed_columns: dict[str, set[str]] = {}
+    for model in proposed.get("models", []) or []:
+        if not isinstance(model, dict) or not isinstance(model.get("name"), str):
+            continue
+        proposed_columns[model["name"]] = {
+            col["name"]
+            for col in model.get("columns", []) or []
+            if isinstance(col, dict) and isinstance(col.get("name"), str)
+        }
+    dropped: list[str] = []
+    for model in base_models:
+        if not isinstance(model, dict):
+            continue
+        name = model.get("name")
+        if not isinstance(name, str) or name not in proposed_columns:
+            continue
+        base_columns = {
+            col["name"]
+            for col in model.get("columns", []) or []
+            if isinstance(col, dict) and isinstance(col.get("name"), str)
+        }
+        for column in sorted(base_columns - proposed_columns[name]):
+            dropped.append(f"{name}.{column}")
+    return dropped
 
 
 def _merge_manifest_sections(
@@ -541,9 +978,11 @@ def _merge_manifest_sections(
     """Overlay a proposed manifest onto a target file's content, section by section.
 
     The target file's other entities (and envelope keys like ``catalog``/
-    ``schema``) are preserved; only the overlay's named entities are added or
-    replaced. This is what makes an enrichment a *patch* of the owning file rather
-    than a wholesale overwrite that would drop its untouched models.
+    ``schema``) are preserved. Models are merged **column-level** so a touched
+    model keeps every existing column and its type (E4); other sections replace
+    the colliding entity by name. This makes an enrichment a *patch* of the owning
+    file rather than a wholesale overwrite that would drop untouched models or
+    columns.
     """
 
     merged = dict(base)
@@ -553,7 +992,17 @@ def _merge_manifest_sections(
         base_list = base_list if isinstance(base_list, list) else []
         overlay_list = overlay_list if isinstance(overlay_list, list) else []
         if base_list or overlay_list:
-            merged[section] = _merge_named(base_list, overlay_list)
+            # Models merge column-level (E4) and cubes entry-level (H5.1) so a
+            # touched entity never loses structure; other sections replace the
+            # colliding entity wholesale.
+            merge_entry: _MergeEntry | None = None
+            if section == "models":
+                merge_entry = _merge_model_preserving_structure
+            elif section == "cubes":
+                merge_entry = _merge_cube_preserving_structure
+            merged[section] = _merge_named(
+                base_list, overlay_list, merge_entry=merge_entry
+            )
     return merged
 
 

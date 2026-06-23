@@ -408,3 +408,21 @@ class AiAgentNlSqlExample(Base):
     native_sql = Column(Text, nullable=False)
     result_meta = Column(JSON, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class AiAgentInstruction(Base):
+    """A user-authored instruction injected into prompts (Wren `instructions`).
+
+    ``is_global`` instructions always apply for the scope; non-global ones are
+    retrieved by similarity to the question.
+    """
+
+    __tablename__ = "ai_agent_instructions"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(String(255), index=True, nullable=False)
+    project_id = Column(String(36), index=True, nullable=True)
+    scope_hash = Column(String(128), index=True, nullable=False)
+    instruction = Column(Text, nullable=False)
+    is_global = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime(timezone=True), nullable=False)

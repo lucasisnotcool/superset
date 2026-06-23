@@ -48,6 +48,7 @@ const StyledEditor = styled.div`
      pre {
        font-size: 11px;
        padding: 0px;
+       margin: 0px;
        background-color: transparent;
        border: 0px;
        line-height: 110%;

@@ -219,6 +219,124 @@ def test_schema_index_from_snapshot_validates_like_live() -> None:
     assert any(m.code == "unknown_column" for m in result.messages)
 
 
+# --- C3: type-aware grounding (cross-family mismatch) -------------------------
+
+
+def _typed_schema_index(**columns: str) -> SchemaIndex:
+    """Live schema index for table `deals` with the given column→type mapping."""
+
+    return SchemaIndex.from_agent_context(
+        AgentContext(
+            database=DatabaseSummary(id=1, name="examples"),
+            datasets=[
+                DatasetMetadata(
+                    id=1,
+                    table_name="deals",
+                    database_id=1,
+                    columns=[
+                        ColumnSummary(name=name, type=type_)
+                        for name, type_ in columns.items()
+                    ],
+                    metrics=[],
+                )
+            ],
+        )
+    )
+
+
+def _deals_column(name: str, type_: str) -> str:
+    return mdl(
+        models=[
+            {
+                "name": "deals",
+                "tableReference": {"table": "deals"},
+                "columns": [{"name": name, "type": type_}],
+            }
+        ]
+    )
+
+
+def test_schema_index_from_agent_context_carries_types() -> None:
+    index = _typed_schema_index(stage="VARCHAR", amount="BIGINT")
+    assert index.has_types() is True
+    assert index.column_type("deals", "amount") == "BIGINT"
+    assert index.column_type("deals", "STAGE") == "VARCHAR"  # case-insensitive
+    assert index.typed_tables() == {"deals": {"stage": "VARCHAR", "amount": "BIGINT"}}
+
+
+def test_type_mismatch_cross_family_is_error() -> None:
+    # Physical `stage` is VARCHAR (string); declaring it BIGINT (numeric) is rejected.
+    result = validate_mdl(
+        _deals_column("stage", "BIGINT"),
+        schema_index=_typed_schema_index(stage="VARCHAR", amount="BIGINT"),
+    )
+    assert result.valid is False
+    mismatch = [m for m in result.messages if m.code == "column_type_mismatch"]
+    assert mismatch
+    assert "deals.stage" in mismatch[0].message
+
+
+def test_type_match_same_family_passes() -> None:
+    # Physical BIGINT vs MDL INTEGER — same (numeric) family, so no mismatch.
+    result = validate_mdl(
+        _deals_column("amount", "INTEGER"),
+        schema_index=_typed_schema_index(stage="VARCHAR", amount="BIGINT"),
+    )
+    assert not any(m.code == "column_type_mismatch" for m in result.messages)
+
+
+def test_type_mismatch_ignored_for_unknown_catalog_type() -> None:
+    # An unrecognized physical type (JSONB) maps to no family → never flagged.
+    result = validate_mdl(
+        _deals_column("payload", "VARCHAR"),
+        schema_index=_typed_schema_index(payload="JSONB"),
+    )
+    assert not any(m.code == "column_type_mismatch" for m in result.messages)
+
+
+def test_type_check_skipped_for_names_only_snapshot() -> None:
+    # The persisted snapshot is names-only (no types) → type checking degrades off,
+    # even for a mismatch that the live path would flag.
+    typed = _typed_schema_index(stage="VARCHAR", amount="BIGINT")
+    snapshot = SchemaIndex.from_snapshot(typed.to_tables())  # types dropped
+    assert snapshot.has_types() is False
+    result = validate_mdl(_deals_column("stage", "BIGINT"), schema_index=snapshot)
+    assert not any(m.code == "column_type_mismatch" for m in result.messages)
+
+
+def test_from_snapshot_with_types_enables_type_check() -> None:
+    # A typed snapshot (live types threaded through) restores the mismatch check.
+    index = SchemaIndex.from_snapshot(
+        {"deals": ["stage"]}, {"deals": {"stage": "VARCHAR"}}
+    )
+    result = validate_mdl(_deals_column("stage", "DOUBLE"), schema_index=index)
+    assert any(m.code == "column_type_mismatch" for m in result.messages)
+
+
+def test_type_mismatch_skipped_for_calculated_column() -> None:
+    # Calculated columns are derived, not physical-mapped → no type-family check.
+    content = mdl(
+        models=[
+            {
+                "name": "deals",
+                "tableReference": {"table": "deals"},
+                "columns": [
+                    {
+                        "name": "amount",
+                        "type": "VARCHAR",
+                        "isCalculated": True,
+                        "expression": "CAST(amount AS VARCHAR)",
+                    }
+                ],
+            }
+        ]
+    )
+    result = validate_mdl(
+        content, schema_index=_typed_schema_index(amount="BIGINT")
+    )
+    assert not any(m.code == "column_type_mismatch" for m in result.messages)
+
+
 def test_column_without_type_is_flagged_structurally() -> None:
     # W5: a typeless column is caught structurally with a readable message,
     # before it can reach wren-core's opaque "missing field `type`" serde error.

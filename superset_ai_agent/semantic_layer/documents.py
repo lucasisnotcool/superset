@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.conversations.schemas import ConversationScope
 from superset_ai_agent.conversations.store import DEFAULT_OWNER_ID
+from superset_ai_agent.semantic_layer.document_chunks import truncate_to_sections
 from superset_ai_agent.semantic_layer.extractors import (
     DocumentExtractor,
     normalize_content_type,
@@ -79,9 +80,14 @@ def create_document(
             content=content,
         )
         warnings: list[str] = []
-        if len(extracted_text) > 20_000:
+        # C4: retain whole sections up to the (large) extract limit instead of a
+        # blind head-cut, so late-document content survives ingestion and can be
+        # relevance-selected at enrichment time.
+        extracted_text, truncated = truncate_to_sections(
+            extracted_text, config.wren_document_extract_char_limit
+        )
+        if truncated:
             warnings.append("Document text was truncated for review.")
-            extracted_text = extracted_text[:20_000]
         document = document.model_copy(
             update={
                 "status": "extracted",

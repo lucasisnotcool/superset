@@ -22,7 +22,16 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
@@ -88,6 +97,10 @@ from superset_ai_agent.semantic_layer.file_storage import (
     S3DocumentStorage,
 )
 from superset_ai_agent.semantic_layer.indexer import rebuild_index
+from superset_ai_agent.semantic_layer.instructions import (
+    create_instruction_store,
+    Instruction,
+)
 from superset_ai_agent.semantic_layer.jobs import (
     InMemoryJobStore,
     JobNotFoundError,
@@ -122,6 +135,7 @@ from superset_ai_agent.semantic_layer.review import apply_review
 from superset_ai_agent.semantic_layer.schema_retriever import (
     create_retriever,
     effective_vector_index,
+    reindex_project_mdl,
 )
 from superset_ai_agent.semantic_layer.schema_snapshot import (
     InMemorySchemaSnapshotStore,
@@ -130,6 +144,7 @@ from superset_ai_agent.semantic_layer.schema_snapshot import (
     SqlAlchemySchemaSnapshotStore,
 )
 from superset_ai_agent.semantic_layer.schemas import (
+    InstructionCreateRequest,
     MdlEnrichmentProposal,
     MdlFile,
     MdlFileCreateRequest,
@@ -152,9 +167,11 @@ from superset_ai_agent.semantic_layer.sqlalchemy_store import (
     SqlAlchemySemanticLayerStore,
 )
 from superset_ai_agent.semantic_layer.store import (
+    instruction_scope_hash,
     SemanticDocumentNotFoundError,
     SemanticLayerStore,
 )
+from superset_ai_agent.semantic_layer.wren_core_validator import wren_core_available
 from superset_ai_agent.semantic_layer.wren_materializer import materialize_wren_project
 from superset_ai_agent.tools.sql import validate_read_only_sql
 
@@ -194,6 +211,7 @@ def create_app(  # noqa: C901
     job_store: JobStore | None = None,
     job_runner: JobRunner | None = None,
     schema_snapshot_store: SchemaSnapshotStore | None = None,
+    retriever: Any | None = None,
 ) -> FastAPI:
     """Create the standalone AI agent API.
 
@@ -252,12 +270,25 @@ def create_app(  # noqa: C901
             session_factory=session_factory,
         )
     )
-    active_memory = create_memory(app_config, session_factory=session_factory)
     # Build the embedder + retriever once per app so the in-process vector index
     # (and any LanceDB connection) is shared across requests/graphs in a worker
     # — instead of a cold index per request (wren_full.md C4).
     active_embedder = create_embedder(app_config)
-    active_retriever = create_retriever(app_config, active_embedder)
+    # Share the embedder with memory so example recall is semantic (R3/R6), not
+    # keyword — degrading closed to token overlap when no embedder is configured.
+    active_memory = create_memory(
+        app_config,
+        session_factory=session_factory,
+        embedder=active_embedder,
+    )
+    # User-authored instructions (Wren `instructions`) — semantic recall shares the
+    # app embedder, durable when the agent DB is configured.
+    active_instruction_store = create_instruction_store(
+        app_config,
+        session_factory=session_factory,
+        embedder=active_embedder,
+    )
+    active_retriever = retriever or create_retriever(app_config, active_embedder)
     active_vector_index = effective_vector_index(app_config, active_retriever)
     if active_vector_index == "memory_fallback":
         logger.warning(
@@ -299,6 +330,7 @@ def create_app(  # noqa: C901
             mdl_file_store=active_mdl_file_store,
             memory=active_memory,
             retriever=active_retriever,
+            instruction_store=active_instruction_store,
         )
         service_conversation_graph = conversation_graph or ConversationGraph(
             config=app_config,
@@ -369,6 +401,7 @@ def create_app(  # noqa: C901
             mdl_file_store=active_mdl_file_store,
             memory=active_memory,
             retriever=active_retriever,
+            instruction_store=active_instruction_store,
         )
 
     def build_conversation_graph(request: Request) -> Any:
@@ -1051,10 +1084,22 @@ def create_app(  # noqa: C901
                     "schema validation."
                 ),
             )
+        # F0.1: when configured, the wren-core engine must be present and authoritative
+        # for activation — degrade *closed* instead of silently structural-only.
+        require_engine = app_config.wren_activation_requires_engine
+        if require_engine and not wren_core_available():
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "The wren-core engine is required for activation but is not "
+                    "installed; install wren-core-py or unset "
+                    "WREN_ACTIVATION_REQUIRES_ENGINE."
+                ),
+            )
         validation = validate_project_manifest(
             [*siblings, new_content],
             schema_index=schema_index,
-            deep_validate=app_config.wren_core_validation_enabled,
+            deep_validate=app_config.wren_core_validation_enabled or require_engine,
             # W4: an enrichment that re-emits an existing model supersedes the
             # older copy instead of failing as a duplicate_model. new_content is
             # last, so the file being activated wins.
@@ -1115,12 +1160,23 @@ def create_app(  # noqa: C901
                 if request.content is not None
                 else None
             )
-            return active_mdl_file_store.update(
+            updated = active_mdl_file_store.update(
                 file_id,
                 request,
                 owner_id=identity.owner_id,
                 validation=file_validation,
             )
+            # E6: eager deploy→reindex. When a file is activated, refresh the
+            # retriever index now (off the next query's critical path; primes the
+            # persistent index) so retrieval reflects the new MDL immediately.
+            if request.status == "active":
+                reindex_project_mdl(
+                    retriever=active_retriever,
+                    project_id=project_id,
+                    owner_id=identity.owner_id,
+                    mdl_file_store=active_mdl_file_store,
+                )
+            return updated
         except MdlFileNotFoundError as ex:
             raise HTTPException(status_code=404, detail="MDL file not found.") from ex
         except MdlFileValidationError as ex:
@@ -1498,14 +1554,40 @@ def create_app(  # noqa: C901
             ) from ex
         if document.project_id != project_id:
             raise HTTPException(status_code=404, detail="Semantic document not found.")
+        # E2: ground the proposal on the authoritative physical schema up front so
+        # the model avoids inventing columns/tables, and the modeling repair loop
+        # can correct physical errors (E3) — then reuse the same index to re-validate.
+        schema_index = _schema_index_for_project(project, fastapi_request)
+        # Inject operator instructions for the project's scope (global + those most
+        # relevant to the document) so guidance steers the enrichment too.
+        instructions: list[str] = []
+        if project.default_database_id is not None:
+            scope = _scope_from_project(project)
+            instructions = [
+                item.instruction
+                for item in active_instruction_store.recall(
+                    f"{document.filename} {document.summary or ''}".strip(),
+                    scope_hash=instruction_scope_hash(scope),
+                    owner_id=identity.owner_id,
+                    k=app_config.wren_instruction_recall_k,
+                )
+            ]
         proposal = _enrichment_proposal(
             project=project,
             document=document,
             wren_client=active_wren_client,
+            schema=schema_index.to_tables() if schema_index is not None else None,
+            # C3: pass catalog types only when the live fetch supplied them; the
+            # names-only snapshot path leaves this None (degrades to E2 grounding).
+            schema_types=(
+                schema_index.typed_tables()
+                if schema_index is not None and schema_index.has_types()
+                else None
+            ),
+            instructions=instructions,
         )
         # Re-validate the proposal against the live schema (R3) so hallucinated
         # columns/tables are visible before the user tries to activate.
-        schema_index = _schema_index_for_project(project, fastapi_request)
         if schema_index is not None:
             validation = validate_mdl(
                 proposal.proposed_content,
@@ -1699,6 +1781,78 @@ def create_app(  # noqa: C901
             message=f"Semantic-layer index {version.version} rebuilt.",
         )
         return version
+
+    @api.post(
+        "/agent/semantic-layer/instructions",
+        response_model=Instruction,
+    )
+    def create_instruction(
+        fastapi_request: Request,
+        request: InstructionCreateRequest,
+        identity: AgentIdentity = identity_dependency,
+    ) -> Instruction:
+        """Add a user-authored instruction injected into generation for a scope."""
+
+        authorize_semantic_scope(
+            fastapi_request,
+            request.scope,
+            identity=identity,
+            permission=SemanticPermission.WRITE,
+        )
+        text = request.instruction.strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="Instruction is empty.")
+        return active_instruction_store.add(
+            instruction=text,
+            scope_hash=instruction_scope_hash(request.scope),
+            owner_id=identity.owner_id,
+            is_global=request.is_global,
+        )
+
+    @api.get(
+        "/agent/semantic-layer/instructions",
+        response_model=list[Instruction],
+    )
+    def list_instructions(
+        fastapi_request: Request,
+        database_id: int,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        dataset_ids: str | None = Query(default=None),
+        identity: AgentIdentity = identity_dependency,
+    ) -> list[Instruction]:
+        """List instructions for a scope."""
+
+        scope = ConversationScope(
+            database_id=database_id,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            dataset_ids=_parse_dataset_ids(dataset_ids),
+        )
+        authorize_semantic_scope(
+            fastapi_request,
+            scope,
+            identity=identity,
+            permission=SemanticPermission.READ,
+        )
+        return active_instruction_store.list_instructions(
+            scope_hash=instruction_scope_hash(scope),
+            owner_id=identity.owner_id,
+        )
+
+    @api.delete("/agent/semantic-layer/instructions/{instruction_id}")
+    def delete_instruction(
+        instruction_id: str,
+        identity: AgentIdentity = identity_dependency,
+    ) -> dict[str, bool]:
+        """Delete one of the caller's instructions."""
+
+        deleted = active_instruction_store.delete(
+            instruction_id, owner_id=identity.owner_id
+        )
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Instruction not found.")
+        return {"deleted": True}
 
     @api.get(
         "/agent/semantic-layer/state",
@@ -1954,10 +2108,16 @@ def _enrichment_proposal(
     project: SemanticProject,
     document: SemanticDocument,
     wren_client: WrenClient,
+    schema: dict[str, list[str]] | None = None,
+    schema_types: dict[str, dict[str, str]] | None = None,
+    instructions: list[str] | None = None,
 ) -> MdlEnrichmentProposal:
     return wren_client.propose_mdl_from_document(
         project=project,
         document=document,
+        schema=schema,
+        schema_types=schema_types,
+        instructions=instructions,
     )
 
 

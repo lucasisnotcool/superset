@@ -35,6 +35,8 @@ from superset_ai_agent.llm.base import ChatMessage, ModelResult
 from superset_ai_agent.schemas import ModelInfo
 from superset_ai_agent.semantic_layer.schemas import (
     MdlFile,
+    MdlValidationMessage,
+    MdlValidationResult,
     SemanticDocument,
     SemanticProject,
 )
@@ -482,3 +484,611 @@ def test_factory_returns_llm_client_with_model_client() -> None:
 def test_factory_falls_back_without_model_client() -> None:
     client = create_wren_client(_config(), model_client=None)
     assert not isinstance(client, LlmWrenClient)
+
+
+# --- E4/E5: enrichment preserves column structure of touched models -----------
+
+
+def _model_with_columns(
+    name: str, columns: list[dict[str, Any]], **extra: Any
+) -> dict[str, Any]:
+    model: dict[str, Any] = {
+        "name": name,
+        "tableReference": {"table": name},
+        "columns": columns,
+    }
+    model.update(extra)
+    return model
+
+
+def test_enrichment_preserves_omitted_column_on_touched_model() -> None:
+    # E4: the overlay re-emits "beta" but omits the "amount" column. The merge
+    # must keep "amount" (with its type) rather than dropping it.
+    store = _FakeFileStore(
+        [
+            _active_file(
+                "models/b.json",
+                [
+                    _model_with_columns(
+                        "beta",
+                        [
+                            {"name": "id", "type": "INT"},
+                            {"name": "amount", "type": "BIGINT"},
+                        ],
+                    )
+                ],
+            )
+        ]
+    )
+    overlay_model = _model_with_columns(
+        "beta",
+        [{"name": "id", "type": "INT", "description": "identifier"}],
+        description="enriched beta",
+    )
+    client = LlmWrenClient(
+        _config(),
+        FakeModelClient(_enrich_payload([overlay_model])),
+        mdl_file_store=store,
+    )
+
+    proposal = client.propose_mdl_from_document(
+        project=_project(), document=_document()
+    )
+
+    assert proposal.proposed_path == "models/b.json"
+    beta = next(
+        model
+        for model in json.loads(proposal.proposed_content)["models"]
+        if model["name"] == "beta"
+    )
+    column_names = [column["name"] for column in beta["columns"]]
+    assert column_names == ["id", "amount"]  # amount preserved
+    amount = next(col for col in beta["columns"] if col["name"] == "amount")
+    assert amount["type"] == "BIGINT"
+    # Semantics from the overlay are still applied to the touched column/model.
+    identifier = next(col for col in beta["columns"] if col["name"] == "id")
+    assert identifier["description"] == "identifier"
+    assert beta["description"] == "enriched beta"
+    # No drop happened, so no drop warning is surfaced (no false positives).
+    assert not any(
+        "dropped existing column" in warning for warning in proposal.warnings
+    )
+
+
+def test_enrichment_does_not_retype_existing_column() -> None:
+    # E4: the overlay tries to change "id" from INT to VARCHAR. Physical type is
+    # authoritative and must survive.
+    store = _FakeFileStore(
+        [_active_file("models/b.json", [_model_with_columns(
+            "beta", [{"name": "id", "type": "INT"}]
+        )])]
+    )
+    overlay_model = _model_with_columns(
+        "beta", [{"name": "id", "type": "VARCHAR", "description": "id col"}]
+    )
+    client = LlmWrenClient(
+        _config(),
+        FakeModelClient(_enrich_payload([overlay_model])),
+        mdl_file_store=store,
+    )
+
+    proposal = client.propose_mdl_from_document(
+        project=_project(), document=_document()
+    )
+
+    beta = json.loads(proposal.proposed_content)["models"][0]
+    assert beta["columns"][0]["type"] == "INT"  # not retyped
+    assert beta["columns"][0]["description"] == "id col"  # semantics still applied
+
+
+def test_enrichment_appends_genuinely_new_column() -> None:
+    # E4: a new column the overlay introduces is appended (subject to downstream
+    # physical validation), while existing columns are kept.
+    store = _FakeFileStore(
+        [_active_file("models/b.json", [_model_with_columns(
+            "beta", [{"name": "id", "type": "INT"}]
+        )])]
+    )
+    overlay_model = _model_with_columns(
+        "beta",
+        [
+            {"name": "id", "type": "INT"},
+            {"name": "region", "type": "VARCHAR", "description": "sales region"},
+        ],
+    )
+    client = LlmWrenClient(
+        _config(),
+        FakeModelClient(_enrich_payload([overlay_model])),
+        mdl_file_store=store,
+    )
+
+    proposal = client.propose_mdl_from_document(
+        project=_project(), document=_document()
+    )
+
+    beta = json.loads(proposal.proposed_content)["models"][0]
+    assert [col["name"] for col in beta["columns"]] == ["id", "region"]
+
+
+def test_enrichment_fallback_preserves_columns_across_files() -> None:
+    # E4: overlay spans two files (no single owner) -> fallback path. Touched
+    # models must still keep their base columns via reconciliation.
+    store = _FakeFileStore(
+        [
+            _active_file(
+                "models/a.json",
+                [_model_with_columns(
+                    "alpha", [{"name": "id", "type": "INT"},
+                              {"name": "k", "type": "TEXT"}]
+                )],
+            ),
+            _active_file(
+                "models/b.json",
+                [_model_with_columns("beta", [{"name": "id", "type": "INT"}])],
+            ),
+        ]
+    )
+    # Overlay re-emits alpha (omitting "k") and beta -> spans files.
+    client = LlmWrenClient(
+        _config(),
+        FakeModelClient(
+            _enrich_payload(
+                [
+                    _model_with_columns("alpha", [{"name": "id", "type": "INT"}]),
+                    _model_with_columns("beta", [{"name": "id", "type": "INT"}]),
+                ]
+            )
+        ),
+        mdl_file_store=store,
+    )
+
+    proposal = client.propose_mdl_from_document(
+        project=_project(), document=_document()
+    )
+
+    models = {m["name"]: m for m in json.loads(proposal.proposed_content)["models"]}
+    alpha_columns = [col["name"] for col in models["alpha"]["columns"]]
+    assert alpha_columns == ["id", "k"]  # "k" preserved despite the omission
+    assert not any(
+        "dropped existing column" in warning for warning in proposal.warnings
+    )
+
+
+def test_dropped_columns_helper_detects_a_real_drop() -> None:
+    # E5: the detector flags a base column missing from the proposal, and ignores
+    # models that are absent from the proposal entirely (they live in other files).
+    from superset_ai_agent.integrations.wren.llm_client import _dropped_columns
+
+    base_models = [
+        _model_with_columns(
+            "beta",
+            [{"name": "id", "type": "INT"}, {"name": "amount", "type": "BIGINT"}],
+        ),
+        _model_with_columns("other", [{"name": "x", "type": "INT"}]),
+    ]
+    proposed = json.dumps(
+        {"models": [_model_with_columns("beta", [{"name": "id", "type": "INT"}])]}
+    )
+
+    assert _dropped_columns(base_models, proposed) == ["beta.amount"]
+    # "other" is not in the proposal at all -> not reported as dropped.
+    assert all(not item.startswith("other.") for item in _dropped_columns(
+        base_models, proposed
+    ))
+
+
+# --- E2: the prompt sees a trimmed reference, not full re-emittable bodies ----
+
+
+class SequencedModelClient:
+    """ModelClient stub returning a queued sequence of payloads, one per call."""
+
+    def __init__(self, contents: list[str]) -> None:
+        self.contents = list(contents)
+        self.calls: list[list[ChatMessage]] = []
+
+    def chat(
+        self,
+        messages: list[ChatMessage],
+        *,
+        model: str | None = None,
+        format_schema: dict[str, Any] | None = None,
+    ) -> ModelResult:
+        self.calls.append(messages)
+        index = min(len(self.calls) - 1, len(self.contents) - 1)
+        return ModelResult(content=self.contents[index])
+
+    def is_reachable(self) -> bool:
+        return True
+
+    def list_models(self) -> list[ModelInfo]:
+        return []
+
+
+def _payload_sent(messages: list[ChatMessage]) -> dict[str, Any]:
+    """Extract the JSON payload from a recorded enrichment user message."""
+
+    return json.loads(messages[-1].content.split("\n", 1)[1])
+
+
+def test_enrichment_prompt_sends_trimmed_reference_not_full_bodies() -> None:
+    # E2 / W4: current_mdl in the prompt is a reference (names, table refs,
+    # column name+type+description) — not full bodies (no refSql/properties/
+    # isCalculated).
+    full_model = {
+        "name": "beta",
+        "tableReference": {"table": "beta"},
+        "refSql": "SELECT * FROM beta",
+        "properties": {"owner": "sales"},
+        "columns": [
+            {"name": "id", "type": "INT", "properties": {"synonym": "identifier"}},
+            {"name": "amount", "type": "BIGINT", "description": "amount moved"},
+        ],
+    }
+    store = _FakeFileStore([_active_file("models/b.json", [full_model])])
+    client = LlmWrenClient(
+        _config(),
+        FakeModelClient(_enrich_payload([_model("beta", description="x")])),
+        mdl_file_store=store,
+    )
+
+    client.propose_mdl_from_document(project=_project(), document=_document())
+
+    reference = _payload_sent(client.model_client.calls[0])["current_mdl"]
+    beta = reference[0]
+    assert beta["name"] == "beta"
+    assert beta["tableReference"] == {"table": "beta"}
+    assert "refSql" not in beta
+    assert "properties" not in beta
+    columns = {col["name"]: col for col in beta["columns"]}
+    assert set(columns["id"].keys()) <= {"name", "type", "description"}
+    assert "properties" not in columns["id"]
+    assert columns["amount"]["type"] == "BIGINT"
+    assert columns["amount"]["description"] == "amount moved"
+
+
+# --- E3: authoring correction loop -------------------------------------------
+
+
+_INVALID_MODEL = {
+    "name": "deals",
+    "tableReference": {"table": "deals"},
+    # Calculated column without an expression: parses, but fails structural
+    # validation (calculated_requires_expression) — a clean retry trigger.
+    "columns": [{"name": "score", "type": "DOUBLE", "isCalculated": True}],
+}
+_VALID_MODEL = {
+    "name": "deals",
+    "tableReference": {"table": "deals"},
+    "columns": [{"name": "score", "type": "DOUBLE"}],
+}
+
+
+def test_enrichment_retries_on_invalid_then_succeeds() -> None:
+    # E3: first draft is structurally invalid; the loop re-prompts with the errors
+    # and the second draft validates. Default config allows one retry.
+    model = SequencedModelClient(
+        [_enrich_payload([_INVALID_MODEL]), _enrich_payload([_VALID_MODEL])]
+    )
+    client = LlmWrenClient(_config(), model)
+
+    proposal = client.propose_mdl_from_document(
+        project=_project(), document=_document()
+    )
+
+    assert proposal.validation.valid is True
+    assert len(model.calls) == 2
+    second_payload = _payload_sent(model.calls[1])
+    assert "previous_validation_errors" in second_payload
+    assert any(
+        "expression" in error.lower()
+        for error in second_payload["previous_validation_errors"]
+    )
+
+
+def test_enrichment_no_retry_when_budget_is_zero() -> None:
+    # E3: with the retry budget at 0, the invalid first draft is returned as-is
+    # (one model call only).
+    config = AgentConfig(wren_adapter="llm", wren_modeling_max_correction_retries=0)
+    model = SequencedModelClient(
+        [_enrich_payload([_INVALID_MODEL]), _enrich_payload([_VALID_MODEL])]
+    )
+    client = LlmWrenClient(config, model)
+
+    proposal = client.propose_mdl_from_document(
+        project=_project(), document=_document()
+    )
+
+    assert proposal.validation.valid is False
+    assert len(model.calls) == 1
+
+
+# --- C2.1: deep-engine validation inside the correction loop -----------------
+
+
+def test_full_proposed_manifest_unions_proposed_over_base() -> None:
+    from superset_ai_agent.integrations.wren.llm_client import _full_proposed_manifest
+
+    base = [
+        {"name": "deals", "columns": [{"name": "old", "type": "INT"}]},
+        {"name": "customers", "columns": [{"name": "id", "type": "INT"}]},
+    ]
+    proposed = {
+        "models": [{"name": "deals", "columns": [{"name": "new", "type": "INT"}]}],
+        "relationships": [{"name": "r", "models": ["deals", "customers"]}],
+    }
+
+    models, relationships = _full_proposed_manifest(base, proposed)
+
+    # Proposed `deals` wins and leads; the untouched `customers` is carried over so
+    # the cross-file relationship can resolve.
+    assert [m["name"] for m in models] == ["deals", "customers"]
+    assert models[0]["columns"] == [{"name": "new", "type": "INT"}]
+    assert [r["name"] for r in relationships] == ["r"]
+
+
+def test_enrichment_deep_validation_repairs_engine_error(monkeypatch) -> None:
+    # C2.1: both drafts are structurally valid, but wren-core rejects the first
+    # (an expression error). The loop must fold the engine error into the retry and
+    # surface the corrected second draft.
+    from superset_ai_agent.integrations.wren import llm_client as mod
+
+    monkeypatch.setattr(mod, "wren_core_available", lambda: True)
+    deep_calls = {"n": 0}
+
+    def fake_deep(models, relationships):
+        deep_calls["n"] += 1
+        if deep_calls["n"] == 1:
+            return MdlValidationResult(
+                valid=False,
+                messages=[
+                    MdlValidationMessage(
+                        message="calculated field 'score' references unknown column",
+                        code="wren_core_error",
+                    )
+                ],
+            )
+        return MdlValidationResult(valid=True)
+
+    monkeypatch.setattr(mod, "validate_with_wren_core", fake_deep)
+    config = AgentConfig(wren_adapter="llm", wren_modeling_deep_validation=True)
+    model = SequencedModelClient(
+        [_enrich_payload([_VALID_MODEL]), _enrich_payload([_VALID_MODEL])]
+    )
+    client = LlmWrenClient(config, model)
+
+    proposal = client.propose_mdl_from_document(
+        project=_project(), document=_document()
+    )
+
+    assert proposal.validation.valid is True
+    assert deep_calls["n"] == 2  # deep-validated each draft
+    assert len(model.calls) == 2  # the engine error forced a retry
+    second_payload = _payload_sent(model.calls[1])
+    assert any(
+        "calculated field" in error.lower()
+        for error in second_payload["previous_validation_errors"]
+    )
+
+
+def test_enrichment_skips_deep_validation_when_flag_off(monkeypatch) -> None:
+    # Default config: deep validation never runs even with wren-core present.
+    from superset_ai_agent.integrations.wren import llm_client as mod
+
+    monkeypatch.setattr(mod, "wren_core_available", lambda: True)
+    called = {"n": 0}
+
+    def fake_deep(models, relationships):
+        called["n"] += 1
+        return MdlValidationResult(valid=False)
+
+    monkeypatch.setattr(mod, "validate_with_wren_core", fake_deep)
+    client = LlmWrenClient(_config(), FakeModelClient(_enrich_payload([_VALID_MODEL])))
+
+    proposal = client.propose_mdl_from_document(
+        project=_project(), document=_document()
+    )
+
+    assert proposal.validation.valid is True
+    assert called["n"] == 0  # flag off → no deep validation
+
+
+# --- H5.1: cube entries survive a patch --------------------------------------
+
+
+def test_cube_merge_preserves_omitted_measures() -> None:
+    from superset_ai_agent.integrations.wren.llm_client import (
+        _merge_manifest_sections,
+    )
+
+    base = {
+        "cubes": [
+            {
+                "name": "sales",
+                "baseObject": "deals",
+                "measures": [{"name": "m1"}, {"name": "m2"}],
+            }
+        ]
+    }
+    overlay = {"cubes": [{"name": "sales", "measures": [{"name": "m1",
+                                                         "description": "enriched"}]}]}
+
+    merged = _merge_manifest_sections(base, overlay)
+
+    cube = merged["cubes"][0]
+    assert [measure["name"] for measure in cube["measures"]] == ["m1", "m2"]
+    assert cube["baseObject"] == "deals"  # authoritative, preserved
+    m1 = next(m for m in cube["measures"] if m["name"] == "m1")
+    assert m1["description"] == "enriched"
+
+
+# --- E2/E3: physical-schema grounding + physical repair ----------------------
+
+
+_GHOST_MODEL = {
+    "name": "deals",
+    "tableReference": {"table": "deals"},
+    "columns": [
+        {"name": "id", "type": "INT"},
+        {"name": "ghost", "type": "INT"},  # not in the physical schema
+    ],
+}
+_REAL_MODEL = {
+    "name": "deals",
+    "tableReference": {"table": "deals"},
+    "columns": [{"name": "id", "type": "INT"}],
+}
+
+
+def test_enrichment_prompt_includes_physical_schema() -> None:
+    # E2: the authoritative physical schema is handed to the model for grounding.
+    model = FakeModelClient(_enrich_payload([_REAL_MODEL]))
+    client = LlmWrenClient(_config(), model)
+
+    client.propose_mdl_from_document(
+        project=_project(),
+        document=_document(),
+        schema={"deals": ["id", "amount"]},
+    )
+
+    payload = _payload_sent(model.calls[0])
+    assert payload["physical_schema"] == {"deals": ["id", "amount"]}
+
+
+def test_enrichment_repairs_hallucinated_column_against_schema() -> None:
+    # E3: the first draft references a column absent from the physical schema; the
+    # loop is told (physical error) and the corrected second draft validates.
+    model = SequencedModelClient(
+        [_enrich_payload([_GHOST_MODEL]), _enrich_payload([_REAL_MODEL])]
+    )
+    client = LlmWrenClient(_config(), model)
+
+    proposal = client.propose_mdl_from_document(
+        project=_project(),
+        document=_document(),
+        schema={"deals": ["id"]},
+    )
+
+    assert proposal.validation.valid is True
+    assert len(model.calls) == 2
+    second = _payload_sent(model.calls[1])
+    assert any(
+        "ghost" in error.lower()
+        for error in second["previous_validation_errors"]
+    )
+
+
+def test_enrichment_without_schema_does_not_send_physical_schema() -> None:
+    model = FakeModelClient(_enrich_payload([_REAL_MODEL]))
+    client = LlmWrenClient(_config(), model)
+
+    client.propose_mdl_from_document(project=_project(), document=_document())
+
+    assert "physical_schema" not in _payload_sent(model.calls[0])
+
+
+def test_enrichment_prompt_includes_physical_schema_types() -> None:
+    # C3: catalog types are handed to the model so it types new columns correctly.
+    model = FakeModelClient(_enrich_payload([_REAL_MODEL]))
+    client = LlmWrenClient(_config(), model)
+
+    client.propose_mdl_from_document(
+        project=_project(),
+        document=_document(),
+        schema={"deals": ["id", "amount"]},
+        schema_types={"deals": {"id": "INT", "amount": "BIGINT"}},
+    )
+
+    payload = _payload_sent(model.calls[0])
+    assert payload["physical_schema_types"] == {
+        "deals": {"id": "INT", "amount": "BIGINT"}
+    }
+
+
+def _long_document(extracted_text: str) -> SemanticDocument:
+    return SemanticDocument(
+        filename="glossary.md",
+        content_type="text/markdown",
+        size_bytes=len(extracted_text),
+        scope=ConversationScope(
+            database_id=1, catalog_name=None, schema_name="sales", dataset_ids=[]
+        ),
+        checksum="abc",
+        storage_uri="mem://glossary.md",
+        extracted_text=extracted_text,
+    )
+
+
+def test_enrichment_selects_relevant_late_section_within_budget() -> None:
+    # C4: a large document with irrelevant head filler and a schema-relevant late
+    # section — the prompt keeps the late section instead of a blind head-cut.
+    filler = "\n\n".join(f"filler paragraph {i} about nothing" for i in range(40))
+    late = "The amount column on deals records the booked value."
+    document = _long_document(f"{filler}\n\n{late}")
+    config = AgentConfig(wren_adapter="llm", wren_document_prompt_char_budget=150)
+    model = FakeModelClient(_enrich_payload([_model("deals")]))
+    client = LlmWrenClient(config, model)
+
+    client.propose_mdl_from_document(
+        project=_project(),
+        document=document,
+        schema={"deals": ["amount"]},
+    )
+
+    sent_text = _payload_sent(model.calls[0])["document_text"]
+    assert "amount column on deals" in sent_text  # relevant late section survived
+    assert len(sent_text) <= 150  # budgeted
+
+
+def test_enrichment_small_document_sent_whole() -> None:
+    # A document within budget is unchanged (no chunking surprises).
+    document = _long_document("Gross moves means total units shifted.")
+    model = FakeModelClient(_enrich_payload([_model("deals")]))
+    client = LlmWrenClient(_config(), model)
+
+    client.propose_mdl_from_document(project=_project(), document=document)
+
+    assert (
+        _payload_sent(model.calls[0])["document_text"]
+        == "Gross moves means total units shifted."
+    )
+
+
+def test_enrichment_omits_physical_schema_types_when_absent() -> None:
+    # Names-only schema (snapshot path) → no types key, grounding degrades to E2.
+    model = FakeModelClient(_enrich_payload([_REAL_MODEL]))
+    client = LlmWrenClient(_config(), model)
+
+    client.propose_mdl_from_document(
+        project=_project(),
+        document=_document(),
+        schema={"deals": ["id", "amount"]},
+    )
+
+    assert "physical_schema_types" not in _payload_sent(model.calls[0])
+
+
+def test_enrichment_prompt_includes_instructions() -> None:
+    model = FakeModelClient(_enrich_payload([_model("deals")]))
+    client = LlmWrenClient(_config(), model)
+
+    client.propose_mdl_from_document(
+        project=_project(),
+        document=_document(),
+        instructions=["Prefer gross over net", "Name metrics in snake_case"],
+    )
+
+    payload = _payload_sent(model.calls[0])
+    assert payload["instructions"] == [
+        "Prefer gross over net",
+        "Name metrics in snake_case",
+    ]
+
+
+def test_enrichment_omits_instructions_when_none() -> None:
+    model = FakeModelClient(_enrich_payload([_model("deals")]))
+    client = LlmWrenClient(_config(), model)
+
+    client.propose_mdl_from_document(project=_project(), document=_document())
+
+    assert "instructions" not in _payload_sent(model.calls[0])

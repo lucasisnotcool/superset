@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 import hashlib
-import json
+import json  # noqa: TID251 - standalone agent: stable scope-hash serialization
 from typing import Protocol
 
 from superset_ai_agent.conversations.schemas import ConversationScope
@@ -173,6 +173,26 @@ def scope_hash(scope: ConversationScope) -> str:
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def instruction_scope_hash(scope: ConversationScope) -> str:
+    """Scope hash for **instructions** — schema-level (dataset selection ignored).
+
+    Instructions are operator guidance for a database/catalog/schema, not for a
+    transient per-query dataset selection. The authoring UI scopes them at the schema
+    level (``dataset_ids=[]``), but a chat query carries the user's selected
+    ``dataset_ids``; hashing those in would give the two a different ``scope_hash`` and
+    silently hide every authored instruction whenever a query has datasets selected.
+    (``is_global`` does not rescue it — recall filters by ``scope_hash`` *before* the
+    global split.) Excluding ``dataset_ids`` makes authoring and recall agree.
+
+    Distinct from :func:`scope_hash` (used for NL→SQL memory, which is legitimately
+    dataset-scoped) — do not unify the two.
+    """
+
+    if scope.dataset_ids:
+        scope = scope.model_copy(update={"dataset_ids": []})
+    return scope_hash(scope)
 
 
 def scope_matches(left: ConversationScope, right: ConversationScope) -> bool:

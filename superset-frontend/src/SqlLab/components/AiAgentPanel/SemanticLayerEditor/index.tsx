@@ -33,6 +33,7 @@ import {
   Flex,
   Input,
   Switch,
+  Tabs,
   Tooltip,
   Typography,
 } from '@superset-ui/core/components';
@@ -59,6 +60,7 @@ import {
 } from '../api';
 import SemanticLayerStateBadge from '../SemanticLayerStateBadge';
 import SemanticLayerImportDialog from './SemanticLayerImportDialog';
+import InstructionsPanel from './InstructionsPanel';
 
 const EditorRoot = styled.div`
   ${({ theme }) => css`
@@ -78,6 +80,39 @@ const EditorHeader = styled.div`
     gap: ${theme.sizeUnit * 2}px;
     padding: ${theme.sizeUnit * 3}px;
     border-bottom: 1px solid ${theme.colorBorderSecondary};
+  `}
+`;
+
+const ContentTabs = styled(Tabs)`
+  ${({ theme }) => css`
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    flex-direction: column;
+
+    .ant-tabs-nav {
+      margin: 0 ${theme.sizeUnit * 3}px;
+    }
+
+    .ant-tabs-content-holder {
+      display: flex;
+      min-height: 0;
+      flex: 1;
+    }
+
+    .ant-tabs-content {
+      height: 100%;
+    }
+
+    // Only the active pane flexes to full height; scoping to -active leaves
+    // antd's .ant-tabs-tabpane-hidden { display: none } unopposed so the
+    // inactive pane stays hidden instead of showing through.
+    .ant-tabs-tabpane-active {
+      display: flex;
+      min-height: 0;
+      height: 100%;
+      flex-direction: column;
+    }
   `}
 `;
 
@@ -437,160 +472,185 @@ export default function SemanticLayerEditor({
           <SemanticLayerStateBadge state={state} />
         </Flex>
       </EditorHeader>
-      <EditorBody>
-        <BrowserPane>
-          {!scope.schema_name && (
-            <Alert
-              type="warning"
-              message={t('Select a database and schema.')}
-            />
-          )}
-          <Flex gap="small" wrap="wrap">
-            <Button
-              buttonStyle="primary"
-              disabled={!project || !canWrite || isLoading}
-              onClick={() => saveFile()}
-              icon={<Icons.SaveOutlined iconSize="m" />}
-            >
-              {t('Save')}
-            </Button>
-            <Button
-              buttonStyle="tertiary"
-              disabled={!project || !canWrite || isLoading}
-              onClick={startNewFile}
-              icon={<Icons.PlusOutlined iconSize="m" />}
-            >
-              {t('New')}
-            </Button>
-          </Flex>
-          <ScrollList>
-            {mdlFiles.map(file => (
-              <FileButton
-                key={file.id}
-                role="button"
-                tabIndex={0}
-                data-active={file.id === activeFileId}
-                onClick={() => selectFile(file)}
-                onKeyDown={event => {
-                  if (event.key === 'Enter' || event.key === ' ') {
-                    event.preventDefault();
-                    selectFile(file);
-                  }
-                }}
-              >
-                <FilePath>{file.path}</FilePath>
-                <ToggleCell
-                  // Keep clicks/keys on the toggle from selecting the row.
-                  onClick={event => event.stopPropagation()}
-                  onKeyDown={event => event.stopPropagation()}
-                  role="presentation"
-                >
-                  <Tooltip title={STATUS_TOGGLE_HELP}>
-                    <Switch
-                      size="small"
-                      checked={file.status === 'active'}
-                      disabled={!canWrite || isLoading}
-                      checkedChildren={t('Active')}
-                      unCheckedChildren={t('Draft')}
-                      onChange={checked => toggleFileStatus(file, checked)}
+      <ContentTabs
+        defaultActiveKey="models"
+        items={[
+          {
+            key: 'models',
+            label: t('Models'),
+            children: (
+              <EditorBody>
+                <BrowserPane>
+                  {!scope.schema_name && (
+                    <Alert
+                      type="warning"
+                      message={t('Select a database and schema.')}
                     />
-                  </Tooltip>
-                </ToggleCell>
-              </FileButton>
-            ))}
-          </ScrollList>
-          <Button
-            block
-            buttonStyle="tertiary"
-            disabled={
-              !project || !canWrite || isLoading || mdlFiles.length === 0
-            }
-            onClick={() => setAllStatuses(!allActive)}
-            icon={
-              allActive ? (
-                <Icons.MinusCircleOutlined iconSize="m" />
-              ) : (
-                <Icons.CheckCircleOutlined iconSize="m" />
-              )
-            }
-          >
-            {allActive ? t('Deactivate all') : t('Activate all')}
-          </Button>
-          <Flex gap="small" wrap="wrap">
-            <Button
-              buttonStyle="tertiary"
-              disabled={!project || !canWrite || isLoading}
-              onClick={() => setShowImportDialog(true)}
-              icon={<Icons.UploadOutlined iconSize="m" />}
-            >
-              {t('Add…')}
-            </Button>
-            <Button
-              buttonStyle="tertiary"
-              loading={isOnboarding}
-              disabled={!project || !canWrite || isLoading || isOnboarding}
-              onClick={onboardProject}
-              icon={<Icons.DatabaseOutlined iconSize="m" />}
-            >
-              {isOnboarding ? t('Onboarding…') : t('Onboard')}
-            </Button>
-          </Flex>
-        </BrowserPane>
-        <EditorPane>
-          <Input
-            value={editorPath}
-            disabled={!canWrite || isLoading}
-            onChange={(event: ChangeEvent<HTMLInputElement>) =>
-              setEditorPath(event.target.value)
-            }
-          />
-          <StyledEditorHost
-            id={`semantic-mdl-${project?.id || 'empty'}`}
-            height="100%"
-            language="json"
-            onChange={setEditorValue}
-            readOnly={!canWrite || isLoading}
-            value={editorValue}
-            width="100%"
-          />
-          {activeFile?.validation && !activeFile.validation.valid && (
-            <Alert
-              type="warning"
-              message={activeFile.validation.messages
-                .map(message => message.message)
-                .join('\n')}
-            />
-          )}
-          <Flex justify="space-between" gap="small" wrap="wrap">
-            <Flex gap="small" wrap="wrap">
-              <Button
-                buttonStyle="primary"
-                disabled={!project || !canWrite || isLoading}
-                onClick={() => saveFile()}
-                icon={<Icons.SaveOutlined iconSize="m" />}
-              >
-                {t('Save draft')}
-              </Button>
-              <Button
-                buttonStyle="tertiary"
-                disabled={!project || !canWrite || isLoading}
-                onClick={() => saveFile('active')}
-                icon={<Icons.CheckCircleOutlined iconSize="m" />}
-              >
-                {t('Activate')}
-              </Button>
-            </Flex>
-            <Button
-              buttonStyle="danger"
-              disabled={!activeFile || !project || !canWrite || isLoading}
-              onClick={() => activeFile && deleteFile(activeFile)}
-              icon={<Icons.DeleteOutlined iconSize="m" />}
-            >
-              {t('Delete')}
-            </Button>
-          </Flex>
-        </EditorPane>
-      </EditorBody>
+                  )}
+                  <Flex gap="small" wrap="wrap">
+                    <Button
+                      buttonStyle="primary"
+                      disabled={!project || !canWrite || isLoading}
+                      onClick={() => saveFile()}
+                      icon={<Icons.SaveOutlined iconSize="m" />}
+                    >
+                      {t('Save')}
+                    </Button>
+                    <Button
+                      buttonStyle="tertiary"
+                      disabled={!project || !canWrite || isLoading}
+                      onClick={startNewFile}
+                      icon={<Icons.PlusOutlined iconSize="m" />}
+                    >
+                      {t('New')}
+                    </Button>
+                  </Flex>
+                  <ScrollList>
+                    {mdlFiles.map(file => (
+                      <FileButton
+                        key={file.id}
+                        role="button"
+                        tabIndex={0}
+                        data-active={file.id === activeFileId}
+                        onClick={() => selectFile(file)}
+                        onKeyDown={event => {
+                          if (event.key === 'Enter' || event.key === ' ') {
+                            event.preventDefault();
+                            selectFile(file);
+                          }
+                        }}
+                      >
+                        <FilePath>{file.path}</FilePath>
+                        <ToggleCell
+                          // Keep clicks/keys on the toggle from selecting the row.
+                          onClick={event => event.stopPropagation()}
+                          onKeyDown={event => event.stopPropagation()}
+                          role="presentation"
+                        >
+                          <Tooltip title={STATUS_TOGGLE_HELP}>
+                            <Switch
+                              size="small"
+                              checked={file.status === 'active'}
+                              disabled={!canWrite || isLoading}
+                              checkedChildren={t('Active')}
+                              unCheckedChildren={t('Draft')}
+                              onChange={checked =>
+                                toggleFileStatus(file, checked)
+                              }
+                            />
+                          </Tooltip>
+                        </ToggleCell>
+                      </FileButton>
+                    ))}
+                  </ScrollList>
+                  <Button
+                    block
+                    buttonStyle="tertiary"
+                    disabled={
+                      !project ||
+                      !canWrite ||
+                      isLoading ||
+                      mdlFiles.length === 0
+                    }
+                    onClick={() => setAllStatuses(!allActive)}
+                    icon={
+                      allActive ? (
+                        <Icons.MinusCircleOutlined iconSize="m" />
+                      ) : (
+                        <Icons.CheckCircleOutlined iconSize="m" />
+                      )
+                    }
+                  >
+                    {allActive ? t('Deactivate all') : t('Activate all')}
+                  </Button>
+                  <Flex gap="small" wrap="wrap">
+                    <Button
+                      buttonStyle="tertiary"
+                      disabled={!project || !canWrite || isLoading}
+                      onClick={() => setShowImportDialog(true)}
+                      icon={<Icons.UploadOutlined iconSize="m" />}
+                    >
+                      {t('Add…')}
+                    </Button>
+                    <Button
+                      buttonStyle="tertiary"
+                      loading={isOnboarding}
+                      disabled={
+                        !project || !canWrite || isLoading || isOnboarding
+                      }
+                      onClick={onboardProject}
+                      icon={<Icons.DatabaseOutlined iconSize="m" />}
+                    >
+                      {isOnboarding ? t('Onboarding…') : t('Onboard')}
+                    </Button>
+                  </Flex>
+                </BrowserPane>
+                <EditorPane>
+                  <Input
+                    value={editorPath}
+                    disabled={!canWrite || isLoading}
+                    onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                      setEditorPath(event.target.value)
+                    }
+                  />
+                  <StyledEditorHost
+                    id={`semantic-mdl-${project?.id || 'empty'}`}
+                    height="100%"
+                    language="json"
+                    onChange={setEditorValue}
+                    readOnly={!canWrite || isLoading}
+                    value={editorValue}
+                    width="100%"
+                  />
+                  {activeFile?.validation && !activeFile.validation.valid && (
+                    <Alert
+                      type="warning"
+                      message={activeFile.validation.messages
+                        .map(message => message.message)
+                        .join('\n')}
+                    />
+                  )}
+                  <Flex justify="space-between" gap="small" wrap="wrap">
+                    <Flex gap="small" wrap="wrap">
+                      <Button
+                        buttonStyle="primary"
+                        disabled={!project || !canWrite || isLoading}
+                        onClick={() => saveFile()}
+                        icon={<Icons.SaveOutlined iconSize="m" />}
+                      >
+                        {t('Save draft')}
+                      </Button>
+                      <Button
+                        buttonStyle="tertiary"
+                        disabled={!project || !canWrite || isLoading}
+                        onClick={() => saveFile('active')}
+                        icon={<Icons.CheckCircleOutlined iconSize="m" />}
+                      >
+                        {t('Activate')}
+                      </Button>
+                    </Flex>
+                    <Button
+                      buttonStyle="danger"
+                      disabled={
+                        !activeFile || !project || !canWrite || isLoading
+                      }
+                      onClick={() => activeFile && deleteFile(activeFile)}
+                      icon={<Icons.DeleteOutlined iconSize="m" />}
+                    >
+                      {t('Delete')}
+                    </Button>
+                  </Flex>
+                </EditorPane>
+              </EditorBody>
+            ),
+          },
+          {
+            key: 'instructions',
+            label: t('Instructions'),
+            children: <InstructionsPanel scope={scope} canWrite={canWrite} />,
+          },
+        ]}
+      />
       <SemanticLayerImportDialog
         show={showImportDialog}
         onHide={() => setShowImportDialog(false)}

@@ -153,6 +153,14 @@ class SemanticLayerIndexRequest(BaseModel):
     scope: ConversationScope
 
 
+class InstructionCreateRequest(BaseModel):
+    """Request to add a user-authored instruction for a scope (Wren guidance)."""
+
+    scope: ConversationScope
+    instruction: str
+    is_global: bool = False
+
+
 class SemanticLayerEvent(BaseModel):
     """Semantic-layer event for polling or server-sent events."""
 

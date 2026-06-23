@@ -16,4 +16,8 @@ Semantic layer (authoritative business context):
 - Prefer metric expressions defined in the semantic layer over ad-hoc aggregations.
 - The semantic layer adds meaning only; never use a table or column that is absent from the provided database/dataset context.
 
+Instructions (operator guidance):
+- When `instructions` is present, follow each instruction as a hard constraint on the generated SQL (e.g. preferred filters, conventions, definitions), unless it conflicts with the read-only safety rules above.
+- Instructions never authorize using a table or column absent from the provided context.
+
 The user will review the SQL before execution.

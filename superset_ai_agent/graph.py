@@ -57,12 +57,17 @@ from superset_ai_agent.semantic_layer.engine.planning import (
     plan_semantic_sql_step,
     with_engine_provenance,
 )
+from superset_ai_agent.semantic_layer.instructions import (
+    InstructionStore,
+    NullInstructionStore,
+)
 from superset_ai_agent.semantic_layer.mdl_files import MdlFileStore
 from superset_ai_agent.semantic_layer.memory_store import Memory, NullMemory
 from superset_ai_agent.semantic_layer.projects import SemanticProjectStore
 from superset_ai_agent.semantic_layer.runtime import (
-    cap_context_items,
+    build_unified_context,
     merge_indexed_semantic_context,
+    ModelSelector,
 )
 from superset_ai_agent.semantic_layer.schema_retriever import (
     create_retriever,
@@ -70,7 +75,11 @@ from superset_ai_agent.semantic_layer.schema_retriever import (
     Retriever,
 )
 from superset_ai_agent.semantic_layer.schemas import WrenMaterializationResult
-from superset_ai_agent.semantic_layer.store import scope_hash, SemanticLayerStore
+from superset_ai_agent.semantic_layer.store import (
+    instruction_scope_hash,
+    scope_hash,
+    SemanticLayerStore,
+)
 from superset_ai_agent.semantic_layer.wren_runtime import (
     materialize_request_semantic_project,
 )
@@ -88,6 +97,102 @@ _SEMANTIC_SQL_GUIDANCE = (
     "rewrites your query into native SQL. Never reference tables or columns "
     "absent from the provided semantic context."
 )
+
+
+_TABLE_SELECTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"models": {"type": "array", "items": {"type": "string"}}},
+    "required": ["models"],
+}
+
+
+def llm_select_models(
+    model_client: ModelClient,
+    question: str,
+    candidates: list[str],
+    limit: int,
+) -> list[str] | None:
+    """Ask the model to pick the relevant model subset (C1.3); ``None`` to defer.
+
+    Returns chosen names validated against ``candidates`` (hallucinated names
+    dropped), in retriever-rank order, capped to ``limit`` (when > 0). Returns
+    ``None`` on a missing prompt, a provider error, or an unparseable/empty result —
+    so :func:`build_unified_context` degrades closed to the heuristic selector.
+    """
+
+    if not candidates:
+        return None
+    try:
+        prompt = get_prompt("table_selection")
+    except OSError:
+        return None
+    payload = {
+        "question": question,
+        "candidate_models": candidates,
+        "max_models": limit,
+    }
+    try:
+        result = model_client.chat(
+            [
+                ChatMessage(role="system", content=prompt),
+                ChatMessage(
+                    role="user",
+                    content=(
+                        "Select the relevant models. Return only JSON matching the "
+                        f"schema.\n{json.dumps(payload, default=str)}"
+                    ),
+                ),
+            ],
+            format_schema=_TABLE_SELECTION_SCHEMA,
+        )
+        data = json.loads(result.content)
+    except Exception:  # pylint: disable=broad-except - degrade to heuristic
+        return None
+    chosen = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(chosen, list):
+        return None
+    chosen_names = {str(name) for name in chosen}
+    # Preserve retriever rank order; keep only real candidates; cap to the limit.
+    ordered = [name for name in candidates if name in chosen_names]
+    if limit > 0:
+        ordered = ordered[:limit]
+    return ordered or None
+
+
+def dry_plan_diagnostics(dry_plan: dict[str, Any] | None) -> list[str]:
+    """Actionable engine diagnostics from a Wren dry-plan, for repair (C2.2).
+
+    The dry-plan node collects engine planning metadata once on the initial draft;
+    its error signals — a hallucinated table/column the engine could not resolve, an
+    unsupported expression — are exactly what a repair should address, beyond the
+    read-only validator's syntactic errors. Pulls the common diagnostic shapes
+    (``error`` string, ``errors`` list) defensively and degrades to ``[]`` for an
+    unavailable or diagnostic-free plan. Deduped to avoid inflating the prompt.
+
+    Note: the dry-plan runs once on the initial draft (not re-run inside the repair
+    loop), so these diagnostics describe the *first* SQL — still useful guidance for
+    every repair attempt.
+    """
+
+    if not isinstance(dry_plan, dict):
+        return []
+    raw: list[str] = []
+    error = dry_plan.get("error")
+    if isinstance(error, str) and error.strip():
+        raw.append(error.strip())
+    errors = dry_plan.get("errors")
+    if isinstance(errors, list):
+        for item in errors:
+            text = (item if isinstance(item, str) else str(item)).strip()
+            if text:
+                raw.append(text)
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for text in raw:
+        if text not in seen:
+            seen.add(text)
+            deduped.append(text)
+    return deduped
 
 
 class SqlDraft(BaseModel):
@@ -122,6 +227,7 @@ class AgentState(TypedDict, total=False):
     engine_correctable_warnings: list[str]
     engine_correction_attempts: int
     recalled_examples: list[dict[str, Any]]
+    instructions: list[str]
     trace: list[TraceEvent]
     repair_attempts: int
     error: str | None
@@ -144,6 +250,7 @@ class TextToSqlGraph:
         semantic_engine: SemanticEngine | None = None,
         memory: Memory | None = None,
         retriever: Retriever | None = None,
+        instruction_store: InstructionStore | None = None,
     ):
         self.config = config
         self.model_client = model_client
@@ -156,6 +263,7 @@ class TextToSqlGraph:
         self.semantic_engine = semantic_engine or create_semantic_engine(config)
         self.memory = memory or NullMemory()
         self.retriever = retriever or create_retriever(config, create_embedder(config))
+        self.instruction_store = instruction_store or NullInstructionStore()
         self.graph = self._compile_graph()
 
     def run(
@@ -347,6 +455,9 @@ class TextToSqlGraph:
             ),
             owner_id=state.get("owner_id", DEFAULT_OWNER_ID),
             wren_context=wren_context,
+            # E1/E6: single-source by default — skip the legacy doc overlay unless
+            # explicitly re-enabled.
+            enabled=self.config.wren_semantic_overlay_enabled,
         )
         if materialization is not None:
             warnings = list(wren_context.warnings)
@@ -369,24 +480,16 @@ class TextToSqlGraph:
             owner_id=state.get("owner_id", DEFAULT_OWNER_ID),
             mdl_file_store=self.mdl_file_store,
         )
-        if retrieved_items:
-            wren_context = wren_context.model_copy(
-                update={
-                    "context_items": [
-                        *wren_context.context_items,
-                        *retrieved_items,
-                    ],
-                    "retrieval_mode": retrieved_items[0]["retriever"],
-                    "retrieved_item_count": len(retrieved_items),
-                }
-            )
-        # Dedup + bound the merged context across all sources (R-RET-E).
-        wren_context = wren_context.model_copy(
-            update={
-                "context_items": cap_context_items(
-                    wren_context.context_items, self.config.wren_max_context_items
-                )
-            }
+        # R2/C1: one post-retrieval entrypoint — unify fetch_context + overlay +
+        # retriever chunks, run table-selection over the *unified* set (C1.1), then
+        # dedup + bound across all sources (R-RET-E). C1.3: an opt-in LLM selector
+        # picks the relevant model subset, degrading closed to the heuristic.
+        wren_context = build_unified_context(
+            wren_context=wren_context,
+            retrieved_items=retrieved_items,
+            table_selection_limit=self.config.wren_table_selection_limit,
+            max_context_items=self.config.wren_max_context_items,
+            model_selector=self._model_selector(request.question),
         )
         retrieval_artifact = state.get("wren_retrieval")
         if retrieval_artifact is not None and project_id is not None:
@@ -418,26 +521,64 @@ class TextToSqlGraph:
             ],
         }
 
-    def _request_scope_hash(self, request: AgentQueryRequest) -> str:
-        return scope_hash(
-            ConversationScope(
-                database_id=request.database_id,
-                catalog_name=request.catalog_name,
-                schema_name=request.schema_name,
-                dataset_ids=request.dataset_ids,
+    def _model_selector(self, question: str) -> ModelSelector | None:
+        """Build the C1.3 LLM model selector when enabled, else ``None`` (heuristic).
+
+        The closure binds the question + model client; ``build_unified_context``
+        calls it with the candidate model names and degrades closed on a ``None``.
+        """
+
+        if not self.config.wren_llm_table_selection:
+            return None
+
+        def selector(candidates: list[str]) -> list[str] | None:
+            return llm_select_models(
+                self.model_client,
+                question,
+                candidates,
+                self.config.wren_table_selection_limit,
             )
+
+        return selector
+
+    def _request_scope(self, request: AgentQueryRequest) -> ConversationScope:
+        return ConversationScope(
+            database_id=request.database_id,
+            catalog_name=request.catalog_name,
+            schema_name=request.schema_name,
+            dataset_ids=request.dataset_ids,
         )
+
+    def _request_scope_hash(self, request: AgentQueryRequest) -> str:
+        return scope_hash(self._request_scope(request))
+
+    def _instruction_scope_hash(self, request: AgentQueryRequest) -> str:
+        return instruction_scope_hash(self._request_scope(request))
 
     def _draft_sql(self, state: AgentState) -> AgentState:
         request = state["request"]
         context = state["context"]
+        scope_hash_value = self._request_scope_hash(request)
+        owner_id = state.get("owner_id", DEFAULT_OWNER_ID)
         recalled = [
             pair.model_dump()
             for pair in self.memory.recall_examples(
                 request.question,
-                scope_hash=self._request_scope_hash(request),
-                owner_id=state.get("owner_id", DEFAULT_OWNER_ID),
+                scope_hash=scope_hash_value,
+                owner_id=owner_id,
                 k=self.config.wren_memory_recall_k,
+            )
+        ]
+        instructions = [
+            item.instruction
+            for item in self.instruction_store.recall(
+                request.question,
+                # Instructions are schema-scoped (dataset selection ignored) so an
+                # editor-authored instruction is recalled regardless of the query's
+                # selected datasets (C5.1 fix); memory recall above stays query-scoped.
+                scope_hash=self._instruction_scope_hash(request),
+                owner_id=owner_id,
+                k=self.config.wren_instruction_recall_k,
             )
         ]
         draft = self._call_sql_model(
@@ -446,6 +587,7 @@ class TextToSqlGraph:
             wren_context=state.get("wren_context"),
             validation_errors=[],
             recalled_examples=recalled,
+            instructions=instructions,
         )
         # Stamp how many learned examples were recalled so the UI can badge it.
         wren_context = state.get("wren_context")
@@ -458,6 +600,7 @@ class TextToSqlGraph:
             "sql": draft.sql,
             "explanation": draft.explanation,
             "recalled_examples": recalled,
+            "instructions": instructions,
             "wren_context": wren_context,
             "trace": [
                 *state.get("trace", []),
@@ -598,14 +741,24 @@ class TextToSqlGraph:
         request = state["request"]
         context = state["context"]
         validation = state["validation"]
-        # Fold semantic-engine feedback into the repair prompt (1.4).
-        repair_errors = [*validation.errors, *state.get("engine_warnings", [])]
+        # Fold semantic-engine feedback (1.4) and Wren dry-plan diagnostics (C2.2)
+        # into the repair prompt — the engine's planning errors, not just the
+        # read-only validator's syntax errors.
+        dry_plan_errors = dry_plan_diagnostics(
+            getattr(state.get("wren_context"), "dry_plan", None)
+        )
+        repair_errors = [
+            *validation.errors,
+            *state.get("engine_warnings", []),
+            *dry_plan_errors,
+        ]
         draft = self._call_sql_model(
             request=request,
             context=context,
             wren_context=state.get("wren_context"),
             validation_errors=repair_errors,
             recalled_examples=state.get("recalled_examples", []),
+            instructions=state.get("instructions", []),
         )
         return {
             **state,
@@ -617,7 +770,10 @@ class TextToSqlGraph:
                 TraceEvent(
                     step="repair_sql",
                     summary="Asked the model to repair invalid SQL.",
-                    details={"errors": validation.errors},
+                    details={
+                        "errors": validation.errors,
+                        "dry_plan_diagnostics": dry_plan_errors,
+                    },
                 ),
             ],
         }
@@ -764,6 +920,7 @@ class TextToSqlGraph:
             wren_context=state.get("wren_context"),
             validation_errors=warnings,
             recalled_examples=state.get("recalled_examples", []),
+            instructions=state.get("instructions", []),
         )
         return {
             **state,
@@ -792,6 +949,7 @@ class TextToSqlGraph:
         wren_context: WrenContextArtifact | None,
         validation_errors: list[str],
         recalled_examples: list[dict[str, Any]] | None = None,
+        instructions: list[str] | None = None,
     ) -> SqlDraft:
         prompt = get_prompt("text_to_sql")
         semantic_sql_mode = (
@@ -811,6 +969,8 @@ class TextToSqlGraph:
                 _SEMANTIC_SQL_GUIDANCE if semantic_sql_mode else None
             ),
             "recalled_examples": recalled_examples or [],
+            # User-authored guidance (Wren `instructions`) steers generation.
+            "instructions": instructions or [],
         }
         schema = SqlDraft.model_json_schema()
         result = self.model_client.chat(

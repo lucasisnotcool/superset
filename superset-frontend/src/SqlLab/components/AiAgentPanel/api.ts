@@ -459,6 +459,14 @@ export interface SemanticJob {
   updated_at: string;
 }
 
+export interface Instruction {
+  id: string;
+  instruction: string;
+  is_global: boolean;
+  project_id?: string | null;
+  created_at: string;
+}
+
 const trimTrailingSlash = (url: string) => url.replace(/\/+$/, '');
 
 export const getAgentBaseUrl = () =>
@@ -1030,4 +1038,26 @@ export const createProjectSemanticLayerEventSource = (projectId: string) =>
   new EventSource(
     `${getAgentBaseUrl()}/agent/semantic-layer/projects/${projectId}/events`,
     { withCredentials: true },
+  );
+
+export const listInstructions = (scope: ConversationScope) =>
+  requestJson<Instruction[]>(
+    `/agent/semantic-layer/instructions?${semanticScopeParams(scope)}`,
+    { method: 'GET' },
+  );
+
+export const createInstruction = (
+  scope: ConversationScope,
+  instruction: string,
+  isGlobal: boolean,
+) =>
+  requestJson<Instruction>('/agent/semantic-layer/instructions', {
+    method: 'POST',
+    body: JSON.stringify({ scope, instruction, is_global: isGlobal }),
+  });
+
+export const deleteInstruction = (instructionId: string) =>
+  requestJson<{ deleted: boolean }>(
+    `/agent/semantic-layer/instructions/${instructionId}`,
+    { method: 'DELETE' },
   );

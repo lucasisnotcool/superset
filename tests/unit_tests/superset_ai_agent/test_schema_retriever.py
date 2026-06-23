@@ -429,3 +429,94 @@ def test_openai_embedder_live_smoke() -> None:  # pragma: no cover - network
     vectors = embedder.embed(["quarterly revenue by region"])
     assert len(vectors) == 1
     assert len(vectors[0]) == 256
+
+
+# --- E6: eager re-index on activation -----------------------------------------
+
+
+from superset_ai_agent.semantic_layer.schema_retriever import (  # noqa: E402
+    ensure_project_indexed,
+    reindex_project_mdl,
+)
+from superset_ai_agent.semantic_layer.schemas import MdlFile  # noqa: E402
+
+
+def _active_file(content: str = _MDL) -> MdlFile:
+    return MdlFile(
+        project_id="p1",
+        path="models/m.json",
+        filename="m.json",
+        content=content,
+        checksum="c",
+        status="active",
+    )
+
+
+class _FakeMdlStore:
+    def __init__(self, files):
+        self._files = files
+
+    def list(self, project_id, *, owner_id="local"):
+        return list(self._files)
+
+
+class _RaisingMdlStore:
+    def list(self, project_id, *, owner_id="local"):
+        raise RuntimeError("db down")
+
+
+def test_ensure_project_indexed_builds_index() -> None:
+    retriever = KeywordRetriever()
+    store = _FakeMdlStore([_active_file()])
+
+    result = ensure_project_indexed(
+        retriever=retriever, project_id="p1", owner_id="u1", mdl_file_store=store
+    )
+
+    assert result is not None
+    scope_key, checksum = result
+    assert scope_key == "u1:p1"
+    assert retriever.has_index(scope_key, checksum)  # eagerly indexed
+
+
+def test_ensure_project_indexed_none_without_active_files() -> None:
+    store = _FakeMdlStore([])  # no active MDL
+    assert (
+        ensure_project_indexed(
+            retriever=KeywordRetriever(),
+            project_id="p1",
+            owner_id="u1",
+            mdl_file_store=store,
+        )
+        is None
+    )
+
+
+def test_reindex_project_mdl_eagerly_indexes_without_a_query() -> None:
+    # E6: activation primes the index so retrieval reflects the new MDL with no
+    # first-query build cost.
+    retriever = KeywordRetriever()
+    store = _FakeMdlStore([_active_file()])
+
+    assert (
+        reindex_project_mdl(
+            retriever=retriever, project_id="p1", owner_id="u1", mdl_file_store=store
+        )
+        is True
+    )
+    # Index is present even though retrieve() was never called.
+    checksum = retriever._index.get("u1:p1").checksum  # type: ignore[union-attr]
+    assert retriever.has_index("u1:p1", checksum)
+
+
+def test_reindex_project_mdl_swallows_errors() -> None:
+    # Activation must never fail because re-indexing hiccupped.
+    assert (
+        reindex_project_mdl(
+            retriever=KeywordRetriever(),
+            project_id="p1",
+            owner_id="u1",
+            mdl_file_store=_RaisingMdlStore(),
+        )
+        is False
+    )

@@ -44,40 +44,120 @@ from superset_ai_agent.semantic_layer.schemas import (
 
 @dataclass
 class SchemaIndex:
-    """Permission-filtered physical schema used for MDL validation."""
+    """Permission-filtered physical schema used for MDL validation.
+
+    ``tables`` carries column **names**; ``column_types`` (table → {column: type})
+    carries catalog **types** when they are available (C3). Types come only from the
+    *live* ``from_agent_context`` path — the persisted ``from_snapshot`` is names-only,
+    so type grounding/checking degrades closed to the names-only behavior on a
+    Superset outage (snapshot uniformity is intentionally preserved).
+    """
 
     tables: dict[str, set[str]] = field(default_factory=dict)
+    column_types: dict[str, dict[str, str]] = field(default_factory=dict)
 
     @classmethod
     def from_agent_context(cls, context: AgentContext) -> "SchemaIndex":
         tables: dict[str, set[str]] = {}
+        column_types: dict[str, dict[str, str]] = {}
         for dataset in context.datasets:
             if not dataset.table_name:
                 continue
-            tables[dataset.table_name.lower()] = {
+            table = dataset.table_name.lower()
+            tables[table] = {
                 column.name.lower() for column in dataset.columns if column.name
             }
-        return cls(tables=tables)
+            types = {
+                column.name.lower(): column.type
+                for column in dataset.columns
+                if column.name and column.type
+            }
+            if types:
+                column_types[table] = types
+        return cls(tables=tables, column_types=column_types)
 
     @classmethod
-    def from_snapshot(cls, tables: dict[str, list[str]]) -> "SchemaIndex":
-        return cls(
+    def from_snapshot(
+        cls,
+        tables: dict[str, list[str]],
+        types: dict[str, dict[str, str]] | None = None,
+    ) -> "SchemaIndex":
+        index = cls(
             tables={
                 str(table).lower(): {str(column).lower() for column in columns}
                 for table, columns in tables.items()
             }
         )
+        if types:
+            index.column_types = {
+                str(table).lower(): {
+                    str(column).lower(): str(type_)
+                    for column, type_ in cols.items()
+                }
+                for table, cols in types.items()
+            }
+        return index
 
     def to_tables(self) -> dict[str, list[str]]:
         """Serialize for persistence (sets become sorted lists)."""
 
         return {table: sorted(columns) for table, columns in self.tables.items()}
 
+    def typed_tables(self) -> dict[str, dict[str, str]]:
+        """Table → {column: type} for prompt grounding; empty when no types known."""
+
+        return {
+            table: dict(cols) for table, cols in self.column_types.items() if cols
+        }
+
+    def has_types(self) -> bool:
+        return any(self.column_types.values())
+
     def has_table(self, table: str) -> bool:
         return table.lower() in self.tables
 
     def has_column(self, table: str, column: str) -> bool:
         return column.lower() in self.tables.get(table.lower(), set())
+
+    def column_type(self, table: str, column: str) -> str | None:
+        return self.column_types.get(table.lower(), {}).get(column.lower())
+
+
+#: Coarse type families for the C3 cross-family mismatch check. Substring match on
+#: the base type (params stripped), so VARCHAR(255)→string, BIGINT→numeric. Anything
+#: unrecognized maps to ``None`` and is never flagged — the check fires only on an
+#: unambiguous family mismatch (e.g. a numeric MDL type on a VARCHAR column), keeping
+#: false positives near zero given catalog vs. MDL type-vocabulary differences.
+_TYPE_FAMILIES: dict[str, tuple[str, ...]] = {
+    "temporal": ("DATE", "TIME", "TIMESTAMP"),
+    "boolean": ("BOOL",),
+    "string": ("CHAR", "TEXT", "STRING", "CLOB", "UUID"),
+    # "BIT" is intentionally excluded — it is boolean in some dialects, numeric in
+    # others, so flagging it cross-family would be a false positive.
+    "numeric": (
+        "INT", "DEC", "NUMERIC", "NUMBER", "FLOAT", "DOUBLE", "REAL", "SERIAL",
+        "MONEY",
+    ),
+}
+
+
+def _type_family(type_str: str | None) -> str | None:
+    """Map a SQL/MDL type to a coarse family, or ``None`` when unrecognized.
+
+    ``temporal``/``boolean`` are checked before ``numeric`` so ``TIMESTAMP`` (which
+    contains ``TIME``) and ``BOOLEAN`` are not misread; ``string`` before ``numeric``
+    is irrelevant but kept ordered for clarity.
+    """
+
+    if not type_str:
+        return None
+    base = type_str.upper().split("(", 1)[0].strip()
+    if not base:
+        return None
+    for family, keywords in _TYPE_FAMILIES.items():
+        if any(keyword in base for keyword in keywords):
+            return family
+    return None
 
 
 def validate_mdl(
@@ -319,47 +399,115 @@ def _validate_columns(
                 )
             )
         seen_columns.add(column_name)
+        _validate_column_semantics(
+            model_name=model_name,
+            column=column,
+            column_name=column_name,
+            table=table,
+            table_known=table_known,
+            schema_index=schema_index,
+            messages=messages,
+        )
 
-        is_calculated = bool(column.get("isCalculated"))
-        if is_calculated and not column.get("expression"):
-            messages.append(
-                MdlValidationMessage(
-                    message=(
-                        f"Calculated column {model_name}.{column_name} requires "
-                        "an expression."
-                    ),
-                    code="calculated_requires_expression",
-                )
+
+def _validate_column_semantics(
+    *,
+    model_name: str,
+    column: dict[str, Any],
+    column_name: str,
+    table: str | None,
+    table_known: bool,
+    schema_index: SchemaIndex | None,
+    messages: list[MdlValidationMessage],
+) -> None:
+    """Per-column semantic checks: calculated, type presence, physical mapping (C3)."""
+
+    is_calculated = bool(column.get("isCalculated"))
+    is_relationship = bool(column.get("relationship"))
+    if is_calculated and not column.get("expression"):
+        messages.append(
+            MdlValidationMessage(
+                message=(
+                    f"Calculated column {model_name}.{column_name} requires "
+                    "an expression."
+                ),
+                code="calculated_requires_expression",
             )
-        # W5: wren-core requires every non-relationship column to carry a `type`.
-        # Catch it here with a readable, field-anchored message instead of letting
-        # it surface as the engine's opaque "missing field `type`" serde offset.
-        if not column.get("relationship") and not column.get("type"):
-            messages.append(
-                MdlValidationMessage(
-                    message=(
-                        f"Column {model_name}.{column_name} is missing a type; "
-                        "wren-core requires a type on every column."
-                    ),
-                    code="column_without_type",
-                )
+        )
+    # W5: wren-core requires every non-relationship column to carry a `type`.
+    # Catch it here with a readable, field-anchored message instead of letting
+    # it surface as the engine's opaque "missing field `type`" serde offset.
+    if not is_relationship and not column.get("type"):
+        messages.append(
+            MdlValidationMessage(
+                message=(
+                    f"Column {model_name}.{column_name} is missing a type; "
+                    "wren-core requires a type on every column."
+                ),
+                code="column_without_type",
             )
-        if (
-            table_known
-            and table is not None
-            and not is_calculated
-            and not column.get("relationship")
-            and not schema_index.has_column(table, column_name)  # type: ignore[union-attr]
-        ):
-            messages.append(
-                MdlValidationMessage(
-                    message=(
-                        f"Column {model_name}.{column_name} does not exist in "
-                        f"table '{table}'."
-                    ),
-                    code="unknown_column",
-                )
+        )
+    if not (table_known and table is not None and not is_relationship):
+        return
+    if (
+        not is_calculated
+        and not schema_index.has_column(table, column_name)  # type: ignore[union-attr]
+    ):
+        messages.append(
+            MdlValidationMessage(
+                message=(
+                    f"Column {model_name}.{column_name} does not exist in "
+                    f"table '{table}'."
+                ),
+                code="unknown_column",
             )
+        )
+    # C3: reject an unambiguous cross-family type mismatch on a physical column.
+    mismatch = _type_mismatch_message(
+        schema_index, table, model_name, column_name, column, is_calculated
+    )
+    if mismatch is not None:
+        messages.append(mismatch)
+
+
+def _type_mismatch_message(
+    schema_index: SchemaIndex | None,
+    table: str,
+    model_name: str,
+    column_name: str,
+    column: dict[str, Any],
+    is_calculated: bool,
+) -> MdlValidationMessage | None:
+    """Cross-family type-mismatch error for a physical-mapped column (C3), or None.
+
+    Conservative: fires only when the catalog type and the proposed type both resolve
+    to a known, *different* family. Calculated columns are derived (a CAST may change
+    family legitimately), so they are skipped. Degrades to ``None`` for unknown types
+    or the names-only snapshot path (no catalog type).
+    """
+
+    if schema_index is None or is_calculated:
+        return None
+    catalog_family = _type_family(schema_index.column_type(table, column_name))
+    proposed_type = column.get("type")
+    proposed_family = (
+        _type_family(proposed_type) if isinstance(proposed_type, str) else None
+    )
+    if (
+        catalog_family is None
+        or proposed_family is None
+        or catalog_family == proposed_family
+    ):
+        return None
+    catalog_type = schema_index.column_type(table, column_name)
+    return MdlValidationMessage(
+        message=(
+            f"Column {model_name}.{column_name} is typed '{proposed_type}' "
+            f"({proposed_family}) but the physical column is '{catalog_type}' "
+            f"({catalog_family}). Use a type matching the physical column."
+        ),
+        code="column_type_mismatch",
+    )
 
 
 def _validate_views(

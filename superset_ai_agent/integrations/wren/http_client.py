@@ -157,6 +157,9 @@ class WrenHttpClient:
         *,
         project: SemanticProject,
         document: SemanticDocument,
+        schema: dict[str, list[str]] | None = None,
+        schema_types: dict[str, dict[str, str]] | None = None,
+        instructions: list[str] | None = None,
     ) -> MdlEnrichmentProposal:
         if not self.config.wren_onboarding_enabled:
             proposal = deterministic_mdl_proposal(project=project, document=document)

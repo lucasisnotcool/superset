@@ -260,7 +260,10 @@ export default function SemanticLayerImportDialog({
         borderRadius: `${theme.borderRadius}px`,
         border: `1px solid ${theme.colorBorder}`,
       },
-      contentText: { fontFamily: theme.fontFamilyCode },
+      // Reset the user-agent <pre> margin so the fixed-height, overflow-hidden
+      // title block does not clip the column headers ("Current"/"Proposed").
+      titleBlock: { height: 'auto', overflow: 'visible' },
+      contentText: { fontFamily: theme.fontFamilyCode, margin: 0 },
       gutter: { fontFamily: theme.fontFamilyCode },
       lineNumber: { fontFamily: theme.fontFamilyCode },
     };

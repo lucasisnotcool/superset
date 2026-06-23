@@ -124,6 +124,13 @@ class AgentConfig:
     wren_schema_context_token_budget: int = 6000
     wren_require_schema_scope: bool = True
     wren_max_document_bytes: int = 2_000_000
+    # C4 (wren_enrich_and_retrieve.md): document chunking + relevance selection.
+    # Ingestion retains whole sections up to this many chars (was a hard 20k head
+    # cut); enrichment then assembles the schema-relevant sections within the prompt
+    # budget. Retention >> budget so late-document content survives ingestion and can
+    # be selected when relevant. 0 disables the respective limit.
+    wren_document_extract_char_limit: int = 200_000
+    wren_document_prompt_char_budget: int = 20_000
     wren_allowed_document_types: tuple[str, ...] = (
         "text/plain",
         "text/markdown",
@@ -137,6 +144,25 @@ class AgentConfig:
     # it degrades to passthrough when a query's backend has no wren-core dialect
     # or no MDL exists for the scope.
     wren_core_validation_enabled: bool = True
+    # F0.1 (wren_enrich_and_retrieve.md): when true, MDL activation requires the
+    # wren-core engine to be importable and runs deep engine validation — it
+    # degrades *closed* (activation fails) rather than silently structural-only.
+    # Default false so no-engine deployments keep working unchanged.
+    wren_activation_requires_engine: bool = False
+    # E3 (wren_enrich_and_retrieve.md): authoring-side correction loop. When > 0,
+    # an enrichment proposal that fails structural validation is re-drafted up to
+    # this many times with the validation errors fed back to the model before the
+    # draft is surfaced. The analogue of wren_engine_max_correction_retries for
+    # SQL. Default 1 — a single cheap corrective pass.
+    wren_modeling_max_correction_retries: int = 1
+    # C2.1 (wren_enrich_and_retrieve.md): run wren-core *deep* validation inside the
+    # enrichment correction loop, so expression errors (calculated fields, metrics,
+    # relationship expressions) are caught + repaired at draft time, not only at
+    # activation. The overlay is merged against the full active MDL first (wren-core
+    # compiles a whole manifest). No-op when wren-core is absent. Default false:
+    # opt-in, since it adds an engine compile per draft and can surface validation
+    # failures earlier than before.
+    wren_modeling_deep_validation: bool = False
     # Wren full-parity seams (see wren_full.md). All default to the
     # zero-dependency binding so the service starts unchanged; turning any of
     # these on requires durable semantic persistence (semantic_layer_store=
@@ -161,9 +187,30 @@ class AgentConfig:
     # the prompt (wren_full.md R-RET-E). Retrieval-ranked chunks win on overflow.
     # 0 = unlimited.
     wren_max_context_items: int = 40
+    # R2 (wren_enrich_and_retrieve.md): table-selection prune. Narrow the
+    # retrieval-ranked MDL chunks to the top-N most relevant *models* (keeping each
+    # selected model's columns coherent, dropping less-relevant models), mirroring
+    # Wren's table-selection step. Relationship/model-less chunks are always kept.
+    # 0 = off (no model-level prune; only the count cap above applies).
+    wren_table_selection_limit: int = 5
+    # C1.3 (wren_enrich_and_retrieve.md): use an LLM to pick the relevant model
+    # subset (Wren's table/column selection) instead of the heuristic top-N. Adds one
+    # model call to the retrieval node; degrades closed to wren_table_selection_limit
+    # on any failure/empty result. Default false (opt-in: latency/cost).
+    wren_llm_table_selection: bool = False
+    # E1/E6 (wren_enrich_and_retrieve.md): the legacy heuristic document-overlay —
+    # approved document updates merged into the prompt at query time via
+    # `merge_indexed_semantic_context` — is a *second* semantic system parallel to
+    # MDL. Default false converges on a single source (MDL/enrichment): the overlay
+    # channel is skipped at query time. Set true to restore the legacy overlay.
+    wren_semantic_overlay_enabled: bool = False
     wren_memory_store: WrenMemoryStoreMode = "none"
     wren_memory_learning_enabled: bool = True
     wren_memory_recall_k: int = 3
+    # R3 instructions (wren_enrich_and_retrieve.md): how many *non-global*
+    # instructions to retrieve by similarity per question (global instructions
+    # always apply and are not counted here).
+    wren_instruction_recall_k: int = 3
     # Decay/aging: cap confirmed examples retained per owner+scope; the oldest are
     # evicted past this bound so the store does not grow unbounded. 0 = unlimited.
     wren_memory_max_examples: int = 200
@@ -453,6 +500,18 @@ class AgentConfig:
                     str(cls.wren_max_document_bytes),
                 )
             ),
+            wren_document_extract_char_limit=int(
+                os.getenv(
+                    "WREN_DOCUMENT_EXTRACT_CHAR_LIMIT",
+                    str(cls.wren_document_extract_char_limit),
+                )
+            ),
+            wren_document_prompt_char_budget=int(
+                os.getenv(
+                    "WREN_DOCUMENT_PROMPT_CHAR_BUDGET",
+                    str(cls.wren_document_prompt_char_budget),
+                )
+            ),
             wren_allowed_document_types=_env_list(
                 "WREN_ALLOWED_DOCUMENT_TYPES",
                 cls.wren_allowed_document_types,
@@ -477,6 +536,20 @@ class AgentConfig:
             wren_core_validation_enabled=_env_bool(
                 "WREN_CORE_VALIDATION_ENABLED",
                 cls.wren_core_validation_enabled,
+            ),
+            wren_activation_requires_engine=_env_bool(
+                "WREN_ACTIVATION_REQUIRES_ENGINE",
+                cls.wren_activation_requires_engine,
+            ),
+            wren_modeling_max_correction_retries=int(
+                os.getenv(
+                    "WREN_MODELING_MAX_CORRECTION_RETRIES",
+                    str(cls.wren_modeling_max_correction_retries),
+                )
+            ),
+            wren_modeling_deep_validation=_env_bool(
+                "WREN_MODELING_DEEP_VALIDATION",
+                cls.wren_modeling_deep_validation,
             ),
             wren_engine=cast(
                 WrenEngineMode,
@@ -511,6 +584,20 @@ class AgentConfig:
                     "WREN_MAX_CONTEXT_ITEMS", str(cls.wren_max_context_items)
                 )
             ),
+            wren_table_selection_limit=int(
+                os.getenv(
+                    "WREN_TABLE_SELECTION_LIMIT",
+                    str(cls.wren_table_selection_limit),
+                )
+            ),
+            wren_llm_table_selection=_env_bool(
+                "WREN_LLM_TABLE_SELECTION",
+                cls.wren_llm_table_selection,
+            ),
+            wren_semantic_overlay_enabled=_env_bool(
+                "WREN_SEMANTIC_OVERLAY_ENABLED",
+                cls.wren_semantic_overlay_enabled,
+            ),
             wren_memory_store=cast(
                 WrenMemoryStoreMode,
                 os.getenv("WREN_MEMORY_STORE", cls.wren_memory_store).strip().lower(),
@@ -521,6 +608,11 @@ class AgentConfig:
             ),
             wren_memory_recall_k=int(
                 os.getenv("WREN_MEMORY_RECALL_K", str(cls.wren_memory_recall_k))
+            ),
+            wren_instruction_recall_k=int(
+                os.getenv(
+                    "WREN_INSTRUCTION_RECALL_K", str(cls.wren_instruction_recall_k)
+                )
             ),
             wren_memory_max_examples=int(
                 os.getenv(

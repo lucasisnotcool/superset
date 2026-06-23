@@ -543,6 +543,71 @@ def _content_checksum(files: list[MdlFile]) -> str:
     return digest.hexdigest()
 
 
+def ensure_project_indexed(
+    *,
+    retriever: Retriever,
+    project_id: str | None,
+    owner_id: str,
+    mdl_file_store: MdlFileStore | None,
+) -> tuple[str, str] | None:
+    """Build/refresh the retriever index for a project's active MDL (idempotent).
+
+    Returns ``(scope_key, checksum)`` when an index exists or was built, else
+    ``None`` (no project, no store, or no active MDL). Shared by
+    `retrieve_mdl_context` (lazy, per query) and the activation route (eager
+    re-index on MDL deploy, E6) so both use one indexing path. Raises on a
+    compile/index error; callers wrap as appropriate (retrieval is best-effort,
+    activation re-index is best-effort).
+    """
+
+    if project_id is None or mdl_file_store is None:
+        return None
+    active_files = [
+        file
+        for file in mdl_file_store.list(project_id, owner_id=owner_id)
+        if file.status == "active" and file.deleted_at is None
+    ]
+    if not active_files:
+        return None
+    checksum = _content_checksum(active_files)
+    scope_key = f"{owner_id}:{project_id}"
+    # Recompile + (re)index only when the MDL content changed (G2/G3).
+    if not retriever.has_index(scope_key, checksum):
+        items = manifest_to_schema_items(compile_manifest(active_files))
+        if not items:
+            return None
+        retriever.index(items, scope_key=scope_key, checksum=checksum)
+    return scope_key, checksum
+
+
+def reindex_project_mdl(
+    *,
+    retriever: Retriever,
+    project_id: str | None,
+    owner_id: str,
+    mdl_file_store: MdlFileStore | None,
+) -> bool:
+    """Best-effort eager re-index of a project's active MDL (E6 deploy→reindex).
+
+    Returns whether an index is now present. Never raises — activation must not
+    fail because retrieval indexing hiccupped.
+    """
+
+    try:
+        return (
+            ensure_project_indexed(
+                retriever=retriever,
+                project_id=project_id,
+                owner_id=owner_id,
+                mdl_file_store=mdl_file_store,
+            )
+            is not None
+        )
+    except Exception as ex:  # pylint: disable=broad-except
+        logger.warning("Eager MDL re-index failed (non-fatal): %s", ex)
+        return False
+
+
 def retrieve_mdl_context(
     *,
     config: AgentConfig,
@@ -570,22 +635,18 @@ def retrieve_mdl_context(
     if project_id is None or mdl_file_store is None:
         return []
     try:
-        active_files = [
-            file
-            for file in mdl_file_store.list(project_id, owner_id=owner_id)
-            if file.status == "active" and file.deleted_at is None
-        ]
-        if not active_files:
+        # Ensure the index is current for this MDL version (lazy build on a warm
+        # checksum embeds just the question, G1); shared with the eager activation
+        # re-index (E6) so both paths index identically.
+        indexed = ensure_project_indexed(
+            retriever=retriever,
+            project_id=project_id,
+            owner_id=owner_id,
+            mdl_file_store=mdl_file_store,
+        )
+        if indexed is None:
             return []
-        checksum = _content_checksum(active_files)
-        scope_key = f"{owner_id}:{project_id}"
-        # Recompile + (re)index only when the MDL content changed (G2/G3). On a
-        # warm checksum the embedding path embeds just the question (G1).
-        if not retriever.has_index(scope_key, checksum):
-            items = manifest_to_schema_items(compile_manifest(active_files))
-            if not items:
-                return []
-            retriever.index(items, scope_key=scope_key, checksum=checksum)
+        scope_key, checksum = indexed
         top = retriever.retrieve(
             question,
             scope_key=scope_key,

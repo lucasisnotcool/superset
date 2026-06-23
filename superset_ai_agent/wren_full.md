@@ -223,13 +223,14 @@ descriptions, every column still carries its real `type` and a valid
 ### W4 — Delta/patch enrichment + in-place targeting `[DONE]`
 
 - Enrichment passes existing models as **read-only reference context** (names +
-  table refs + column names — not full re-emittable bodies) and requests **only
-  new/changed entities** keyed by name
-  ([`llm_client.py:166-207`](integrations/wren/llm_client.py#L166-L207)).
+  table refs + column names+types — not full re-emittable bodies). This trimming
+  is implemented by `_mdl_reference` and applied in `propose_mdl_from_document`
+  (see E2 in [`wren_enrich_and_retrieve.md`](wren_enrich_and_retrieve.md)); the
+  full file content is preserved by the column-level merge (E4), so the model only
+  needs to emit the models it changes.
 - Apply the delta to the **target file in place**; do not create a colliding
-  sibling. Safety net in `_enforce_activation`
-  ([`app.py:1019-1055`](app.py#L1019-L1055)): on a re-declared model that is
-  byte-identical or a strict superset, prefer the newer, drop the older.
+  sibling. Safety net in `_enforce_activation` (`app.py`): on a re-declared model
+  that is byte-identical or a strict superset, prefer the newer, drop the older.
 
 **Acceptance:** `test_app.py` — enriching a project with an existing active model
 yields an activatable manifest (no `duplicate_model`); untouched models retain

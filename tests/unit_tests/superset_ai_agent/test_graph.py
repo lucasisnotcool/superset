@@ -21,7 +21,8 @@ import json  # noqa: TID251 - tests cover the standalone agent JSON contract
 
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.conversations.schemas import ConversationScope
-from superset_ai_agent.graph import TextToSqlGraph
+from superset_ai_agent.conversations.store import DEFAULT_OWNER_ID
+from superset_ai_agent.graph import dry_plan_diagnostics, TextToSqlGraph
 from superset_ai_agent.integrations.superset.client import (
     AgentContext,
     ColumnSummary,
@@ -35,8 +36,10 @@ from superset_ai_agent.schemas import (
     AgentQueryRequest,
     ExecutionResult,
     SqlExecutionSource,
+    SqlValidation,
     WrenContextArtifact,
 )
+from superset_ai_agent.semantic_layer.instructions import InMemoryInstructionStore
 from superset_ai_agent.semantic_layer.mdl_files import InMemoryMdlFileStore
 from superset_ai_agent.semantic_layer.memory import InMemorySemanticLayerStore
 from superset_ai_agent.semantic_layer.projects import InMemorySemanticProjectStore
@@ -46,7 +49,10 @@ from superset_ai_agent.semantic_layer.schemas import (
     SemanticLayerVersion,
     SemanticProjectResolveRequest,
 )
-from superset_ai_agent.semantic_layer.store import scope_hash
+from superset_ai_agent.semantic_layer.store import (
+    instruction_scope_hash,
+    scope_hash,
+)
 
 
 class FakeModelClient:
@@ -316,7 +322,9 @@ def test_graph_materializes_schema_project_for_wren_context(tmp_path) -> None:
     assert wren_client.mdl_paths == [response.wren_context.mdl_path]
 
 
-def test_graph_merges_indexed_semantic_context() -> None:
+def _store_with_indexed_overlay() -> (
+    tuple[InMemorySemanticLayerStore, ConversationScope]
+):
     semantic_layer_store = InMemorySemanticLayerStore()
     scope = ConversationScope(database_id=1, schema_name="main")
     semantic_layer_store.save_version(
@@ -337,8 +345,14 @@ def test_graph_merges_indexed_semantic_context() -> None:
         ),
         owner_id="analyst",
     )
+    return semantic_layer_store, scope
+
+
+def _run_overlay_graph(
+    semantic_layer_store: InMemorySemanticLayerStore, *, overlay_enabled: bool
+):
     graph = TextToSqlGraph(
-        config=AgentConfig(),
+        config=AgentConfig(wren_semantic_overlay_enabled=overlay_enabled),
         model_client=FakeModelClient(
             "SELECT name, SUM(num) AS total_births FROM birth_names GROUP BY name"
         ),
@@ -347,8 +361,7 @@ def test_graph_merges_indexed_semantic_context() -> None:
         wren_client=FakeWrenClient(),
         semantic_layer_store=semantic_layer_store,
     )
-
-    response = graph.run(
+    return graph.run(
         AgentQueryRequest(
             question="Show total births",
             database_id=1,
@@ -357,6 +370,12 @@ def test_graph_merges_indexed_semantic_context() -> None:
         owner_id="analyst",
     )
 
+
+def test_graph_merges_indexed_semantic_context_when_overlay_enabled() -> None:
+    semantic_layer_store, _ = _store_with_indexed_overlay()
+
+    response = _run_overlay_graph(semantic_layer_store, overlay_enabled=True)
+
     assert response.wren_context is not None
     assert response.wren_context.semantic_layer_version == "v1"
     assert response.wren_context.indexing_status == "indexed"
@@ -364,6 +383,20 @@ def test_graph_merges_indexed_semantic_context() -> None:
     assert response.wren_context.context_items == [
         {"kind": "document", "name": "terms"}
     ]
+
+
+def test_graph_skips_overlay_by_default_single_source() -> None:
+    # E1/E6: with the overlay off (default), the indexed doc-overlay does not reach
+    # the prompt — MDL is the single semantic source.
+    semantic_layer_store, _ = _store_with_indexed_overlay()
+
+    response = _run_overlay_graph(semantic_layer_store, overlay_enabled=False)
+
+    assert response.wren_context is not None
+    assert {"kind": "document", "name": "terms"} not in (
+        response.wren_context.context_items
+    )
+    assert response.wren_context.document_ids == []
 
 
 def test_graph_injects_materialized_mdl_into_sql_prompt(tmp_path) -> None:
@@ -483,3 +516,181 @@ def test_graph_executes_valid_sql_when_requested() -> None:
         "execute_sql",
         "build_artifacts",
     ]
+
+
+def test_instruction_scope_hash_ignores_dataset_selection() -> None:
+    # C5.1 fix: instructions are schema-scoped; the editor authors with no datasets,
+    # a chat query carries selected datasets — both must hash equal. Memory's
+    # scope_hash, by contrast, stays dataset-sensitive.
+    schema = ConversationScope(database_id=1, schema_name="main", dataset_ids=[])
+    query = ConversationScope(database_id=1, schema_name="main", dataset_ids=[16, 3])
+    assert instruction_scope_hash(schema) == instruction_scope_hash(query)
+    other = ConversationScope(database_id=1, schema_name="other", dataset_ids=[])
+    assert instruction_scope_hash(query) != instruction_scope_hash(other)
+    assert scope_hash(schema) != scope_hash(query)  # memory still dataset-scoped
+
+
+def test_graph_injects_instructions_into_sql_prompt() -> None:
+    # R3 instructions + C5.1 fix: an instruction authored at SCHEMA scope (as the
+    # editor does — no dataset_ids) is recalled into the SQL prompt even when the
+    # chat query selects datasets. Previously the differing scope hashes hid it.
+    instruction_store = InMemoryInstructionStore()
+    authored_scope = ConversationScope(
+        database_id=1, schema_name="main", dataset_ids=[]
+    )
+    instruction_store.add(
+        instruction="ALWAYS exclude test accounts",
+        scope_hash=instruction_scope_hash(authored_scope),
+        owner_id=DEFAULT_OWNER_ID,
+        is_global=True,
+    )
+    model = FakeModelClient("SELECT name FROM birth_names")
+    graph = TextToSqlGraph(
+        config=AgentConfig(),
+        model_client=model,
+        context_provider=FakeContextProvider(),
+        superset_client=FakeSupersetClient(),
+        instruction_store=instruction_store,
+    )
+
+    graph.run(
+        AgentQueryRequest(
+            question="top names",
+            database_id=1,
+            schema_name="main",
+            dataset_ids=[16],
+            execute=False,
+        )
+    )
+
+    user_messages = [
+        message.content
+        for messages in model.messages
+        for message in messages
+        if message.role == "user"
+    ]
+    assert any("ALWAYS exclude test accounts" in content for content in user_messages)
+
+
+# --- C2.2: Wren dry-plan diagnostics feed the repair prompt --------------------
+
+
+def test_dry_plan_diagnostics_extracts_error_and_errors() -> None:
+    assert dry_plan_diagnostics({"error": "table foo missing"}) == [
+        "table foo missing"
+    ]
+    assert dry_plan_diagnostics(
+        {"errors": ["bad column a", "bad column b"]}
+    ) == ["bad column a", "bad column b"]
+    # error + errors combine, with dedup and order preserved.
+    assert dry_plan_diagnostics(
+        {"error": "dup", "errors": ["dup", "other"]}
+    ) == ["dup", "other"]
+
+
+def test_dry_plan_diagnostics_degrades_for_clean_or_missing_plan() -> None:
+    assert dry_plan_diagnostics(None) == []
+    assert dry_plan_diagnostics({"available": True, "planning_only": True}) == []
+    assert dry_plan_diagnostics({"error": "  "}) == []  # blank ignored
+    assert dry_plan_diagnostics("not a dict") == []  # type: ignore[arg-type]
+
+
+def test_repair_sql_folds_dry_plan_diagnostics_into_prompt() -> None:
+    model = FakeModelClient("SELECT 1")
+    graph = TextToSqlGraph(
+        config=AgentConfig(),
+        model_client=model,
+        context_provider=FakeContextProvider(),
+        superset_client=FakeSupersetClient(),
+    )
+    request = AgentQueryRequest(question="q", database_id=1, schema_name="main")
+    state = {
+        "request": request,
+        "context": FakeContextProvider().get_context(request),
+        "validation": SqlValidation(
+            is_valid=False, is_read_only=True, errors=["syntax error near FROM"]
+        ),
+        "wren_context": WrenContextArtifact(
+            enabled=True,
+            dry_plan={"available": False, "error": "table foo not found in MDL"},
+        ),
+        "repair_attempts": 0,
+    }
+
+    graph._repair_sql(state)
+
+    sent = model.messages[-1][-1].content
+    # Both the validator's syntax error and the engine's dry-plan diagnostic reach
+    # the repair prompt (C2.2).
+    assert "syntax error near FROM" in sent
+    assert "table foo not found in MDL" in sent
+
+
+# --- C1.3: LLM table/column selection -----------------------------------------
+
+
+class _SelectorModelClient:
+    """Model client returning a fixed payload for the table-selection call."""
+
+    def __init__(self, content: str) -> None:
+        self.content = content
+        self.calls = 0
+
+    def chat(self, messages, *, model=None, format_schema=None):
+        self.calls += 1
+        return ModelResult(content=self.content)
+
+
+def test_llm_select_models_returns_validated_subset() -> None:
+    from superset_ai_agent.graph import llm_select_models
+
+    model = _SelectorModelClient(json.dumps({"models": ["beta", "ghost"]}))
+    chosen = llm_select_models(model, "q", ["alpha", "beta", "gamma"], 5)
+    # "ghost" is not a candidate → dropped; "beta" kept.
+    assert chosen == ["beta"]
+
+
+def test_llm_select_models_caps_to_limit_in_rank_order() -> None:
+    from superset_ai_agent.graph import llm_select_models
+
+    model = _SelectorModelClient(json.dumps({"models": ["gamma", "alpha", "beta"]}))
+    chosen = llm_select_models(model, "q", ["alpha", "beta", "gamma"], 2)
+    # Capped to 2, preserving candidate (retriever-rank) order.
+    assert chosen == ["alpha", "beta"]
+
+
+def test_llm_select_models_bad_json_returns_none() -> None:
+    from superset_ai_agent.graph import llm_select_models
+
+    model = _SelectorModelClient("not json at all")
+    assert llm_select_models(model, "q", ["alpha"], 5) is None
+
+
+def test_llm_select_models_empty_candidates_skips_call() -> None:
+    from superset_ai_agent.graph import llm_select_models
+
+    model = _SelectorModelClient(json.dumps({"models": ["alpha"]}))
+    assert llm_select_models(model, "q", [], 5) is None
+    assert model.calls == 0  # no model call when there is nothing to select
+
+
+def test_model_selector_is_none_when_flag_off() -> None:
+    graph = TextToSqlGraph(
+        config=AgentConfig(wren_llm_table_selection=False),
+        model_client=FakeModelClient("SELECT 1"),
+        context_provider=FakeContextProvider(),
+        superset_client=FakeSupersetClient(),
+    )
+    assert graph._model_selector("any question") is None
+
+
+def test_model_selector_built_when_flag_on() -> None:
+    graph = TextToSqlGraph(
+        config=AgentConfig(wren_llm_table_selection=True),
+        model_client=_SelectorModelClient(json.dumps({"models": ["alpha"]})),
+        context_provider=FakeContextProvider(),
+        superset_client=FakeSupersetClient(),
+    )
+    selector = graph._model_selector("any question")
+    assert selector is not None
+    assert selector(["alpha", "beta"]) == ["alpha"]
