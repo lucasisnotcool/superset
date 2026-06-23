@@ -20,14 +20,14 @@ from __future__ import annotations
 import hashlib
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
-from typing import Protocol, cast
+from typing import cast, Protocol
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from superset_ai_agent.conversations.store import DEFAULT_OWNER_ID
 from superset_ai_agent.persistence.models import AiAgentSemanticMdlFile
-from superset_ai_agent.semantic_layer.mdl_validation import validate_mdl_yaml
+from superset_ai_agent.semantic_layer.mdl_validation import validate_mdl
 from superset_ai_agent.semantic_layer.schemas import (
     MdlFile,
     MdlFileCreateRequest,
@@ -55,7 +55,7 @@ def _assert_activatable(status: str | None, content: str) -> None:
 
     if status != "active":
         return
-    validation = validate_mdl_yaml(content)
+    validation = validate_mdl(content)
     if validation.valid:
         return
     errors = "; ".join(
@@ -69,7 +69,7 @@ def _assert_activatable(status: str | None, content: str) -> None:
 
 
 class MdlFileStore(Protocol):
-    """Storage contract for project-scoped MDL YAML files."""
+    """Storage contract for project-scoped MDL JSON files."""
 
     def list(
         self,
@@ -95,7 +95,7 @@ class MdlFileStore(Protocol):
         owner_id: str = DEFAULT_OWNER_ID,
         validation: MdlValidationResult | None = None,
     ) -> MdlFile:
-        """Create an MDL YAML file.
+        """Create an MDL JSON file.
 
         ``validation`` overrides the structural-only check with a precomputed
         (e.g. schema-aware) result so physical findings are persisted.
@@ -109,7 +109,7 @@ class MdlFileStore(Protocol):
         owner_id: str = DEFAULT_OWNER_ID,
         validation: MdlValidationResult | None = None,
     ) -> MdlFile:
-        """Update one MDL YAML file."""
+        """Update one MDL JSON file."""
 
     def delete(
         self,
@@ -117,7 +117,7 @@ class MdlFileStore(Protocol):
         *,
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> None:
-        """Soft-delete one MDL YAML file."""
+        """Soft-delete one MDL JSON file."""
 
     def validate(
         self,
@@ -125,7 +125,7 @@ class MdlFileStore(Protocol):
         *,
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> MdlValidationResult:
-        """Validate one MDL YAML file and persist validation output."""
+        """Validate one MDL JSON file and persist validation output."""
 
 
 class InMemoryMdlFileStore:
@@ -214,7 +214,7 @@ class InMemoryMdlFileStore:
             updates["validation"] = (
                 validation
                 if validation is not None
-                else validate_mdl_yaml(request.content)
+                else validate_mdl(request.content)
             )
         elif validation is not None:
             updates["validation"] = validation
@@ -252,7 +252,7 @@ class InMemoryMdlFileStore:
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> MdlValidationResult:
         file = self.get(file_id, owner_id=owner_id)
-        validation = validate_mdl_yaml(file.content)
+        validation = validate_mdl(file.content)
         self.update(
             file_id,
             MdlFileUpdateRequest(content=file.content),
@@ -381,7 +381,7 @@ class SqlAlchemyMdlFileStore:
                 effective = (
                     validation
                     if validation is not None
-                    else validate_mdl_yaml(request.content)
+                    else validate_mdl(request.content)
                 )
                 model.validation = effective.model_dump(mode="json")
             elif validation is not None:
@@ -416,7 +416,7 @@ class SqlAlchemyMdlFileStore:
     ) -> MdlValidationResult:
         with self.session_factory() as session:
             model = self._get_model(session, file_id, owner_id=owner_id)
-            validation = validate_mdl_yaml(model.content)
+            validation = validate_mdl(model.content)
             model.validation = validation.model_dump(mode="json")
             model.updated_at = _utc_now()
             model.updated_by = owner_id
@@ -461,7 +461,7 @@ class SqlAlchemyMdlFileStore:
 
 
 def normalize_mdl_path(path: str) -> str:
-    """Normalize a project-relative MDL YAML path."""
+    """Normalize a project-relative MDL JSON path."""
 
     normalized = path.strip().replace("\\", "/")
     if not normalized:
@@ -469,8 +469,8 @@ def normalize_mdl_path(path: str) -> str:
     posix_path = PurePosixPath(normalized)
     if posix_path.is_absolute() or ".." in posix_path.parts:
         raise ValueError("MDL path must stay within the semantic project.")
-    if posix_path.suffix.lower() not in {".yaml", ".yml"}:
-        raise ValueError("MDL files must use a .yaml or .yml extension.")
+    if posix_path.suffix.lower() != ".json":
+        raise ValueError("MDL files must use a .json extension.")
     return str(posix_path)
 
 
@@ -483,7 +483,7 @@ def _new_file(
     validation: MdlValidationResult | None = None,
 ) -> MdlFile:
     if validation is None:
-        validation = validate_mdl_yaml(request.content)
+        validation = validate_mdl(request.content)
     return MdlFile(
         project_id=project_id,
         path=path,

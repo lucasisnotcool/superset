@@ -15,13 +15,25 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Canonical typed MDL (Modeling Definition Language) schema.
+"""Canonical typed MDL schema — wren-core's *native* manifest shape.
 
-These models mirror the snake_case Wren MDL spec and serve as the canonical
-structural reference for :mod:`superset_ai_agent.semantic_layer.mdl_validator`.
-They are intentionally lenient (``extra="allow"``) so unknown/forward-compatible
-keys such as ``properties`` do not fail parsing, while required fields are still
-enforced.
+This is the single source of truth for the MDL vocabulary. There is **no
+snake_case authoring dialect and no translation layer**: the field names here are
+exactly what wren-core deserializes (camelCase: ``tableReference``, ``joinType``,
+``isCalculated``, ``notNull``, ``refSql``, ``baseObject``, ``timeDimensions``).
+
+Verified empirically against ``wren-core-py`` 0.7.1 (2026-06-23): a manifest in
+this shape loads into ``SessionContext`` and rewrites SQL; a column missing
+``type`` is rejected with ``missing field 'type'``; a snake_case
+``table_reference`` is silently ignored (the model is treated as having no
+source). The golden round-trip test ``test_native_manifest_contract.py`` pins
+this shape to the installed wheel.
+
+Python attributes stay snake_case for readability; the camelCase JSON form is
+produced/consumed via aliases (``populate_by_name=True``), so
+``model_dump(by_alias=True)`` and ``model_json_schema(by_alias=True)`` both emit
+the native shape. ``extra="allow"`` keeps forward-compatible keys such as
+``properties`` (synonyms, business notes) — wren-core tolerates unknown fields.
 """
 
 from __future__ import annotations
@@ -29,6 +41,7 @@ from __future__ import annotations
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
+from pydantic.alias_generators import to_camel
 
 JOIN_TYPES: frozenset[str] = frozenset(
     {
@@ -39,32 +52,39 @@ JOIN_TYPES: frozenset[str] = frozenset(
     }
 )
 
-#: Keys under which a manifest/file may carry model definitions.
-MODEL_CONTAINER_KEYS: tuple[str, ...] = ("models", "semantic_models")
+#: Key under which a manifest/file carries model definitions (native shape).
+MODEL_CONTAINER_KEYS: tuple[str, ...] = ("models",)
+
+_NATIVE_CONFIG = ConfigDict(
+    alias_generator=to_camel,
+    populate_by_name=True,
+    extra="allow",
+)
 
 
 class MdlColumn(BaseModel):
     """A model column, calculated field, or relationship column."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = _NATIVE_CONFIG
 
     name: str
+    #: Physical/logical type. Required by wren-core for non-relationship columns;
+    #: validation enforces presence so a missing type cannot reach the engine.
     type: str | None = None
     is_calculated: bool = False
     expression: str | None = None
     relationship: str | None = None
     not_null: bool = False
-    is_primary_key: bool = False
-    is_hidden: bool = False
     properties: dict[str, Any] = Field(default_factory=dict)
 
 
 class MdlTableReference(BaseModel):
     """Physical table mapping for a model."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = _NATIVE_CONFIG
 
     catalog: str | None = None
+    # wren-core uses the bare key ``schema`` here (not ``schemaName``).
     schema_name: str | None = Field(default=None, alias="schema")
     table: str | None = None
 
@@ -72,21 +92,20 @@ class MdlTableReference(BaseModel):
 class MdlModel(BaseModel):
     """A logical dataset backed by a physical table or SQL definition."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = _NATIVE_CONFIG
 
     name: str
     table_reference: MdlTableReference | None = None
     ref_sql: str | None = None
     columns: list[MdlColumn] = Field(default_factory=list)
     primary_key: str | None = None
-    metrics: list[dict[str, Any]] = Field(default_factory=list)
     properties: dict[str, Any] = Field(default_factory=dict)
 
 
 class MdlRelationship(BaseModel):
     """A reusable join between two models."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = _NATIVE_CONFIG
 
     name: str
     models: list[str] = Field(default_factory=list)
@@ -97,7 +116,7 @@ class MdlRelationship(BaseModel):
 class MdlView(BaseModel):
     """A named SQL statement that behaves like a stable virtual table."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = _NATIVE_CONFIG
 
     name: str
     statement: str
@@ -107,7 +126,7 @@ class MdlView(BaseModel):
 class MdlMetric(BaseModel):
     """A reusable aggregation defined once and referenced across queries."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = _NATIVE_CONFIG
 
     name: str
     base_object: str | None = None
@@ -118,7 +137,7 @@ class MdlMetric(BaseModel):
 class MdlCube(BaseModel):
     """A structured aggregation object (measures, dimensions, time dimensions)."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = _NATIVE_CONFIG
 
     name: str
     measures: list[dict[str, Any]] = Field(default_factory=list)
@@ -131,8 +150,10 @@ class MdlCube(BaseModel):
 class MdlManifest(BaseModel):
     """A full MDL manifest (one file or a merged project manifest)."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = _NATIVE_CONFIG
 
+    catalog: str = "wren"
+    schema_name: str = Field(default="public", alias="schema")
     models: list[MdlModel] = Field(default_factory=list)
     relationships: list[MdlRelationship] = Field(default_factory=list)
     views: list[MdlView] = Field(default_factory=list)

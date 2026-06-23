@@ -15,17 +15,17 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Canonical MDL compilation: authoring YAML (snake_case) -> engine manifest.
+"""MDL compilation: merge authored JSON files into one engine manifest.
 
-This module is the **single source of camelCase truth** for the agent. MDL is
-authored and stored as readable snake_case YAML (the `mdl_schema` spec); the
-semantic engine (wren-core) consumes a camelCase manifest (`tableReference`,
-`joinType`, `isCalculated`, ...). `compile_manifest` performs that mapping once,
-so no other module hand-rolls camelCase (resolves wren_full.md R9/R16).
+MDL is authored, stored, and validated in wren-core's **native** manifest shape
+(camelCase JSON — ``tableReference``, ``joinType``, ``isCalculated``). There is
+no snake_case dialect and no field translation: ``compile_manifest`` merely
+parses each file's JSON and merges the native entity lists into the manifest
+envelope (catalog/schema/dataSource + models/relationships/views/metrics/cubes).
 
-The compiled manifest mirrors Wren's own model: source YAML -> compiled
-`mdl.json`. `CompiledManifest.to_base64_json` produces exactly what wren-core's
-`to_manifest` expects.
+``CompiledManifest.to_base64_json`` produces exactly what wren-core's
+``SessionContext`` / ``to_manifest`` consume. Verified against wren-core-py 0.7.1
+by ``test_native_manifest_contract.py``.
 """
 
 from __future__ import annotations
@@ -34,13 +34,12 @@ import base64
 import json  # noqa: TID251 - standalone agent JSON contract
 from typing import Any
 
-import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 from superset_ai_agent.semantic_layer.schemas import MdlFile
 
-#: Keys under which a YAML file may carry model definitions (snake_case spec).
-_MODEL_KEYS: tuple[str, ...] = ("models", "semantic_models")
+#: Keys under which a JSON file may carry each native entity list.
+_MODEL_KEYS: tuple[str, ...] = ("models",)
 _RELATIONSHIP_KEYS: tuple[str, ...] = ("relationships",)
 _VIEW_KEYS: tuple[str, ...] = ("views",)
 _METRIC_KEYS: tuple[str, ...] = ("metrics",)
@@ -48,10 +47,10 @@ _CUBE_KEYS: tuple[str, ...] = ("cubes",)
 
 
 class CompiledManifest(BaseModel):
-    """A compiled, engine-ready MDL manifest (camelCase model/relationship bodies).
+    """A compiled, engine-ready MDL manifest in wren-core's native shape.
 
-    This is the artifact the `SemanticEngine` seam consumes. It is intentionally
-    decoupled from the authoring YAML so the engine never sees snake_case.
+    This is the artifact the ``SemanticEngine`` seam consumes. Its entity bodies
+    are the authored native dicts, merged unchanged from the project files.
     """
 
     model_config = ConfigDict(populate_by_name=True)
@@ -66,7 +65,7 @@ class CompiledManifest(BaseModel):
     cubes: list[dict[str, Any]] = Field(default_factory=list)
 
     def to_engine_manifest(self) -> dict[str, Any]:
-        """Return the full camelCase manifest dict wren-core's ``to_manifest`` wants."""
+        """Return the full native manifest dict wren-core's ``to_manifest`` wants."""
 
         out: dict[str, Any] = {
             "catalog": self.catalog,
@@ -99,33 +98,34 @@ class CompiledManifest(BaseModel):
 def compile_manifest(
     mdl_files: list[MdlFile] | None = None,
     *,
-    yaml_contents: list[str] | None = None,
+    json_contents: list[str] | None = None,
     catalog: str = "wren",
     schema: str = "public",
     data_source: dict[str, Any] | None = None,
 ) -> CompiledManifest:
-    """Compile authoring YAML files into a camelCase engine manifest.
+    """Compile authored JSON files into one native engine manifest.
 
-    Pass either ``mdl_files`` (their ``content`` is read) or raw ``yaml_contents``.
+    Pass either ``mdl_files`` (their ``content`` is read) or raw ``json_contents``.
     Files are merged in the given order; later files append, they do not override.
+    Entity bodies are passed through unchanged — they are already native.
     """
 
-    if yaml_contents is None:
-        yaml_contents = [file.content for file in (mdl_files or [])]
-    merged = _merge_yaml(yaml_contents)
+    if json_contents is None:
+        json_contents = [file.content for file in (mdl_files or [])]
+    merged = _merge_json(json_contents)
     return CompiledManifest(
         catalog=catalog,
         schema=schema,
         data_source=data_source,
-        models=[model_to_camel(model) for model in merged["models"]],
-        relationships=[relationship_to_camel(rel) for rel in merged["relationships"]],
-        views=[view_to_camel(view) for view in merged["views"]],
-        metrics=[metric_to_camel(metric) for metric in merged["metrics"]],
-        cubes=[cube_to_camel(cube) for cube in merged["cubes"]],
+        models=merged["models"],
+        relationships=merged["relationships"],
+        views=merged["views"],
+        metrics=merged["metrics"],
+        cubes=merged["cubes"],
     )
 
 
-def _merge_yaml(yaml_contents: list[str]) -> dict[str, list[dict[str, Any]]]:
+def _merge_json(json_contents: list[str]) -> dict[str, list[dict[str, Any]]]:
     merged: dict[str, list[dict[str, Any]]] = {
         "models": [],
         "relationships": [],
@@ -140,10 +140,10 @@ def _merge_yaml(yaml_contents: list[str]) -> dict[str, list[dict[str, Any]]]:
         "metrics": _METRIC_KEYS,
         "cubes": _CUBE_KEYS,
     }
-    for content in yaml_contents:
+    for content in json_contents:
         try:
-            payload = yaml.safe_load(content)
-        except yaml.YAMLError:
+            payload = json.loads(content)
+        except (ValueError, TypeError):
             continue
         if not isinstance(payload, dict):
             continue
@@ -159,89 +159,3 @@ def _collect(payload: dict[str, Any], keys: tuple[str, ...]) -> list[dict[str, A
         if isinstance(value, list):
             items.extend(item for item in value if isinstance(item, dict))
     return items
-
-
-# --- snake_case authoring -> camelCase engine mapping (single source) --------
-
-
-def model_to_camel(model: dict[str, Any]) -> dict[str, Any]:
-    """Map a snake_case authoring model to the wren-core camelCase shape."""
-
-    reference = model.get("table_reference") or {}
-    out: dict[str, Any] = {
-        "name": model.get("name"),
-        "columns": [column_to_camel(column) for column in model.get("columns", [])],
-    }
-    if isinstance(reference, dict) and reference.get("table"):
-        out["tableReference"] = _drop_none(
-            {
-                "catalog": reference.get("catalog"),
-                "schema": reference.get("schema") or reference.get("schema_name"),
-                "table": reference.get("table"),
-            }
-        )
-    if model.get("ref_sql"):
-        out["refSql"] = model["ref_sql"]
-    if model.get("primary_key"):
-        out["primaryKey"] = model["primary_key"]
-    return _drop_none(out)
-
-
-def column_to_camel(column: dict[str, Any]) -> dict[str, Any]:
-    return _drop_none(
-        {
-            "name": column.get("name"),
-            "type": column.get("type"),
-            "isCalculated": bool(column.get("is_calculated", False)),
-            "expression": column.get("expression"),
-            "relationship": column.get("relationship"),
-            "notNull": bool(column.get("not_null", False)),
-        }
-    )
-
-
-def relationship_to_camel(relationship: dict[str, Any]) -> dict[str, Any]:
-    return _drop_none(
-        {
-            "name": relationship.get("name"),
-            "models": relationship.get("models"),
-            "joinType": relationship.get("join_type"),
-            "condition": relationship.get("condition"),
-        }
-    )
-
-
-def view_to_camel(view: dict[str, Any]) -> dict[str, Any]:
-    return _drop_none(
-        {
-            "name": view.get("name"),
-            "statement": view.get("statement"),
-        }
-    )
-
-
-def metric_to_camel(metric: dict[str, Any]) -> dict[str, Any]:
-    return _drop_none(
-        {
-            "name": metric.get("name"),
-            "baseObject": metric.get("base_object") or metric.get("baseObject"),
-            "expression": metric.get("expression"),
-        }
-    )
-
-
-def cube_to_camel(cube: dict[str, Any]) -> dict[str, Any]:
-    return _drop_none(
-        {
-            "name": cube.get("name"),
-            "measures": cube.get("measures"),
-            "dimensions": cube.get("dimensions"),
-            "timeDimensions": cube.get("time_dimensions")
-            or cube.get("timeDimensions"),
-            "hierarchies": cube.get("hierarchies"),
-        }
-    )
-
-
-def _drop_none(value: dict[str, Any]) -> dict[str, Any]:
-    return {key: item for key, item in value.items() if item is not None}

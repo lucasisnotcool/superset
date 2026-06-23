@@ -23,6 +23,20 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# wren-core-py ships prebuilt wheels for manylinux x86_64 (and macOS/Windows)
+# but none for Linux aarch64, so on arm64 pip must build it from the sdist via
+# maturin, which needs a Rust toolchain and a C compiler. TARGETARCH is supplied
+# automatically by BuildKit; on amd64 this block is skipped and the prebuilt
+# wheel is used exactly as before.
+ARG TARGETARCH
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+        apt-get update && \
+        apt-get install -y --no-install-recommends build-essential curl && \
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
+ENV PATH="/root/.cargo/bin:${PATH}"
+
 COPY requirements-ai-agent.txt /app/requirements-ai-agent.txt
 RUN pip install --no-cache-dir -r /app/requirements-ai-agent.txt
 

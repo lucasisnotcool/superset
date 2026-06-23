@@ -62,8 +62,8 @@ const mdlFile = (id: string, path: string) => ({
   project_id: 'project-1',
   path,
   filename: path.split('/').pop(),
-  content: `models:\n  - name: ${id}\n`,
-  content_type: 'application/x-yaml',
+  content: `{"models":[{"name":"${id}"}]}`,
+  content_type: 'application/json',
   source_type: 'manual',
   status: 'active',
   validation: { valid: true, messages: [] },
@@ -113,7 +113,7 @@ const mockOnboard = (warnings: string[] = []) => {
         project_id: 'project-1',
         model_count: 1,
         warnings,
-        files: [mdlFile('moves', 'models/moves.yaml')],
+        files: [mdlFile('moves', 'models/moves.json')],
       },
     },
   );
@@ -121,8 +121,8 @@ const mockOnboard = (warnings: string[] = []) => {
 
 test('loads the project once per scope without re-fetch loops', async () => {
   mockBaseRoutes([
-    mdlFile('a', 'models/a.yaml'),
-    mdlFile('b', 'models/b.yaml'),
+    mdlFile('a', 'models/a.json'),
+    mdlFile('b', 'models/b.json'),
   ]);
 
   render(
@@ -153,7 +153,7 @@ test('loads the project once per scope without re-fetch loops', async () => {
 
 test('eagerly onboards an empty schema and surfaces warnings as a toast', async () => {
   mockBaseRoutes([]);
-  mockOnboard(['models/moves.yaml cannot be activated until fixed: bad']);
+  mockOnboard(['models/moves.json cannot be activated until fixed: bad']);
   const store = createStore({}, reducerIndex);
 
   render(
@@ -179,7 +179,7 @@ test('eagerly onboards an empty schema and surfaces warnings as a toast', async 
 });
 
 test('opens the Add dialog with a drop zone', async () => {
-  mockBaseRoutes([mdlFile('a', 'models/a.yaml')]);
+  mockBaseRoutes([mdlFile('a', 'models/a.json')]);
 
   render(
     <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="main" />,
@@ -198,7 +198,7 @@ test('opens the Add dialog with a drop zone', async () => {
 });
 
 test('manual Onboard button triggers onboarding', async () => {
-  mockBaseRoutes([mdlFile('a', 'models/a.yaml')]);
+  mockBaseRoutes([mdlFile('a', 'models/a.json')]);
   mockOnboard();
 
   render(

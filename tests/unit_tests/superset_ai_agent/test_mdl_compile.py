@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Phase 0.3 — canonical MDL compile (snake_case YAML -> camelCase manifest)."""
+"""MDL compile — merge native JSON files into one engine manifest (no mapping)."""
 
 from __future__ import annotations
 
@@ -28,51 +28,59 @@ from superset_ai_agent.semantic_layer.mdl_compile import (
 )
 from superset_ai_agent.semantic_layer.wren_core_validator import to_wren_core_manifest
 
-_DEALS_YAML = """
-models:
-  - name: deals
-    table_reference:
-      schema: sales
-      table: deals
-    primary_key: id
-    columns:
-      - name: id
-        type: BIGINT
-      - name: amount
-        type: DOUBLE
-      - name: net_amount
-        type: DOUBLE
-        is_calculated: true
-        expression: amount * 0.9
-relationships:
-  - name: deal_customer
-    models: [deals, customers]
-    join_type: MANY_TO_ONE
-    condition: deals.customer_id = customers.id
-views:
-  - name: top_deals
-    statement: SELECT * FROM deals ORDER BY amount DESC
-"""
+_DEALS_JSON = json.dumps(
+    {
+        "models": [
+            {
+                "name": "deals",
+                "tableReference": {"schema": "sales", "table": "deals"},
+                "primaryKey": "id",
+                "columns": [
+                    {"name": "id", "type": "BIGINT"},
+                    {"name": "amount", "type": "DOUBLE"},
+                    {
+                        "name": "net_amount",
+                        "type": "DOUBLE",
+                        "isCalculated": True,
+                        "expression": "amount * 0.9",
+                    },
+                ],
+            }
+        ],
+        "relationships": [
+            {
+                "name": "deal_customer",
+                "models": ["deals", "customers"],
+                "joinType": "MANY_TO_ONE",
+                "condition": "deals.customer_id = customers.id",
+            }
+        ],
+        "views": [
+            {"name": "top_deals", "statement": "SELECT * FROM deals ORDER BY amount"}
+        ],
+    }
+)
 
-_CUSTOMERS_YAML = """
-models:
-  - name: customers
-    table_reference:
-      schema: sales
-      table: customers
-    columns:
-      - name: id
-        type: BIGINT
-"""
+_CUSTOMERS_JSON = json.dumps(
+    {
+        "models": [
+            {
+                "name": "customers",
+                "tableReference": {"schema": "sales", "table": "customers"},
+                "columns": [{"name": "id", "type": "BIGINT"}],
+            }
+        ]
+    }
+)
 
 
-def test_compile_manifest_maps_snake_case_to_camel_case() -> None:
-    manifest = compile_manifest(yaml_contents=[_DEALS_YAML])
+def test_compile_manifest_passes_native_entities_through() -> None:
+    manifest = compile_manifest(json_contents=[_DEALS_JSON])
     model = manifest.models[0]
     assert model["name"] == "deals"
+    # Native camelCase is preserved verbatim — no translation.
     assert model["tableReference"] == {"schema": "sales", "table": "deals"}
     assert model["primaryKey"] == "id"
-    # Calculated column carries camelCase isCalculated + expression.
     net = next(col for col in model["columns"] if col["name"] == "net_amount")
     assert net["isCalculated"] is True
     assert net["expression"] == "amount * 0.9"
@@ -81,13 +89,13 @@ def test_compile_manifest_maps_snake_case_to_camel_case() -> None:
 
 
 def test_compile_manifest_merges_multiple_files_in_order() -> None:
-    manifest = compile_manifest(yaml_contents=[_DEALS_YAML, _CUSTOMERS_YAML])
+    manifest = compile_manifest(json_contents=[_DEALS_JSON, _CUSTOMERS_JSON])
     assert manifest.model_names == ["deals", "customers"]
 
 
 def test_to_engine_manifest_and_base64_roundtrip() -> None:
     manifest = compile_manifest(
-        yaml_contents=[_DEALS_YAML], catalog="wren", schema="public"
+        json_contents=[_DEALS_JSON], catalog="wren", schema="public"
     )
     engine = manifest.to_engine_manifest()
     assert engine["catalog"] == "wren"
@@ -98,43 +106,17 @@ def test_to_engine_manifest_and_base64_roundtrip() -> None:
     assert decoded == engine
 
 
-def test_invalid_yaml_is_skipped_not_raised() -> None:
-    manifest = compile_manifest(yaml_contents=["{ this: : is not yaml"])
+def test_invalid_json_is_skipped_not_raised() -> None:
+    manifest = compile_manifest(json_contents=["{ this is not json"])
     assert isinstance(manifest, CompiledManifest)
     assert manifest.models == []
 
 
-def test_to_wren_core_manifest_delegates_to_shared_mapping() -> None:
-    """The deep-validation manifest must use the same snake->camel mapping."""
+def test_to_wren_core_manifest_wraps_native_entities() -> None:
+    """Deep-validation manifest wraps native entities in the envelope, no mapping."""
 
-    compiled = compile_manifest(yaml_contents=[_DEALS_YAML])
-    shared = to_wren_core_manifest(
-        [
-            {
-                "name": "deals",
-                "table_reference": {"schema": "sales", "table": "deals"},
-                "primary_key": "id",
-                "columns": [
-                    {"name": "id", "type": "BIGINT"},
-                    {"name": "amount", "type": "DOUBLE"},
-                    {
-                        "name": "net_amount",
-                        "type": "DOUBLE",
-                        "is_calculated": True,
-                        "expression": "amount * 0.9",
-                    },
-                ],
-            }
-        ],
-        [
-            {
-                "name": "deal_customer",
-                "models": ["deals", "customers"],
-                "join_type": "MANY_TO_ONE",
-                "condition": "deals.customer_id = customers.id",
-            }
-        ],
-    )
+    compiled = compile_manifest(json_contents=[_DEALS_JSON])
+    shared = to_wren_core_manifest(compiled.models, compiled.relationships)
     assert shared["models"][0]["tableReference"] == {
         "schema": "sales",
         "table": "deals",
@@ -143,35 +125,33 @@ def test_to_wren_core_manifest_delegates_to_shared_mapping() -> None:
     assert shared["relationships"][0] == compiled.relationships[0]
 
 
-_CUBES_YAML = """
-models:
-  - name: sales
-    table_reference:
-      schema: public
-      table: sales
-    columns:
-      - name: amount
-        type: DOUBLE
-metrics:
-  - name: total_amount
-    base_object: sales
-    expression: SUM(amount)
-cubes:
-  - name: sales_cube
-    measures:
-      - name: total
-        expression: SUM(amount)
-    dimensions:
-      - name: region
-    time_dimensions:
-      - name: order_date
-    hierarchies:
-      - name: geo
-"""
+_CUBES_JSON = json.dumps(
+    {
+        "models": [
+            {
+                "name": "sales",
+                "tableReference": {"schema": "public", "table": "sales"},
+                "columns": [{"name": "amount", "type": "DOUBLE"}],
+            }
+        ],
+        "metrics": [
+            {"name": "total_amount", "baseObject": "sales", "expression": "SUM(amount)"}
+        ],
+        "cubes": [
+            {
+                "name": "sales_cube",
+                "measures": [{"name": "total", "expression": "SUM(amount)"}],
+                "dimensions": [{"name": "region"}],
+                "timeDimensions": [{"name": "order_date"}],
+                "hierarchies": [{"name": "geo"}],
+            }
+        ],
+    }
+)
 
 
-def test_compile_manifest_maps_metrics_and_cubes() -> None:
-    manifest = compile_manifest(yaml_contents=[_CUBES_YAML])
+def test_compile_manifest_carries_metrics_and_cubes() -> None:
+    manifest = compile_manifest(json_contents=[_CUBES_JSON])
     assert manifest.metrics[0]["name"] == "total_amount"
     assert manifest.metrics[0]["baseObject"] == "sales"
     cube = manifest.cubes[0]

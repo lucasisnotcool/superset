@@ -17,7 +17,7 @@
 
 """Schema-aware MDL validation.
 
-This module provides structural validation of MDL YAML (grammar, required
+This module provides structural validation of MDL JSON (grammar, required
 fields, relationship resolution) and optional *physical* validation against a
 :class:`SchemaIndex` built from permission-filtered Superset metadata. Physical
 validation is what code-enforces "never invent columns/tables" (risk R3): an MDL
@@ -27,10 +27,9 @@ validation and therefore cannot be activated (risk R1).
 
 from __future__ import annotations
 
+import json  # noqa: TID251 - standalone agent JSON contract
 from dataclasses import dataclass, field
 from typing import Any
-
-import yaml
 
 from superset_ai_agent.integrations.superset.client import AgentContext
 from superset_ai_agent.semantic_layer.mdl_schema import (
@@ -88,30 +87,20 @@ class SchemaIndex:
         return column.lower() in self.tables.get(table.lower(), set())
 
 
-def validate_mdl_yaml(content: str) -> MdlValidationResult:
-    """Structural-only MDL validation (no physical schema check).
-
-    Kept as the drop-in replacement for the original shallow validator so all
-    existing call sites gain real structural validation.
-    """
-
-    return validate_mdl(content)
-
-
 def validate_mdl(
     content: str,
     *,
     schema_index: SchemaIndex | None = None,
     strict_relationships: bool = False,
 ) -> MdlValidationResult:
-    """Validate one MDL YAML document.
+    """Validate one MDL JSON document (wren-core native shape).
 
     ``schema_index`` enables physical validation (R3). ``strict_relationships``
     turns unresolved relationship endpoints into errors instead of warnings;
     use it for merged project manifests where every model must be present.
     """
 
-    parsed, parse_message = _parse_yaml(content)
+    parsed, parse_message = _parse_json(content)
     if parse_message is not None:
         return MdlValidationResult(valid=False, messages=[parse_message])
 
@@ -165,12 +154,18 @@ def validate_project_manifest(
     *,
     schema_index: SchemaIndex | None = None,
     deep_validate: bool = False,
+    dedup_models: bool = False,
 ) -> MdlValidationResult:
     """Validate a merged set of MDL files as one project manifest.
 
     Relationship resolution is strict here because every referenced model should
     be present once all project files are combined. ``deep_validate`` additionally
     runs the optional wren-core engine and merges its findings.
+
+    ``dedup_models`` collapses models re-declared across files to their **last**
+    occurrence (the W4 safety net): an enrichment that re-emits an existing model
+    supersedes the older copy instead of failing as a ``duplicate_model``. Each
+    collapse is surfaced as an informational message, never silently.
     """
 
     merged_models: list[Any] = []
@@ -179,7 +174,7 @@ def validate_project_manifest(
     merged_metrics: list[Any] = []
     merged_cubes: list[Any] = []
     for content in contents:
-        parsed, parse_message = _parse_yaml(content)
+        parsed, parse_message = _parse_json(content)
         if parse_message is not None:
             return MdlValidationResult(valid=False, messages=[parse_message])
         merged_models.extend(_extract_models(parsed))
@@ -188,21 +183,27 @@ def validate_project_manifest(
         merged_metrics.extend(_extract_list(parsed, "metrics"))
         merged_cubes.extend(_extract_list(parsed, "cubes"))
 
-    merged_yaml = yaml.safe_dump(
+    dedup_messages: list[MdlValidationMessage] = []
+    if dedup_models:
+        merged_models, dedup_messages = _dedup_models_keep_last(merged_models)
+
+    merged_json = json.dumps(
         {
             "models": merged_models,
             "relationships": merged_relationships,
             "views": merged_views,
             "metrics": merged_metrics,
             "cubes": merged_cubes,
-        },
-        sort_keys=False,
-        allow_unicode=False,
+        }
     )
     result = validate_mdl(
-        merged_yaml,
+        merged_json,
         schema_index=schema_index,
         strict_relationships=True,
+    )
+    result = MdlValidationResult(
+        valid=result.valid,
+        messages=[*dedup_messages, *result.messages],
     )
     if not deep_validate:
         return result
@@ -261,7 +262,7 @@ def _validate_models(
                 MdlValidationMessage(
                     severity="warning",
                     message=(
-                        f"Model {name} has no table_reference or ref_sql; it "
+                        f"Model {name} has no tableReference or refSql; it "
                         "cannot be mapped to a physical table."
                     ),
                     code="model_without_mapping",
@@ -326,7 +327,7 @@ def _validate_columns(
             )
         seen_columns.add(column_name)
 
-        is_calculated = bool(column.get("is_calculated"))
+        is_calculated = bool(column.get("isCalculated"))
         if is_calculated and not column.get("expression"):
             messages.append(
                 MdlValidationMessage(
@@ -335,6 +336,19 @@ def _validate_columns(
                         "an expression."
                     ),
                     code="calculated_requires_expression",
+                )
+            )
+        # W5: wren-core requires every non-relationship column to carry a `type`.
+        # Catch it here with a readable, field-anchored message instead of letting
+        # it surface as the engine's opaque "missing field `type`" serde offset.
+        if not column.get("relationship") and not column.get("type"):
+            messages.append(
+                MdlValidationMessage(
+                    message=(
+                        f"Column {model_name}.{column_name} is missing a type; "
+                        "wren-core requires a type on every column."
+                    ),
+                    code="column_without_type",
                 )
             )
         if (
@@ -392,7 +406,7 @@ def _validate_relationships(
         if not isinstance(relationship, dict):
             continue
         label = relationship.get("name") or f"#{index + 1}"
-        join_type = relationship.get("join_type")
+        join_type = relationship.get("joinType")
         if join_type is None or str(join_type).upper() not in JOIN_TYPES:
             messages.append(
                 MdlValidationMessage(
@@ -464,7 +478,7 @@ def _validate_metrics(
             )
         seen_names.add(name)
 
-        base = metric.get("base_object")
+        base = metric.get("baseObject")
         if base and base not in base_object_names:
             messages.append(
                 MdlValidationMessage(
@@ -527,7 +541,7 @@ def _validate_cubes(
             )
         seen_names.add(name)
 
-        base = cube.get("base_object")
+        base = cube.get("baseObject")
         if base and base not in base_object_names:
             messages.append(
                 MdlValidationMessage(
@@ -549,7 +563,7 @@ def _validate_cubes(
             name, "dimension", cube.get("dimensions"), messages
         )
         _validate_named_entries(
-            name, "time dimension", cube.get("time_dimensions"), messages
+            name, "time dimension", cube.get("timeDimensions"), messages
         )
         _validate_named_entries(
             name, "hierarchy", cube.get("hierarchies"), messages
@@ -571,9 +585,9 @@ def _validate_cube_semantics(
     """
 
     dimension_names = _names(cube.get("dimensions") or []) | _names(
-        cube.get("time_dimensions") or []
+        cube.get("timeDimensions") or []
     )
-    for time_dimension in cube.get("time_dimensions") or []:
+    for time_dimension in cube.get("timeDimensions") or []:
         if not isinstance(time_dimension, dict):
             continue
         granularity = time_dimension.get("granularity")
@@ -704,15 +718,49 @@ def _names(items: list[Any]) -> set[str]:
 
 
 def _table_name(model: dict[str, Any]) -> str | None:
-    reference = model.get("table_reference")
+    reference = model.get("tableReference")
     if isinstance(reference, dict):
         table = reference.get("table")
         if isinstance(table, str) and table:
             return table
-    if model.get("ref_sql"):
+    if model.get("refSql"):
         # SQL-backed models are not mapped to a single physical table.
         return None
     return None
+
+
+def _dedup_models_keep_last(
+    models: list[Any],
+) -> tuple[list[Any], list[MdlValidationMessage]]:
+    """Collapse models re-declared by name to their last occurrence.
+
+    Returns the deduplicated list (in last-occurrence order) plus one info message
+    per collapsed name so the supersede is visible to the reviewer.
+    """
+
+    by_name: dict[str, Any] = {}
+    passthrough: list[Any] = []
+    duplicated: set[str] = set()
+    for model in models:
+        if not isinstance(model, dict) or not isinstance(model.get("name"), str):
+            passthrough.append(model)
+            continue
+        name = model["name"]
+        if name in by_name:
+            duplicated.add(name)
+        by_name[name] = model
+    messages = [
+        MdlValidationMessage(
+            severity="info",
+            message=(
+                f"Model {name} is defined more than once; using the newest "
+                "definition and dropping the older copy."
+            ),
+            code="model_superseded",
+        )
+        for name in duplicated
+    ]
+    return [*passthrough, *by_name.values()], messages
 
 
 def _extract_models(parsed: Any) -> list[Any]:
@@ -734,39 +782,35 @@ def _extract_list(parsed: Any, key: str) -> list[Any]:
     return []
 
 
-def _parse_yaml(content: str) -> tuple[Any, MdlValidationMessage | None]:
+def _parse_json(content: str) -> tuple[Any, MdlValidationMessage | None]:
     if not content.strip():
         return None, MdlValidationMessage(
-            message="MDL YAML is empty.",
-            code="empty_yaml",
+            message="MDL JSON is empty.",
+            code="empty_json",
         )
     try:
-        parsed = yaml.safe_load(content)
-    except yaml.YAMLError as ex:
-        return None, _yaml_error_message(ex)
+        parsed = json.loads(content)
+    except (ValueError, TypeError) as ex:
+        return None, _json_error_message(ex)
     if not isinstance(parsed, dict | list):
         return None, MdlValidationMessage(
-            message="MDL YAML must parse to an object or list.",
+            message="MDL JSON must parse to an object or list.",
             code="invalid_root",
         )
     if (isinstance(parsed, dict | list) and len(parsed) == 0) or parsed is None:
         return None, MdlValidationMessage(
-            message="MDL YAML must contain at least one entry.",
+            message="MDL JSON must contain at least one entry.",
             code="empty_root",
         )
     return parsed, None
 
 
-def _yaml_error_message(ex: yaml.YAMLError) -> MdlValidationMessage:
-    line: int | None = None
-    column: int | None = None
-    mark = getattr(ex, "problem_mark", None)
-    if mark is not None:
-        line = mark.line + 1
-        column = mark.column + 1
+def _json_error_message(ex: Exception) -> MdlValidationMessage:
+    line = getattr(ex, "lineno", None)
+    column = getattr(ex, "colno", None)
     return MdlValidationMessage(
         line=line,
         column=column,
         message=str(ex),
-        code="yaml_parse_error",
+        code="json_parse_error",
     )

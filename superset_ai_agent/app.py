@@ -829,10 +829,20 @@ def create_app(  # noqa: C901
                 request=request,
                 permission=SemanticPermission.READ,
             )
+        except SemanticProjectNotFoundError as ex:
+            raise HTTPException(
+                status_code=404,
+                detail="Semantic project not found.",
+            ) from ex
         except ValueError as ex:
             raise HTTPException(status_code=400, detail=str(ex)) from ex
         except SupersetAuthError as ex:
             raise HTTPException(status_code=ex.status_code, detail=str(ex)) from ex
+        except PermissionError as ex:
+            raise HTTPException(
+                status_code=403,
+                detail="Insufficient semantic project permission.",
+            ) from ex
 
     @api.get(
         "/agent/semantic-layer/projects",
@@ -904,7 +914,7 @@ def create_app(  # noqa: C901
         fastapi_request: Request,
         identity: AgentIdentity = identity_dependency,
     ) -> list[MdlFile]:
-        """List MDL YAML files in a governed semantic project."""
+        """List MDL JSON files in a governed semantic project."""
 
         authorize_semantic_project(
             fastapi_request,
@@ -924,7 +934,7 @@ def create_app(  # noqa: C901
         fastapi_request: Request,
         identity: AgentIdentity = identity_dependency,
     ) -> MdlFile:
-        """Create an MDL YAML file in a governed semantic project."""
+        """Create an MDL JSON file in a governed semantic project."""
 
         project = authorize_semantic_project(
             fastapi_request,
@@ -955,7 +965,7 @@ def create_app(  # noqa: C901
         fastapi_request: Request,
         identity: AgentIdentity = identity_dependency,
     ) -> MdlFile:
-        """Return one MDL YAML file from a governed semantic project."""
+        """Return one MDL JSON file from a governed semantic project."""
 
         authorize_semantic_project(
             fastapi_request,
@@ -1044,6 +1054,10 @@ def create_app(  # noqa: C901
             [*siblings, new_content],
             schema_index=schema_index,
             deep_validate=app_config.wren_core_validation_enabled,
+            # W4: an enrichment that re-emits an existing model supersedes the
+            # older copy instead of failing as a duplicate_model. new_content is
+            # last, so the file being activated wins.
+            dedup_models=True,
         )
         if not validation.valid:
             raise HTTPException(
@@ -1065,7 +1079,7 @@ def create_app(  # noqa: C901
         fastapi_request: Request,
         identity: AgentIdentity = identity_dependency,
     ) -> MdlFile:
-        """Update one MDL YAML file in a governed semantic project."""
+        """Update one MDL JSON file in a governed semantic project."""
 
         project = authorize_semantic_project(
             fastapi_request,
@@ -1122,7 +1136,7 @@ def create_app(  # noqa: C901
         fastapi_request: Request,
         identity: AgentIdentity = identity_dependency,
     ) -> dict[str, bool]:
-        """Delete one MDL YAML file from a governed semantic project."""
+        """Delete one MDL JSON file from a governed semantic project."""
 
         authorize_semantic_project(
             fastapi_request,
@@ -1152,7 +1166,7 @@ def create_app(  # noqa: C901
         fastapi_request: Request,
         identity: AgentIdentity = identity_dependency,
     ) -> MdlValidationResult:
-        """Validate one MDL YAML file from a governed semantic project."""
+        """Validate one MDL JSON file from a governed semantic project."""
 
         authorize_semantic_project(
             fastapi_request,
@@ -1183,7 +1197,7 @@ def create_app(  # noqa: C901
         fastapi_request: Request,
         identity: AgentIdentity = identity_dependency,
     ) -> WrenMaterializationResult:
-        """Materialize active MDL YAML files for read-only Wren context use."""
+        """Materialize active MDL JSON files for read-only Wren context use."""
 
         project = authorize_semantic_project(
             fastapi_request,
@@ -1328,7 +1342,7 @@ def create_app(  # noqa: C901
         file: UploadFile = upload_file,
         identity: AgentIdentity = identity_dependency,
     ) -> MdlFile:
-        """Upload a reviewed MDL YAML file to a governed semantic project."""
+        """Upload a reviewed MDL JSON file to a governed semantic project."""
 
         authorize_semantic_project(
             fastapi_request,
@@ -1338,7 +1352,7 @@ def create_app(  # noqa: C901
         )
         try:
             content = (await file.read()).decode("utf-8")
-            target_path = path or file.filename or "model.yaml"
+            target_path = path or file.filename or "model.json"
             return active_mdl_file_store.create(
                 project_id,
                 MdlFileCreateRequest(
@@ -1351,7 +1365,7 @@ def create_app(  # noqa: C901
         except UnicodeDecodeError as ex:
             raise HTTPException(
                 status_code=400,
-                detail="MDL YAML upload must be UTF-8 text.",
+                detail="MDL JSON upload must be UTF-8 text.",
             ) from ex
         except ValueError as ex:
             raise HTTPException(status_code=400, detail=str(ex)) from ex
@@ -1493,7 +1507,7 @@ def create_app(  # noqa: C901
         schema_index = _schema_index_for_project(project, fastapi_request)
         if schema_index is not None:
             validation = validate_mdl(
-                proposal.proposed_yaml,
+                proposal.proposed_content,
                 schema_index=schema_index,
             )
             extra_warnings = (

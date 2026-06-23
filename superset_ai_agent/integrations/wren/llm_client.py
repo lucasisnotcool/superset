@@ -33,40 +33,26 @@ import json  # noqa: TID251 - keep the standalone agent independent of Superset
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
-
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.integrations.superset.client import AgentContext
-from superset_ai_agent.integrations.wren.client import (
-    deterministic_base_model_proposals,
-    deterministic_mdl_proposal,
-)
+from superset_ai_agent.integrations.wren.client import deterministic_mdl_proposal
+from superset_ai_agent.integrations.wren.mdl_exporter import model_from_dataset
 from superset_ai_agent.llm.base import ChatMessage, ModelClient
 from superset_ai_agent.prompts.registry import get_prompt
 from superset_ai_agent.schemas import WrenContextArtifact
+from superset_ai_agent.semantic_layer.mdl_authoring import (
+    MdlProposalResponse,
+    proposal_response_schema,
+    serialize_manifest,
+)
 from superset_ai_agent.semantic_layer.mdl_files import MdlFileStore
-from superset_ai_agent.semantic_layer.mdl_validation import validate_mdl_yaml
+from superset_ai_agent.semantic_layer.mdl_validation import validate_mdl
 from superset_ai_agent.semantic_layer.schemas import (
     MdlEnrichmentProposal,
     SemanticDocument,
     SemanticProject,
     SemanticUpdate,
 )
-
-
-class _ProposedMdlFile(BaseModel):
-    """One MDL YAML file proposed by the model."""
-
-    path: str
-    yaml: str
-    notes: str | None = None
-
-
-class _MdlProposalResponse(BaseModel):
-    """Structured response envelope for MDL generation/enrichment."""
-
-    files: list[_ProposedMdlFile] = Field(default_factory=list)
-    warnings: list[str] = Field(default_factory=list)
 
 
 class LlmWrenClient:
@@ -169,7 +155,7 @@ class LlmWrenClient:
         project: SemanticProject,
         document: SemanticDocument,
     ) -> MdlEnrichmentProposal:
-        base_mdl = self._active_mdl_yaml(project)
+        base_mdl = self._active_mdl_json(project)
         document_text = (
             document.extracted_text or document.extracted_text_preview or ""
         ).strip()
@@ -190,16 +176,20 @@ class LlmWrenClient:
         if response is None or not response.files:
             return deterministic_mdl_proposal(project=project, document=document)
         first = response.files[0]
-        proposed_yaml = first.yaml.strip()
-        if not proposed_yaml:
-            return deterministic_mdl_proposal(project=project, document=document)
+        proposed_content = serialize_manifest(first.manifest)
+        # W4: when exactly one active file exists, target it in place so applying
+        # the enrichment updates that file rather than creating a sibling that
+        # collides on activation (the duplicate_model cascade). Otherwise fall back
+        # to the model's path or the schema default.
+        in_place = self._single_active_path(project)
+        proposed_path = in_place or _safe_relative_path(
+            first.path, default=f"models/{_safe_name(project.schema_name)}.json"
+        )
         return MdlEnrichmentProposal(
             source_document_id=document.id,
-            proposed_path=_safe_relative_path(
-                first.path, default=f"models/{_safe_name(project.schema_name)}.yaml"
-            ),
-            proposed_yaml=proposed_yaml,
-            validation=validate_mdl_yaml(proposed_yaml),
+            proposed_path=proposed_path,
+            proposed_content=proposed_content,
+            validation=validate_mdl(proposed_content),
             warnings=[
                 *response.warnings,
                 "LLM-generated MDL draft. Review before activation.",
@@ -236,55 +226,83 @@ class LlmWrenClient:
                 for dataset in superset_context.datasets
             ],
         }
-        response = self._call_model("wren_onboarding", payload)
-        if response is None or not response.files:
-            return deterministic_base_model_proposals(
-                project=project,
-                superset_context=superset_context,
+        # W3: structure is seeded deterministically from the permission-filtered
+        # datasets (authoritative name/tableReference/columns+types). The model
+        # only supplies *semantics* (descriptions, synonyms), which are overlaid
+        # onto the seed — so a useless or absent model can never drop a column or
+        # its required type. This is how Wren avoids the structural-hallucination
+        # class: structure from the catalog, semantics from the model.
+        seeds = {
+            str(seed.get("name")): seed
+            for seed in (
+                model_from_dataset(dataset) for dataset in superset_context.datasets
             )
+            if seed.get("name")
+        }
+        response = self._call_model("wren_onboarding", payload)
+        llm_models, warnings = _llm_models_by_name(response)
+
         proposals: list[MdlEnrichmentProposal] = []
-        for index, file in enumerate(response.files):
-            proposed_yaml = file.yaml.strip()
-            if not proposed_yaml:
-                continue
+        for name, seed in seeds.items():
+            _overlay_model_semantics(seed, llm_models.get(name))
+            proposed_content = json.dumps({"models": [seed]}, indent=2)
             proposals.append(
                 MdlEnrichmentProposal(
                     source_document_id=f"onboarding:{project.id}",
-                    proposed_path=_safe_relative_path(
-                        file.path, default=f"models/model_{index}.yaml"
-                    ),
-                    proposed_yaml=proposed_yaml,
-                    validation=validate_mdl_yaml(proposed_yaml),
+                    proposed_path=f"models/{_safe_name(name)}.json",
+                    proposed_content=proposed_content,
+                    validation=validate_mdl(proposed_content),
                     warnings=[
-                        *response.warnings,
-                        "LLM-generated base model from schema introspection. "
-                        "Review descriptions, metrics, and relationships before "
-                        "activation.",
+                        *warnings,
+                        "Base model seeded from schema introspection; descriptions "
+                        "enriched by the model. Review before activation.",
                     ],
                 )
             )
-        if not proposals:
-            return deterministic_base_model_proposals(
-                project=project,
-                superset_context=superset_context,
-            )
         return proposals
 
-    def _active_mdl_yaml(self, project: SemanticProject) -> str:
+    def _single_active_path(self, project: SemanticProject) -> str | None:
+        """Return the lone active file's path, for in-place enrichment targeting."""
+
         if self.mdl_file_store is None:
-            return ""
+            return None
         try:
             files = self.mdl_file_store.list(project.id)
         except Exception:  # pylint: disable=broad-except
-            return ""
+            return None
         active = [file for file in files if file.status == "active"]
-        return "\n---\n".join(file.content for file in active)
+        return active[0].path if len(active) == 1 else None
+
+    def _active_mdl_json(self, project: SemanticProject) -> list[dict[str, Any]]:
+        """Return the active models as native dicts — read-only enrichment context."""
+
+        if self.mdl_file_store is None:
+            return []
+        try:
+            files = self.mdl_file_store.list(project.id)
+        except Exception:  # pylint: disable=broad-except
+            return []
+        models: list[dict[str, Any]] = []
+        for file in files:
+            if file.status != "active":
+                continue
+            try:
+                payload = json.loads(file.content)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(payload, dict):
+                models.extend(
+                    model
+                    for model in payload.get("models", [])
+                    if isinstance(model, dict)
+                )
+        return models
 
     def _call_model(
         self,
         prompt_name: str,
         payload: dict[str, Any],
-    ) -> _MdlProposalResponse | None:
+    ) -> MdlProposalResponse | None:
         try:
             prompt = get_prompt(prompt_name)
         except OSError:
@@ -302,13 +320,13 @@ class LlmWrenClient:
                         ),
                     ),
                 ],
-                format_schema=_MdlProposalResponse.model_json_schema(),
+                format_schema=proposal_response_schema(),
             )
         except Exception:  # pylint: disable=broad-except
             return None
         try:
             data = json.loads(result.content)
-            return _MdlProposalResponse.model_validate(data)
+            return MdlProposalResponse.model_validate(data)
         except Exception:  # pylint: disable=broad-except
             return None
 
@@ -368,6 +386,54 @@ def _trim_to_budget(
     return items
 
 
+def _llm_models_by_name(
+    response: MdlProposalResponse | None,
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Index the model's proposed manifests by model name (native dicts)."""
+
+    if response is None:
+        return {}, []
+    models: dict[str, dict[str, Any]] = {}
+    for file in response.files:
+        payload = file.manifest.model_dump(by_alias=True, exclude_none=True)
+        for model in payload.get("models", []):
+            name = model.get("name")
+            if isinstance(name, str) and name:
+                models[name] = model
+    return models, list(response.warnings)
+
+
+def _overlay_model_semantics(
+    seed: dict[str, Any],
+    llm_model: dict[str, Any] | None,
+) -> None:
+    """Overlay model/column descriptions + synonyms from the model onto the seed.
+
+    Structure (name, tableReference, column names + types) stays authoritative;
+    only semantic fields are taken from the LLM, and only when present.
+    """
+
+    if not llm_model:
+        return
+    if llm_model.get("description"):
+        seed["description"] = llm_model["description"]
+    llm_columns = {
+        col.get("name"): col
+        for col in llm_model.get("columns", [])
+        if isinstance(col, dict) and col.get("name")
+    }
+    for column in seed.get("columns", []):
+        match = llm_columns.get(column.get("name"))
+        if not match:
+            continue
+        if match.get("description"):
+            column["description"] = match["description"]
+        if isinstance(match.get("properties"), dict):
+            merged = {**column.get("properties", {}), **match["properties"]}
+            if merged:
+                column["properties"] = merged
+
+
 def _safe_name(value: str) -> str:
     chars = [char if char.isalnum() else "_" for char in value.lower()]
     name = "_".join("".join(chars).split("_"))
@@ -378,6 +444,8 @@ def _safe_relative_path(path: str, *, default: str) -> str:
     candidate = (path or "").strip().replace("\\", "/").lstrip("/")
     if not candidate or ".." in candidate.split("/"):
         return default
-    if not candidate.endswith((".yaml", ".yml")):
-        candidate = f"{candidate}.yaml"
+    if candidate.endswith((".yaml", ".yml")):
+        candidate = candidate.rsplit(".", 1)[0]
+    if not candidate.endswith(".json"):
+        candidate = f"{candidate}.json"
     return candidate

@@ -364,7 +364,7 @@ class AiAgentJob(Base):
 
 
 class AiAgentSemanticMdlFile(Base):
-    """YAML MDL file belonging to a semantic project."""
+    """JSON MDL file belonging to a semantic project."""
 
     __tablename__ = "ai_agent_semantic_mdl_files"
     __table_args__ = (

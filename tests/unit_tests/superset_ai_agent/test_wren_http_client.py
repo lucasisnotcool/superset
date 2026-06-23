@@ -130,8 +130,8 @@ def test_wren_http_client_proposes_mdl_from_document() -> None:
             200,
             json={
                 "result": {
-                    "proposed_path": "models/moves.yaml",
-                    "proposed_yaml": "models:\n  - name: moves\n",
+                    "proposed_path": "models/moves.json",
+                    "proposed_content": json.dumps({"models": [{"name": "moves"}]}),
                     "warnings": ["review before activation"],
                 }
             },
@@ -151,8 +151,8 @@ def test_wren_http_client_proposes_mdl_from_document() -> None:
         document=_document(),
     )
 
-    assert proposal.proposed_path == "models/moves.yaml"
-    assert proposal.proposed_yaml == "models:\n  - name: moves\n"
+    assert proposal.proposed_path == "models/moves.json"
+    assert json.loads(proposal.proposed_content) == {"models": [{"name": "moves"}]}
     assert proposal.validation.valid is True
     assert proposal.warnings == ["review before activation"]
 

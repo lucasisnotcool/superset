@@ -22,8 +22,6 @@ import json  # noqa: TID251 - standalone agent JSON contract
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 from superset_ai_agent.semantic_layer.mdl_compile import compile_manifest
 from superset_ai_agent.semantic_layer.mdl_files import normalize_mdl_path
 from superset_ai_agent.semantic_layer.mdl_validator import validate_project_manifest
@@ -40,7 +38,7 @@ def materialize_wren_project(
     mdl_files: list[MdlFile],
     base_path: Path,
 ) -> WrenMaterializationResult:
-    """Materialize active project MDL YAML files and a combined JSON sidecar."""
+    """Materialize active project MDL JSON files and a combined JSON sidecar."""
 
     active_files = sorted(
         [
@@ -82,7 +80,7 @@ def materialize_wren_project(
         checksum.update(relative_path.encode("utf-8"))
         checksum.update(b"\0")
         checksum.update(file.content.encode("utf-8"))
-        _merge_mdl_yaml(merged, file.content)
+        _merge_mdl_json(merged, file.content)
 
     sidecar_path = project_path / "mdl.json"
     sidecar_path.write_text(
@@ -137,17 +135,19 @@ def materialize_wren_project(
     )
 
 
-def _merge_mdl_yaml(target: dict[str, Any], content: str) -> None:
-    payload = yaml.safe_load(content)
+def _merge_mdl_json(target: dict[str, Any], content: str) -> None:
+    try:
+        payload = json.loads(content)
+    except (ValueError, TypeError):
+        return
     if not isinstance(payload, dict):
         return
-    for key in ("models", "semantic_models", "views"):
-        value = payload.get(key)
-        if isinstance(value, list):
-            target.setdefault("models", []).extend(
-                item for item in value if isinstance(item, dict)
-            )
-    for key in ("relationships", "metrics", "enums"):
+    value = payload.get("models")
+    if isinstance(value, list):
+        target.setdefault("models", []).extend(
+            item for item in value if isinstance(item, dict)
+        )
+    for key in ("relationships", "views", "metrics", "cubes"):
         value = payload.get(key)
         if isinstance(value, list):
             target.setdefault(key, []).extend(

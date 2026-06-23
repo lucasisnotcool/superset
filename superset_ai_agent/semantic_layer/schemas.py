@@ -176,7 +176,7 @@ MdlFileSourceType = Literal[
     "enriched_markdown",
     "onboarding",
 ]
-MdlContentType = Literal["application/x-yaml", "text/yaml"]
+MdlContentType = Literal["application/json"]
 
 
 class SemanticProject(BaseModel):
@@ -216,7 +216,7 @@ class SemanticProjectResolveRequest(BaseModel):
 
 
 class MdlValidationMessage(BaseModel):
-    """YAML/MDL validation message for editor annotations."""
+    """MDL validation message for editor annotations."""
 
     line: int | None = None
     column: int | None = None
@@ -226,21 +226,21 @@ class MdlValidationMessage(BaseModel):
 
 
 class MdlValidationResult(BaseModel):
-    """Validation result for one MDL YAML file."""
+    """Validation result for one MDL JSON file."""
 
     valid: bool
     messages: list[MdlValidationMessage] = Field(default_factory=list)
 
 
 class MdlFile(BaseModel):
-    """One YAML file in a schema-scoped Wren MDL project."""
+    """One JSON file in a schema-scoped Wren MDL project (native manifest shape)."""
 
     id: str = Field(default_factory=_new_id)
     project_id: str
     path: str
     filename: str
     content: str
-    content_type: MdlContentType = "application/x-yaml"
+    content_type: MdlContentType = "application/json"
     source_type: MdlFileSourceType = "manual"
     status: MdlFileStatus = "draft"
     validation: MdlValidationResult | None = None
@@ -254,7 +254,7 @@ class MdlFile(BaseModel):
 
 
 class MdlFileCreateRequest(BaseModel):
-    """Create a draft MDL YAML file."""
+    """Create a draft MDL JSON file."""
 
     path: str
     content: str
@@ -263,7 +263,7 @@ class MdlFileCreateRequest(BaseModel):
 
 
 class MdlFileUpdateRequest(BaseModel):
-    """Update an MDL YAML file."""
+    """Update an MDL JSON file."""
 
     path: str | None = None
     content: str | None = None
@@ -271,11 +271,11 @@ class MdlFileUpdateRequest(BaseModel):
 
 
 class MdlEnrichmentProposal(BaseModel):
-    """Proposed MDL generated from a source document."""
+    """Proposed MDL (native JSON) generated from a source document."""
 
     source_document_id: str
     proposed_path: str
-    proposed_yaml: str
+    proposed_content: str
     validation: MdlValidationResult
     warnings: list[str] = Field(default_factory=list)
 

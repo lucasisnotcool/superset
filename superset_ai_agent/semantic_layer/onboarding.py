@@ -73,13 +73,13 @@ def onboard_schema_project(
         # Physical, schema-aware validation (R3): a hallucinated table/column
         # makes the draft non-activatable but is still written so a human can
         # correct it rather than silently losing the proposal.
-        validation = validate_mdl(proposal.proposed_yaml, schema_index=schema_index)
+        validation = validate_mdl(proposal.proposed_content, schema_index=schema_index)
         try:
             created = mdl_file_store.create(
                 project.id,
                 MdlFileCreateRequest(
                     path=proposal.proposed_path,
-                    content=proposal.proposed_yaml,
+                    content=proposal.proposed_content,
                     source_type="onboarding",
                 ),
                 owner_id=owner_id,

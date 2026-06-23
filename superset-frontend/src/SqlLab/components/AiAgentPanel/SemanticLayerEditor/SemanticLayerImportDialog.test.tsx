@@ -17,7 +17,12 @@
  * under the License.
  */
 import fetchMock from 'fetch-mock';
-import { render, screen, userEvent, waitFor } from 'spec/helpers/testing-library';
+import {
+  render,
+  screen,
+  userEvent,
+  waitFor,
+} from 'spec/helpers/testing-library';
 import SemanticLayerImportDialog from './SemanticLayerImportDialog';
 
 const originalAgentUrl = process.env.SUPERSET_AI_AGENT_URL;
@@ -60,23 +65,26 @@ const renderDialog = () => {
 
 test('stages a dropped YAML file as a new MDL draft with a diff', async () => {
   const { fileInput } = renderDialog();
-  fetchMock.post('http://agent.local/agent/semantic-layer/projects/project-1/mdl-files', {
-    id: 'file-new',
-    project_id: 'project-1',
-    path: 'models/model.yaml',
-    filename: 'model.yaml',
-    content: 'models:\n  - name: model\n',
-    content_type: 'application/x-yaml',
-    source_type: 'uploaded_mdl',
-    status: 'draft',
-    checksum: 'x',
-    created_at: '2026-06-19T00:00:00Z',
-    updated_at: '2026-06-19T00:00:00Z',
-  });
+  fetchMock.post(
+    'http://agent.local/agent/semantic-layer/projects/project-1/mdl-files',
+    {
+      id: 'file-new',
+      project_id: 'project-1',
+      path: 'models/model.json',
+      filename: 'model.json',
+      content: '{"models":[{"name":"model"}]}',
+      content_type: 'application/json',
+      source_type: 'uploaded_mdl',
+      status: 'draft',
+      checksum: 'x',
+      created_at: '2026-06-19T00:00:00Z',
+      updated_at: '2026-06-19T00:00:00Z',
+    },
+  );
 
   await userEvent.upload(
     fileInput(),
-    makeFile('models:\n  - name: model\n', 'model.yaml', 'text/yaml'),
+    makeFile('{"models":[{"name":"model"}]}', 'model.json', 'application/json'),
   );
 
   await waitFor(() => {
@@ -92,7 +100,7 @@ test('stages a dropped YAML file as a new MDL draft with a diff', async () => {
     );
     expect(calls).toHaveLength(1);
     expect(JSON.parse(String(calls[0].options.body))).toMatchObject({
-      path: 'models/model.yaml',
+      path: 'models/model.json',
       source_type: 'uploaded_mdl',
     });
   });
@@ -122,8 +130,8 @@ test('routes a dropped Markdown file through the enrichment pipeline', async () 
     'http://agent.local/agent/semantic-layer/projects/project-1/documents/document-9/enrich',
     {
       source_document_id: 'document-9',
-      proposed_path: 'models/enriched.yaml',
-      proposed_yaml: 'models:\n  - name: enriched\n',
+      proposed_path: 'models/enriched.json',
+      proposed_content: '{"models":[{"name":"enriched"}]}',
       validation: { valid: true, messages: [] },
       warnings: [],
     },

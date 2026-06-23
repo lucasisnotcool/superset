@@ -17,47 +17,74 @@
 
 from __future__ import annotations
 
+import json  # noqa: TID251 - standalone agent JSON contract
+
 import pytest
 
 from superset_ai_agent.semantic_layer.mdl_validator import validate_project_manifest
 from superset_ai_agent.semantic_layer.wren_core_validator import (
+    _friendly_engine_error,
     to_wren_core_manifest,
     validate_with_wren_core,
     wren_core_available,
 )
 
+
+def test_friendly_engine_error_maps_missing_type() -> None:
+    msg = _friendly_engine_error("missing field `type` at line 1 column 4109")
+    assert msg.code == "wren_core_missing_field"
+    assert "type" in msg.message
+    assert "column" in msg.message.lower()
+
+
+def test_friendly_engine_error_maps_unknown_variant() -> None:
+    msg = _friendly_engine_error("unknown variant `SIDEWAYS`, expected one of ...")
+    assert msg.code == "wren_core_unknown_variant"
+    assert "SIDEWAYS" in msg.message
+
+
+def test_friendly_engine_error_passes_through_unknown_shape() -> None:
+    msg = _friendly_engine_error("some other engine failure")
+    assert msg.code == "wren_core_error"
+    assert "some other engine failure" in msg.message
+
 # wren-core requires every column to carry a ``type``; a complete model
 # round-trips through deep validation cleanly.
-_VALID_MODEL = (
-    "models:\n"
-    "  - name: deals\n"
-    "    table_reference:\n"
-    "      table: deals\n"
-    "    columns:\n"
-    "      - name: stage\n"
-    "        type: VARCHAR\n"
+_VALID_MODEL = json.dumps(
+    {
+        "models": [
+            {
+                "name": "deals",
+                "tableReference": {"table": "deals"},
+                "columns": [{"name": "stage", "type": "VARCHAR"}],
+            }
+        ]
+    }
 )
 
 # Same model but a column is missing its required ``type`` — wren-core rejects it.
-_INCOMPLETE_MODEL = (
-    "models:\n"
-    "  - name: deals\n"
-    "    table_reference:\n"
-    "      table: deals\n"
-    "    columns:\n"
-    "      - name: stage\n"
+_INCOMPLETE_MODEL = json.dumps(
+    {
+        "models": [
+            {
+                "name": "deals",
+                "tableReference": {"table": "deals"},
+                "columns": [{"name": "stage"}],
+            }
+        ]
+    }
 )
 
 
-def test_to_wren_core_manifest_maps_snake_case_to_camel_case() -> None:
+def test_to_wren_core_manifest_wraps_native_entities() -> None:
     manifest = to_wren_core_manifest(
         [
             {
                 "name": "deals",
-                "table_reference": {"schema": "sales", "table": "deals"},
+                "tableReference": {"schema": "sales", "table": "deals"},
                 "columns": [
                     {"name": "stage", "type": "VARCHAR"},
-                    {"name": "total", "is_calculated": True, "expression": "SUM(x)"},
+                    {"name": "total", "isCalculated": True, "expression": "SUM(x)"},
                 ],
             }
         ],
@@ -65,12 +92,13 @@ def test_to_wren_core_manifest_maps_snake_case_to_camel_case() -> None:
             {
                 "name": "deals_sites",
                 "models": ["deals", "sites"],
-                "join_type": "MANY_TO_ONE",
+                "joinType": "MANY_TO_ONE",
                 "condition": "deals.site_id = sites.id",
             }
         ],
     )
     model = manifest["models"][0]
+    # Pass-through: native entities are placed in the envelope unchanged.
     assert model["tableReference"] == {"schema": "sales", "table": "deals"}
     assert model["columns"][1]["isCalculated"] is True
     assert manifest["relationships"][0]["joinType"] == "MANY_TO_ONE"
@@ -91,11 +119,24 @@ def test_deep_validate_passes_complete_manifest() -> None:
     assert result.valid is True
 
 
+def test_incomplete_manifest_is_caught_structurally() -> None:
+    # W5: a column missing its required ``type`` is now caught by the structural
+    # validator (with a readable message) before deep validation — no wren-core
+    # needed, no opaque serde offset.
+    result = validate_project_manifest([_INCOMPLETE_MODEL])
+    assert result.valid is False
+    assert any(m.code == "column_without_type" for m in result.messages)
+
+
 @pytest.mark.skipif(
     not wren_core_available(), reason="wren-core not installed"
 )
-def test_wren_core_rejects_incomplete_manifest() -> None:
-    # A column missing its required ``type`` is rejected by the live engine.
+def test_wren_core_missing_field_is_mapped_friendly() -> None:
+    # If a typeless column reaches the engine (deep validate), the serde error is
+    # translated to a field-anchored message rather than a byte offset.
     result = validate_project_manifest([_INCOMPLETE_MODEL], deep_validate=True)
     assert result.valid is False
-    assert any(m.code == "wren_core_error" for m in result.messages)
+    assert any(
+        m.code in {"column_without_type", "wren_core_missing_field"}
+        for m in result.messages
+    )

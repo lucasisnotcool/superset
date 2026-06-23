@@ -22,7 +22,6 @@ import json  # noqa: TID251 - tests cover the standalone agent JSON contract
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.conversations.schemas import ConversationScope
 from superset_ai_agent.graph import TextToSqlGraph
-from superset_ai_agent.integrations.wren.llm_client import LlmWrenClient
 from superset_ai_agent.integrations.superset.client import (
     AgentContext,
     ColumnSummary,
@@ -30,6 +29,7 @@ from superset_ai_agent.integrations.superset.client import (
     DatasetMetadata,
     MetricSummary,
 )
+from superset_ai_agent.integrations.wren.llm_client import LlmWrenClient
 from superset_ai_agent.llm.base import ChatMessage, ModelResult
 from superset_ai_agent.schemas import (
     AgentQueryRequest,
@@ -276,8 +276,8 @@ def test_graph_materializes_schema_project_for_wren_context(tmp_path) -> None:
     file = mdl_store.create(
         project.id,
         MdlFileCreateRequest(
-            path="models/birth_names.yaml",
-            content="models:\n  - name: birth_names\n",
+            path="models/birth_names.json",
+            content=json.dumps({"models": [{"name": "birth_names"}]}),
         ),
         owner_id="analyst",
     )
@@ -382,11 +382,18 @@ def test_graph_injects_materialized_mdl_into_sql_prompt(tmp_path) -> None:
     file = mdl_store.create(
         project.id,
         MdlFileCreateRequest(
-            path="models/birth_names.yaml",
-            content=(
-                "models:\n"
-                "  - name: birth_names\n"
-                "    description: Annual baby name registrations and totals\n"
+            path="models/birth_names.json",
+            content=json.dumps(
+                {
+                    "models": [
+                        {
+                            "name": "birth_names",
+                            "properties": {
+                                "description": "Annual baby name registrations"
+                            },
+                        }
+                    ]
+                }
             ),
         ),
         owner_id="analyst",

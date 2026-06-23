@@ -26,23 +26,19 @@ Validation is performed by loading the MDL manifest into wren-core: a malformed
 or semantically inconsistent manifest raises when ``to_manifest`` parses it or
 when ``SessionContext`` is constructed, which we surface as validation errors.
 
-NOTE: wren-core consumes a manifest in ``wren-core-base``'s exact serde shape
-(camelCase: ``tableReference``, ``joinType``, ``isCalculated``). The
-``to_wren_core_manifest`` mapping below targets that shape and MUST be
-re-verified against the installed wren-core version before relying on it (see
-``wren_model.md`` risk R9/R11).
+MDL is authored and stored in wren-core's native shape (camelCase), so there is
+no field mapping here: ``to_wren_core_manifest`` simply wraps the native entity
+lists in the manifest envelope. The native shape is pinned to the installed
+wheel by ``test_native_manifest_contract.py``.
 """
 
 from __future__ import annotations
 
 import base64
 import json  # noqa: TID251 - standalone agent JSON contract
+import re
 from typing import Any
 
-from superset_ai_agent.semantic_layer.mdl_compile import (
-    model_to_camel,
-    relationship_to_camel,
-)
 from superset_ai_agent.semantic_layer.schemas import (
     MdlValidationMessage,
     MdlValidationResult,
@@ -105,30 +101,60 @@ def validate_engine_manifest(engine_manifest: dict[str, Any]) -> MdlValidationRe
     except Exception as ex:  # pylint: disable=broad-except
         return MdlValidationResult(
             valid=False,
-            messages=[
-                MdlValidationMessage(
-                    message=f"wren-core rejected the manifest: {ex}",
-                    code="wren_core_error",
-                )
-            ],
+            messages=[_friendly_engine_error(str(ex))],
         )
     return MdlValidationResult(valid=True)
+
+
+def _friendly_engine_error(raw: str) -> MdlValidationMessage:
+    """Translate wren-core's serde errors into field-anchored guidance.
+
+    wren-core reports schema violations as Rust serde errors with a byte offset
+    (e.g. ``missing field `type` at line 1 column 4109``) that is meaningless to a
+    user. Recognize the common shapes and surface an actionable message instead.
+    """
+
+    missing = re.search(r"missing field `([^`]+)`", raw)
+    if missing is not None:
+        field = missing.group(1)
+        return MdlValidationMessage(
+            message=(
+                f"The manifest is missing the required field '{field}'. Every "
+                f"column needs a 'type'; check that no column omits it."
+                if field == "type"
+                else f"The manifest is missing the required field '{field}'."
+            ),
+            code="wren_core_missing_field",
+        )
+    variant = re.search(r"unknown variant `([^`]+)`", raw)
+    if variant is not None:
+        return MdlValidationMessage(
+            message=(
+                f"The manifest uses an unsupported value '{variant.group(1)}' "
+                "(for example an invalid joinType). Use one of the documented "
+                "enum values."
+            ),
+            code="wren_core_unknown_variant",
+        )
+    return MdlValidationMessage(
+        message=f"wren-core rejected the manifest: {raw}",
+        code="wren_core_error",
+    )
 
 
 def to_wren_core_manifest(
     models: list[dict[str, Any]],
     relationships: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Map snake_case MDL models/relationships to the wren-core manifest shape.
+    """Wrap native models/relationships in the wren-core manifest envelope.
 
-    Delegates to :mod:`superset_ai_agent.semantic_layer.mdl_compile`, the single
-    source of the snake->camel mapping, so deep validation and engine
-    compilation can never drift apart (wren_full.md R9/R16).
+    MDL is already authored in wren-core's native shape, so this is a pass-through
+    that only adds the catalog/schema envelope — no field translation.
     """
 
     return {
         "catalog": "wren",
         "schema": "public",
-        "models": [model_to_camel(model) for model in models],
-        "relationships": [relationship_to_camel(rel) for rel in relationships],
+        "models": models,
+        "relationships": relationships,
     }

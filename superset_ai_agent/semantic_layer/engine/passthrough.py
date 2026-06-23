@@ -18,7 +18,7 @@
 """Passthrough engine: the zero-dependency default SemanticEngine binding.
 
 It compiles MDL and returns SQL unchanged from ``plan_sql`` (the LLM writes
-native SQL directly). Structural/physical validation of authoring YAML stays on
+native SQL directly). Structural/physical validation of authoring JSON stays on
 the existing ``validate_project_manifest`` path (activation gate, materializer);
 the engine's ``validate`` covers only engine-specific deep checks, which the
 passthrough binding does not perform.

@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-import json
+import json  # noqa: TID251 - standalone agent JSON contract
 
 from superset_ai_agent.semantic_layer.schemas import MdlFile, SemanticProject
 from superset_ai_agent.semantic_layer.wren_materializer import (
@@ -25,7 +25,7 @@ from superset_ai_agent.semantic_layer.wren_materializer import (
 )
 
 
-def test_materialize_wren_project_writes_active_yaml_and_json(tmp_path) -> None:
+def test_materialize_wren_project_writes_active_json_and_sidecar(tmp_path) -> None:
     project = SemanticProject(
         id="project-1",
         name="Sales.pipeline",
@@ -38,17 +38,17 @@ def test_materialize_wren_project_writes_active_yaml_and_json(tmp_path) -> None:
     )
     active_file = MdlFile(
         project_id=project.id,
-        path="models/gross_moves.yaml",
-        filename="gross_moves.yaml",
-        content="models:\n  - name: gross_moves\n",
+        path="models/gross_moves.json",
+        filename="gross_moves.json",
+        content=json.dumps({"models": [{"name": "gross_moves"}]}),
         status="active",
         checksum="checksum",
     )
     draft_file = MdlFile(
         project_id=project.id,
-        path="models/draft.yaml",
-        filename="draft.yaml",
-        content="models:\n  - name: draft\n",
+        path="models/draft.json",
+        filename="draft.json",
+        content=json.dumps({"models": [{"name": "draft"}]}),
         status="draft",
         checksum="checksum",
     )
@@ -60,8 +60,8 @@ def test_materialize_wren_project_writes_active_yaml_and_json(tmp_path) -> None:
     )
 
     assert result.file_count == 1
-    assert (tmp_path / project.id / "mdl" / "models" / "gross_moves.yaml").exists()
-    assert not (tmp_path / project.id / "mdl" / "models" / "draft.yaml").exists()
+    assert (tmp_path / project.id / "mdl" / "models" / "gross_moves.json").exists()
+    assert not (tmp_path / project.id / "mdl" / "models" / "draft.json").exists()
     payload = json.loads((tmp_path / project.id / "mdl.json").read_text())
     assert payload["models"] == [{"name": "gross_moves"}]
     assert payload["dataSource"]["properties"]["semantic_project_id"] == project.id

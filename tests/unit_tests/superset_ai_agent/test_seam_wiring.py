@@ -46,27 +46,28 @@ from tests.unit_tests.superset_ai_agent.test_graph_semantic_engine import (
     _FakeGatingEngine,
 )
 
-_MODEL_YAML = """
-models:
-  - name: orders
-    table_reference:
-      schema: sales
-      table: orders
-    columns:
-      - name: id
-        type: BIGINT
-      - name: revenue
-        type: DOUBLE
-  - name: customers
-    table_reference:
-      schema: sales
-      table: customers
-    columns:
-      - name: id
-        type: BIGINT
-      - name: region
-        type: VARCHAR
-"""
+_MODEL_MDL = json.dumps(
+    {
+        "models": [
+            {
+                "name": "orders",
+                "tableReference": {"schema": "sales", "table": "orders"},
+                "columns": [
+                    {"name": "id", "type": "BIGINT"},
+                    {"name": "revenue", "type": "DOUBLE"},
+                ],
+            },
+            {
+                "name": "customers",
+                "tableReference": {"schema": "sales", "table": "customers"},
+                "columns": [
+                    {"name": "id", "type": "BIGINT"},
+                    {"name": "region", "type": "VARCHAR"},
+                ],
+            },
+        ]
+    }
+)
 
 
 @dataclass
@@ -94,7 +95,7 @@ def test_retrieve_mdl_context_ranks_active_mdl_into_context_items() -> None:
         question="customer region",
         project_id="proj-1",
         owner_id="owner-1",
-        mdl_file_store=_FakeMdlFileStore([_FakeMdlFile(_MODEL_YAML)]),
+        mdl_file_store=_FakeMdlFileStore([_FakeMdlFile(_MODEL_MDL)]),
     )
     assert items, "expected retrieved schema context items"
     assert all(item["source"] == "retriever" for item in items)
@@ -117,7 +118,7 @@ def test_retrieve_mdl_context_stamps_effective_mode_on_fallback() -> None:
         question="customer region",
         project_id="proj-1",
         owner_id="owner-1",
-        mdl_file_store=_FakeMdlFileStore([_FakeMdlFile(_MODEL_YAML)]),
+        mdl_file_store=_FakeMdlFileStore([_FakeMdlFile(_MODEL_MDL)]),
     )
     assert items
     assert all(item["retriever"] == "keyword" for item in items)
@@ -134,7 +135,7 @@ def test_retrieve_mdl_context_degrades_closed() -> None:
             question="q",
             project_id=None,
             owner_id="o",
-            mdl_file_store=_FakeMdlFileStore([_FakeMdlFile(_MODEL_YAML)]),
+            mdl_file_store=_FakeMdlFileStore([_FakeMdlFile(_MODEL_MDL)]),
         )
         == []
     )
@@ -157,7 +158,7 @@ def test_retrieve_mdl_context_degrades_closed() -> None:
             project_id="p",
             owner_id="o",
             mdl_file_store=_FakeMdlFileStore(
-                [_FakeMdlFile(_MODEL_YAML, status="draft")]
+                [_FakeMdlFile(_MODEL_MDL, status="draft")]
             ),
         )
         == []

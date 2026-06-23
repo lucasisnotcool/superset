@@ -365,10 +365,10 @@ test('semantic project API helpers use project and MDL endpoints', async () => {
   const mdlFile = {
     id: 'file-1',
     project_id: 'project-1',
-    path: 'models/gross_moves.yaml',
-    filename: 'gross_moves.yaml',
-    content: 'models:\n  - name: gross_moves\n',
-    content_type: 'application/x-yaml',
+    path: 'models/gross_moves.json',
+    filename: 'gross_moves.json',
+    content: '{"models":[{"name":"gross_moves"}]}',
+    content_type: 'application/json',
     source_type: 'manual',
     status: 'draft',
     validation: { valid: true, messages: [] },
@@ -428,8 +428,8 @@ test('semantic project API helpers use project and MDL endpoints', async () => {
     'http://agent.local/agent/semantic-layer/projects/project-1/documents/document-1/enrich',
     {
       source_document_id: 'document-1',
-      proposed_path: 'models/gross_moves.yaml',
-      proposed_yaml: 'models:\n  - name: gross_moves\n',
+      proposed_path: 'models/gross_moves.json',
+      proposed_content: '{"models":[{"name":"gross_moves"}]}',
       validation: { valid: true, messages: [] },
       warnings: [],
     },
@@ -457,8 +457,8 @@ test('semantic project API helpers use project and MDL endpoints', async () => {
   expect(
     (
       await createMdlFile('project-1', {
-        path: 'models/gross_moves.yaml',
-        content: 'models:\n  - name: gross_moves\n',
+        path: 'models/gross_moves.json',
+        content: '{"models":[{"name":"gross_moves"}]}',
       })
     ).id,
   ).toBe('file-1');
@@ -474,7 +474,7 @@ test('semantic project API helpers use project and MDL endpoints', async () => {
     (
       await uploadMdlFile(
         'project-1',
-        new File(['models: []'], 'mdl.yaml', { type: 'text/yaml' }),
+        new File(['{"models":[]}'], 'mdl.json', { type: 'application/json' }),
       )
     ).id,
   ).toBe('file-1');
@@ -488,7 +488,7 @@ test('semantic project API helpers use project and MDL endpoints', async () => {
   ).toBe('project-1');
   expect(
     (await enrichProjectDocument('project-1', 'document-1')).proposed_path,
-  ).toBe('models/gross_moves.yaml');
+  ).toBe('models/gross_moves.json');
   expect((await materializeSemanticProject('project-1')).file_count).toBe(1);
 
   const [resolveCall] = fetchMock.callHistory.calls(

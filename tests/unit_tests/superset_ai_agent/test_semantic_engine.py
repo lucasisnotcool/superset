@@ -19,6 +19,8 @@
 
 from __future__ import annotations
 
+import json  # noqa: TID251 - standalone agent JSON contract
+
 import pytest
 
 from superset_ai_agent.config import AgentConfig
@@ -33,22 +35,23 @@ from superset_ai_agent.semantic_layer.engine.wren_core_engine import wren_core_a
 from superset_ai_agent.semantic_layer.mdl_compile import compile_manifest
 from superset_ai_agent.semantic_layer.schemas import MdlFile
 
-_YAML = """
-models:
-  - name: deals
-    table_reference:
-      schema: sales
-      table: deals
-    columns:
-      - name: amount
-        type: DOUBLE
-"""
+_MDL = json.dumps(
+    {
+        "models": [
+            {
+                "name": "deals",
+                "tableReference": {"schema": "sales", "table": "deals"},
+                "columns": [{"name": "amount", "type": "DOUBLE"}],
+            }
+        ]
+    }
+)
 
 _SQL = "SELECT amount FROM deals"
 
 
 def _manifest():
-    return compile_manifest(yaml_contents=[_YAML])
+    return compile_manifest(json_contents=[_MDL])
 
 
 def test_resolve_dialect_maps_known_and_unknown_backends() -> None:
@@ -98,9 +101,9 @@ def test_passthrough_compile_roundtrips_manifest() -> None:
     mdl_file = MdlFile(
         id="f1",
         project_id="p1",
-        path="m.yaml",
-        filename="m.yaml",
-        content=_YAML,
+        path="m.json",
+        filename="m.json",
+        content=_MDL,
         checksum="abc",
     )
     manifest = engine.compile([mdl_file])
@@ -139,20 +142,25 @@ def test_wren_core_rewrites_model_to_physical_table() -> None:
     assert "sales.deals" in planned.native_sql
 
 
-_CALC_YAML = """
-models:
-  - name: deals
-    table_reference:
-      schema: sales
-      table: deals
-    columns:
-      - name: amount
-        type: DOUBLE
-      - name: margin
-        type: DOUBLE
-        is_calculated: true
-        expression: amount * 0.1
-"""
+_CALC_MDL = json.dumps(
+    {
+        "models": [
+            {
+                "name": "deals",
+                "tableReference": {"schema": "sales", "table": "deals"},
+                "columns": [
+                    {"name": "amount", "type": "DOUBLE"},
+                    {
+                        "name": "margin",
+                        "type": "DOUBLE",
+                        "isCalculated": True,
+                        "expression": "amount * 0.1",
+                    },
+                ],
+            }
+        ]
+    }
+)
 
 
 @pytest.mark.skipif(
@@ -162,7 +170,7 @@ def test_wren_core_computes_calculated_column() -> None:
     engine = WrenCoreEngine()
     planned = engine.plan_sql(
         "SELECT margin FROM deals",
-        compile_manifest(yaml_contents=[_CALC_YAML]),
+        compile_manifest(json_contents=[_CALC_MDL]),
         dialect="postgres",
     )
     # The engine — not the LLM — generates the calculated expression.
@@ -172,29 +180,29 @@ def test_wren_core_computes_calculated_column() -> None:
 # Parity litmus (wren_full.md Phase 1 Tests): a query joining two logical models
 # is rewritten into native SQL whose physical tables + join the engine — not the
 # LLM — materialized as CTEs.
-_MULTI_MODEL_YAML = """
-models:
-  - name: deals
-    table_reference:
-      schema: sales
-      table: deals
-    columns:
-      - name: id
-        type: BIGINT
-      - name: customer_id
-        type: BIGINT
-      - name: amount
-        type: DOUBLE
-  - name: Customers
-    table_reference:
-      schema: sales
-      table: customers
-    columns:
-      - name: id
-        type: BIGINT
-      - name: region
-        type: VARCHAR
-"""
+_MULTI_MODEL_MDL = json.dumps(
+    {
+        "models": [
+            {
+                "name": "deals",
+                "tableReference": {"schema": "sales", "table": "deals"},
+                "columns": [
+                    {"name": "id", "type": "BIGINT"},
+                    {"name": "customer_id", "type": "BIGINT"},
+                    {"name": "amount", "type": "DOUBLE"},
+                ],
+            },
+            {
+                "name": "Customers",
+                "tableReference": {"schema": "sales", "table": "customers"},
+                "columns": [
+                    {"name": "id", "type": "BIGINT"},
+                    {"name": "region", "type": "VARCHAR"},
+                ],
+            },
+        ]
+    }
+)
 
 
 @pytest.mark.skipif(
@@ -205,7 +213,7 @@ def test_wren_core_rewrites_multi_model_join() -> None:
     planned = engine.plan_sql(
         "SELECT c.region, SUM(d.amount) AS total FROM deals d "
         "JOIN Customers c ON d.customer_id = c.id GROUP BY c.region",
-        compile_manifest(yaml_contents=[_MULTI_MODEL_YAML]),
+        compile_manifest(json_contents=[_MULTI_MODEL_MDL]),
         dialect="postgres",
     )
     assert planned.rewritten is True

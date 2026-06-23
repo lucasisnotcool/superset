@@ -114,7 +114,7 @@ const newId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
 const isMarkdown = (filename: string) => /\.(md|markdown|txt)$/i.test(filename);
 
-const isYaml = (filename: string) => /\.(ya?ml)$/i.test(filename);
+const isJson = (filename: string) => /\.json$/i.test(filename);
 
 const isProcessing = (status: StagedStatus) =>
   status === 'uploading' || status === 'enriching';
@@ -172,7 +172,7 @@ export default function SemanticLayerImportDialog({
     setItems(current => [
       ...current,
       ...entries.map(({ file, id }) => {
-        const supported = isYaml(file.name) || isMarkdown(file.name);
+        const supported = isJson(file.name) || isMarkdown(file.name);
         return {
           id,
           filename: file.name,
@@ -183,18 +183,18 @@ export default function SemanticLayerImportDialog({
           status: (supported ? 'uploading' : 'error') as StagedStatus,
           error: supported
             ? undefined
-            : t('Unsupported file type. Drop a .yaml, .yml or .md file.'),
+            : t('Unsupported file type. Drop a .json or .md file.'),
         };
       }),
     ]);
     try {
       for (const { file, id } of entries) {
-        if (isYaml(file.name)) {
-          // YAML is treated as a new/updated MDL file directly.
+        if (isJson(file.name)) {
+          // JSON is treated as a new/updated MDL file directly.
           // eslint-disable-next-line no-await-in-loop
           const text = await file.text();
           patchItem(id, {
-            path: `models/${file.name.replace(/\.(ya?ml)$/i, '')}.yaml`,
+            path: `models/${file.name.replace(/\.json$/i, '')}.json`,
             content: text,
             status: 'pending',
           });
@@ -213,7 +213,7 @@ export default function SemanticLayerImportDialog({
           const proposal = await enrichProjectDocument(projectId, document.id);
           patchItem(id, {
             path: proposal.proposed_path,
-            content: proposal.proposed_yaml,
+            content: proposal.proposed_content,
             kind: 'enrichment',
             validation: proposal.validation,
             status: 'pending',
@@ -402,7 +402,7 @@ export default function SemanticLayerImportDialog({
         ref={inputRef}
         type="file"
         multiple
-        accept=".yaml,.yml,.md,.markdown,.txt"
+        accept=".json,.md,.markdown,.txt"
         onChange={onPick}
       />
       <StagedList>

@@ -15,7 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
+"""Structural + physical MDL validation over wren-core's native JSON shape."""
+
 from __future__ import annotations
+
+import json  # noqa: TID251 - standalone agent JSON contract
+from typing import Any
 
 from superset_ai_agent.integrations.superset.client import (
     AgentContext,
@@ -28,6 +33,12 @@ from superset_ai_agent.semantic_layer.mdl_validator import (
     validate_mdl,
     validate_project_manifest,
 )
+
+
+def mdl(**sections: Any) -> str:
+    """Serialize a native MDL manifest (camelCase) to JSON content."""
+
+    return json.dumps(sections)
 
 
 def _schema_index() -> SchemaIndex:
@@ -59,13 +70,15 @@ def _schema_index() -> SchemaIndex:
 
 def test_valid_model_passes_structural_validation() -> None:
     result = validate_mdl(
-        "models:\n"
-        "  - name: deals\n"
-        "    table_reference:\n"
-        "      table: deals\n"
-        "    columns:\n"
-        "      - name: stage\n"
-        "        type: VARCHAR\n"
+        mdl(
+            models=[
+                {
+                    "name": "deals",
+                    "tableReference": {"table": "deals"},
+                    "columns": [{"name": "stage", "type": "VARCHAR"}],
+                }
+            ]
+        )
     )
     assert result.valid is True
     assert result.messages == []
@@ -73,14 +86,16 @@ def test_valid_model_passes_structural_validation() -> None:
 
 def test_invalid_join_type_is_error() -> None:
     result = validate_mdl(
-        "models:\n"
-        "  - name: deals\n"
-        "    columns:\n"
-        "      - name: stage\n"
-        "relationships:\n"
-        "  - name: deals_sites\n"
-        "    models: [deals, sites]\n"
-        "    join_type: SIDEWAYS\n"
+        mdl(
+            models=[{"name": "deals", "columns": [{"name": "stage", "type": "v"}]}],
+            relationships=[
+                {
+                    "name": "deals_sites",
+                    "models": ["deals", "sites"],
+                    "joinType": "SIDEWAYS",
+                }
+            ],
+        )
     )
     assert result.valid is False
     assert any(m.code == "invalid_join_type" for m in result.messages)
@@ -88,13 +103,18 @@ def test_invalid_join_type_is_error() -> None:
 
 def test_duplicate_column_is_error() -> None:
     result = validate_mdl(
-        "models:\n"
-        "  - name: deals\n"
-        "    table_reference:\n"
-        "      table: deals\n"
-        "    columns:\n"
-        "      - name: stage\n"
-        "      - name: stage\n"
+        mdl(
+            models=[
+                {
+                    "name": "deals",
+                    "tableReference": {"table": "deals"},
+                    "columns": [
+                        {"name": "stage", "type": "v"},
+                        {"name": "stage", "type": "v"},
+                    ],
+                }
+            ]
+        )
     )
     assert result.valid is False
     assert any(m.code == "duplicate_column" for m in result.messages)
@@ -102,13 +122,15 @@ def test_duplicate_column_is_error() -> None:
 
 def test_calculated_column_requires_expression() -> None:
     result = validate_mdl(
-        "models:\n"
-        "  - name: deals\n"
-        "    table_reference:\n"
-        "      table: deals\n"
-        "    columns:\n"
-        "      - name: derived\n"
-        "        is_calculated: true\n"
+        mdl(
+            models=[
+                {
+                    "name": "deals",
+                    "tableReference": {"table": "deals"},
+                    "columns": [{"name": "derived", "isCalculated": True}],
+                }
+            ]
+        )
     )
     assert result.valid is False
     assert any(m.code == "calculated_requires_expression" for m in result.messages)
@@ -116,12 +138,15 @@ def test_calculated_column_requires_expression() -> None:
 
 def test_physical_validation_flags_unknown_table() -> None:
     result = validate_mdl(
-        "models:\n"
-        "  - name: ghosts\n"
-        "    table_reference:\n"
-        "      table: ghosts\n"
-        "    columns:\n"
-        "      - name: stage\n",
+        mdl(
+            models=[
+                {
+                    "name": "ghosts",
+                    "tableReference": {"table": "ghosts"},
+                    "columns": [{"name": "stage", "type": "v"}],
+                }
+            ]
+        ),
         schema_index=_schema_index(),
     )
     assert result.valid is False
@@ -130,13 +155,18 @@ def test_physical_validation_flags_unknown_table() -> None:
 
 def test_physical_validation_flags_hallucinated_column() -> None:
     result = validate_mdl(
-        "models:\n"
-        "  - name: deals\n"
-        "    table_reference:\n"
-        "      table: deals\n"
-        "    columns:\n"
-        "      - name: stage\n"
-        "      - name: invented_total\n",
+        mdl(
+            models=[
+                {
+                    "name": "deals",
+                    "tableReference": {"table": "deals"},
+                    "columns": [
+                        {"name": "stage", "type": "v"},
+                        {"name": "invented_total", "type": "v"},
+                    ],
+                }
+            ]
+        ),
         schema_index=_schema_index(),
     )
     assert result.valid is False
@@ -147,15 +177,23 @@ def test_physical_validation_flags_hallucinated_column() -> None:
 
 def test_physical_validation_allows_calculated_column() -> None:
     result = validate_mdl(
-        "models:\n"
-        "  - name: deals\n"
-        "    table_reference:\n"
-        "      table: deals\n"
-        "    columns:\n"
-        "      - name: stage\n"
-        "      - name: total\n"
-        "        is_calculated: true\n"
-        "        expression: SUM(gross_moves)\n",
+        mdl(
+            models=[
+                {
+                    "name": "deals",
+                    "tableReference": {"table": "deals"},
+                    "columns": [
+                        {"name": "stage", "type": "v"},
+                        {
+                            "name": "total",
+                            "type": "DOUBLE",
+                            "isCalculated": True,
+                            "expression": "SUM(gross_moves)",
+                        },
+                    ],
+                }
+            ]
+        ),
         schema_index=_schema_index(),
     )
     assert result.valid is True
@@ -166,30 +204,89 @@ def test_schema_index_from_snapshot_validates_like_live() -> None:
     snapshot_index = SchemaIndex.from_snapshot(index.to_tables())
 
     result = validate_mdl(
-        "models:\n"
-        "  - name: deals\n"
-        "    table_reference:\n"
-        "      table: deals\n"
-        "    columns:\n"
-        "      - name: ghost\n",
+        mdl(
+            models=[
+                {
+                    "name": "deals",
+                    "tableReference": {"table": "deals"},
+                    "columns": [{"name": "ghost", "type": "v"}],
+                }
+            ]
+        ),
         schema_index=snapshot_index,
     )
     assert result.valid is False
     assert any(m.code == "unknown_column" for m in result.messages)
 
 
+def test_column_without_type_is_flagged_structurally() -> None:
+    # W5: a typeless column is caught structurally with a readable message,
+    # before it can reach wren-core's opaque "missing field `type`" serde error.
+    result = validate_mdl(
+        mdl(
+            models=[
+                {
+                    "name": "deals",
+                    "tableReference": {"table": "deals"},
+                    "columns": [{"name": "stage"}],  # no type
+                }
+            ]
+        )
+    )
+    assert result.valid is False
+    type_errors = [m for m in result.messages if m.code == "column_without_type"]
+    assert type_errors
+    assert "deals.stage" in type_errors[0].message
+
+
+def test_relationship_column_may_omit_type() -> None:
+    # A relationship column references another model and legitimately has no type.
+    result = validate_mdl(
+        mdl(
+            models=[
+                {
+                    "name": "deals",
+                    "tableReference": {"table": "deals"},
+                    "columns": [
+                        {"name": "amount", "type": "DOUBLE"},
+                        {"name": "customer", "relationship": "deal_customer"},
+                    ],
+                }
+            ]
+        )
+    )
+    assert not any(m.code == "column_without_type" for m in result.messages)
+
+
+def test_json_parse_error_is_reported() -> None:
+    result = validate_mdl('{"models": [')
+    assert result.valid is False
+    assert result.messages[0].code == "json_parse_error"
+
+
+_DEALS = {
+    "name": "deals",
+    "tableReference": {"table": "deals"},
+    "columns": [{"name": "amount", "type": "DOUBLE"}],
+}
+
+
 def test_relationship_unresolved_is_warning_per_file_error_in_project() -> None:
-    deals = (
-        "models:\n"
-        "  - name: deals\n"
-        "    table_reference:\n"
-        "      table: deals\n"
-        "    columns:\n"
-        "      - name: stage\n"
-        "relationships:\n"
-        "  - name: deals_sites\n"
-        "    models: [deals, sites]\n"
-        "    join_type: MANY_TO_ONE\n"
+    deals = mdl(
+        models=[
+            {
+                "name": "deals",
+                "tableReference": {"table": "deals"},
+                "columns": [{"name": "stage", "type": "v"}],
+            }
+        ],
+        relationships=[
+            {
+                "name": "deals_sites",
+                "models": ["deals", "sites"],
+                "joinType": "MANY_TO_ONE",
+            }
+        ],
     )
     per_file = validate_mdl(deals)
     assert per_file.valid is True
@@ -198,13 +295,14 @@ def test_relationship_unresolved_is_warning_per_file_error_in_project() -> None:
         for m in per_file.messages
     )
 
-    sites = (
-        "models:\n"
-        "  - name: sites\n"
-        "    table_reference:\n"
-        "      table: sites\n"
-        "    columns:\n"
-        "      - name: site_id\n"
+    sites = mdl(
+        models=[
+            {
+                "name": "sites",
+                "tableReference": {"table": "sites"},
+                "columns": [{"name": "site_id", "type": "v"}],
+            }
+        ]
     )
     project = validate_project_manifest([deals, sites])
     assert project.valid is True
@@ -217,57 +315,83 @@ def test_relationship_unresolved_is_warning_per_file_error_in_project() -> None:
     )
 
 
-_DEALS_MODEL = (
-    "models:\n"
-    "  - name: deals\n"
-    "    table_reference:\n"
-    "      table: deals\n"
-    "    columns:\n"
-    "      - name: amount\n"
-    "        type: DOUBLE\n"
-)
+def test_dedup_models_supersedes_older_copy_instead_of_erroring() -> None:
+    # W4: re-emitting an existing model (the enrichment cascade) must not fail as
+    # duplicate_model when dedup is on; the newest definition wins, with an info.
+    older = mdl(
+        models=[
+            {
+                "name": "deals",
+                "tableReference": {"table": "deals"},
+                "columns": [{"name": "amount", "type": "DOUBLE"}],
+            }
+        ]
+    )
+    newer = mdl(
+        models=[
+            {
+                "name": "deals",
+                "description": "Enriched deals",
+                "tableReference": {"table": "deals"},
+                "columns": [{"name": "amount", "type": "DOUBLE"}],
+            }
+        ]
+    )
+
+    without_dedup = validate_project_manifest([older, newer])
+    assert without_dedup.valid is False
+    assert any(m.code == "duplicate_model" for m in without_dedup.messages)
+
+    with_dedup = validate_project_manifest([older, newer], dedup_models=True)
+    assert with_dedup.valid is True
+    assert any(m.code == "model_superseded" for m in with_dedup.messages)
+    assert not any(m.code == "duplicate_model" for m in with_dedup.messages)
 
 
 def test_valid_metric_passes_structural_validation() -> None:
     result = validate_mdl(
-        _DEALS_MODEL + "metrics:\n"
-        "  - name: total_amount\n"
-        "    base_object: deals\n"
-        "    expression: SUM(amount)\n"
+        mdl(
+            models=[_DEALS],
+            metrics=[
+                {
+                    "name": "total_amount",
+                    "baseObject": "deals",
+                    "expression": "SUM(amount)",
+                }
+            ],
+        )
     )
     assert result.valid is True
     assert result.messages == []
 
 
 def test_metric_only_file_is_not_empty_root() -> None:
-    result = validate_mdl(
-        "metrics:\n  - name: total\n    expression: SUM(amount)\n"
-    )
+    result = validate_mdl(mdl(metrics=[{"name": "total", "expression": "SUM(amount)"}]))
     assert not any(m.code == "empty_root" for m in result.messages)
 
 
 def test_metric_without_measure_is_warning() -> None:
     result = validate_mdl(
-        _DEALS_MODEL + "metrics:\n  - name: total_amount\n    base_object: deals\n"
+        mdl(models=[_DEALS], metrics=[{"name": "total_amount", "baseObject": "deals"}])
     )
     assert result.valid is True
     assert any(m.code == "metric_without_measure" for m in result.messages)
 
 
 def test_metric_unresolved_base_is_warning_per_file_error_in_project() -> None:
-    metric = (
-        "metrics:\n"
-        "  - name: total_amount\n"
-        "    base_object: ghost\n"
-        "    expression: SUM(amount)\n"
+    content = mdl(
+        models=[_DEALS],
+        metrics=[
+            {"name": "total_amount", "baseObject": "ghost", "expression": "SUM(amount)"}
+        ],
     )
-    per_file = validate_mdl(_DEALS_MODEL + metric)
+    per_file = validate_mdl(content)
     assert per_file.valid is True
     assert any(
         m.code == "unresolved_metric_base" and m.severity == "warning"
         for m in per_file.messages
     )
-    project = validate_project_manifest([_DEALS_MODEL + metric])
+    project = validate_project_manifest([content])
     assert project.valid is False
     assert any(
         m.code == "unresolved_metric_base" and m.severity == "error"
@@ -277,9 +401,13 @@ def test_metric_unresolved_base_is_warning_per_file_error_in_project() -> None:
 
 def test_duplicate_metric_name_is_error() -> None:
     result = validate_mdl(
-        _DEALS_MODEL + "metrics:\n"
-        "  - name: total\n    expression: SUM(amount)\n"
-        "  - name: total\n    expression: COUNT(*)\n"
+        mdl(
+            models=[_DEALS],
+            metrics=[
+                {"name": "total", "expression": "SUM(amount)"},
+                {"name": "total", "expression": "COUNT(*)"},
+            ],
+        )
     )
     assert result.valid is False
     assert any(m.code == "duplicate_metric" for m in result.messages)
@@ -287,7 +415,7 @@ def test_duplicate_metric_name_is_error() -> None:
 
 def test_cube_without_measures_is_warning() -> None:
     result = validate_mdl(
-        _DEALS_MODEL + "cubes:\n  - name: deal_cube\n    base_object: deals\n"
+        mdl(models=[_DEALS], cubes=[{"name": "deal_cube", "baseObject": "deals"}])
     )
     assert result.valid is True
     assert any(m.code == "cube_without_measures" for m in result.messages)
@@ -295,26 +423,33 @@ def test_cube_without_measures_is_warning() -> None:
 
 def test_cube_measure_requires_expression() -> None:
     result = validate_mdl(
-        _DEALS_MODEL + "cubes:\n"
-        "  - name: deal_cube\n"
-        "    base_object: deals\n"
-        "    measures:\n"
-        "      - name: total\n"
+        mdl(
+            models=[_DEALS],
+            cubes=[
+                {
+                    "name": "deal_cube",
+                    "baseObject": "deals",
+                    "measures": [{"name": "total"}],
+                }
+            ],
+        )
     )
     assert result.valid is True
     assert any(m.code == "cube_measure_without_expression" for m in result.messages)
 
 
 def test_cube_unresolved_base_is_error_in_project() -> None:
-    cube = (
-        "cubes:\n"
-        "  - name: deal_cube\n"
-        "    base_object: ghost\n"
-        "    measures:\n"
-        "      - name: total\n"
-        "        expression: SUM(amount)\n"
+    content = mdl(
+        models=[_DEALS],
+        cubes=[
+            {
+                "name": "deal_cube",
+                "baseObject": "ghost",
+                "measures": [{"name": "total", "expression": "SUM(amount)"}],
+            }
+        ],
     )
-    project = validate_project_manifest([_DEALS_MODEL + cube])
+    project = validate_project_manifest([content])
     assert project.valid is False
     assert any(
         m.code == "unresolved_cube_base" and m.severity == "error"
@@ -322,47 +457,51 @@ def test_cube_unresolved_base_is_error_in_project() -> None:
     )
 
 
+def _cube(**extra: Any) -> dict[str, Any]:
+    cube = {
+        "name": "deal_cube",
+        "baseObject": "deals",
+        "measures": [{"name": "total", "expression": "SUM(amount)"}],
+    }
+    cube.update(extra)
+    return cube
+
+
 def test_cube_dimension_without_name_is_flagged() -> None:
     result = validate_mdl(
-        _DEALS_MODEL + "cubes:\n"
-        "  - name: deal_cube\n"
-        "    base_object: deals\n"
-        "    measures:\n"
-        "      - name: total\n"
-        "        expression: SUM(amount)\n"
-        "    dimensions:\n"
-        "      - description: a dimension with no name\n"
+        mdl(
+            models=[_DEALS],
+            cubes=[_cube(dimensions=[{"description": "a dimension with no name"}])],
+        )
     )
     assert any(m.code == "cube_entry_without_name" for m in result.messages)
 
 
 def test_cube_time_dimension_and_hierarchy_names_pass() -> None:
     result = validate_mdl(
-        _DEALS_MODEL + "cubes:\n"
-        "  - name: deal_cube\n"
-        "    base_object: deals\n"
-        "    measures:\n"
-        "      - name: total\n"
-        "        expression: SUM(amount)\n"
-        "    time_dimensions:\n"
-        "      - name: closed_at\n"
-        "    hierarchies:\n"
-        "      - name: geography\n"
+        mdl(
+            models=[_DEALS],
+            cubes=[
+                _cube(
+                    timeDimensions=[{"name": "closed_at"}],
+                    hierarchies=[{"name": "geography", "levels": ["x"]}],
+                )
+            ],
+        )
     )
     assert not any(m.code == "cube_entry_without_name" for m in result.messages)
 
 
 def test_cube_unknown_granularity_is_warning() -> None:
     result = validate_mdl(
-        _DEALS_MODEL + "cubes:\n"
-        "  - name: deal_cube\n"
-        "    base_object: deals\n"
-        "    measures:\n"
-        "      - name: total\n"
-        "        expression: SUM(amount)\n"
-        "    time_dimensions:\n"
-        "      - name: closed_at\n"
-        "        granularity: fortnight\n"
+        mdl(
+            models=[_DEALS],
+            cubes=[
+                _cube(
+                    timeDimensions=[{"name": "closed_at", "granularity": "fortnight"}]
+                )
+            ],
+        )
     )
     assert result.valid is True
     assert any(m.code == "cube_unknown_granularity" for m in result.messages)
@@ -370,67 +509,43 @@ def test_cube_unknown_granularity_is_warning() -> None:
 
 def test_cube_known_granularity_passes() -> None:
     result = validate_mdl(
-        _DEALS_MODEL + "cubes:\n"
-        "  - name: deal_cube\n"
-        "    base_object: deals\n"
-        "    measures:\n"
-        "      - name: total\n"
-        "        expression: SUM(amount)\n"
-        "    time_dimensions:\n"
-        "      - name: closed_at\n"
-        "        granularity: Month\n"
+        mdl(
+            models=[_DEALS],
+            cubes=[
+                _cube(timeDimensions=[{"name": "closed_at", "granularity": "Month"}])
+            ],
+        )
     )
     assert not any(m.code == "cube_unknown_granularity" for m in result.messages)
 
 
 def test_cube_hierarchy_level_must_resolve_to_a_dimension() -> None:
     result = validate_mdl(
-        _DEALS_MODEL + "cubes:\n"
-        "  - name: deal_cube\n"
-        "    base_object: deals\n"
-        "    measures:\n"
-        "      - name: total\n"
-        "        expression: SUM(amount)\n"
-        "    dimensions:\n"
-        "      - name: region\n"
-        "    hierarchies:\n"
-        "      - name: geo\n"
-        "        levels: [region, ghost_level]\n"
+        mdl(
+            models=[_DEALS],
+            cubes=[
+                _cube(
+                    dimensions=[{"name": "region"}],
+                    hierarchies=[{"name": "geo", "levels": ["region", "ghost_level"]}],
+                )
+            ],
+        )
     )
     codes = [m.code for m in result.messages]
     assert "cube_hierarchy_unknown_level" in codes
-    # The defined dimension `region` is not flagged.
-    unknown = [
-        m
-        for m in result.messages
-        if m.code == "cube_hierarchy_unknown_level"
-    ]
+    unknown = [m for m in result.messages if m.code == "cube_hierarchy_unknown_level"]
     assert all("ghost_level" in m.message for m in unknown)
 
 
 def test_cube_hierarchy_without_levels_is_warning() -> None:
     result = validate_mdl(
-        _DEALS_MODEL + "cubes:\n"
-        "  - name: deal_cube\n"
-        "    base_object: deals\n"
-        "    measures:\n"
-        "      - name: total\n"
-        "        expression: SUM(amount)\n"
-        "    hierarchies:\n"
-        "      - name: geo\n"
+        mdl(models=[_DEALS], cubes=[_cube(hierarchies=[{"name": "geo"}])])
     )
     assert any(m.code == "cube_hierarchy_without_levels" for m in result.messages)
 
 
 def test_cube_dimensions_must_be_a_list() -> None:
     result = validate_mdl(
-        _DEALS_MODEL + "cubes:\n"
-        "  - name: deal_cube\n"
-        "    base_object: deals\n"
-        "    measures:\n"
-        "      - name: total\n"
-        "        expression: SUM(amount)\n"
-        "    dimensions:\n"
-        "      region: not-a-list\n"
+        mdl(models=[_DEALS], cubes=[_cube(dimensions={"region": "not-a-list"})])
     )
     assert any(m.code == "cube_invalid_entries" for m in result.messages)

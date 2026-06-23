@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-import json
+import json  # noqa: TID251 - standalone agent JSON contract
 import re
 from pathlib import Path
 from typing import Any
@@ -80,7 +80,7 @@ def model_from_dataset(dataset: DatasetMetadata) -> dict[str, Any]:
 
     model = {
         "name": _safe_identifier(dataset.table_name or f"dataset_{dataset.id}"),
-        "table_reference": {
+        "tableReference": {
             "schema": dataset.schema_name,
             "table": dataset.table_name,
         },
@@ -112,13 +112,13 @@ def measure_from_metric(metric: MetricSummary) -> dict[str, Any]:
 
 
 def column_to_field(column: ColumnSummary) -> dict[str, Any]:
-    """Map a Superset column to a Wren field (canonical snake_case MDL)."""
+    """Map a Superset column to a Wren column (wren-core native shape)."""
 
     return _drop_none(
         {
             "name": _safe_identifier(column.name),
             "type": column.type,
-            "is_calculated": False,
+            "isCalculated": False,
             "description": column.description,
             "properties": _drop_none(
                 {

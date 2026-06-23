@@ -20,8 +20,6 @@ from __future__ import annotations
 import json  # noqa: TID251 - standalone agent JSON contract
 from typing import Any
 
-import yaml
-
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.conversations.schemas import ConversationScope
 from superset_ai_agent.integrations.superset.client import (
@@ -119,12 +117,17 @@ def test_generate_base_model_parses_llm_proposals() -> None:
     payload = {
         "files": [
             {
-                "path": "models/deals.yaml",
-                "yaml": (
-                    "models:\n"
-                    "  - name: deals\n"
-                    "    description: Sales deals and pipeline stages\n"
-                ),
+                "path": "models/deals.json",
+                "manifest": {
+                    "models": [
+                        {
+                            "name": "deals",
+                            "description": "Sales deals and pipeline stages",
+                            "tableReference": {"schema": "sales", "table": "deals"},
+                            "columns": [{"name": "stage", "type": "VARCHAR"}],
+                        }
+                    ]
+                },
             }
         ],
         "warnings": [],
@@ -136,9 +139,106 @@ def test_generate_base_model_parses_llm_proposals() -> None:
     )
 
     assert len(proposals) == 1
-    assert proposals[0].proposed_path == "models/deals.yaml"
+    assert proposals[0].proposed_path == "models/deals.json"
     assert proposals[0].validation.valid is True
     assert any("review" in warning.lower() for warning in proposals[0].warnings)
+    # The model returned a typed object; we serialized native camelCase JSON.
+    parsed = json.loads(proposals[0].proposed_content)
+    assert parsed["models"][0]["tableReference"]["table"] == "deals"
+
+
+def test_generate_base_model_rejects_typeless_column() -> None:
+    # A column missing the required `type` fails schema validation, so the typed
+    # parse fails and we fall back to the deterministic (native) proposal.
+    payload = {
+        "files": [
+            {
+                "path": "models/deals.json",
+                "manifest": {
+                    "models": [
+                        {
+                            "name": "deals",
+                            "tableReference": {"schema": "sales", "table": "deals"},
+                            "columns": [{"name": "stage"}],  # no type
+                        }
+                    ]
+                },
+            }
+        ]
+    }
+    client = LlmWrenClient(_config(), FakeModelClient(json.dumps(payload)))
+
+    proposals = client.generate_base_model(
+        project=_project(), superset_context=_agent_context()
+    )
+
+    # Deterministic fallback kicked in; every column still carries a type.
+    assert len(proposals) == 1
+    parsed = json.loads(proposals[0].proposed_content)
+    assert all("type" in col for col in parsed["models"][0]["columns"])
+
+
+def test_generate_base_model_seeds_structure_even_with_useless_model() -> None:
+    # W3: a model that returns no usable semantics must not cost us structure.
+    # Every column still carries its real type and a valid tableReference because
+    # the structure is seeded from the datasets, not authored by the model.
+    empty_payload = json.dumps({"files": [], "warnings": []})
+    client = LlmWrenClient(_config(), FakeModelClient(empty_payload))
+
+    proposals = client.generate_base_model(
+        project=_project(), superset_context=_agent_context()
+    )
+
+    assert len(proposals) == 1
+    parsed = json.loads(proposals[0].proposed_content)
+    model = parsed["models"][0]
+    assert model["tableReference"]["table"] == "deals"
+    columns = {col["name"]: col for col in model["columns"]}
+    assert columns["stage"]["type"] == "VARCHAR"
+    assert columns["gross_moves"]["type"] == "BIGINT"
+    assert proposals[0].validation.valid is True
+
+
+def test_generate_base_model_overlays_llm_descriptions_onto_seed() -> None:
+    # The model's descriptions are overlaid onto the seeded structure.
+    payload = json.dumps(
+        {
+            "files": [
+                {
+                    "path": "models/deals.json",
+                    "manifest": {
+                        "models": [
+                            {
+                                "name": "deals",
+                                "description": "Sales pipeline deals",
+                                "tableReference": {"schema": "sales", "table": "deals"},
+                                "columns": [
+                                    {
+                                        "name": "stage",
+                                        "type": "VARCHAR",
+                                        "description": "Pipeline stage label",
+                                    }
+                                ],
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+    )
+    client = LlmWrenClient(_config(), FakeModelClient(payload))
+
+    proposals = client.generate_base_model(
+        project=_project(), superset_context=_agent_context()
+    )
+
+    parsed = json.loads(proposals[0].proposed_content)
+    model = parsed["models"][0]
+    assert model["description"] == "Sales pipeline deals"
+    stage = next(c for c in model["columns"] if c["name"] == "stage")
+    assert stage["description"] == "Pipeline stage label"
+    # Structure (type) preserved from the seed regardless of the overlay.
+    assert stage["type"] == "VARCHAR"
 
 
 def test_generate_base_model_falls_back_on_bad_output() -> None:
@@ -148,18 +248,27 @@ def test_generate_base_model_falls_back_on_bad_output() -> None:
         project=_project(), superset_context=_agent_context()
     )
 
-    # Deterministic fallback: one proposal per dataset, snake_case MDL.
+    # Deterministic fallback: one proposal per dataset, native camelCase MDL.
     assert len(proposals) == 1
-    parsed = yaml.safe_load(proposals[0].proposed_yaml)
-    assert parsed["models"][0]["table_reference"]["table"] == "deals"
+    parsed = json.loads(proposals[0].proposed_content)
+    assert parsed["models"][0]["tableReference"]["table"] == "deals"
 
 
 def test_propose_mdl_from_document_uses_llm() -> None:
     payload = {
         "files": [
             {
-                "path": "models/deals.yaml",
-                "yaml": "models:\n  - name: deals\n    description: enriched\n",
+                "path": "models/deals.json",
+                "manifest": {
+                    "models": [
+                        {
+                            "name": "deals",
+                            "description": "enriched",
+                            "tableReference": {"schema": "sales", "table": "deals"},
+                            "columns": [{"name": "stage", "type": "VARCHAR"}],
+                        }
+                    ]
+                },
             }
         ]
     }
@@ -172,6 +281,7 @@ def test_propose_mdl_from_document_uses_llm() -> None:
 
     assert proposal.source_document_id == document.id
     assert proposal.validation.valid is True
+    assert "enriched" in proposal.proposed_content
 
 
 def test_fetch_context_surfaces_materialized_mdl(tmp_path) -> None:

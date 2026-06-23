@@ -19,6 +19,8 @@
 
 from __future__ import annotations
 
+import json  # noqa: TID251 - standalone agent JSON contract
+
 import pytest
 
 from superset_ai_agent.app import (
@@ -38,15 +40,16 @@ from superset_ai_agent.semantic_layer.schemas import (
     MdlFileUpdateRequest,
 )
 
-_MDL_YAML = (
-    "models:\n"
-    "  - name: gross_moves\n"
-    "    table_reference:\n"
-    "      schema: public\n"
-    "      table: gross_moves\n"
-    "    columns:\n"
-    "      - name: stage\n"
-    "        type: VARCHAR\n"
+_MDL_CONTENT = json.dumps(
+    {
+        "models": [
+            {
+                "name": "gross_moves",
+                "tableReference": {"schema": "public", "table": "gross_moves"},
+                "columns": [{"name": "stage", "type": "VARCHAR"}],
+            }
+        ]
+    }
 )
 
 
@@ -115,7 +118,7 @@ def test_mdl_survives_restart_with_sqlalchemy_store(tmp_path) -> None:
     store = SqlAlchemyMdlFileStore(create_session_factory(engine))
     created = store.create(
         "project-1",
-        MdlFileCreateRequest(path="models/gross_moves.yaml", content=_MDL_YAML),
+        MdlFileCreateRequest(path="models/gross_moves.json", content=_MDL_CONTENT),
     )
     store.update(created.id, MdlFileUpdateRequest(status="active"))
 
@@ -124,6 +127,6 @@ def test_mdl_survives_restart_with_sqlalchemy_store(tmp_path) -> None:
     store2 = SqlAlchemyMdlFileStore(create_session_factory(engine2))
     reloaded = store2.list("project-1")
 
-    assert [file.path for file in reloaded] == ["models/gross_moves.yaml"]
+    assert [file.path for file in reloaded] == ["models/gross_moves.json"]
     assert reloaded[0].status == "active"
-    assert reloaded[0].content == _MDL_YAML
+    assert reloaded[0].content == _MDL_CONTENT

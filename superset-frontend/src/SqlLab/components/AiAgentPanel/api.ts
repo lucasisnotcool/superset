@@ -397,7 +397,7 @@ export interface MdlFile {
   path: string;
   filename: string;
   content: string;
-  content_type: 'application/x-yaml' | 'text/yaml';
+  content_type: 'application/json';
   source_type: MdlFileSourceType;
   status: MdlFileStatus;
   validation?: MdlValidationResult | null;
@@ -426,7 +426,7 @@ export interface MdlFileUpdateRequest {
 export interface MdlEnrichmentProposal {
   source_document_id: string;
   proposed_path: string;
-  proposed_yaml: string;
+  proposed_content: string;
   validation: MdlValidationResult;
   warnings: string[];
 }

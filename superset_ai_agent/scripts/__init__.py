@@ -15,24 +15,4 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""MDL validation entry point.
-
-The real implementation lives in
-:mod:`superset_ai_agent.semantic_layer.mdl_validator`, which performs structural
-and optional physical (schema-aware) validation of MDL JSON in wren-core's native
-shape. This module re-exports the canonical entry points.
-"""
-
-from __future__ import annotations
-
-from superset_ai_agent.semantic_layer.mdl_validator import (
-    SchemaIndex,
-    validate_mdl,
-    validate_project_manifest,
-)
-
-__all__ = [
-    "SchemaIndex",
-    "validate_mdl",
-    "validate_project_manifest",
-]
+"""Operational one-off scripts for the standalone AI agent."""

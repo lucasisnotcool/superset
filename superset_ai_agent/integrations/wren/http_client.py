@@ -28,7 +28,7 @@ from superset_ai_agent.integrations.wren.client import (
     deterministic_mdl_proposal,
 )
 from superset_ai_agent.schemas import WrenContextArtifact
-from superset_ai_agent.semantic_layer.mdl_validation import validate_mdl_yaml
+from superset_ai_agent.semantic_layer.mdl_validation import validate_mdl
 from superset_ai_agent.semantic_layer.schemas import (
     MdlEnrichmentProposal,
     SemanticDocument,
@@ -188,22 +188,22 @@ class WrenHttpClient:
                 }
             )
         data = _result(payload)
-        proposed_yaml = str(
-            data.get("proposed_yaml")
-            or data.get("yaml")
+        proposed_content = str(
+            data.get("proposed_content")
+            or data.get("mdl")
             or data.get("content")
             or ""
         )
-        validation = validate_mdl_yaml(proposed_yaml)
+        validation = validate_mdl(proposed_content)
         warnings = data.get("warnings")
         return MdlEnrichmentProposal(
             source_document_id=document.id,
             proposed_path=str(
                 data.get("proposed_path")
                 or data.get("path")
-                or f"{project.schema_name}/{document.filename}.yaml"
+                or f"{project.schema_name}/{document.filename}.json"
             ),
-            proposed_yaml=proposed_yaml,
+            proposed_content=proposed_content,
             validation=validation,
             warnings=(
                 [str(warning) for warning in warnings]
@@ -250,13 +250,13 @@ class WrenHttpClient:
             )
         proposals: list[MdlEnrichmentProposal] = []
         for item in _payload_items(payload, "proposals"):
-            proposed_yaml = str(
-                item.get("proposed_yaml")
-                or item.get("yaml")
+            proposed_content = str(
+                item.get("proposed_content")
+                or item.get("mdl")
                 or item.get("content")
                 or ""
             )
-            if not proposed_yaml.strip():
+            if not proposed_content.strip():
                 continue
             proposals.append(
                 MdlEnrichmentProposal(
@@ -266,10 +266,10 @@ class WrenHttpClient:
                     proposed_path=str(
                         item.get("proposed_path")
                         or item.get("path")
-                        or "models/model.yaml"
+                        or "models/model.json"
                     ),
-                    proposed_yaml=proposed_yaml,
-                    validation=validate_mdl_yaml(proposed_yaml),
+                    proposed_content=proposed_content,
+                    validation=validate_mdl(proposed_content),
                     warnings=[str(warning) for warning in item.get("warnings", [])],
                 )
             )

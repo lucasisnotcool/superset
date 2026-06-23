@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-import json
+import json  # noqa: TID251 - standalone agent JSON contract
 
 from fastapi.testclient import TestClient
 
@@ -259,8 +259,8 @@ def test_semantic_project_mdl_and_document_flow(tmp_path) -> None:
     create_response = client.post(
         f"/agent/semantic-layer/projects/{project['id']}/mdl-files",
         json={
-            "path": "models/gross_moves.yaml",
-            "content": "models:\n  - name: gross_moves\n",
+            "path": "models/gross_moves.json",
+            "content": json.dumps({"models": [{"name": "gross_moves"}]}),
         },
     )
 
@@ -317,7 +317,7 @@ def test_semantic_project_mdl_and_document_flow(tmp_path) -> None:
     proposal = enrichment_response.json()
     assert proposal["source_document_id"] == document["id"]
     assert proposal["validation"]["valid"] is True
-    assert "models:" in proposal["proposed_yaml"]
+    assert "models" in proposal["proposed_content"]
 
 
 def test_onboard_creates_draft_models_deterministic_fallback(tmp_path) -> None:
@@ -355,12 +355,17 @@ def test_onboard_uses_llm_when_available(tmp_path) -> None:
         {
             "files": [
                 {
-                    "path": "models/moves.yaml",
-                    "yaml": (
-                        "models:\n"
-                        "  - name: moves\n"
-                        "    description: Pipeline moves documented by the model\n"
-                    ),
+                    "path": "models/moves.json",
+                    "manifest": {
+                        "models": [
+                            {
+                                "name": "moves",
+                                "description": "Pipeline moves documented by the model",
+                                "tableReference": {"table": "moves"},
+                                "columns": [{"name": "stage", "type": "varchar"}],
+                            }
+                        ]
+                    },
                 }
             ]
         }
@@ -378,22 +383,26 @@ def test_onboard_uses_llm_when_available(tmp_path) -> None:
     assert "documented by the model" in result["files"][0]["content"]
 
 
-def test_onboard_flags_hallucinated_columns_as_non_activatable(tmp_path) -> None:
-    # "moves" exists with no columns; an LLM that invents a column produces a
-    # draft that is written but flagged non-activatable (R3).
+def test_onboard_seeding_ignores_invented_columns(tmp_path) -> None:
+    # W3: onboarding structure is seeded from the catalog, not authored by the
+    # model. An LLM that invents a column cannot inject it — the column is simply
+    # absent from the seeded draft, so the structural-hallucination class is gone.
     payload = json.dumps(
         {
             "files": [
                 {
-                    "path": "models/moves.yaml",
-                    "yaml": (
-                        "models:\n"
-                        "  - name: moves\n"
-                        "    table_reference:\n"
-                        "      table: moves\n"
-                        "    columns:\n"
-                        "      - name: ghost_metric\n"
-                    ),
+                    "path": "models/moves.json",
+                    "manifest": {
+                        "models": [
+                            {
+                                "name": "moves",
+                                "tableReference": {"table": "moves"},
+                                "columns": [
+                                    {"name": "ghost_metric", "type": "varchar"}
+                                ],
+                            }
+                        ]
+                    },
                 }
             ]
         }
@@ -409,7 +418,8 @@ def test_onboard_flags_hallucinated_columns_as_non_activatable(tmp_path) -> None
     result = response.json()["result"]
     assert result["model_count"] == 1
     assert result["files"][0]["status"] == "draft"
-    assert any("cannot be activated" in w for w in result["warnings"])
+    # The invented column never made it into the seeded model.
+    assert "ghost_metric" not in result["files"][0]["content"]
 
 
 def test_enrich_flags_hallucinated_columns(tmp_path) -> None:
@@ -417,15 +427,18 @@ def test_enrich_flags_hallucinated_columns(tmp_path) -> None:
         {
             "files": [
                 {
-                    "path": "models/moves.yaml",
-                    "yaml": (
-                        "models:\n"
-                        "  - name: moves\n"
-                        "    table_reference:\n"
-                        "      table: moves\n"
-                        "    columns:\n"
-                        "      - name: ghost_metric\n"
-                    ),
+                    "path": "models/moves.json",
+                    "manifest": {
+                        "models": [
+                            {
+                                "name": "moves",
+                                "tableReference": {"table": "moves"},
+                                "columns": [
+                                    {"name": "ghost_metric", "type": "varchar"}
+                                ],
+                            }
+                        ]
+                    },
                 }
             ]
         }
@@ -471,14 +484,17 @@ def test_activation_uses_schema_snapshot_during_outage(tmp_path) -> None:
     valid = client.post(
         f"/agent/semantic-layer/projects/{project['id']}/mdl-files",
         json={
-            "path": "models/moves.yaml",
-            "content": (
-                "models:\n"
-                "  - name: moves\n"
-                "    table_reference:\n"
-                "      table: moves\n"
-                "    columns:\n"
-                "      - name: stage\n"
+            "path": "models/moves.json",
+            "content": json.dumps(
+                {
+                    "models": [
+                        {
+                            "name": "moves",
+                            "tableReference": {"table": "moves"},
+                            "columns": [{"name": "stage", "type": "varchar"}],
+                        }
+                    ]
+                }
             ),
         },
     ).json()
@@ -494,14 +510,17 @@ def test_activation_uses_schema_snapshot_during_outage(tmp_path) -> None:
     hallucinated = client.post(
         f"/agent/semantic-layer/projects/{project['id']}/mdl-files",
         json={
-            "path": "models/ghosts.yaml",
-            "content": (
-                "models:\n"
-                "  - name: ghosts\n"
-                "    table_reference:\n"
-                "      table: moves\n"
-                "    columns:\n"
-                "      - name: phantom\n"
+            "path": "models/ghosts.json",
+            "content": json.dumps(
+                {
+                    "models": [
+                        {
+                            "name": "ghosts",
+                            "tableReference": {"table": "moves"},
+                            "columns": [{"name": "phantom", "type": "varchar"}],
+                        }
+                    ]
+                }
             ),
         },
     ).json()
@@ -516,6 +535,39 @@ def test_activation_uses_schema_snapshot_during_outage(tmp_path) -> None:
     )
 
 
+def test_activation_dedups_re_emitted_model_across_files(tmp_path) -> None:
+    # W4: an enrichment that re-emits an existing model into a new file must not
+    # block activation with duplicate_model. The newer file supersedes the older.
+    client, _ = _client(tmp_path)
+    project = _resolve_project(client)
+
+    def _make(path: str, description: str | None) -> str:
+        model = {"name": "moves", "tableReference": {"table": "moves"}}
+        if description:
+            model["description"] = description
+        created = client.post(
+            f"/agent/semantic-layer/projects/{project['id']}/mdl-files",
+            json={"path": path, "content": json.dumps({"models": [model]})},
+        ).json()
+        return created["id"]
+
+    first = _make("models/moves.json", None)
+    activate_first = client.patch(
+        f"/agent/semantic-layer/projects/{project['id']}/mdl-files/{first}",
+        json={"status": "active"},
+    )
+    assert activate_first.status_code == 200
+
+    # A second file re-declares `moves` (the enrichment cascade) — activates via
+    # the dedup safety net rather than failing as duplicate_model.
+    second = _make("models/moves_enriched.json", "Enriched moves")
+    activate_second = client.patch(
+        f"/agent/semantic-layer/projects/{project['id']}/mdl-files/{second}",
+        json={"status": "active"},
+    )
+    assert activate_second.status_code == 200
+
+
 def test_create_persists_physical_validation(tmp_path) -> None:
     # The created draft's stored validation reflects physical schema findings
     # immediately, not just at activation time (R15).
@@ -525,14 +577,17 @@ def test_create_persists_physical_validation(tmp_path) -> None:
     response = client.post(
         f"/agent/semantic-layer/projects/{project['id']}/mdl-files",
         json={
-            "path": "models/moves.yaml",
-            "content": (
-                "models:\n"
-                "  - name: moves\n"
-                "    table_reference:\n"
-                "      table: moves\n"
-                "    columns:\n"
-                "      - name: ghost_metric\n"
+            "path": "models/moves.json",
+            "content": json.dumps(
+                {
+                    "models": [
+                        {
+                            "name": "moves",
+                            "tableReference": {"table": "moves"},
+                            "columns": [{"name": "ghost_metric", "type": "varchar"}],
+                        }
+                    ]
+                }
             ),
         },
     )
@@ -551,14 +606,17 @@ def test_activation_blocked_for_hallucinated_column(tmp_path) -> None:
     create = client.post(
         f"/agent/semantic-layer/projects/{project['id']}/mdl-files",
         json={
-            "path": "models/moves.yaml",
-            "content": (
-                "models:\n"
-                "  - name: moves\n"
-                "    table_reference:\n"
-                "      table: moves\n"
-                "    columns:\n"
-                "      - name: ghost_metric\n"
+            "path": "models/moves.json",
+            "content": json.dumps(
+                {
+                    "models": [
+                        {
+                            "name": "moves",
+                            "tableReference": {"table": "moves"},
+                            "columns": [{"name": "ghost_metric", "type": "varchar"}],
+                        }
+                    ]
+                }
             ),
         },
     )

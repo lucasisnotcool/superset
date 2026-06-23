@@ -242,16 +242,17 @@ def test_memory_writeback_and_recall_round_trip() -> None:
     assert response2.wren_context.recalled_example_count == 1
 
 
-_GATING_YAML = """
-models:
-  - name: birth_names
-    table_reference:
-      schema: public
-      table: birth_names
-    columns:
-      - name: num
-        type: BIGINT
-"""
+_GATING_MDL = json.dumps(
+    {
+        "models": [
+            {
+                "name": "birth_names",
+                "tableReference": {"schema": "public", "table": "birth_names"},
+                "columns": [{"name": "num", "type": "BIGINT"}],
+            }
+        ]
+    }
+)
 
 
 class _SequenceModelClient:
@@ -277,7 +278,7 @@ class _FakeGatingEngine:
         return True
 
     def compile(self, mdl_files):
-        return compile_manifest(yaml_contents=[_GATING_YAML])
+        return compile_manifest(json_contents=[_GATING_MDL])
 
     def validate(self, manifest, *, deep=False, schema_index=None):
         return MdlValidationResult(valid=True)

@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import json  # noqa: TID251 - standalone agent JSON contract
 import os
 
 import pytest
@@ -38,33 +39,36 @@ from superset_ai_agent.semantic_layer.schema_retriever import (
     manifest_to_schema_items,
 )
 
-_YAML = """
-models:
-  - name: deals
-    table_reference:
-      schema: sales
-      table: deals
-    columns:
-      - name: amount
-        type: DOUBLE
-      - name: stage
-        type: VARCHAR
-  - name: customers
-    table_reference:
-      schema: sales
-      table: customers
-    columns:
-      - name: region
-        type: VARCHAR
-relationships:
-  - name: deal_customer
-    models: [deals, customers]
-    join_type: MANY_TO_ONE
-"""
+_MDL = json.dumps(
+    {
+        "models": [
+            {
+                "name": "deals",
+                "tableReference": {"schema": "sales", "table": "deals"},
+                "columns": [
+                    {"name": "amount", "type": "DOUBLE"},
+                    {"name": "stage", "type": "VARCHAR"},
+                ],
+            },
+            {
+                "name": "customers",
+                "tableReference": {"schema": "sales", "table": "customers"},
+                "columns": [{"name": "region", "type": "VARCHAR"}],
+            },
+        ],
+        "relationships": [
+            {
+                "name": "deal_customer",
+                "models": ["deals", "customers"],
+                "joinType": "MANY_TO_ONE",
+            }
+        ],
+    }
+)
 
 
 def _items():
-    return manifest_to_schema_items(compile_manifest(yaml_contents=[_YAML]))
+    return manifest_to_schema_items(compile_manifest(json_contents=[_MDL]))
 
 
 class _FakeEmbedder:

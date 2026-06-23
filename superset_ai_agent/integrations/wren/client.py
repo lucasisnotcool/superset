@@ -18,17 +18,15 @@
 from __future__ import annotations
 
 import hashlib
-import json
+import json  # noqa: TID251 - standalone agent JSON contract
 from pathlib import Path
 from typing import Any, Protocol
-
-import yaml
 
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.integrations.superset.client import AgentContext
 from superset_ai_agent.integrations.wren.mdl_exporter import model_from_dataset
 from superset_ai_agent.schemas import WrenContextArtifact
-from superset_ai_agent.semantic_layer.mdl_validation import validate_mdl_yaml
+from superset_ai_agent.semantic_layer.mdl_validation import validate_mdl
 from superset_ai_agent.semantic_layer.schemas import (
     MdlEnrichmentProposal,
     SemanticDocument,
@@ -87,7 +85,7 @@ class WrenClient(Protocol):
         project: SemanticProject,
         document: SemanticDocument,
     ) -> MdlEnrichmentProposal:
-        """Return reviewable MDL YAML without activating it."""
+        """Return reviewable MDL JSON without activating it."""
 
     def validate_mdl_project(self, *, mdl_path: str) -> dict[str, Any]:
         """Validate a materialized MDL project without executing queries."""
@@ -449,16 +447,12 @@ def deterministic_mdl_proposal(
             }
         ]
     }
-    proposed_yaml = yaml.safe_dump(
-        payload,
-        sort_keys=False,
-        allow_unicode=False,
-    )
+    proposed_content = json.dumps(payload, indent=2)
     return MdlEnrichmentProposal(
         source_document_id=document.id,
-        proposed_path=f"{model_name}/{_safe_mdl_name(document.filename)}.yaml",
-        proposed_yaml=proposed_yaml,
-        validation=validate_mdl_yaml(proposed_yaml),
+        proposed_path=f"{model_name}/{_safe_mdl_name(document.filename)}.json",
+        proposed_content=proposed_content,
+        validation=validate_mdl(proposed_content),
         warnings=[
             "Generated MDL is a review draft. Confirm model names, columns, "
             "metrics, and relationships before activation."
@@ -477,17 +471,13 @@ def deterministic_base_model_proposals(
     for dataset in superset_context.datasets:
         model = model_from_dataset(dataset)
         model_name = str(model.get("name") or _safe_mdl_name(dataset.table_name))
-        proposed_yaml = yaml.safe_dump(
-            {"models": [model]},
-            sort_keys=False,
-            allow_unicode=False,
-        )
+        proposed_content = json.dumps({"models": [model]}, indent=2)
         proposals.append(
             MdlEnrichmentProposal(
                 source_document_id=f"onboarding:{dataset.id}",
-                proposed_path=f"models/{model_name}.yaml",
-                proposed_yaml=proposed_yaml,
-                validation=validate_mdl_yaml(proposed_yaml),
+                proposed_path=f"models/{model_name}.json",
+                proposed_content=proposed_content,
+                validation=validate_mdl(proposed_content),
                 warnings=[
                     "Generated from schema introspection. Review descriptions, "
                     "metrics, and relationships before activation."

@@ -176,9 +176,16 @@ const StyledEditorHost = styled(EditorHost)`
   }
 `;
 
-const defaultYaml = `models:
-  - name: new_model
-    description: ''
+const defaultMdl = `{
+  "models": [
+    {
+      "name": "new_model",
+      "description": "",
+      "tableReference": { "schema": "", "table": "" },
+      "columns": []
+    }
+  ]
+}
 `;
 
 export interface SemanticLayerEditorProps {
@@ -207,8 +214,8 @@ export default function SemanticLayerEditor({
   const [mdlFiles, setMdlFiles] = useState<MdlFile[]>([]);
   const [state, setState] = useState<SemanticLayerState | null>(null);
   const [activeFileId, setActiveFileId] = useState<string | null>(null);
-  const [editorPath, setEditorPath] = useState('models/new_model.yaml');
-  const [editorValue, setEditorValue] = useState(defaultYaml);
+  const [editorPath, setEditorPath] = useState('models/new_model.json');
+  const [editorValue, setEditorValue] = useState(defaultMdl);
   const [showImportDialog, setShowImportDialog] = useState(false);
   const [isOnboarding, setIsOnboarding] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
@@ -291,8 +298,8 @@ export default function SemanticLayerEditor({
   const startNewFile = () => {
     activeFileIdRef.current = null;
     setActiveFileId(null);
-    setEditorPath('models/new_model.yaml');
-    setEditorValue(defaultYaml);
+    setEditorPath('models/new_model.json');
+    setEditorValue(defaultMdl);
   };
 
   const saveFile = (status?: MdlFileStatus) =>
@@ -540,7 +547,7 @@ export default function SemanticLayerEditor({
           <StyledEditorHost
             id={`semantic-mdl-${project?.id || 'empty'}`}
             height="100%"
-            language="yaml"
+            language="json"
             onChange={setEditorValue}
             readOnly={!canWrite || isLoading}
             value={editorValue}

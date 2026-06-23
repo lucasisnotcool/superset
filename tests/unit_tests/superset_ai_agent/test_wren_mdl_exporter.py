@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-import json
+import json  # noqa: TID251 - standalone agent JSON contract
 
 from superset_ai_agent.integrations.superset.client import (
     AgentContext,
@@ -70,12 +70,12 @@ def test_export_agent_context_to_mdl_maps_superset_metadata() -> None:
 
     assert mdl["dataSource"]["properties"]["superset_database_id"] == 1
     assert mdl["models"][0]["name"] == "gross_moves"
-    assert mdl["models"][0]["table_reference"] == {
+    assert mdl["models"][0]["tableReference"] == {
         "schema": "main",
         "table": "gross moves",
     }
     assert mdl["models"][0]["columns"][0]["name"] == "stage"
-    assert mdl["models"][0]["columns"][0]["is_calculated"] is False
+    assert mdl["models"][0]["columns"][0]["isCalculated"] is False
     assert mdl["models"][0]["columns"][1]["properties"]["is_time"] is True
     assert mdl["models"][0]["metrics"][0]["expression"] == "COUNT(*)"
     assert mdl["semanticOverlay"]["semantic_updates"][0]["id"] == "update-1"

@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+import json  # noqa: TID251 - standalone agent JSON contract
+
 import pytest
 
 from superset_ai_agent.semantic_layer.mdl_files import (
@@ -24,7 +26,7 @@ from superset_ai_agent.semantic_layer.mdl_files import (
     MdlFileValidationError,
     normalize_mdl_path,
 )
-from superset_ai_agent.semantic_layer.mdl_validation import validate_mdl_yaml
+from superset_ai_agent.semantic_layer.mdl_validation import validate_mdl
 from superset_ai_agent.semantic_layer.schemas import (
     MdlFileCreateRequest,
     MdlFileUpdateRequest,
@@ -33,14 +35,19 @@ from superset_ai_agent.semantic_layer.schemas import (
 )
 
 
-def test_mdl_validation_accepts_object_yaml() -> None:
-    result = validate_mdl_yaml(
-        "models:\n"
-        "  - name: gross_moves\n"
-        "    table_reference:\n"
-        "      table: gross_moves\n"
-        "    columns:\n"
-        "      - name: stage\n"
+def test_mdl_validation_accepts_object_json() -> None:
+    result = validate_mdl(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "name": "gross_moves",
+                        "tableReference": {"table": "gross_moves"},
+                        "columns": [{"name": "stage", "type": "varchar"}],
+                    }
+                ]
+            }
+        )
     )
 
     assert result.valid is True
@@ -48,7 +55,7 @@ def test_mdl_validation_accepts_object_yaml() -> None:
 
 
 def test_mdl_validation_accepts_minimal_model_with_warnings() -> None:
-    result = validate_mdl_yaml("models:\n  - name: gross_moves\n")
+    result = validate_mdl(json.dumps({"models": [{"name": "gross_moves"}]}))
 
     # Structurally valid, but warns that the model has no mapping or columns.
     assert result.valid is True
@@ -59,11 +66,10 @@ def test_mdl_validation_accepts_minimal_model_with_warnings() -> None:
 
 
 def test_mdl_validation_reports_parse_errors() -> None:
-    result = validate_mdl_yaml("models:\n - [")
+    result = validate_mdl('{"models": [')
 
     assert result.valid is False
-    assert result.messages[0].code == "yaml_parse_error"
-    assert result.messages[0].line == 2
+    assert result.messages[0].code == "json_parse_error"
 
 
 def test_cannot_activate_structurally_invalid_mdl_file() -> None:
@@ -71,18 +77,24 @@ def test_cannot_activate_structurally_invalid_mdl_file() -> None:
     file = store.create(
         "project-1",
         MdlFileCreateRequest(
-            path="models/bad.yaml",
-            content=(
-                "models:\n"
-                "  - name: deals\n"
-                "    table_reference:\n"
-                "      table: deals\n"
-                "    columns:\n"
-                "      - name: stage\n"
-                "relationships:\n"
-                "  - name: r\n"
-                "    models: [deals, sites]\n"
-                "    join_type: SIDEWAYS\n"
+            path="models/bad.json",
+            content=json.dumps(
+                {
+                    "models": [
+                        {
+                            "name": "deals",
+                            "tableReference": {"table": "deals"},
+                            "columns": [{"name": "stage", "type": "varchar"}],
+                        }
+                    ],
+                    "relationships": [
+                        {
+                            "name": "r",
+                            "models": ["deals", "sites"],
+                            "joinType": "SIDEWAYS",
+                        }
+                    ],
+                }
             ),
         ),
         owner_id="owner",
@@ -109,14 +121,17 @@ def test_create_persists_validation_override() -> None:
     file = store.create(
         "project-1",
         MdlFileCreateRequest(
-            path="models/a.yaml",
-            content=(
-                "models:\n"
-                "  - name: a\n"
-                "    table_reference:\n"
-                "      table: a\n"
-                "    columns:\n"
-                "      - name: c\n"
+            path="models/a.json",
+            content=json.dumps(
+                {
+                    "models": [
+                        {
+                            "name": "a",
+                            "tableReference": {"table": "a"},
+                            "columns": [{"name": "c", "type": "int"}],
+                        }
+                    ]
+                }
             ),
         ),
         owner_id="owner",
@@ -128,11 +143,11 @@ def test_create_persists_validation_override() -> None:
 
 
 def test_normalize_mdl_path_rejects_unsafe_paths() -> None:
-    assert normalize_mdl_path("models/gross_moves.yaml") == "models/gross_moves.yaml"
-    with pytest.raises(ValueError):
-        normalize_mdl_path("../gross_moves.yaml")
-    with pytest.raises(ValueError):
-        normalize_mdl_path("gross_moves.md")
+    assert normalize_mdl_path("models/gross_moves.json") == "models/gross_moves.json"
+    with pytest.raises(ValueError, match="semantic project"):
+        normalize_mdl_path("../gross_moves.json")
+    with pytest.raises(ValueError, match=".json extension"):
+        normalize_mdl_path("gross_moves.yaml")
 
 
 def test_mdl_file_store_round_trips_and_soft_deletes() -> None:
@@ -140,8 +155,8 @@ def test_mdl_file_store_round_trips_and_soft_deletes() -> None:
     file = store.create(
         "project-1",
         MdlFileCreateRequest(
-            path="models/gross_moves.yaml",
-            content="models:\n  - name: gross_moves\n",
+            path="models/gross_moves.json",
+            content=json.dumps({"models": [{"name": "gross_moves"}]}),
         ),
         owner_id="owner",
     )
@@ -153,7 +168,7 @@ def test_mdl_file_store_round_trips_and_soft_deletes() -> None:
     updated = store.update(
         file.id,
         MdlFileUpdateRequest(
-            content="models:\n  - name: gross_moves_by_stage\n",
+            content=json.dumps({"models": [{"name": "gross_moves_by_stage"}]}),
             status="active",
         ),
         owner_id="analyst",
