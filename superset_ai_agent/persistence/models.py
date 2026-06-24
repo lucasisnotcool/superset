@@ -21,7 +21,6 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
-    Float,
     ForeignKey,
     Index,
     Integer,
@@ -159,88 +158,6 @@ class AiAgentSemanticDocument(Base):
     )
     updated_at = Column(
         DateTime(timezone=True), nullable=False
-    )
-
-
-class AiAgentSemanticUpdate(Base):
-    """Persisted proposed or reviewed semantic-layer update."""
-
-    __tablename__ = "ai_agent_semantic_updates"
-
-    id = Column(String(36), primary_key=True)
-    project_id = Column(String(36), index=True, nullable=True)
-    document_id = Column(
-        String(36),
-        ForeignKey("ai_agent_semantic_documents.id", ondelete="CASCADE"),
-        index=True,
-        nullable=False,
-    )
-    owner_id = Column(String(255), index=True, nullable=False)
-    kind = Column(String(64), nullable=False)
-    target = Column(JSON, nullable=False)
-    value = Column(JSON, nullable=False)
-    confidence = Column(Float, nullable=True)
-    reviewed = Column(Boolean, nullable=False, default=False)
-    approved = Column(Boolean, nullable=False, default=False)
-    reviewer_id = Column(String(255), nullable=True)
-    review_notes = Column(Text, nullable=True)
-    created_at = Column(
-        DateTime(timezone=True), nullable=False
-    )
-    updated_at = Column(
-        DateTime(timezone=True), nullable=False
-    )
-    reviewed_at = Column(
-        DateTime(timezone=True),
-        nullable=True,
-    )
-
-
-class AiAgentSemanticLayerVersion(Base):
-    """Versioned semantic overlay generated from reviewed updates."""
-
-    __tablename__ = "ai_agent_semantic_layer_versions"
-
-    id = Column(String(36), primary_key=True)
-    project_id = Column(String(36), index=True, nullable=True)
-    owner_id = Column(String(255), index=True, nullable=False)
-    database_id = Column(Integer, index=True, nullable=False)
-    catalog_name = Column(String(255), nullable=True)
-    schema_name = Column(String(255), nullable=True)
-    dataset_ids = Column(JSON, nullable=False)
-    scope_hash = Column(String(128), index=True, nullable=False)
-    version = Column(String(64), nullable=False)
-    status = Column(String(64), nullable=False)
-    mdl = Column(JSON, nullable=True)
-    wren_context = Column(JSON, nullable=True)
-    source_update_ids = Column(JSON, nullable=False)
-    published_semantic_layer_uuid = Column(
-        String(36),
-        nullable=True,
-    )
-    created_at = Column(
-        DateTime(timezone=True), nullable=False
-    )
-
-
-class AiAgentWrenContextCache(Base):
-    """Cached Wren context for a scope/question pair."""
-
-    __tablename__ = "ai_agent_wren_context_cache"
-
-    id = Column(String(36), primary_key=True)
-    project_id = Column(String(36), index=True, nullable=True)
-    owner_id = Column(String(255), index=True, nullable=False)
-    scope_hash = Column(String(128), index=True, nullable=False)
-    question_hash = Column(String(128), index=True, nullable=False)
-    context = Column(JSON, nullable=False)
-    created_at = Column(
-        DateTime(timezone=True), nullable=False
-    )
-    expires_at = Column(
-        DateTime(timezone=True),
-        index=True,
-        nullable=True,
     )
 
 

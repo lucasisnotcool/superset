@@ -17,18 +17,13 @@
 
 from __future__ import annotations
 
-from superset_ai_agent.conversations.schemas import ConversationScope
 from superset_ai_agent.schemas import WrenContextArtifact
-from superset_ai_agent.semantic_layer.memory import InMemorySemanticLayerStore
 from superset_ai_agent.semantic_layer.runtime import (
     build_unified_context,
     canonical_model_name,
     cap_context_items,
-    merge_indexed_semantic_context,
     select_relevant_models,
 )
-from superset_ai_agent.semantic_layer.schemas import SemanticLayerVersion
-from superset_ai_agent.semantic_layer.store import scope_hash
 
 
 def test_cap_context_items_dedups_and_prioritizes_retriever_chunks() -> None:
@@ -52,98 +47,6 @@ def test_cap_context_items_dedups_and_prioritizes_retriever_chunks() -> None:
         {"source": "retriever", "text": "r1"},
         {"source": "retriever", "text": "r2"},
     ]
-
-
-def test_merge_indexed_semantic_context_combines_runtime_and_indexed_items() -> None:
-    scope = ConversationScope(database_id=1, schema_name="sales")
-    store = InMemorySemanticLayerStore()
-    store.save_version(
-        SemanticLayerVersion(
-            scope=scope,
-            scope_hash=scope_hash(scope),
-            version="v1",
-            status="idle",
-            wren_context=WrenContextArtifact(
-                enabled=True,
-                available=True,
-                document_ids=["doc-2"],
-                semantic_layer_version="v1",
-                indexing_status="indexed",
-                context_items=[{"kind": "indexed"}],
-                warnings=["indexed warning"],
-            ),
-        ),
-        owner_id="analyst",
-    )
-
-    merged = merge_indexed_semantic_context(
-        semantic_layer_store=store,
-        scope=scope,
-        owner_id="analyst",
-        wren_context=WrenContextArtifact(
-            enabled=True,
-            available=True,
-            document_ids=["doc-1"],
-            context_items=[{"kind": "runtime"}],
-            warnings=["runtime warning"],
-        ),
-    )
-
-    assert merged.document_ids == ["doc-1", "doc-2"]
-    assert merged.semantic_layer_version == "v1"
-    assert merged.indexing_status == "indexed"
-    assert merged.context_items == [{"kind": "runtime"}, {"kind": "indexed"}]
-    assert merged.warnings == ["runtime warning", "indexed warning"]
-
-
-def test_merge_indexed_semantic_context_noops_without_matching_version() -> None:
-    scope = ConversationScope(database_id=1, schema_name="sales")
-    context = WrenContextArtifact(enabled=True, available=True)
-
-    assert (
-        merge_indexed_semantic_context(
-            semantic_layer_store=InMemorySemanticLayerStore(),
-            scope=scope,
-            owner_id="analyst",
-            wren_context=context,
-        )
-        == context
-    )
-
-
-def test_merge_indexed_semantic_context_skips_overlay_when_disabled() -> None:
-    # E1/E6: with the overlay disabled, the doc-update channel is skipped entirely
-    # even when an indexed version exists — MDL is the single semantic source.
-    scope = ConversationScope(database_id=1, schema_name="sales")
-    store = InMemorySemanticLayerStore()
-    store.save_version(
-        SemanticLayerVersion(
-            scope=scope,
-            scope_hash=scope_hash(scope),
-            version="v1",
-            status="idle",
-            wren_context=WrenContextArtifact(
-                enabled=True,
-                available=True,
-                context_items=[{"kind": "indexed"}],
-            ),
-        ),
-        owner_id="analyst",
-    )
-    context = WrenContextArtifact(
-        enabled=True, available=True, context_items=[{"kind": "runtime"}]
-    )
-
-    merged = merge_indexed_semantic_context(
-        semantic_layer_store=store,
-        scope=scope,
-        owner_id="analyst",
-        wren_context=context,
-        enabled=False,
-    )
-
-    assert merged == context  # overlay not merged
-    assert merged.context_items == [{"kind": "runtime"}]
 
 
 # --- R2: table-selection prune over ranked retriever chunks -------------------

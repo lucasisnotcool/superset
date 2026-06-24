@@ -35,8 +35,6 @@ import {
   listSemanticDocuments,
   materializeSemanticProject,
   queryAgent,
-  rebuildSemanticLayerIndex,
-  reviewSemanticDocument,
   resolveSemanticProject,
   sendConversationMessage,
   updateMdlFile,
@@ -276,11 +274,10 @@ test('semantic-layer API helpers use typed document endpoints', async () => {
     filename: 'notes.md',
     content_type: 'text/markdown',
     size_bytes: 12,
-    status: 'needs_review',
+    status: 'extracted',
     scope,
     checksum: 'abc',
     storage_uri: 'file:///tmp/notes.md',
-    proposed_updates: [],
     warnings: [],
     created_at: '2026-06-19T00:00:00Z',
     updated_at: '2026-06-19T00:00:00Z',
@@ -290,21 +287,6 @@ test('semantic-layer API helpers use typed document endpoints', async () => {
     'http://agent.local/agent/semantic-layer/documents?database_id=1&dataset_ids=16',
     [document],
   );
-  fetchMock.patch(
-    'http://agent.local/agent/semantic-layer/documents/document-1/review',
-    { ...document, status: 'approved' },
-  );
-  fetchMock.post('http://agent.local/agent/semantic-layer/index/rebuild', {
-    id: 'version-1',
-    scope,
-    scope_hash: 'hash',
-    version: 'v1',
-    status: 'idle',
-    mdl: null,
-    wren_context: null,
-    source_update_ids: [],
-    created_at: '2026-06-19T00:00:00Z',
-  });
   fetchMock.get(
     'http://agent.local/agent/semantic-layer/state?database_id=1&dataset_ids=16',
     {
@@ -312,10 +294,6 @@ test('semantic-layer API helpers use typed document endpoints', async () => {
       schema_name: null,
       dataset_ids: [16],
       document_count: 1,
-      approved_document_count: 1,
-      indexed_document_count: 0,
-      semantic_layer_version: 'v1',
-      indexing_status: 'idle',
       last_error: null,
     },
   );
@@ -329,16 +307,6 @@ test('semantic-layer API helpers use typed document endpoints', async () => {
     ).id,
   ).toBe('document-1');
   expect(await listSemanticDocuments(scope)).toHaveLength(1);
-  expect(
-    (
-      await reviewSemanticDocument('document-1', {
-        approved_update_ids: ['update-1'],
-        rejected_update_ids: [],
-        edited_updates: [],
-      })
-    ).status,
-  ).toBe('approved');
-  expect((await rebuildSemanticLayerIndex(scope)).version).toBe('v1');
   expect((await getSemanticLayerState(scope)).document_count).toBe(1);
   const [uploadCall] = fetchMock.callHistory.calls(
     'http://agent.local/agent/semantic-layer/documents',
@@ -391,7 +359,6 @@ test('semantic project API helpers use project and MDL endpoints', async () => {
     },
     checksum: 'abc',
     storage_uri: 'file:///tmp/notes.md',
-    proposed_updates: [],
     warnings: [],
     created_at: '2026-06-19T00:00:00Z',
     updated_at: '2026-06-19T00:00:00Z',

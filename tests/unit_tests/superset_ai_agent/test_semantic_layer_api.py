@@ -175,7 +175,9 @@ def test_semantic_layer_returns_auth_status_when_scope_auth_fails(tmp_path) -> N
     assert response.json()["detail"] == "Superset session expired."
 
 
-def test_semantic_layer_document_review_index_and_events(tmp_path) -> None:
+def test_semantic_layer_document_upload_state_and_events(tmp_path) -> None:
+    # C6: the legacy review/index/overlay routes are gone; upload still extracts the
+    # document (an enrichment source) and surfaces state + events.
     client, context_provider = _client(tmp_path)
     scope = {"database_id": 1, "schema_name": None, "dataset_ids": [42]}
 
@@ -197,44 +199,37 @@ def test_semantic_layer_document_review_index_and_events(tmp_path) -> None:
 
     assert upload_response.status_code == 200
     document = upload_response.json()
-    assert document["status"] == "needs_review"
-    assert document["proposed_updates"]
+    assert document["status"] == "extracted"
+    assert "proposed_updates" not in document
     assert context_provider.requests[0].database_id == 1
 
-    update_id = document["proposed_updates"][0]["id"]
-    review_response = client.patch(
-        f"/agent/semantic-layer/documents/{document['id']}/review",
-        json={"approved_update_ids": [update_id], "notes": "approved"},
+    # The removed review/index routes return 404/405.
+    assert (
+        client.patch(
+            f"/agent/semantic-layer/documents/{document['id']}/review",
+            json={"approved_update_ids": [], "notes": "x"},
+        ).status_code
+        in {404, 405}
     )
-
-    assert review_response.status_code == 200
-    reviewed_document = review_response.json()
-    assert reviewed_document["status"] == "approved"
-    assert reviewed_document["proposed_updates"][0]["approved"] is True
-
-    index_response = client.post(
-        "/agent/semantic-layer/index/rebuild",
-        json={"scope": scope},
+    assert (
+        client.post(
+            "/agent/semantic-layer/index/rebuild", json={"scope": scope}
+        ).status_code
+        in {404, 405}
     )
-
-    assert index_response.status_code == 200
-    version = index_response.json()
-    assert version["wren_context"]["available"] is True
-    assert version["wren_context"]["document_ids"] == [document["id"]]
 
     state = client.get(
         "/agent/semantic-layer/state?database_id=1&dataset_ids=42",
     ).json()
     assert state["document_count"] == 1
-    assert state["indexed_document_count"] == 1
-    assert state["semantic_layer_version"] == version["version"]
+    assert "indexed_document_count" not in state
+    assert "semantic_layer_version" not in state
 
     events_response = client.get(
         "/agent/semantic-layer/events?database_id=1&dataset_ids=42",
     )
     assert events_response.status_code == 200
     assert "event: document_uploaded" in events_response.text
-    assert "event: index_completed" in events_response.text
 
 
 def test_semantic_project_mdl_and_document_flow(tmp_path) -> None:

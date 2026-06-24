@@ -27,8 +27,6 @@ from superset_ai_agent.semantic_layer.schemas import (
     SemanticDocument,
     SemanticLayerEvent,
     SemanticLayerState,
-    SemanticLayerVersion,
-    SemanticUpdate,
 )
 
 
@@ -78,47 +76,6 @@ class SemanticLayerStore(Protocol):
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> SemanticDocument:
         """Update an existing semantic-layer document."""
-
-    def save_updates(
-        self,
-        document_id: str,
-        updates: list[SemanticUpdate],
-        *,
-        owner_id: str = DEFAULT_OWNER_ID,
-    ) -> list[SemanticUpdate]:
-        """Persist proposed or reviewed semantic updates."""
-
-    def list_approved_updates(
-        self,
-        scope: ConversationScope,
-        *,
-        owner_id: str = DEFAULT_OWNER_ID,
-    ) -> list[SemanticUpdate]:
-        """Return reviewed, approved updates for a scope."""
-
-    def list_project_approved_updates(
-        self,
-        project_id: str,
-        *,
-        owner_id: str = DEFAULT_OWNER_ID,
-    ) -> list[SemanticUpdate]:
-        """Return reviewed, approved updates for a semantic project."""
-
-    def save_version(
-        self,
-        version: SemanticLayerVersion,
-        *,
-        owner_id: str = DEFAULT_OWNER_ID,
-    ) -> SemanticLayerVersion:
-        """Persist a reviewed semantic overlay version."""
-
-    def get_latest_version(
-        self,
-        scope: ConversationScope,
-        *,
-        owner_id: str = DEFAULT_OWNER_ID,
-    ) -> SemanticLayerVersion | None:
-        """Return the latest indexed semantic overlay for a scope."""
 
     def get_state(
         self,

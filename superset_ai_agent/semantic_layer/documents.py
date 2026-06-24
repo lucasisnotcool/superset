@@ -29,7 +29,6 @@ from superset_ai_agent.semantic_layer.extractors import (
     normalize_content_type,
 )
 from superset_ai_agent.semantic_layer.file_storage import DocumentStorage
-from superset_ai_agent.semantic_layer.review import propose_updates
 from superset_ai_agent.semantic_layer.schemas import SemanticDocument
 from superset_ai_agent.semantic_layer.store import SemanticLayerStore
 
@@ -47,7 +46,7 @@ def create_document(
     storage: DocumentStorage,
     extractor: DocumentExtractor,
 ) -> SemanticDocument:
-    """Validate, store, extract, and create review updates for a document."""
+    """Validate, store, and extract text from a semantic source document."""
 
     normalized_type = normalize_content_type(content_type)
     _validate_document(
@@ -95,16 +94,6 @@ def create_document(
                 "extracted_text": extracted_text,
                 "extracted_text_preview": _preview(extracted_text),
                 "warnings": [*document.warnings, *warnings],
-                "updated_at": _utc_now(),
-            }
-        )
-        updates = propose_updates(document)
-        if updates:
-            store.save_updates(document.id, updates, owner_id=owner_id)
-        document = document.model_copy(
-            update={
-                "status": "needs_review" if updates else "extracted",
-                "proposed_updates": updates,
                 "updated_at": _utc_now(),
             }
         )

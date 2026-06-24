@@ -53,7 +53,6 @@ from superset_ai_agent.semantic_layer.schemas import (
     MdlValidationResult,
     SemanticDocument,
     SemanticProject,
-    SemanticUpdate,
 )
 from superset_ai_agent.semantic_layer.wren_core_validator import (
     validate_with_wren_core,
@@ -158,14 +157,6 @@ class LlmWrenClient:
             "planning_only": True,
             "execution": "disabled",
         }
-
-    def preview_document_updates(
-        self,
-        *,
-        project: SemanticProject,
-        document: SemanticDocument,
-    ) -> list[SemanticUpdate]:
-        return []
 
     def propose_mdl_from_document(
         self,

@@ -18,14 +18,16 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
 from superset_ai_agent.conversations.schemas import ConversationScope
-from superset_ai_agent.schemas import WrenContextArtifact
 
+# Active values are "uploaded"/"extracted"/"error". "needs_review"/"approved"/
+# "indexed" are legacy (the removed document-review/overlay flow) and are retained
+# ONLY so pre-existing persisted rows still validate on read; nothing produces them.
 SemanticDocumentStatus = Literal[
     "uploaded",
     "extracted",
@@ -34,15 +36,9 @@ SemanticDocumentStatus = Literal[
     "indexed",
     "error",
 ]
-SemanticUpdateKind = Literal[
-    "model_description",
-    "field_description",
-    "metric",
-    "synonym",
-    "example",
-    "relationship",
-]
-IndexingStatus = Literal["idle", "running", "error"]
+# "review_*"/"index_*" are legacy event types from the removed review/overlay flow,
+# retained only for read-compat with persisted rows; current code emits the
+# "document_*"/"onboarding_*" types (plus "index_failed" reused for extraction errors).
 SemanticLayerEventType = Literal[
     "document_uploaded",
     "document_extracted",
@@ -66,24 +62,6 @@ def _new_id() -> str:
     return str(uuid4())
 
 
-class SemanticUpdate(BaseModel):
-    """Proposed or reviewed semantic-layer update derived from a document."""
-
-    id: str = Field(default_factory=_new_id)
-    kind: SemanticUpdateKind
-    target: dict[str, Any]
-    value: dict[str, Any]
-    confidence: float | None = Field(default=None, ge=0, le=1)
-    source_document_id: str
-    reviewed: bool = False
-    approved: bool = False
-    reviewer_id: str | None = None
-    review_notes: str | None = None
-    created_at: datetime = Field(default_factory=_utc_now)
-    updated_at: datetime = Field(default_factory=_utc_now)
-    reviewed_at: datetime | None = None
-
-
 class SemanticDocument(BaseModel):
     """Uploaded semantic-layer source document."""
 
@@ -99,24 +77,14 @@ class SemanticDocument(BaseModel):
     summary: str | None = None
     extracted_text: str | None = None
     extracted_text_preview: str | None = None
-    proposed_updates: list[SemanticUpdate] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None
     created_at: datetime = Field(default_factory=_utc_now)
     updated_at: datetime = Field(default_factory=_utc_now)
 
 
-class SemanticLayerReviewRequest(BaseModel):
-    """Review decision for proposed semantic-layer updates."""
-
-    approved_update_ids: list[str] = Field(default_factory=list)
-    rejected_update_ids: list[str] = Field(default_factory=list)
-    edited_updates: list[SemanticUpdate] = Field(default_factory=list)
-    notes: str | None = None
-
-
 class SemanticLayerState(BaseModel):
-    """Semantic-layer document and indexing state for one Superset scope."""
+    """Semantic-layer document state for one Superset scope."""
 
     project_id: str | None = None
     database_id: int
@@ -124,33 +92,7 @@ class SemanticLayerState(BaseModel):
     schema_name: str | None = None
     dataset_ids: list[int] = Field(default_factory=list)
     document_count: int
-    approved_document_count: int
-    indexed_document_count: int
-    semantic_layer_version: str | None = None
-    indexing_status: IndexingStatus = "idle"
     last_error: str | None = None
-
-
-class SemanticLayerVersion(BaseModel):
-    """Versioned reviewed semantic overlay for a Superset scope."""
-
-    id: str = Field(default_factory=_new_id)
-    project_id: str | None = None
-    scope: ConversationScope
-    scope_hash: str
-    version: str
-    status: IndexingStatus = "idle"
-    mdl: dict[str, Any] | None = None
-    wren_context: WrenContextArtifact | None = None
-    source_update_ids: list[str] = Field(default_factory=list)
-    published_semantic_layer_uuid: str | None = None
-    created_at: datetime = Field(default_factory=_utc_now)
-
-
-class SemanticLayerIndexRequest(BaseModel):
-    """Request to rebuild the reviewed semantic overlay for a scope."""
-
-    scope: ConversationScope
 
 
 class InstructionCreateRequest(BaseModel):

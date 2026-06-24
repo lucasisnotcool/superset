@@ -23,12 +23,10 @@ from superset_ai_agent.semantic_layer.schemas import (
     SemanticDocument,
     SemanticLayerEvent,
     SemanticLayerState,
-    SemanticLayerVersion,
-    SemanticUpdate,
 )
 from superset_ai_agent.semantic_layer.store import (
-    SemanticDocumentNotFoundError,
     scope_matches,
+    SemanticDocumentNotFoundError,
 )
 
 
@@ -37,7 +35,6 @@ class InMemorySemanticLayerStore:
 
     def __init__(self) -> None:
         self._documents: dict[str, tuple[str, SemanticDocument]] = {}
-        self._versions: list[tuple[str, SemanticLayerVersion]] = []
         self._events: list[tuple[str, SemanticLayerEvent]] = []
 
     def save_document(
@@ -94,77 +91,6 @@ class InMemorySemanticLayerStore:
         self._documents[document.id] = (owner_id, document.model_copy(deep=True))
         return document.model_copy(deep=True)
 
-    def save_updates(
-        self,
-        document_id: str,
-        updates: list[SemanticUpdate],
-        *,
-        owner_id: str = DEFAULT_OWNER_ID,
-    ) -> list[SemanticUpdate]:
-        document = self.get_document(document_id, owner_id=owner_id)
-        by_id = {update.id: update for update in document.proposed_updates}
-        for update in updates:
-            by_id[update.id] = update
-        document.proposed_updates = list(by_id.values())
-        self.update_document(document, owner_id=owner_id)
-        return [update.model_copy(deep=True) for update in updates]
-
-    def list_approved_updates(
-        self,
-        scope: ConversationScope,
-        *,
-        owner_id: str = DEFAULT_OWNER_ID,
-    ) -> list[SemanticUpdate]:
-        updates: list[SemanticUpdate] = []
-        for document in self.list_documents(scope, owner_id=owner_id):
-            updates.extend(
-                update.model_copy(deep=True)
-                for update in document.proposed_updates
-                if update.reviewed and update.approved
-            )
-        return updates
-
-    def list_project_approved_updates(
-        self,
-        project_id: str,
-        *,
-        owner_id: str = DEFAULT_OWNER_ID,
-    ) -> list[SemanticUpdate]:
-        updates: list[SemanticUpdate] = []
-        for document in self.list_project_documents(project_id, owner_id=owner_id):
-            updates.extend(
-                update.model_copy(deep=True)
-                for update in document.proposed_updates
-                if update.reviewed and update.approved
-            )
-        return updates
-
-    def save_version(
-        self,
-        version: SemanticLayerVersion,
-        *,
-        owner_id: str = DEFAULT_OWNER_ID,
-    ) -> SemanticLayerVersion:
-        self._versions.append((owner_id, version.model_copy(deep=True)))
-        return version.model_copy(deep=True)
-
-    def get_latest_version(
-        self,
-        scope: ConversationScope,
-        *,
-        owner_id: str = DEFAULT_OWNER_ID,
-    ) -> SemanticLayerVersion | None:
-        matching = [
-            version
-            for stored_owner_id, version in self._versions
-            if stored_owner_id == owner_id and scope_matches(version.scope, scope)
-        ]
-        if not matching:
-            return None
-        return sorted(matching, key=lambda item: item.created_at)[-1].model_copy(
-            deep=True
-        )
-
     def get_state(
         self,
         scope: ConversationScope,
@@ -172,7 +98,6 @@ class InMemorySemanticLayerStore:
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> SemanticLayerState:
         documents = self.list_documents(scope, owner_id=owner_id)
-        latest_version = self.get_latest_version(scope, owner_id=owner_id)
         last_error = next(
             (document.error for document in documents if document.status == "error"),
             None,
@@ -184,20 +109,6 @@ class InMemorySemanticLayerStore:
             schema_name=scope.schema_name,
             dataset_ids=scope.dataset_ids,
             document_count=len(documents),
-            approved_document_count=len(
-                [
-                    document
-                    for document in documents
-                    if document.status in {"approved", "indexed"}
-                ]
-            ),
-            indexed_document_count=len(
-                [document for document in documents if document.status == "indexed"]
-            ),
-            semantic_layer_version=(
-                latest_version.version if latest_version is not None else None
-            ),
-            indexing_status=latest_version.status if latest_version else "idle",
             last_error=last_error,
         )
 
@@ -223,18 +134,6 @@ class InMemorySemanticLayerStore:
             schema_name=first_scope.schema_name,
             dataset_ids=first_scope.dataset_ids,
             document_count=len(documents),
-            approved_document_count=len(
-                [
-                    document
-                    for document in documents
-                    if document.status in {"approved", "indexed"}
-                ]
-            ),
-            indexed_document_count=len(
-                [document for document in documents if document.status == "indexed"]
-            ),
-            semantic_layer_version=None,
-            indexing_status="idle",
             last_error=last_error,
         )
 

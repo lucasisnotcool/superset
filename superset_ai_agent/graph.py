@@ -66,7 +66,6 @@ from superset_ai_agent.semantic_layer.memory_store import Memory, NullMemory
 from superset_ai_agent.semantic_layer.projects import SemanticProjectStore
 from superset_ai_agent.semantic_layer.runtime import (
     build_unified_context,
-    merge_indexed_semantic_context,
     ModelSelector,
 )
 from superset_ai_agent.semantic_layer.schema_retriever import (
@@ -78,7 +77,6 @@ from superset_ai_agent.semantic_layer.schemas import WrenMaterializationResult
 from superset_ai_agent.semantic_layer.store import (
     instruction_scope_hash,
     scope_hash,
-    SemanticLayerStore,
 )
 from superset_ai_agent.semantic_layer.wren_runtime import (
     materialize_request_semantic_project,
@@ -244,7 +242,6 @@ class TextToSqlGraph:
         context_provider: ContextProvider,
         superset_client: SupersetClient,
         wren_client: WrenClient | None = None,
-        semantic_layer_store: SemanticLayerStore | None = None,
         semantic_project_store: SemanticProjectStore | None = None,
         mdl_file_store: MdlFileStore | None = None,
         semantic_engine: SemanticEngine | None = None,
@@ -257,7 +254,6 @@ class TextToSqlGraph:
         self.context_provider = context_provider
         self.superset_client = superset_client
         self.wren_client = wren_client or DisabledWrenClient()
-        self.semantic_layer_store = semantic_layer_store
         self.semantic_project_store = semantic_project_store
         self.mdl_file_store = mdl_file_store
         self.semantic_engine = semantic_engine or create_semantic_engine(config)
@@ -445,20 +441,6 @@ class TextToSqlGraph:
             status: Literal["ok", "warning", "error"] = "warning"
         else:
             status = "ok" if wren_context.available else "warning"
-        wren_context = merge_indexed_semantic_context(
-            semantic_layer_store=self.semantic_layer_store,
-            scope=ConversationScope(
-                database_id=request.database_id,
-                catalog_name=request.catalog_name,
-                schema_name=request.schema_name,
-                dataset_ids=request.dataset_ids,
-            ),
-            owner_id=state.get("owner_id", DEFAULT_OWNER_ID),
-            wren_context=wren_context,
-            # E1/E6: single-source by default — skip the legacy doc overlay unless
-            # explicitly re-enabled.
-            enabled=self.config.wren_semantic_overlay_enabled,
-        )
         if materialization is not None:
             warnings = list(wren_context.warnings)
             if materialization.file_count == 0:
@@ -480,10 +462,10 @@ class TextToSqlGraph:
             owner_id=state.get("owner_id", DEFAULT_OWNER_ID),
             mdl_file_store=self.mdl_file_store,
         )
-        # R2/C1: one post-retrieval entrypoint — unify fetch_context + overlay +
-        # retriever chunks, run table-selection over the *unified* set (C1.1), then
-        # dedup + bound across all sources (R-RET-E). C1.3: an opt-in LLM selector
-        # picks the relevant model subset, degrading closed to the heuristic.
+        # R2/C1: one post-retrieval entrypoint — unify fetch_context + retriever
+        # chunks, run table-selection over the *unified* set (C1.1), then dedup +
+        # bound across all sources (R-RET-E). C1.3: an opt-in LLM selector picks the
+        # relevant model subset, degrading closed to the heuristic.
         wren_context = build_unified_context(
             wren_context=wren_context,
             retrieved_items=retrieved_items,

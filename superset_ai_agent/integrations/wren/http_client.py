@@ -33,7 +33,6 @@ from superset_ai_agent.semantic_layer.schemas import (
     MdlEnrichmentProposal,
     SemanticDocument,
     SemanticProject,
-    SemanticUpdate,
 )
 
 
@@ -132,25 +131,6 @@ class WrenHttpClient:
         data.setdefault("planning_only", True)
         data.setdefault("execution", "disabled")
         return data
-
-    def preview_document_updates(
-        self,
-        *,
-        project: SemanticProject,
-        document: SemanticDocument,
-    ) -> list[SemanticUpdate]:
-        payload = self._request(
-            "POST",
-            "/documents/preview-updates",
-            json={
-                "project": project.model_dump(mode="json"),
-                "document": document.model_dump(mode="json"),
-            },
-        )
-        return [
-            SemanticUpdate.model_validate(item)
-            for item in _payload_items(payload, "updates")
-        ]
 
     def propose_mdl_from_document(
         self,
@@ -327,8 +307,6 @@ def _context_artifact(payload: dict[str, Any]) -> WrenContextArtifact:
         ],
         example_ids=[str(item) for item in example_ids if isinstance(item, str)],
         document_ids=[str(item) for item in document_ids if isinstance(item, str)],
-        semantic_layer_version=data.get("semantic_layer_version"),
-        indexing_status=data.get("indexing_status"),
         context_items=(
             [item for item in context_items if isinstance(item, dict)]
             if isinstance(context_items, list)

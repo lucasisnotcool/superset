@@ -31,7 +31,6 @@ from superset_ai_agent.semantic_layer.schemas import (
     MdlEnrichmentProposal,
     SemanticDocument,
     SemanticProject,
-    SemanticUpdate,
 )
 
 
@@ -70,14 +69,6 @@ class WrenClient(Protocol):
         mdl_path: str | None = None,
     ) -> dict[str, Any]:
         """Return planning metadata without executing SQL."""
-
-    def preview_document_updates(
-        self,
-        *,
-        project: SemanticProject,
-        document: SemanticDocument,
-    ) -> list[SemanticUpdate]:
-        """Return reviewable semantic updates without activating MDL."""
 
     def propose_mdl_from_document(
         self,
@@ -145,14 +136,6 @@ class DisabledWrenClient:
             "planning_only": True,
             "warnings": ["Wren integration is disabled."],
         }
-
-    def preview_document_updates(
-        self,
-        *,
-        project: SemanticProject,
-        document: SemanticDocument,
-    ) -> list[SemanticUpdate]:
-        return []
 
     def propose_mdl_from_document(
         self,
@@ -300,14 +283,6 @@ class FileWrenClient:
             )[: self.config.wren_context_limit],
             "sql_hash": _hash_text(sql or ""),
         }
-
-    def preview_document_updates(
-        self,
-        *,
-        project: SemanticProject,
-        document: SemanticDocument,
-    ) -> list[SemanticUpdate]:
-        return []
 
     def propose_mdl_from_document(
         self,

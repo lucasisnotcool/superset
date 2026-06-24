@@ -77,17 +77,14 @@ from superset_ai_agent.semantic_layer.engine.planning import (
 from superset_ai_agent.semantic_layer.mdl_files import MdlFileStore
 from superset_ai_agent.semantic_layer.memory_store import Memory, NullMemory
 from superset_ai_agent.semantic_layer.projects import SemanticProjectStore
-from superset_ai_agent.semantic_layer.runtime import (
-    cap_context_items,
-    merge_indexed_semantic_context,
-)
+from superset_ai_agent.semantic_layer.runtime import cap_context_items
 from superset_ai_agent.semantic_layer.schema_retriever import (
     create_retriever,
     retrieve_mdl_context,
     Retriever,
 )
 from superset_ai_agent.semantic_layer.schemas import WrenMaterializationResult
-from superset_ai_agent.semantic_layer.store import scope_hash, SemanticLayerStore
+from superset_ai_agent.semantic_layer.store import scope_hash
 from superset_ai_agent.semantic_layer.wren_runtime import (
     materialize_request_semantic_project,
 )
@@ -190,7 +187,6 @@ class ConversationGraph:
         superset_client: SupersetClient,
         conversation_store: ConversationStore,
         wren_client: WrenClient | None = None,
-        semantic_layer_store: SemanticLayerStore | None = None,
         semantic_project_store: SemanticProjectStore | None = None,
         mdl_file_store: MdlFileStore | None = None,
         semantic_engine: SemanticEngine | None = None,
@@ -203,7 +199,6 @@ class ConversationGraph:
         self.superset_client = superset_client
         self.conversation_store = conversation_store
         self.wren_client = wren_client or DisabledWrenClient()
-        self.semantic_layer_store = semantic_layer_store
         self.semantic_project_store = semantic_project_store
         self.mdl_file_store = mdl_file_store
         self.semantic_engine = semantic_engine or create_semantic_engine(config)
@@ -877,12 +872,6 @@ class ConversationGraph:
             status: Literal["ok", "warning", "error"] = "warning"
         else:
             status = "ok" if wren_context.available else "warning"
-        wren_context = merge_indexed_semantic_context(
-            semantic_layer_store=self.semantic_layer_store,
-            scope=request.scope,
-            owner_id=state["owner_id"],
-            wren_context=wren_context,
-        )
         if materialization is not None:
             warnings = list(wren_context.warnings)
             if materialization.file_count == 0:

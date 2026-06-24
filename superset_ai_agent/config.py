@@ -182,10 +182,9 @@ class AgentConfig:
     # Bound the in-process retriever index to the N most-recently-used scopes so a
     # worker serving many projects/owners cannot grow unbounded. 0 = unlimited.
     wren_retriever_cache_scopes: int = 64
-    # Total cap on prompt context_items after the three sources (doc overlay, MDL
-    # retriever chunks, fetch_context) are merged, so a wide schema cannot inflate
-    # the prompt (wren_full.md R-RET-E). Retrieval-ranked chunks win on overflow.
-    # 0 = unlimited.
+    # Total cap on prompt context_items after the sources (MDL retriever chunks and
+    # fetch_context) are merged, so a wide schema cannot inflate the prompt
+    # (wren_full.md R-RET-E). Retrieval-ranked chunks win on overflow. 0 = unlimited.
     wren_max_context_items: int = 40
     # R2 (wren_enrich_and_retrieve.md): table-selection prune. Narrow the
     # retrieval-ranked MDL chunks to the top-N most relevant *models* (keeping each
@@ -198,12 +197,6 @@ class AgentConfig:
     # model call to the retrieval node; degrades closed to wren_table_selection_limit
     # on any failure/empty result. Default false (opt-in: latency/cost).
     wren_llm_table_selection: bool = False
-    # E1/E6 (wren_enrich_and_retrieve.md): the legacy heuristic document-overlay —
-    # approved document updates merged into the prompt at query time via
-    # `merge_indexed_semantic_context` — is a *second* semantic system parallel to
-    # MDL. Default false converges on a single source (MDL/enrichment): the overlay
-    # channel is skipped at query time. Set true to restore the legacy overlay.
-    wren_semantic_overlay_enabled: bool = False
     wren_memory_store: WrenMemoryStoreMode = "none"
     wren_memory_learning_enabled: bool = True
     wren_memory_recall_k: int = 3
@@ -593,10 +586,6 @@ class AgentConfig:
             wren_llm_table_selection=_env_bool(
                 "WREN_LLM_TABLE_SELECTION",
                 cls.wren_llm_table_selection,
-            ),
-            wren_semantic_overlay_enabled=_env_bool(
-                "WREN_SEMANTIC_OVERLAY_ENABLED",
-                cls.wren_semantic_overlay_enabled,
             ),
             wren_memory_store=cast(
                 WrenMemoryStoreMode,

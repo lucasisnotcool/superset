@@ -28,13 +28,10 @@ from superset_ai_agent.persistence.database import (
 from superset_ai_agent.semantic_layer.schemas import (
     SemanticDocument,
     SemanticLayerEvent,
-    SemanticLayerVersion,
-    SemanticUpdate,
 )
 from superset_ai_agent.semantic_layer.sqlalchemy_store import (
     SqlAlchemySemanticLayerStore,
 )
-from superset_ai_agent.semantic_layer.store import scope_hash
 
 
 def _store() -> SqlAlchemySemanticLayerStore:
@@ -65,61 +62,31 @@ def test_sqlalchemy_semantic_layer_store_round_trips_state() -> None:
             scope=scope,
             checksum="abc",
             storage_uri="file:///tmp/notes.txt",
-            status="needs_review",
-        ),
-        owner_id="user-1",
-    )
-    update = SemanticUpdate(
-        kind="metric",
-        target={"field": "gross_moves"},
-        value={"definition": "count moves"},
-        source_document_id=document.id,
-        reviewed=True,
-        approved=True,
-    )
-
-    store.save_updates(document.id, [update], owner_id="user-1")
-    document = store.get_document(document.id, owner_id="user-1")
-    version = store.save_version(
-        SemanticLayerVersion(
-            project_id="project-1",
-            scope=scope,
-            scope_hash=scope_hash(scope),
-            version="v1",
-            source_update_ids=[update.id],
+            status="extracted",
         ),
         owner_id="user-1",
     )
     store.append_event(
         SemanticLayerEvent(
             project_id="project-1",
-            type="review_saved",
+            type="document_extracted",
             scope=scope,
             document_id=document.id,
-            message="Saved review.",
+            message="Extracted document.",
         ),
         owner_id="user-1",
     )
 
-    assert document.proposed_updates[0].approved is True
+    document = store.get_document(document.id, owner_id="user-1")
     assert document.project_id == "project-1"
     assert document.scope.catalog_name == "prod"
-    assert store.list_approved_updates(scope, owner_id="user-1")[0].id == update.id
-    assert (
-        store.list_project_approved_updates("project-1", owner_id="user-1")[0].id
-        == update.id
-    )
-    assert store.get_latest_version(scope, owner_id="user-1").id == version.id
-    latest_version = store.get_latest_version(scope, owner_id="user-1")
-    assert latest_version is not None
-    assert latest_version.project_id == "project-1"
     state = store.get_state(scope, owner_id="user-1")
     assert state.document_count == 1
     assert state.catalog_name == "prod"
     assert state.project_id == "project-1"
     assert store.get_project_state("project-1", owner_id="user-1").document_count == 1
-    assert store.list_events(scope, owner_id="user-1")[0].type == "review_saved"
+    assert store.list_events(scope, owner_id="user-1")[0].type == "document_extracted"
     assert store.list_project_events("project-1", owner_id="user-1")[0].type == (
-        "review_saved"
+        "document_extracted"
     )
     assert store.list_documents(scope, owner_id="user-2") == []

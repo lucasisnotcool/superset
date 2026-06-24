@@ -90,10 +90,6 @@ const mockBaseRoutes = (files: unknown[] = []) => {
       schema_name: 'main',
       dataset_ids: [],
       document_count: 0,
-      approved_document_count: 0,
-      indexed_document_count: 0,
-      semantic_layer_version: null,
-      indexing_status: 'idle',
       last_error: null,
     },
   );

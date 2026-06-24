@@ -152,8 +152,6 @@ class WrenContextArtifact(BaseModel):
     matched_models: list[str] = Field(default_factory=list)
     example_ids: list[str] = Field(default_factory=list)
     document_ids: list[str] = Field(default_factory=list)
-    semantic_layer_version: str | None = None
-    indexing_status: str | None = None
     context_items: list[dict[str, Any]] = Field(default_factory=list)
     retrieval_mode: str | None = None
     #: How many MDL schema chunks the Retriever seam contributed to the prompt

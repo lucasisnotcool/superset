@@ -105,8 +105,6 @@ export interface WrenContextArtifact {
   matched_models: string[];
   example_ids: string[];
   document_ids: string[];
-  semantic_layer_version?: string | null;
-  indexing_status?: string | null;
   context_items: Record<string, unknown>[];
   // Which retriever produced the context items (keyword | embedding), stamped
   // when the Retriever seam contributes context (wren_full.md RV2).
@@ -190,28 +188,6 @@ export type SemanticDocumentStatus =
   | 'indexed'
   | 'error';
 
-export interface SemanticUpdate {
-  id: string;
-  kind:
-    | 'model_description'
-    | 'field_description'
-    | 'metric'
-    | 'synonym'
-    | 'example'
-    | 'relationship';
-  target: Record<string, unknown>;
-  value: Record<string, unknown>;
-  confidence?: number | null;
-  source_document_id: string;
-  reviewed: boolean;
-  approved: boolean;
-  reviewer_id?: string | null;
-  review_notes?: string | null;
-  created_at: string;
-  updated_at: string;
-  reviewed_at?: string | null;
-}
-
 export interface SemanticDocument {
   id: string;
   project_id?: string | null;
@@ -225,18 +201,10 @@ export interface SemanticDocument {
   summary?: string | null;
   extracted_text?: string | null;
   extracted_text_preview?: string | null;
-  proposed_updates: SemanticUpdate[];
   warnings: string[];
   error?: string | null;
   created_at: string;
   updated_at: string;
-}
-
-export interface SemanticLayerReviewRequest {
-  approved_update_ids: string[];
-  rejected_update_ids: string[];
-  edited_updates: SemanticUpdate[];
-  notes?: string | null;
 }
 
 export interface SemanticLayerState {
@@ -246,25 +214,7 @@ export interface SemanticLayerState {
   schema_name?: string | null;
   dataset_ids: number[];
   document_count: number;
-  approved_document_count: number;
-  indexed_document_count: number;
-  semantic_layer_version?: string | null;
-  indexing_status: 'idle' | 'running' | 'error';
   last_error?: string | null;
-}
-
-export interface SemanticLayerVersion {
-  id: string;
-  project_id?: string | null;
-  scope: ConversationScope;
-  scope_hash: string;
-  version: string;
-  status: 'idle' | 'running' | 'error';
-  mdl?: Record<string, unknown> | null;
-  wren_context?: WrenContextArtifact | null;
-  source_update_ids: string[];
-  published_semantic_layer_uuid?: string | null;
-  created_at: string;
 }
 
 export interface ConversationMessage {
@@ -1001,24 +951,6 @@ export const getSemanticDocument = (documentId: string) =>
     `/agent/semantic-layer/documents/${documentId}`,
     { method: 'GET' },
   );
-
-export const reviewSemanticDocument = (
-  documentId: string,
-  payload: SemanticLayerReviewRequest,
-) =>
-  requestJson<SemanticDocument>(
-    `/agent/semantic-layer/documents/${documentId}/review`,
-    {
-      method: 'PATCH',
-      body: JSON.stringify(payload),
-    },
-  );
-
-export const rebuildSemanticLayerIndex = (scope: ConversationScope) =>
-  requestJson<SemanticLayerVersion>('/agent/semantic-layer/index/rebuild', {
-    method: 'POST',
-    body: JSON.stringify({ scope }),
-  });
 
 export const getSemanticLayerState = (scope: ConversationScope) =>
   requestJson<SemanticLayerState>(

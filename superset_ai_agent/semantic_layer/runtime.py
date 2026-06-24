@@ -21,34 +21,7 @@ import json  # noqa: TID251 - standalone agent context-item dedup key
 from collections.abc import Callable
 from typing import Any
 
-from superset_ai_agent.conversations.schemas import ConversationScope
-from superset_ai_agent.conversations.store import DEFAULT_OWNER_ID
 from superset_ai_agent.schemas import WrenContextArtifact
-from superset_ai_agent.semantic_layer.store import SemanticLayerStore
-
-
-def merge_indexed_semantic_context(
-    *,
-    semantic_layer_store: SemanticLayerStore | None,
-    scope: ConversationScope,
-    owner_id: str = DEFAULT_OWNER_ID,
-    wren_context: WrenContextArtifact,
-    enabled: bool = True,
-) -> WrenContextArtifact:
-    """Merge the latest indexed semantic overlay into a Wren context artifact.
-
-    The overlay is the legacy heuristic document-update channel, parallel to MDL.
-    When ``enabled`` is false (E1/E6 single-source convergence), the channel is
-    skipped entirely and the MDL-derived context is the sole semantic source.
-    """
-
-    if not enabled or semantic_layer_store is None:
-        return wren_context
-    latest_version = semantic_layer_store.get_latest_version(scope, owner_id=owner_id)
-    if latest_version is None or latest_version.wren_context is None:
-        return wren_context
-
-    return _merge(wren_context, latest_version.wren_context)
 
 
 def canonical_model_name(item: dict[str, Any]) -> str | None:
@@ -137,8 +110,8 @@ def build_unified_context(
     """Single post-retrieval context entrypoint (C1.2 / C1.3).
 
     Collapses the previously-inline merge → select → cap steps into one path: the
-    already-fetched context (``fetch_context`` plus any enabled doc overlay) and the
-    retriever chunks are unified into **one** list, table-selection runs over that
+    already-fetched ``fetch_context`` context and the retriever chunks are unified
+    into **one** list, table-selection runs over that
     unified set (C1.1 — pruning ``fetch_context`` model items too, not just the
     retriever output), then the result is deduped and capped. The three retrieval
     *sources* still feed this one pipeline. ``retrieval_mode``/
@@ -187,8 +160,8 @@ def cap_context_items(
 ) -> list[dict[str, Any]]:
     """Dedup + bound merged prompt context items (wren_full.md R-RET-E).
 
-    The three context sources (doc overlay, MDL retriever chunks, ``fetch_context``)
-    concatenate with no combined budget, so a wide schema could inflate the prompt.
+    The context sources (MDL retriever chunks and ``fetch_context``) concatenate
+    with no combined budget, so a wide schema could inflate the prompt.
     This dedups exact duplicates and, on overflow, keeps the **retrieval-ranked**
     chunks (``source == "retriever"``) first since those are the most relevant.
     ``max_items <= 0`` is unlimited.
@@ -207,30 +180,3 @@ def cap_context_items(
     ranked = [item for item in deduped if item.get("source") == "retriever"]
     other = [item for item in deduped if item.get("source") != "retriever"]
     return (ranked + other)[:max_items]
-
-
-def _merge(
-    wren_context: WrenContextArtifact, indexed_context: WrenContextArtifact
-) -> WrenContextArtifact:
-    return wren_context.model_copy(
-        update={
-            "enabled": wren_context.enabled or indexed_context.enabled,
-            "available": wren_context.available or indexed_context.available,
-            "document_ids": sorted(
-                {
-                    *wren_context.document_ids,
-                    *indexed_context.document_ids,
-                }
-            ),
-            "semantic_layer_version": indexed_context.semantic_layer_version,
-            "indexing_status": indexed_context.indexing_status,
-            "context_items": [
-                *wren_context.context_items,
-                *indexed_context.context_items,
-            ],
-            "warnings": [
-                *wren_context.warnings,
-                *indexed_context.warnings,
-            ],
-        }
-    )

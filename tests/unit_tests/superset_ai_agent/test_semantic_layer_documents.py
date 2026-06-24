@@ -31,7 +31,7 @@ def _scope() -> ConversationScope:
     return ConversationScope(database_id=1, dataset_ids=[42])
 
 
-def test_create_document_extracts_text_and_proposes_updates(tmp_path) -> None:
+def test_create_document_extracts_text(tmp_path) -> None:
     store = InMemorySemanticLayerStore()
     document = create_document(
         filename="gross_moves.md",
@@ -49,14 +49,11 @@ def test_create_document_extracts_text_and_proposes_updates(tmp_path) -> None:
         extractor=CompositeDocumentExtractor(),
     )
 
-    assert document.status == "needs_review"
+    # The document is extracted for enrichment; the legacy review/overlay flow that
+    # produced "proposed_updates" / "needs_review" was removed in C6.
+    assert document.status == "extracted"
     assert document.extracted_text_preview is not None
-    assert document.proposed_updates
-    assert {update.kind for update in document.proposed_updates} >= {
-        "model_description",
-        "metric",
-        "example",
-    }
+    assert "gross moves" in (document.extracted_text or "").lower()
     assert store.get_document(document.id, owner_id="user-1").checksum
 
 

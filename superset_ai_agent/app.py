@@ -96,7 +96,6 @@ from superset_ai_agent.semantic_layer.file_storage import (
     LocalDocumentStorage,
     S3DocumentStorage,
 )
-from superset_ai_agent.semantic_layer.indexer import rebuild_index
 from superset_ai_agent.semantic_layer.instructions import (
     create_instruction_store,
     Instruction,
@@ -131,7 +130,6 @@ from superset_ai_agent.semantic_layer.projects import (
     SemanticProjectStore,
     SqlAlchemySemanticProjectStore,
 )
-from superset_ai_agent.semantic_layer.review import apply_review
 from superset_ai_agent.semantic_layer.schema_retriever import (
     create_retriever,
     effective_vector_index,
@@ -155,10 +153,7 @@ from superset_ai_agent.semantic_layer.schemas import (
     SemanticJob,
     SemanticLayerEvent,
     SemanticLayerEventType,
-    SemanticLayerIndexRequest,
-    SemanticLayerReviewRequest,
     SemanticLayerState,
-    SemanticLayerVersion,
     SemanticProject,
     SemanticProjectResolveRequest,
     WrenMaterializationResult,
@@ -325,7 +320,6 @@ def create_app(  # noqa: C901
             context_provider=app_context_provider,
             superset_client=app_superset_client,
             wren_client=active_wren_client,
-            semantic_layer_store=active_semantic_layer_store,
             semantic_project_store=active_semantic_project_store,
             mdl_file_store=active_mdl_file_store,
             memory=active_memory,
@@ -339,7 +333,6 @@ def create_app(  # noqa: C901
             superset_client=app_superset_client,
             conversation_store=active_conversation_store,
             wren_client=active_wren_client,
-            semantic_layer_store=active_semantic_layer_store,
             semantic_project_store=active_semantic_project_store,
             mdl_file_store=active_mdl_file_store,
             memory=active_memory,
@@ -396,7 +389,6 @@ def create_app(  # noqa: C901
             context_provider=request_context_provider,
             superset_client=request_superset_client,
             wren_client=active_wren_client,
-            semantic_layer_store=active_semantic_layer_store,
             semantic_project_store=active_semantic_project_store,
             mdl_file_store=active_mdl_file_store,
             memory=active_memory,
@@ -419,7 +411,6 @@ def create_app(  # noqa: C901
             superset_client=request_superset_client,
             conversation_store=active_conversation_store,
             wren_client=active_wren_client,
-            semantic_layer_store=active_semantic_layer_store,
             semantic_project_store=active_semantic_project_store,
             mdl_file_store=active_mdl_file_store,
             memory=active_memory,
@@ -812,16 +803,7 @@ def create_app(  # noqa: C901
             document_id=document.id,
             message=f"Uploaded {document.filename}.",
         )
-        if document.status == "needs_review":
-            _append_semantic_event(
-                store=active_semantic_layer_store,
-                owner_id=identity.owner_id,
-                event_type="review_required",
-                scope=parsed_scope,
-                document_id=document.id,
-                message=f"{document.filename} needs semantic review.",
-            )
-        elif document.status == "error":
+        if document.status == "error":
             _append_semantic_event(
                 store=active_semantic_layer_store,
                 owner_id=identity.owner_id,
@@ -1686,101 +1668,6 @@ def create_app(  # noqa: C901
         )
         return document
 
-    @api.patch(
-        "/agent/semantic-layer/documents/{document_id}/review",
-        response_model=SemanticDocument,
-    )
-    def review_semantic_document(
-        document_id: str,
-        fastapi_request: Request,
-        request: SemanticLayerReviewRequest,
-        identity: AgentIdentity = identity_dependency,
-    ) -> SemanticDocument:
-        """Review proposed semantic-layer updates from a document."""
-
-        try:
-            document = active_semantic_layer_store.get_document(
-                document_id,
-                owner_id=identity.owner_id,
-            )
-            authorize_semantic_scope(
-                fastapi_request,
-                document.scope,
-                identity=identity,
-                permission=SemanticPermission.WRITE,
-            )
-            reviewed_document = apply_review(
-                active_semantic_layer_store,
-                document_id=document_id,
-                request=request,
-                owner_id=identity.owner_id,
-                reviewer_id=identity.username or identity.owner_id,
-            )
-        except SemanticDocumentNotFoundError as ex:
-            raise HTTPException(
-                status_code=404,
-                detail="Semantic document not found.",
-            ) from ex
-        _append_semantic_event(
-            store=active_semantic_layer_store,
-            owner_id=identity.owner_id,
-            event_type="review_saved",
-            scope=reviewed_document.scope,
-            document_id=reviewed_document.id,
-            message=f"Saved review for {reviewed_document.filename}.",
-        )
-        return reviewed_document
-
-    @api.post(
-        "/agent/semantic-layer/index/rebuild",
-        response_model=SemanticLayerVersion,
-    )
-    def rebuild_semantic_layer_index(
-        fastapi_request: Request,
-        request: SemanticLayerIndexRequest,
-        identity: AgentIdentity = identity_dependency,
-    ) -> SemanticLayerVersion:
-        """Rebuild the reviewed semantic overlay for a governed scope."""
-
-        authorize_semantic_scope(
-            fastapi_request,
-            request.scope,
-            identity=identity,
-            permission=SemanticPermission.WRITE,
-        )
-        _append_semantic_event(
-            store=active_semantic_layer_store,
-            owner_id=identity.owner_id,
-            event_type="index_started",
-            scope=request.scope,
-            document_id=None,
-            message="Semantic-layer index rebuild started.",
-        )
-        try:
-            version = rebuild_index(
-                active_semantic_layer_store,
-                scope=request.scope,
-                owner_id=identity.owner_id,
-            )
-        except Exception as ex:  # pylint: disable=broad-except
-            _append_semantic_event(
-                store=active_semantic_layer_store,
-                owner_id=identity.owner_id,
-                event_type="index_failed",
-                scope=request.scope,
-                document_id=None,
-                message=str(ex),
-            )
-            raise HTTPException(status_code=502, detail=str(ex)) from ex
-        _append_semantic_event(
-            store=active_semantic_layer_store,
-            owner_id=identity.owner_id,
-            event_type="index_completed",
-            scope=request.scope,
-            document_id=None,
-            message=f"Semantic-layer index {version.version} rebuilt.",
-        )
-        return version
 
     @api.post(
         "/agent/semantic-layer/instructions",

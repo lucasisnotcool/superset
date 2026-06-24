@@ -20,17 +20,16 @@ import { t } from '@apache-superset/core/translation';
 import { css, styled } from '@apache-superset/core/theme';
 import type { SemanticLayerState } from './api';
 
-const Badge = styled.span<{ status?: SemanticLayerState['indexing_status'] }>`
-  ${({ theme, status }) => css`
+const Badge = styled.span`
+  ${({ theme }) => css`
     display: inline-flex;
     align-items: center;
     max-width: 100%;
     height: 24px;
     padding: 0 ${theme.sizeUnit * 2}px;
-    border: 1px solid
-      ${status === 'error' ? theme.colorErrorBorder : theme.colorBorder};
+    border: 1px solid ${theme.colorBorder};
     border-radius: ${theme.borderRadius}px;
-    color: ${status === 'error' ? theme.colorError : theme.colorTextSecondary};
+    color: ${theme.colorTextSecondary};
     background: ${theme.colorBgContainer};
     font-size: ${theme.fontSizeSM}px;
     overflow: hidden;
@@ -49,11 +48,5 @@ export default function SemanticLayerStateBadge({
   if (!state) {
     return <Badge>{t('Semantic layer')}</Badge>;
   }
-  return (
-    <Badge status={state.indexing_status}>
-      {state.semantic_layer_version
-        ? t('Semantic layer %s', state.semantic_layer_version)
-        : t('%s document(s)', state.document_count)}
-    </Badge>
-  );
+  return <Badge>{t('%s document(s)', state.document_count)}</Badge>;
 }

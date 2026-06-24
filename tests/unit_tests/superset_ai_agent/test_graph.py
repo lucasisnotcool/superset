@@ -41,12 +41,10 @@ from superset_ai_agent.schemas import (
 )
 from superset_ai_agent.semantic_layer.instructions import InMemoryInstructionStore
 from superset_ai_agent.semantic_layer.mdl_files import InMemoryMdlFileStore
-from superset_ai_agent.semantic_layer.memory import InMemorySemanticLayerStore
 from superset_ai_agent.semantic_layer.projects import InMemorySemanticProjectStore
 from superset_ai_agent.semantic_layer.schemas import (
     MdlFileCreateRequest,
     MdlFileUpdateRequest,
-    SemanticLayerVersion,
     SemanticProjectResolveRequest,
 )
 from superset_ai_agent.semantic_layer.store import (
@@ -320,83 +318,6 @@ def test_graph_materializes_schema_project_for_wren_context(tmp_path) -> None:
     assert response.wren_context.mdl_path is not None
     assert response.wren_context.mdl_path.endswith("mdl.json")
     assert wren_client.mdl_paths == [response.wren_context.mdl_path]
-
-
-def _store_with_indexed_overlay() -> (
-    tuple[InMemorySemanticLayerStore, ConversationScope]
-):
-    semantic_layer_store = InMemorySemanticLayerStore()
-    scope = ConversationScope(database_id=1, schema_name="main")
-    semantic_layer_store.save_version(
-        SemanticLayerVersion(
-            scope=scope,
-            scope_hash=scope_hash(scope),
-            version="v1",
-            status="idle",
-            wren_context=WrenContextArtifact(
-                enabled=True,
-                available=True,
-                document_ids=["doc-1"],
-                semantic_layer_version="v1",
-                indexing_status="indexed",
-                context_items=[{"kind": "document", "name": "terms"}],
-                warnings=["Indexed semantic context loaded."],
-            ),
-        ),
-        owner_id="analyst",
-    )
-    return semantic_layer_store, scope
-
-
-def _run_overlay_graph(
-    semantic_layer_store: InMemorySemanticLayerStore, *, overlay_enabled: bool
-):
-    graph = TextToSqlGraph(
-        config=AgentConfig(wren_semantic_overlay_enabled=overlay_enabled),
-        model_client=FakeModelClient(
-            "SELECT name, SUM(num) AS total_births FROM birth_names GROUP BY name"
-        ),
-        context_provider=FakeContextProvider(),
-        superset_client=FakeSupersetClient(),
-        wren_client=FakeWrenClient(),
-        semantic_layer_store=semantic_layer_store,
-    )
-    return graph.run(
-        AgentQueryRequest(
-            question="Show total births",
-            database_id=1,
-            schema_name="main",
-        ),
-        owner_id="analyst",
-    )
-
-
-def test_graph_merges_indexed_semantic_context_when_overlay_enabled() -> None:
-    semantic_layer_store, _ = _store_with_indexed_overlay()
-
-    response = _run_overlay_graph(semantic_layer_store, overlay_enabled=True)
-
-    assert response.wren_context is not None
-    assert response.wren_context.semantic_layer_version == "v1"
-    assert response.wren_context.indexing_status == "indexed"
-    assert response.wren_context.document_ids == ["doc-1"]
-    assert response.wren_context.context_items == [
-        {"kind": "document", "name": "terms"}
-    ]
-
-
-def test_graph_skips_overlay_by_default_single_source() -> None:
-    # E1/E6: with the overlay off (default), the indexed doc-overlay does not reach
-    # the prompt — MDL is the single semantic source.
-    semantic_layer_store, _ = _store_with_indexed_overlay()
-
-    response = _run_overlay_graph(semantic_layer_store, overlay_enabled=False)
-
-    assert response.wren_context is not None
-    assert {"kind": "document", "name": "terms"} not in (
-        response.wren_context.context_items
-    )
-    assert response.wren_context.document_ids == []
 
 
 def test_graph_injects_materialized_mdl_into_sql_prompt(tmp_path) -> None:

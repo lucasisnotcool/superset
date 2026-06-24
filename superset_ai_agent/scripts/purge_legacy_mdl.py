@@ -48,11 +48,10 @@ from superset_ai_agent.persistence.database import create_engine_from_config
 #: The only valid MDL content type after the native-JSON rebuild.
 _JSON_CONTENT_TYPE = "application/json"
 
-#: Tables emptied as derived state (rebuilt on the next materialize).
-_DERIVED_TABLES = (
-    "ai_agent_semantic_layer_versions",
-    "ai_agent_wren_context_cache",
-)
+#: Tables emptied as derived state (rebuilt on the next materialize). The legacy
+#: semantic-overlay derived tables were removed in the C6 cleanup, so there are no
+#: derived tables to clear; the purge now only removes legacy non-JSON MDL files.
+_DERIVED_TABLES: tuple[str, ...] = ()
 
 
 def _counts(connection: sa.Connection) -> dict[str, int]:
