@@ -18,9 +18,9 @@
  */
 import { t } from '@apache-superset/core/translation';
 import { css, styled } from '@apache-superset/core/theme';
-import { Modal, Typography } from '@superset-ui/core/components';
+import { Flex, Modal, Typography } from '@superset-ui/core/components';
 import type { AgentStep } from './api';
-import AgentStepDetail from './AgentStepDetail';
+import AgentStepDetail, { CopyButton } from './AgentStepDetail';
 
 // Human labels for each graph node (api.ts KNOWN_AGENT_STEP_KINDS). An unknown
 // kind falls back to its raw name so a new backend node still renders.
@@ -118,6 +118,23 @@ const UserMessage = styled.div`
   `}
 `;
 
+const Summary = styled(Typography.Text)`
+  ${({ theme }) => css`
+    color: ${theme.colorTextTertiary};
+    font-size: ${theme.fontSizeSM}px;
+  `}
+`;
+
+const AttemptOutcome = styled(Typography.Text)`
+  ${({ theme }) => css`
+    display: block;
+    margin-bottom: ${theme.sizeUnit}px;
+    color: ${theme.colorWarning};
+    font-size: ${theme.fontSizeSM}px;
+    font-weight: ${theme.fontWeightNormal};
+  `}
+`;
+
 const stepLabel = (kind: string): string => STEP_LABELS[kind] ?? kind;
 
 const formatDuration = (ms?: number | null): string | null => {
@@ -128,6 +145,22 @@ const formatDuration = (ms?: number | null): string | null => {
     return t('%s ms', ms);
   }
   return t('%s s', (ms / 1000).toFixed(1));
+};
+
+// Why an attempt did not produce the final answer, pulled from the cycle's
+// reflect feedback / repair errors / failing step (B5), so retries self-explain.
+const attemptOutcome = (cycle: AgentStep[]): string | null => {
+  for (const step of cycle) {
+    const detail = step.detail;
+    if (detail?.kind === 'reflect' && detail.retry_feedback) {
+      return detail.retry_feedback;
+    }
+    if (detail?.kind === 'repair' && detail.errors.length) {
+      return detail.errors.join('; ');
+    }
+  }
+  const failing = cycle.find(step => step.status === 'error');
+  return failing ? failing.summary : null;
 };
 
 export interface ExplainDialogProps {
@@ -152,6 +185,17 @@ export default function ExplainDialog({
   });
   const orderedAttempts = Array.from(attempts.keys()).sort((a, b) => a - b);
   const multiAttempt = orderedAttempts.length > 1;
+  const totalMs = steps.reduce((sum, step) => sum + (step.duration_ms ?? 0), 0);
+  const totalDuration = formatDuration(totalMs);
+  const summary =
+    steps.length > 0
+      ? t(
+          '%s steps · %s attempt(s)%s',
+          steps.length,
+          orderedAttempts.length,
+          totalDuration ? ` · ${totalDuration}` : '',
+        )
+      : null;
 
   return (
     <Modal
@@ -163,6 +207,15 @@ export default function ExplainDialog({
       responsive
       data-test="explain-dialog"
     >
+      {summary ? (
+        <Flex justify="space-between" align="center">
+          <Summary data-test="explain-summary">{summary}</Summary>
+          <CopyButton
+            text={JSON.stringify(steps, null, 2)}
+            label={t('Copy trace as JSON')}
+          />
+        </Flex>
+      ) : null}
       {userMessage ? (
         <UserMessage data-test="explain-user-message">
           <Typography.Text strong>{userMessage}</Typography.Text>
@@ -173,36 +226,48 @@ export default function ExplainDialog({
           {t('No timeline is available for this message yet.')}
         </Typography.Text>
       ) : null}
-      {orderedAttempts.map(attempt => (
-        <div key={attempt} data-test="explain-attempt">
-          {multiAttempt ? (
-            <AttemptHeading>{t('Attempt %s', attempt + 1)}</AttemptHeading>
-          ) : null}
-          {(attempts.get(attempt) ?? []).map((step, index) => {
-            const duration = formatDuration(step.duration_ms);
-            return (
-              <StepRow
-                key={`${step.kind}-${attempt}-${index}`}
-                data-test="explain-step"
-              >
-                <Dot status={step.status} />
-                <StepBody>
-                  <StepHeader>
-                    <Typography.Text strong>
-                      {stepLabel(step.kind)}
-                    </Typography.Text>
-                    {duration ? <Duration>{duration}</Duration> : null}
-                  </StepHeader>
-                  <Typography.Paragraph type="secondary" style={{ margin: 0 }}>
-                    {step.summary}
-                  </Typography.Paragraph>
-                  <AgentStepDetail step={step} />
-                </StepBody>
-              </StepRow>
-            );
-          })}
-        </div>
-      ))}
+      {orderedAttempts.map(attempt => {
+        const cycle = attempts.get(attempt) ?? [];
+        const outcome = multiAttempt ? attemptOutcome(cycle) : null;
+        return (
+          <div key={attempt} data-test="explain-attempt">
+            {multiAttempt ? (
+              <AttemptHeading>{t('Attempt %s', attempt + 1)}</AttemptHeading>
+            ) : null}
+            {outcome ? (
+              <AttemptOutcome data-test="explain-attempt-outcome">
+                {outcome}
+              </AttemptOutcome>
+            ) : null}
+            {cycle.map((step, index) => {
+              const duration = formatDuration(step.duration_ms);
+              return (
+                <StepRow
+                  key={`${step.kind}-${attempt}-${index}`}
+                  data-test="explain-step"
+                >
+                  <Dot status={step.status} />
+                  <StepBody>
+                    <StepHeader>
+                      <Typography.Text strong>
+                        {stepLabel(step.kind)}
+                      </Typography.Text>
+                      {duration ? <Duration>{duration}</Duration> : null}
+                    </StepHeader>
+                    <Typography.Paragraph
+                      type="secondary"
+                      style={{ margin: 0 }}
+                    >
+                      {step.summary}
+                    </Typography.Paragraph>
+                    <AgentStepDetail step={step} />
+                  </StepBody>
+                </StepRow>
+              );
+            })}
+          </div>
+        );
+      })}
     </Modal>
   );
 }

@@ -314,6 +314,186 @@ the existing Semantic Layer editor surfaces; do not merge the two feeds.
 5. **V — Verification.** Behavioral-neutrality snapshot tests (R9); payload-size
    check (R3); `pre-commit run --all-files`; `npm run test` + `npm run type`.
 
+## 7a. Implementation status (source-backed)
+
+Phases B1, B2, F1, and F2 are implemented. Every claim below names the file and
+line that backs it; line numbers are as of this writing — search the named
+symbol if they drift. Items the implementation does *not* do are called out
+explicitly so the doc is not read as over-claiming.
+
+### B1 — the typed contract
+
+- **`AgentStep` + discriminated `AgentStepDetail`.** Eleven shape models
+  (`LoadContextDetail` … `ReflectDetail`) are defined at
+  [schemas.py:224-331](schemas.py); the union with `Field(discriminator="kind")`
+  is at [schemas.py:333](schemas.py) and `AgentStep` at
+  [schemas.py:351](schemas.py). The discriminator is a *shape tag*
+  (`detail.kind`, e.g. `"execute"`, `"repair"`) distinct from the node name
+  (`step.kind`), which is why `execute_sql`/`duplicate_sql` and
+  `repair_sql`/`correct_semantic_sql` can each share one model.
+- **`step.kind` is `str`, not an enum** ([schemas.py:354](schemas.py)) — an
+  unregistered node name still validates and renders as its summary (R4). The
+  canonical name set lives in `KNOWN_AGENT_STEP_KINDS`
+  ([schemas.py:193](schemas.py)); the draft-boundary set used for attempt
+  grouping is `DRAFT_STEP_KINDS` ([schemas.py:219](schemas.py)).
+- **Timing carrier.** `created_at` was added to `TraceEvent`
+  ([schemas.py:40](schemas.py)) with a `default_factory`, so every existing
+  `TraceEvent(...)` call site stays valid unchanged.
+- **`timeline` fields.** Added to `AgentQueryResponse`
+  ([schemas.py:394](schemas.py)), and to `ConversationArtifact`
+  ([conversations/schemas.py:81](conversations/schemas.py)) and
+  `ConversationTurnResponse`
+  ([conversations/schemas.py:172](conversations/schemas.py)).
+
+### The mapper (`explain.py`)
+
+- **Assembly.** `build_agent_timeline` ([explain.py:59](explain.py)) iterates the
+  trace and, per event, computes `attempt_index` from draft boundaries
+  ([explain.py:80](explain.py)), `duration_ms` as the delta to the next event's
+  `created_at` ([explain.py:124](explain.py), `None` for the last step), a
+  best-effort `artifact_id` by SQL match, and the typed `detail`.
+- **Dispatch, not a branch chain.** `_detail_from_event` looks the step up in
+  `_DETAIL_HANDLERS` ([explain.py:138](explain.py),
+  [explain.py:204](explain.py)); an unmatched step returns `detail=None`. This
+  was a deliberate refactor to satisfy the complexity gate (ruff C901).
+- **Carriers are a fallback, not the source.** Each handler reads
+  `event.details` first and only falls back to `wren_context`/`audit` when a
+  field is absent — verified by
+  `test_carriers_backfill_sparse_steps`
+  ([test_explain.py:147](../tests/unit_tests/superset_ai_agent/test_explain.py)).
+- **Live single-event mapping.** `step_from_event` ([explain.py:98](explain.py))
+  builds one step from one event with no carriers (used by streaming);
+  `attempt_index_at` ([explain.py:115](explain.py)) computes the same grouping
+  for a streamed event.
+
+### Self-describing nodes (additive only)
+
+These node edits add keys to the emitted `TraceEvent.details`; **no routing,
+prompt, validation, or execution logic was changed.** They make each step
+self-describing so a live frame carries the same data as the final timeline
+(closes Seam 1). The node→trace step sequence is unchanged, asserted verbatim by
+the pre-existing trace-order tests
+([test_graph.py](../tests/unit_tests/superset_ai_agent/test_graph.py),
+[test_conversation_graph.py](../tests/unit_tests/superset_ai_agent/test_conversation_graph.py)).
+
+| Step | One-shot graph | Conversation graph | Added keys |
+|---|---|---|---|
+| `load_context` | [graph.py:377](graph.py) | [conversation_graph.py:812](conversation_graph.py) | `dataset_count`, `database_name`, `retrieval` |
+| `plan_semantic_sql` | [graph.py:676](graph.py) | [conversation_graph.py:1104](conversation_graph.py) | `semantic_sql`, `native_sql` |
+| `execute_sql` (success) | [graph.py:830](graph.py) | [conversation_graph.py:1373](conversation_graph.py) | `row_count` |
+| `build_artifacts` | [graph.py:878](graph.py) | [conversation_graph.py:1200](conversation_graph.py) | `has_data_preview` |
+
+For steps **not** in this table (`load_wren_context`, `dry_plan_with_wren`,
+`validate_sql`, `repair_sql`, `correct_semantic_sql`, `reflect_sql_outcome`,
+`classify_intent`) the mapper reads details those nodes *already* emitted — no
+node change was needed. `load_wren_context` already dumps the full
+`WrenContextArtifact` into details, and `execute_sql` success `row_count` is also
+parsed from the summary as a fallback for older traces
+([explain.py](explain.py), `_parse_row_count`).
+
+### Where `timeline` is populated
+
+- **One-shot:** `TextToSqlGraph.run` builds it from the final state
+  ([graph.py:325](graph.py)).
+- **Conversation, turn-level:** `_turn_timeline`
+  ([conversation_graph.py:1730](conversation_graph.py)) is set on the response in
+  `run` ([conversation_graph.py:252](conversation_graph.py)), `run_stream`
+  ([conversation_graph.py:539](conversation_graph.py)), and the approved-SQL
+  execute path ([conversation_graph.py:363](conversation_graph.py)).
+- **Per-artifact (history):** `_with_artifact_timeline`
+  ([conversation_graph.py:1764](conversation_graph.py)) stamps each artifact's
+  own timeline from its own `trace`, applied in `_artifacts_from_state`
+  ([conversation_graph.py:1727](conversation_graph.py)). Because
+  `ConversationArtifact` already round-trips through the SQLAlchemy store, the
+  new field persists for reopened chats (R8) with a `[]` default for old rows.
+
+### B2 — live stream
+
+`_progress_event` ([conversation_graph.py:1776](conversation_graph.py)) now emits
+`agent_step` (the full `step_from_event` dump) *alongside* the legacy
+`step`/`status`/`summary` keys ([conversation_graph.py:1790](conversation_graph.py)),
+so old clients reading `summary` are unaffected. `_emit_new_trace` passes the
+per-event `attempt_index` ([conversation_graph.py:556](conversation_graph.py)).
+
+### F1/F2 — the UI
+
+- **Types** mirror the backend union:
+  [api.ts:213](../superset-frontend/src/SqlLab/components/AiAgentPanel/api.ts)
+  (`AgentStepDetail`), [api.ts:226](../superset-frontend/src/SqlLab/components/AiAgentPanel/api.ts)
+  (`AgentStep`), `agent_step?` on the progress event
+  ([api.ts:658](../superset-frontend/src/SqlLab/components/AiAgentPanel/api.ts)),
+  and `timeline?` on the three carriers
+  ([api.ts:262, :291, :384](../superset-frontend/src/SqlLab/components/AiAgentPanel/api.ts)).
+- **`ExplainDialog.tsx`** — the lightbox: groups steps by `attempt_index`, status
+  dots, durations, one box per step. **`AgentStepDetail.tsx`** — a `switch` on
+  `detail.kind` rendering only the fields each shape carries, defaulting to
+  `null` for an unknown shape.
+- **Triggers** in
+  [index.tsx](../superset-frontend/src/SqlLab/components/AiAgentPanel/index.tsx):
+  an "Explain" button per assistant artifact
+  ([index.tsx:1326](../superset-frontend/src/SqlLab/components/AiAgentPanel/index.tsx))
+  and on the live progress bubble
+  ([index.tsx:1440](../superset-frontend/src/SqlLab/components/AiAgentPanel/index.tsx));
+  live steps accumulate from `onProgressUpdate`
+  ([index.tsx:838](../superset-frontend/src/SqlLab/components/AiAgentPanel/index.tsx)).
+  The dialog reads `liveSteps` when the target is live, else the artifact
+  timeline ([index.tsx:1477](../superset-frontend/src/SqlLab/components/AiAgentPanel/index.tsx)).
+- **Retired surfaces.** The raw `Wren context` JSON dump and flat `Trace` list
+  `<details>` blocks were removed from `index.tsx`; the now-orphaned
+  `TraceDetails`/`TraceList` styled components were deleted with them.
+
+### Verification (commands run, actual results)
+
+- **Backend:** `pytest tests/unit_tests/superset_ai_agent/` → **421 passed, 4
+  skipped**. Includes the new
+  [test_explain.py](../tests/unit_tests/superset_ai_agent/test_explain.py) (11
+  tests) — notably the drift guard
+  `test_known_step_kinds_cover_every_step_emitted_by_the_graphs`
+  ([test_explain.py:206](../tests/unit_tests/superset_ai_agent/test_explain.py)),
+  which regex-scans `graph.py`/`conversation_graph.py`/`app.py` for `step="..."`
+  and fails if any name is missing from `KNOWN_AGENT_STEP_KINDS` — plus
+  turn-level + per-artifact timeline assertions added to the existing graph
+  tests.
+- **Frontend:** `jest src/SqlLab/components/AiAgentPanel` → **53 passed (9
+  suites)**, including
+  [ExplainDialog.test.tsx](../superset-frontend/src/SqlLab/components/AiAgentPanel/ExplainDialog.test.tsx)
+  (7 tests) and an end-to-end Explain-flow assertion in `index.test.tsx`.
+  `tsc --noEmit` → **0 errors**; `prettier --check` → clean.
+- **App boot:** `create_app(config=AgentConfig())` builds **45 routes** without
+  error.
+- **`ruff check`** → clean on all changed Python files.
+
+### Honest limitations / not-yet-done
+
+1. **One-shot `/agent/query` has no live stream (R5).** `TextToSqlGraph` is
+   buffered only; its `timeline` renders statically. No SSE variant was added.
+2. **History view ≠ live view for the trailing step.** The per-artifact timeline
+   is built from the artifact's own `trace`, which the graph stops updating once
+   the artifact is finalized in `_build_artifacts`. So `reflect_sql_outcome`
+   (which runs *after* and does not touch the artifact) appears in the
+   turn-level/live timeline but **not** in the timeline of a reopened history
+   artifact. This is asserted, not incidental:
+   `test_conversation_graph_executes_valid_sql_when_requested` checks the
+   artifact timeline ends at `build_artifacts`. Closing this would require
+   persisting the turn-level timeline on the assistant `ConversationMessage`
+   (extra store round-trip) — deliberately deferred.
+3. **mypy is not fully clean in this package, but the new code is.**
+   `explain.py` and the new `schemas.py` code raise no mypy errors. The repo's
+   local mypy still reports pre-existing noise unrelated to this change
+   (SQLAlchemy `Base` resolution in `persistence/models.py`; unused-ignore
+   comments in engine/validator modules) and one pre-existing `union-attr` at
+   `conversation_graph.py` (`pending_artifact.id`, in code this change did not
+   touch). These predate the feature; none are introduced here.
+4. **JS lint (oxlint) was not run.** The local oxlint binary is missing its
+   native module, so JavaScript linting was covered only by `tsc` + `prettier`.
+   CI oxlint must be confirmed on push.
+5. **Detail lists are not length-bounded.** `referenced_tables`, `diagnostics`,
+   and `errors` are projected through as-is in `explain.py`. They are small in
+   practice but uncapped; add a cap if production traces grow large (R3).
+6. **No timing on the buffered path is meaningful for sub-millisecond nodes.**
+   `duration_ms` is a wall-clock delta between consecutive `created_at` stamps;
+   fast adjacent nodes can read `0` and the final step is always `None`.
+
 ## 8. Out of scope (v1)
 
 - Live SSE for the one-shot `/agent/query` (R5).

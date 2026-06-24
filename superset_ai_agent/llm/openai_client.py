@@ -17,17 +17,33 @@
 
 from __future__ import annotations
 
+import json  # noqa: TID251 - standalone agent JSON contract
 from typing import Any
 
-from superset_ai_agent.config import AgentConfig
+from superset_ai_agent.config import AgentConfig, StructuredOutputMode
 from superset_ai_agent.llm.base import ChatMessage, ModelProviderError, ModelResult
 from superset_ai_agent.llm.schema import to_strict_json_schema
 from superset_ai_agent.schemas import ModelInfo
 
+#: Degrade order per starting mode. Strict ``json_schema`` is rejected by OpenAI for
+#: schemas with open-ended objects (our MDL ``properties`` is a free-form dict), so the
+#: client must fall back to ``json_object`` (then prompt-only) rather than failing the
+#: whole call — the documented json_schema→json_object→prompt contract.
+FALLBACK_ORDER: dict[StructuredOutputMode, tuple[StructuredOutputMode, ...]] = {
+    "json_schema": ("json_schema", "json_object", "prompt_only"),
+    "json_object": ("json_object", "prompt_only"),
+    "prompt_only": ("prompt_only",),
+}
 
-def _response_format(format_schema: dict[str, Any] | None) -> dict[str, Any] | None:
-    if not format_schema:
+
+def _response_format(
+    format_schema: dict[str, Any] | None,
+    mode: StructuredOutputMode,
+) -> dict[str, Any] | None:
+    if not format_schema or mode == "prompt_only":
         return None
+    if mode == "json_object":
+        return {"type": "json_object"}
     return {
         "type": "json_schema",
         "json_schema": {
@@ -36,6 +52,39 @@ def _response_format(format_schema: dict[str, Any] | None) -> dict[str, Any] | N
             "strict": True,
         },
     }
+
+
+def _messages_for_mode(
+    messages: list[ChatMessage],
+    format_schema: dict[str, Any] | None,
+    mode: StructuredOutputMode,
+) -> list[ChatMessage]:
+    """In the non-schema modes, inject the schema into the prompt so the model still
+    has the target shape (json_object/prompt_only do not enforce it on the API side)."""
+
+    if not format_schema or mode == "json_schema":
+        return messages
+    instruction = (
+        "Return only a JSON object that validates against this JSON Schema. "
+        "Do not include markdown or prose outside the JSON object.\n"
+        f"{json.dumps(to_strict_json_schema(format_schema))}"
+    )
+    return [*messages, ChatMessage(role="system", content=instruction)]
+
+
+def _status_code(ex: Exception) -> int | None:
+    code = getattr(ex, "status_code", None)
+    if isinstance(code, int):
+        return code
+    response = getattr(ex, "response", None)
+    response_code = getattr(response, "status_code", None)
+    return response_code if isinstance(response_code, int) else None
+
+
+def _can_retry_without_structured_output(ex: Exception) -> bool:
+    # A 400/422 from the schema/response_format is recoverable by degrading the mode;
+    # auth/rate-limit/server errors are not and should surface.
+    return _status_code(ex) in {400, 422}
 
 
 def _model_dump(value: Any) -> dict[str, Any]:
@@ -62,22 +111,44 @@ class OpenAIModelClient:
         model: str | None = None,
         format_schema: dict[str, Any] | None = None,
     ) -> ModelResult:
+        last_error: Exception | None = None
+        modes = FALLBACK_ORDER[self.config.openai_structured_output]
+        for mode in modes:
+            try:
+                return self._chat_with_mode(
+                    messages, model=model, format_schema=format_schema, mode=mode
+                )
+            except Exception as ex:  # pylint: disable=broad-except
+                last_error = ex
+                # Only a schema/response_format rejection is recoverable by degrading
+                # the mode; anything else (auth, rate-limit, 5xx) should surface.
+                if not _can_retry_without_structured_output(ex):
+                    break
+        raise ModelProviderError(
+            f"OpenAI request failed for model {model or self.model!r}: {last_error}"
+        ) from last_error
+
+    def _chat_with_mode(
+        self,
+        messages: list[ChatMessage],
+        *,
+        model: str | None,
+        format_schema: dict[str, Any] | None,
+        mode: StructuredOutputMode,
+    ) -> ModelResult:
         payload: dict[str, Any] = {
             "model": model or self.model,
-            "messages": [message.model_dump() for message in messages],
+            "messages": [
+                message.model_dump()
+                for message in _messages_for_mode(messages, format_schema, mode)
+            ],
             "stream": False,
         }
-        response_format = _response_format(format_schema)
+        response_format = _response_format(format_schema, mode)
         if response_format:
             payload["response_format"] = response_format
 
-        try:
-            response = self.client.chat.completions.create(**payload)
-        except Exception as ex:  # pylint: disable=broad-except
-            raise ModelProviderError(
-                f"OpenAI request failed for model {payload['model']!r}: {ex}"
-            ) from ex
-
+        response = self.client.chat.completions.create(**payload)
         try:
             content = response.choices[0].message.content or ""
         except (AttributeError, IndexError) as ex:

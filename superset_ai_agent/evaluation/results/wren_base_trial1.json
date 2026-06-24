@@ -1,0 +1,449 @@
+[
+  {
+    "id": "Q1",
+    "level": "L1",
+    "question": "How many patties got 86'd on 2025-10-30?",
+    "status": "ok",
+    "sql": "SELECT sum(e.units_scrapped) AS total_patties_scrapped FROM (SELECT seagate_production_events.event_date, seagate_production_events.units_scrapped FROM (SELECT __source.event_date AS event_date, __source.units_scrapped AS units_scrapped FROM seagate.seagate_production_events AS __source) AS seagate_production_events) AS e WHERE CAST(e.event_date AS DATE) = CAST('2025-10-30' AS DATE)\nLIMIT 1000",
+    "answer_summary": "The result includes 1 row(s) with total total patties scrapped of 6.",
+    "result_rows": [
+      {
+        "total_patties_scrapped": 6
+      }
+    ],
+    "result_value": 6,
+    "row_count": 1,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": true,
+      "matched_models": [
+        "seagate_drive_skus",
+        "seagate_production_events",
+        "seagate_production_lines",
+        "seagate_quality_tests",
+        "seagate_shipments",
+        "seagate_sites",
+        "seagate_work_orders"
+      ],
+      "retrieved_item_count": 4,
+      "warnings": []
+    },
+    "error": null
+  },
+  {
+    "id": "Q2",
+    "level": "L1",
+    "question": "How many tickets are currently short order and not yet closed?",
+    "status": "ok",
+    "sql": "SELECT count(1) AS \"count\" FROM (SELECT seagate_work_orders.closed_at, seagate_work_orders.ticket_type FROM (SELECT __source.closed_at AS closed_at, __source.ticket_type AS ticket_type FROM seagate.seagate_work_orders AS __source) AS seagate_work_orders) AS seagate_work_orders WHERE seagate_work_orders.ticket_type = 'short order' AND seagate_work_orders.closed_at IS NULL\nLIMIT 1000",
+    "answer_summary": "The result includes 1 row(s) with total count of 0.",
+    "result_rows": [
+      {
+        "count": 0
+      }
+    ],
+    "result_value": 0,
+    "row_count": 1,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": true,
+      "matched_models": [
+        "seagate_work_orders",
+        "seagate_production_events",
+        "seagate_quality_tests",
+        "seagate_shipments",
+        "seagate_drive_skus",
+        "seagate_production_lines",
+        "seagate_sites"
+      ],
+      "retrieved_item_count": 5,
+      "warnings": []
+    },
+    "error": null
+  },
+  {
+    "id": "Q3",
+    "level": "L1",
+    "question": "How many patties are currently on the griddle, company-wide?",
+    "status": "ok",
+    "sql": "SELECT SUM(units_completed) AS total_patties_on_griddle\nFROM seagate.seagate_production_events\nLIMIT 1000",
+    "answer_summary": "The result includes 1 row(s) with total total patties on griddle of 16,282.",
+    "result_rows": [
+      {
+        "total_patties_on_griddle": 16282
+      }
+    ],
+    "result_value": 16282,
+    "row_count": 1,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": true,
+      "matched_models": [
+        "seagate_drive_skus",
+        "seagate_production_events",
+        "seagate_production_lines",
+        "seagate_quality_tests",
+        "seagate_shipments",
+        "seagate_sites",
+        "seagate_work_orders"
+      ],
+      "retrieved_item_count": 3,
+      "warnings": []
+    },
+    "error": null
+  },
+  {
+    "id": "Q4",
+    "level": "L1",
+    "question": "How many heat lamp tests have a garnish problem logged?",
+    "status": "ok",
+    "sql": "SELECT count(1) AS \"count\" FROM (SELECT seagate_quality_tests.garnish_defect, seagate_quality_tests.test_type FROM (SELECT __source.garnish_defect AS garnish_defect, __source.test_type AS test_type FROM seagate.seagate_quality_tests AS __source) AS seagate_quality_tests) AS seagate_quality_tests WHERE seagate_quality_tests.test_type = 'heat lamp' AND seagate_quality_tests.garnish_defect = true\nLIMIT 1000",
+    "answer_summary": "The result includes 1 row(s) with total count of 0.",
+    "result_rows": [
+      {
+        "count": 0
+      }
+    ],
+    "result_value": 0,
+    "row_count": 1,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": true,
+      "matched_models": [
+        "seagate_quality_tests",
+        "seagate_drive_skus",
+        "seagate_production_events",
+        "seagate_production_lines",
+        "seagate_shipments",
+        "seagate_sites",
+        "seagate_work_orders"
+      ],
+      "retrieved_item_count": 5,
+      "warnings": []
+    },
+    "error": null
+  },
+  {
+    "id": "Q5",
+    "level": "L2",
+    "question": "Which sites currently have a line that's WARM?",
+    "status": "ok",
+    "sql": "SELECT DISTINCT seagate_sites.site_name FROM (SELECT seagate_production_lines.site_id, seagate_production_lines.\"status\" FROM (SELECT __source.site_id AS site_id, __source.\"status\" AS \"status\" FROM seagate.seagate_production_lines AS __source) AS seagate_production_lines) AS seagate_production_lines INNER JOIN (SELECT seagate_sites.site_id, seagate_sites.site_name FROM (SELECT __source.site_id AS site_id, __source.site_name AS site_name FROM seagate.seagate_sites AS __source) AS seagate_sites) AS seagate_sites ON seagate_production_lines.site_id = seagate_sites.site_id WHERE seagate_production_lines.\"status\" = 'WARM' LIMIT 100",
+    "answer_summary": "The query returned 3 row(s).",
+    "result_rows": [
+      {
+        "site_name": "Reef Hollow"
+      },
+      {
+        "site_name": "Scotts Valley West"
+      },
+      {
+        "site_name": "Shugart Yard"
+      }
+    ],
+    "result_value": null,
+    "row_count": 3,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": true,
+      "matched_models": [
+        "seagate_production_lines",
+        "seagate_sites",
+        "seagate_work_orders",
+        "seagate_drive_skus",
+        "seagate_production_events",
+        "seagate_quality_tests",
+        "seagate_shipments"
+      ],
+      "retrieved_item_count": 8,
+      "warnings": []
+    },
+    "error": null
+  },
+  {
+    "id": "Q6",
+    "level": "L2",
+    "question": "How many patties has the Tigerline region plated in total?",
+    "status": "ok",
+    "sql": "SELECT sum(seagate_production_events.units_completed) AS total_patties_plated FROM (SELECT seagate_production_events.units_completed, seagate_production_events.work_order_id FROM (SELECT __source.units_completed AS units_completed, __source.work_order_id AS work_order_id FROM seagate.seagate_production_events AS __source) AS seagate_production_events) AS seagate_production_events INNER JOIN (SELECT seagate_work_orders.line_id, seagate_work_orders.work_order_id FROM (SELECT __source.line_id AS line_id, __source.work_order_id AS work_order_id FROM seagate.seagate_work_orders AS __source) AS seagate_work_orders) AS seagate_work_orders USING(work_order_id) INNER JOIN (SELECT seagate_production_lines.drive_family, seagate_production_lines.line_id FROM (SELECT __source.drive_family AS drive_family, __source.line_id AS line_id FROM seagate.seagate_production_lines AS __source) AS seagate_production_lines) AS seagate_production_lines USING(line_id) WHERE seagate_production_lines.drive_family = 'Tigerline'\nLIMIT 1000",
+    "answer_summary": "The query returned 1 row(s).",
+    "result_rows": [
+      {
+        "total_patties_plated": null
+      }
+    ],
+    "result_value": null,
+    "row_count": 1,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": true,
+      "matched_models": [
+        "seagate_shipments",
+        "seagate_drive_skus",
+        "seagate_production_events",
+        "seagate_production_lines",
+        "seagate_quality_tests",
+        "seagate_sites",
+        "seagate_work_orders"
+      ],
+      "retrieved_item_count": 1,
+      "warnings": []
+    },
+    "error": null
+  },
+  {
+    "id": "Q7",
+    "level": "L2",
+    "question": "How many To-Go units has the Reef region shipped, in total?",
+    "status": "ok",
+    "sql": "SELECT sum(seagate_shipments.qty_units) AS total_to_go_units_shipped FROM (SELECT seagate_shipments.destination_region, seagate_shipments.fulfillment_type, seagate_shipments.qty_units FROM (SELECT __source.destination_region AS destination_region, __source.fulfillment_type AS fulfillment_type, __source.qty_units AS qty_units FROM seagate.seagate_shipments AS __source) AS seagate_shipments) AS seagate_shipments WHERE seagate_shipments.destination_region = 'Reef' AND seagate_shipments.fulfillment_type = 'To-Go'\nLIMIT 1000",
+    "answer_summary": "The query returned 1 row(s).",
+    "result_rows": [
+      {
+        "total_to_go_units_shipped": null
+      }
+    ],
+    "result_value": null,
+    "row_count": 1,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": true,
+      "matched_models": [
+        "seagate_shipments",
+        "seagate_production_events",
+        "seagate_drive_skus",
+        "seagate_production_lines",
+        "seagate_quality_tests",
+        "seagate_sites",
+        "seagate_work_orders"
+      ],
+      "retrieved_item_count": 7,
+      "warnings": []
+    },
+    "error": null
+  },
+  {
+    "id": "Q8",
+    "level": "L2",
+    "question": "How many patties were plated between 2025-12-25 and 2025-12-31, broken down by drive family?",
+    "status": "error",
+    "sql": "SELECT \n  seagate_production_events.event_date,\n  seagate_drive_skus.drive_family,\n  SUM(seagate_production_events.units_completed) AS total_patties_plated\nFROM seagate_production_events\nJOIN seagate_work_orders ON seagate_production_events.work_order_id = seagate_work_orders.work_order_id\nJOIN seagate_drive_skus ON seagate_work_orders.sku_id = seagate_drive_skus.sku_id\nWHERE seagate_production_events.event_date >= '2025-12-25'::DATE\n  AND seagate_production_events.event_date <= '2025-12-31'::DATE\nGROUP BY seagate_drive_skus.drive_family\nORDER BY seagate_drive_skus.drive_family\nLIMIT 100",
+    "answer_summary": null,
+    "result_rows": [],
+    "result_value": null,
+    "row_count": null,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": true,
+      "matched_models": [
+        "seagate_drive_skus",
+        "seagate_production_lines",
+        "seagate_quality_tests",
+        "seagate_production_events",
+        "seagate_shipments",
+        "seagate_sites",
+        "seagate_work_orders"
+      ],
+      "retrieved_item_count": 4,
+      "warnings": []
+    },
+    "error": null
+  },
+  {
+    "id": "Q9",
+    "level": "L3",
+    "question": "What was the Golden Yield for the Cobalt drive family in December 2025?",
+    "status": "error",
+    "sql": "SELECT\n  1.0 - (SUM(seagate_quality_tests.result = 'fail')::FLOAT / NULLIF(COUNT(seagate_quality_tests.test_id), 0)) AS golden_yield\nFROM seagate_quality_tests\nJOIN seagate_work_orders ON seagate_quality_tests.work_order_id = seagate_work_orders.work_order_id\nJOIN seagate_drive_skus ON seagate_work_orders.sku_id = seagate_drive_skus.sku_id\nWHERE seagate_drive_skus.drive_family = 'Cobalt'\n  AND DATE_TRUNC('month', seagate_quality_tests.tested_at) = DATE '2025-12-01'\nLIMIT 1000",
+    "answer_summary": null,
+    "result_rows": [],
+    "result_value": null,
+    "row_count": null,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": true,
+      "matched_models": [
+        "seagate_drive_skus",
+        "seagate_production_lines",
+        "seagate_production_events",
+        "seagate_quality_tests",
+        "seagate_shipments",
+        "seagate_sites",
+        "seagate_work_orders"
+      ],
+      "retrieved_item_count": 5,
+      "warnings": []
+    },
+    "error": null
+  },
+  {
+    "id": "Q10",
+    "level": "L3",
+    "question": "What is the True Pass Rate for Plate Spin tests at Tigerline Point?",
+    "status": "error",
+    "sql": "SELECT CAST(count(CASE WHEN (sqt.\"result\" = 'PASS') THEN 1 END) AS FLOAT) / count(1) AS true_pass_rate FROM (SELECT seagate_quality_tests.\"result\", seagate_quality_tests.test_type, seagate_quality_tests.work_order_id FROM (SELECT __source.\"result\" AS \"result\", __source.test_type AS test_type, __source.work_order_id AS work_order_id FROM seagate.seagate_quality_tests AS __source) AS seagate_quality_tests) AS sqt INNER JOIN (SELECT seagate_work_orders.line_id, seagate_work_orders.work_order_id FROM (SELECT __source.line_id AS line_id, __source.work_order_id AS work_order_id FROM seagate.seagate_work_orders AS __source) AS seagate_work_orders) AS swo ON sqt.work_order_id = swo.work_order_id INNER JOIN (SELECT seagate_production_lines.line_id, seagate_production_lines.site_id FROM (SELECT __source.line_id AS line_id, __source.site_id AS site_id FROM seagate.seagate_production_lines AS __source) AS seagate_production_lines) AS spl ON swo.line_id = spl.line_id INNER JOIN (SELECT seagate_sites.site_id, seagate_sites.site_name FROM (SELECT __source.site_id AS site_id, __source.site_name AS site_name FROM seagate.seagate_sites AS __source) AS seagate_sites) AS ss ON spl.site_id = ss.site_id WHERE sqt.test_type = 'Plate Spin' AND ss.site_name = 'Tigerline Point'\nLIMIT 1000",
+    "answer_summary": null,
+    "result_rows": [],
+    "result_value": null,
+    "row_count": null,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": true,
+      "matched_models": [
+        "seagate_quality_tests",
+        "seagate_work_orders",
+        "seagate_production_events",
+        "seagate_shipments",
+        "seagate_drive_skus",
+        "seagate_production_lines",
+        "seagate_sites"
+      ],
+      "retrieved_item_count": 6,
+      "warnings": []
+    },
+    "error": null
+  },
+  {
+    "id": "Q11",
+    "level": "L3",
+    "question": "How many patties were plated during the Moonlight shift in the Diner Week of 2025-12-17 to 2025-12-23?",
+    "status": "ok",
+    "sql": "SELECT sum(seagate_production_events.units_completed) AS patties_plated FROM (SELECT seagate_production_events.event_date, seagate_production_events.shift_code, seagate_production_events.units_completed FROM (SELECT __source.event_date AS event_date, __source.shift_code AS shift_code, __source.units_completed AS units_completed FROM seagate.seagate_production_events AS __source) AS seagate_production_events) AS seagate_production_events WHERE seagate_production_events.shift_code = 'Moonlight' AND CAST(seagate_production_events.event_date AS DATE) >= CAST('2025-12-17' AS DATE) AND CAST(seagate_production_events.event_date AS DATE) < CAST('2025-12-24' AS DATE)\nLIMIT 1000",
+    "answer_summary": "The query returned 1 row(s).",
+    "result_rows": [
+      {
+        "patties_plated": null
+      }
+    ],
+    "result_value": null,
+    "row_count": 1,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": true,
+      "matched_models": [
+        "seagate_production_events",
+        "seagate_drive_skus",
+        "seagate_production_lines",
+        "seagate_quality_tests",
+        "seagate_shipments",
+        "seagate_sites",
+        "seagate_work_orders"
+      ],
+      "retrieved_item_count": 5,
+      "warnings": []
+    },
+    "error": null
+  },
+  {
+    "id": "Q12",
+    "level": "L3",
+    "question": "What is the Golden Yield for Short Order tickets at Scotts Valley West?",
+    "status": "ok",
+    "sql": "SELECT avg(CAST((coalesce(CAST(seagate_production_events.units_completed AS FLOAT), CAST(0 AS FLOAT)) / nullif(seagate_work_orders.target_qty, 0)) AS DOUBLE)) AS golden_yield FROM (SELECT seagate_work_orders.line_id, seagate_work_orders.target_qty, seagate_work_orders.ticket_type, seagate_work_orders.work_order_id FROM (SELECT __source.line_id AS line_id, __source.target_qty AS target_qty, __source.ticket_type AS ticket_type, __source.work_order_id AS work_order_id FROM seagate.seagate_work_orders AS __source) AS seagate_work_orders) AS seagate_work_orders INNER JOIN (SELECT seagate_production_lines.line_id, seagate_production_lines.site_id FROM (SELECT __source.line_id AS line_id, __source.site_id AS site_id FROM seagate.seagate_production_lines AS __source) AS seagate_production_lines) AS seagate_production_lines ON seagate_work_orders.line_id = seagate_production_lines.line_id INNER JOIN (SELECT seagate_sites.site_id, seagate_sites.site_name FROM (SELECT __source.site_id AS site_id, __source.site_name AS site_name FROM seagate.seagate_sites AS __source) AS seagate_sites) AS seagate_sites ON seagate_production_lines.site_id = seagate_sites.site_id INNER JOIN (SELECT seagate_production_events.units_completed, seagate_production_events.work_order_id FROM (SELECT __source.units_completed AS units_completed, __source.work_order_id AS work_order_id FROM seagate.seagate_production_events AS __source) AS seagate_production_events) AS seagate_production_events ON seagate_work_orders.work_order_id = seagate_production_events.work_order_id WHERE seagate_work_orders.ticket_type = 'Short Order' AND seagate_sites.site_name = 'Scotts Valley West' AND seagate_work_orders.target_qty > 0 LIMIT 1",
+    "answer_summary": "The query returned 1 row(s).",
+    "result_rows": [
+      {
+        "golden_yield": null
+      }
+    ],
+    "result_value": null,
+    "row_count": 1,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": true,
+      "matched_models": [
+        "seagate_quality_tests",
+        "seagate_work_orders",
+        "seagate_production_events",
+        "seagate_shipments",
+        "seagate_drive_skus",
+        "seagate_production_lines",
+        "seagate_sites"
+      ],
+      "retrieved_item_count": 7,
+      "warnings": []
+    },
+    "error": null
+  },
+  {
+    "id": "Q13",
+    "level": "L4",
+    "question": "For Q4 2025 (2025-10-01 to 2025-12-31), compare the Tigerline and Reef regions on both Golden Yield and on units shipped via Combo pallets through Dine-In fulfillment.",
+    "status": "ok",
+    "sql": "SELECT ss.destination_region, sum(CASE WHEN ((ss.fulfillment_type = 'Dine-In') AND (ss.pallet_type = 'Combo')) THEN ss.qty_units ELSE 0 END) AS units_shipped_combo_dinein, CASE WHEN (sum(pe.units_completed) = 0) THEN NULL ELSE CAST(sum(pe.units_completed) AS FLOAT) END AS golden_yield FROM (SELECT seagate_shipments.destination_region, seagate_shipments.fulfillment_type, seagate_shipments.pallet_type, seagate_shipments.qty_units, seagate_shipments.ship_date, seagate_shipments.work_order_id FROM (SELECT __source.destination_region AS destination_region, __source.fulfillment_type AS fulfillment_type, __source.pallet_type AS pallet_type, __source.qty_units AS qty_units, __source.ship_date AS ship_date, __source.work_order_id AS work_order_id FROM seagate.seagate_shipments AS __source) AS seagate_shipments) AS ss LEFT OUTER JOIN (SELECT seagate_work_orders.work_order_id FROM (SELECT __source.work_order_id AS work_order_id FROM seagate.seagate_work_orders AS __source) AS seagate_work_orders) AS swo ON ss.work_order_id = swo.work_order_id LEFT OUTER JOIN (SELECT seagate_production_events.units_completed, seagate_production_events.work_order_id FROM (SELECT __source.units_completed AS units_completed, __source.work_order_id AS work_order_id FROM seagate.seagate_production_events AS __source) AS seagate_production_events) AS pe ON swo.work_order_id = pe.work_order_id WHERE ss.destination_region IN ('Tigerline', 'Reef') AND ss.fulfillment_type = 'Dine-In' AND ss.pallet_type = 'Combo' AND ss.ship_date BETWEEN '2025-10-01' AND '2025-12-31' GROUP BY ss.destination_region LIMIT 100",
+    "answer_summary": "No rows were returned for this query.",
+    "result_rows": [],
+    "result_value": null,
+    "row_count": 0,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": true,
+      "matched_models": [
+        "seagate_shipments",
+        "seagate_production_events",
+        "seagate_drive_skus",
+        "seagate_production_lines",
+        "seagate_quality_tests",
+        "seagate_sites",
+        "seagate_work_orders"
+      ],
+      "retrieved_item_count": 7,
+      "warnings": []
+    },
+    "error": null
+  },
+  {
+    "id": "Q14",
+    "level": "L4",
+    "question": "Which region had the higher True Pass Rate on Heat Lamp tests in Q4 2025, excluding Short Order tickets \u2014 Tigerline or Reef?",
+    "status": "ok",
+    "sql": "SELECT ship.destination_region AS \"region\", CAST(sum(CASE WHEN (qt.\"result\" = 'True Pass') THEN 1 ELSE 0 END) AS FLOAT) / count(qt.test_id) AS true_pass_rate FROM (SELECT seagate_quality_tests.\"result\", seagate_quality_tests.test_id, seagate_quality_tests.test_type, seagate_quality_tests.tested_at, seagate_quality_tests.work_order_id FROM (SELECT __source.\"result\" AS \"result\", __source.test_id AS test_id, __source.test_type AS test_type, __source.tested_at AS tested_at, __source.work_order_id AS work_order_id FROM seagate.seagate_quality_tests AS __source) AS seagate_quality_tests) AS qt INNER JOIN (SELECT seagate_work_orders.ticket_type, seagate_work_orders.work_order_id FROM (SELECT __source.ticket_type AS ticket_type, __source.work_order_id AS work_order_id FROM seagate.seagate_work_orders AS __source) AS seagate_work_orders) AS wo ON qt.work_order_id = wo.work_order_id INNER JOIN (SELECT seagate_shipments.destination_region, seagate_shipments.work_order_id FROM (SELECT __source.destination_region AS destination_region, __source.work_order_id AS work_order_id FROM seagate.seagate_shipments AS __source) AS seagate_shipments) AS ship ON wo.work_order_id = ship.work_order_id WHERE qt.test_type = 'Heat Lamp' AND wo.ticket_type <> 'Short Order' AND qt.tested_at >= '2025-10-01' AND qt.tested_at < '2026-01-01' AND ship.destination_region IN ('Tigerline', 'Reef') GROUP BY ship.destination_region ORDER BY true_pass_rate DESC NULLS LAST LIMIT 2",
+    "answer_summary": "No rows were returned for this query.",
+    "result_rows": [],
+    "result_value": null,
+    "row_count": 0,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": true,
+      "matched_models": [
+        "seagate_quality_tests",
+        "seagate_shipments",
+        "seagate_production_events",
+        "seagate_work_orders",
+        "seagate_drive_skus",
+        "seagate_production_lines",
+        "seagate_sites"
+      ],
+      "retrieved_item_count": 4,
+      "warnings": []
+    },
+    "error": null
+  },
+  {
+    "id": "Q15",
+    "level": "L4",
+    "question": "For Nimbus-family shipments that went Dine-In in the last 60 days (2025-11-02 to 2025-12-31), what share of shipped units rode on Combo pallets, by region?",
+    "status": "ok",
+    "sql": "SELECT seagate_shipments.destination_region AS \"region\", sum(CASE WHEN (seagate_shipments.pallet_type = 'Combo') THEN seagate_shipments.qty_units ELSE 0 END) * 1.0 / sum(seagate_shipments.qty_units) AS combo_pallet_share FROM (SELECT seagate_shipments.destination_region, seagate_shipments.fulfillment_type, seagate_shipments.pallet_type, seagate_shipments.qty_units, seagate_shipments.ship_date, seagate_shipments.work_order_id FROM (SELECT __source.destination_region AS destination_region, __source.fulfillment_type AS fulfillment_type, __source.pallet_type AS pallet_type, __source.qty_units AS qty_units, __source.ship_date AS ship_date, __source.work_order_id AS work_order_id FROM seagate.seagate_shipments AS __source) AS seagate_shipments) AS seagate_shipments INNER JOIN (SELECT seagate_work_orders.sku_id, seagate_work_orders.work_order_id FROM (SELECT __source.sku_id AS sku_id, __source.work_order_id AS work_order_id FROM seagate.seagate_work_orders AS __source) AS seagate_work_orders) AS seagate_work_orders ON seagate_shipments.work_order_id = seagate_work_orders.work_order_id INNER JOIN (SELECT seagate_drive_skus.drive_family, seagate_drive_skus.sku_id FROM (SELECT __source.drive_family AS drive_family, __source.sku_id AS sku_id FROM seagate.seagate_drive_skus AS __source) AS seagate_drive_skus) AS seagate_drive_skus ON seagate_work_orders.sku_id = seagate_drive_skus.sku_id WHERE seagate_drive_skus.drive_family = 'Nimbus' AND seagate_shipments.fulfillment_type = 'Dine-In' AND CAST(seagate_shipments.ship_date AS TIMESTAMP) >= CAST('2025-11-02' AS TIMESTAMP) AND CAST(seagate_shipments.ship_date AS TIMESTAMP) <= CAST('2025-12-31' AS TIMESTAMP) GROUP BY seagate_shipments.destination_region LIMIT 100",
+    "answer_summary": "No rows were returned for this query.",
+    "result_rows": [],
+    "result_value": null,
+    "row_count": 0,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": true,
+      "matched_models": [
+        "seagate_shipments",
+        "seagate_drive_skus",
+        "seagate_production_events",
+        "seagate_production_lines",
+        "seagate_quality_tests",
+        "seagate_sites",
+        "seagate_work_orders"
+      ],
+      "retrieved_item_count": 7,
+      "warnings": []
+    },
+    "error": null
+  }
+]

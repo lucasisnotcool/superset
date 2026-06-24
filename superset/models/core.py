@@ -27,6 +27,7 @@ import textwrap
 import threading
 from ast import literal_eval
 from contextlib import closing, contextmanager, nullcontext, suppress
+from contextvars import ContextVar
 from copy import deepcopy
 from datetime import datetime
 from functools import lru_cache
@@ -104,6 +105,40 @@ logger = logging.getLogger(__name__)
 # different kwargs naturally falls through to a fresh engine.
 _ENGINE_CACHE: dict[tuple[int, str, str], Engine] = {}
 _ENGINE_CACHE_LOCK = threading.Lock()
+
+# Prequeries (e.g. PostgreSQL ``SET search_path``) for the engine in use by the
+# current execution context. Engines are cached and shared across request
+# threads (see ``_get_sqla_engine``), and prequeries vary per request (different
+# catalog/schema reuse the same cached engine). Carrying them in a ContextVar and
+# reading them from a single, permanently-attached ``connect`` listener avoids
+# mutating a shared engine's listener collection at request time — which races
+# with concurrent ``engine.connect()`` ("deque mutated during iteration") when
+# multiple introspection requests hit the same engine at once.
+_ENGINE_PREQUERIES: ContextVar[tuple[str, ...]] = ContextVar(
+    "superset_engine_prequeries", default=()
+)
+
+
+def _run_contextual_prequeries(
+    dbapi_connection: Any,
+    connection_record: Any,  # pylint: disable=unused-argument
+) -> None:
+    """``connect`` event listener: run the current context's prequeries.
+
+    Attached once per engine at creation (before the engine is shared), so the
+    shared engine's listener collection is never mutated again. The actual
+    prequeries are read per-connection from :data:`_ENGINE_PREQUERIES`.
+    """
+
+    prequeries = _ENGINE_PREQUERIES.get()
+    if not prequeries:
+        return
+    cursor = dbapi_connection.cursor()
+    try:
+        for prequery in prequeries:
+            cursor.execute(prequery)
+    finally:
+        cursor.close()
 
 if TYPE_CHECKING:
     from superset_core.queries.types import AsyncQueryHandle, QueryOptions, QueryResult
@@ -510,24 +545,17 @@ class Database(CoreDatabase, AuditMixinNullable, ImportExportMixin):  # pylint: 
                         schema=schema,
                     )
                     if prequeries:
-                        # SQLAlchemy connect event: runs prequeries on every new
-                        # DBAPI connection (e.g. SET search_path for PostgreSQL).
-                        def run_prequeries(
-                            dbapi_connection: Any,
-                            connection_record: Any,  # pylint: disable=unused-argument
-                        ) -> None:
-                            cursor = dbapi_connection.cursor()
-                            try:
-                                for prequery in prequeries:
-                                    cursor.execute(prequery)
-                            finally:
-                                cursor.close()
-
-                        sqla.event.listen(engine, "connect", run_prequeries)
+                        # Publish the prequeries for the permanently-attached
+                        # ``connect`` listener (see ``_run_contextual_prequeries``)
+                        # to pick up — instead of mutating the shared engine's
+                        # listener collection per call, which races with concurrent
+                        # connects. The ContextVar is request/context-scoped, so
+                        # concurrent requests with different schemas don't collide.
+                        token = _ENGINE_PREQUERIES.set(tuple(prequeries))
                         try:
                             yield engine
                         finally:
-                            sqla.event.remove(engine, "connect", run_prequeries)
+                            _ENGINE_PREQUERIES.reset(token)
                     else:
                         yield engine
 
@@ -625,6 +653,14 @@ class Database(CoreDatabase, AuditMixinNullable, ImportExportMixin):  # pylint: 
             engine = create_engine(sqlalchemy_url, **engine_kwargs)
         except Exception as ex:
             raise self.db_engine_spec.get_dbapi_mapped_exception(ex) from ex
+        # Attach the prequery listener exactly once, while the engine is still
+        # local to this thread (not yet shared via the cache). It is a no-op
+        # unless ``_ENGINE_PREQUERIES`` is set for the current context, so it is
+        # safe to attach to every engine regardless of prequery use. Per-engine
+        # (not class-wide) so one database's prequeries never run on another's
+        # connection. Only real ``Engine`` objects support event registration.
+        if isinstance(engine, Engine):
+            sqla.event.listen(engine, "connect", _run_contextual_prequeries)
         if cache_key is not None:
             with _ENGINE_CACHE_LOCK:
                 _ENGINE_CACHE[cache_key] = engine

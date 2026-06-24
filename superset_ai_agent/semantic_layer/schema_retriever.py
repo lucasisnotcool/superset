@@ -54,6 +54,10 @@ class SchemaItem(BaseModel):
     name: str
     model: str | None = None
     text: str
+    #: Query-time relevance (set by the ranker on the returned top-k, not at index
+    #: time): normalized token overlap for keyword, cosine similarity for embedding.
+    #: ``None`` when no question tokens matched or the cold ANN path omits it.
+    score: float | None = None
 
 
 class Retriever(Protocol):
@@ -84,8 +88,40 @@ class Retriever(Protocol):
         """The retriever actually used for ``scope_key`` (``keyword`` on fallback)."""
 
 
+def _semantic_terms(entity: dict[str, Any]) -> str:
+    """Join an entity's human-facing semantics for the retrieval chunk (CR9).
+
+    Pulls ``description`` and the ``properties`` keys Wren bakes into its
+    ``db_schema`` DDL chunk (``displayName``/``alias``), plus any free-text
+    ``synonyms``. These are the terms a colloquial question ("patty", "griddle")
+    must match — without them the chunk is names+types only and enriched semantics
+    never influence retrieval.
+    """
+
+    props = entity.get("properties") or {}
+    parts: list[str] = []
+    for value in (
+        entity.get("description"),
+        props.get("displayName") if isinstance(props, dict) else None,
+        props.get("alias") if isinstance(props, dict) else None,
+        props.get("synonyms") if isinstance(props, dict) else None,
+        props.get("description") if isinstance(props, dict) else None,
+    ):
+        if isinstance(value, str) and value.strip():
+            parts.append(value.strip())
+        elif isinstance(value, (list, tuple)):
+            parts.extend(str(item).strip() for item in value if str(item).strip())
+    return " ".join(parts)
+
+
 def manifest_to_schema_items(manifest: CompiledManifest) -> list[SchemaItem]:
-    """Chunk a compiled manifest into retrievable schema items."""
+    """Chunk a compiled manifest into retrievable schema items.
+
+    Each chunk's ``text`` carries the entity's **semantics** (descriptions, display
+    names, aliases/synonyms) and a relationship's join **condition**, mirroring Wren's
+    annotated ``db_schema`` DDL chunk — so enriched business terms become retrievable
+    (CR9), not just physical names+types.
+    """
 
     items: list[SchemaItem] = []
     for model in manifest.models:
@@ -96,24 +132,32 @@ def manifest_to_schema_items(manifest: CompiledManifest) -> list[SchemaItem]:
         col_names = ", ".join(
             str(col.get("name")) for col in columns if col.get("name")
         )
+        model_text = f"model {model_name} columns: {col_names}"
+        model_terms = _semantic_terms(model)
+        if model_terms:
+            model_text = f"{model_text} — {model_terms}"
         items.append(
             SchemaItem(
                 kind="model",
                 name=model_name,
                 model=model_name,
-                text=f"model {model_name} columns: {col_names}",
+                text=model_text,
             )
         )
         for col in columns:
             col_name = str(col.get("name") or "")
             if not col_name:
                 continue
+            col_text = f"{model_name}.{col_name} {col.get('type') or ''}".strip()
+            col_terms = _semantic_terms(col)
+            if col_terms:
+                col_text = f"{col_text} — {col_terms}"
             items.append(
                 SchemaItem(
                     kind="column",
                     name=col_name,
                     model=model_name,
-                    text=f"{model_name}.{col_name} {col.get('type') or ''}".strip(),
+                    text=col_text,
                 )
             )
     for rel in manifest.relationships:
@@ -121,12 +165,17 @@ def manifest_to_schema_items(manifest: CompiledManifest) -> list[SchemaItem]:
         if not rel_name:
             continue
         models = ", ".join(str(m) for m in (rel.get("models") or []))
+        rel_text = (
+            f"relationship {rel_name} joins {models} ({rel.get('joinType') or ''})"
+        )
+        condition = rel.get("condition")
+        if isinstance(condition, str) and condition.strip():
+            rel_text = f"{rel_text} on {condition.strip()}"
         items.append(
             SchemaItem(
                 kind="relationship",
                 name=rel_name,
-                text=f"relationship {rel_name} joins {models} "
-                f"({rel.get('joinType') or ''})",
+                text=rel_text,
             )
         )
     return items
@@ -143,12 +192,18 @@ def _keyword_rank(
     q_tokens = _tokens(question)
     if not q_tokens:
         return items[:k]
-    scored = sorted(
-        items,
-        key=lambda item: len(q_tokens & _tokens(f"{item.name} {item.text}")),
-        reverse=True,
-    )
-    return scored[:k]
+    overlap = {
+        id(item): len(q_tokens & _tokens(f"{item.name} {item.text}"))
+        for item in items
+    }
+    scored = sorted(items, key=lambda item: overlap[id(item)], reverse=True)
+    # Normalize overlap to 0-1 by the query token count so the surfaced score is
+    # comparable across questions (A3).
+    denom = len(q_tokens)
+    return [
+        item.model_copy(update={"score": round(overlap[id(item)] / denom, 4)})
+        for item in scored[:k]
+    ]
 
 
 def _embedding_rank(
@@ -162,7 +217,10 @@ def _embedding_rank(
         key=lambda pair: _cosine(query_vector, pair[1]),
         reverse=True,
     )
-    return [item for item, _ in scored[:k]]
+    return [
+        item.model_copy(update={"score": round(_cosine(query_vector, vector), 4)})
+        for item, vector in scored[:k]
+    ]
 
 
 @dataclass
@@ -443,6 +501,13 @@ class LanceDbRetriever:
                         name=row["name"],
                         model=row["model"] or None,
                         text=row["text"],
+                        # cosine distance -> similarity, matching the warm path's
+                        # score scale (A3); absent if the column is not returned.
+                        score=(
+                            round(1 - row["_distance"], 4)
+                            if row.get("_distance") is not None
+                            else None
+                        ),
                     )
                     for row in rows
                 ]
@@ -666,6 +731,7 @@ def retrieve_mdl_context(
                 "name": item.name,
                 "model": item.model,
                 "text": item.text,
+                "score": item.score,
             }
             for item in top
         ]

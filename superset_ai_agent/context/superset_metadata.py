@@ -22,8 +22,8 @@ from superset_ai_agent.context.base import ContextProvider
 from superset_ai_agent.integrations.superset.client import AgentContext, SupersetClient
 from superset_ai_agent.schemas import AgentQueryRequest
 from superset_ai_agent.semantic_layer.retrieval import (
-    RetrievedContext,
     retrieve_schema_context,
+    RetrievedContext,
 )
 
 
@@ -75,3 +75,36 @@ class SupersetMetadataContextProvider(ContextProvider):
         )
         self.last_retrieval = retrieved
         return retrieved.context
+
+    def get_full_schema(self, request: AgentQueryRequest) -> AgentContext:
+        """Return the **complete** in-scope schema, with no question ranking (CR3).
+
+        Modeling-time consumers (enrichment, onboarding, MDL validation) must see
+        every dataset in the scope — not a relevance-ranked top-k against a
+        placeholder question, which can silently drop the very tables a document is
+        about. Bounded only by ``wren_schema_table_scan_limit``; the request question
+        is ignored.
+        """
+
+        if request.dataset_ids or not request.schema_name:
+            return self.superset_client.get_agent_context(
+                database_id=request.database_id,
+                catalog_name=request.catalog_name,
+                schema_name=request.schema_name,
+                dataset_ids=request.dataset_ids,
+            )
+        base_context = self.superset_client.get_agent_context(
+            database_id=request.database_id,
+            catalog_name=request.catalog_name,
+            schema_name=request.schema_name,
+            dataset_ids=[],
+        )
+        candidate_datasets = self.superset_client.list_datasets(
+            database_id=request.database_id,
+            catalog_name=request.catalog_name,
+            schema_name=request.schema_name,
+            limit=max(self.config.wren_schema_table_scan_limit, 1),
+        )
+        if not candidate_datasets:
+            return base_context
+        return base_context.model_copy(update={"datasets": candidate_datasets})

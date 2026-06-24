@@ -46,6 +46,10 @@ class MdlFileValidationError(ValueError):
     """Raised when an MDL file cannot be activated due to validation errors."""
 
 
+class MdlFileExistsError(ValueError):
+    """Raised when creating an MDL file whose path already exists (path conflict)."""
+
+
 def _assert_activatable(status: str | None, content: str) -> None:
     """Block the draft->active transition when the file has validation errors.
 
@@ -177,7 +181,7 @@ class InMemoryMdlFileStore:
         path = normalize_mdl_path(request.path)
         existing = self._find_by_path(project_id, path, owner_id=owner_id)
         if existing is not None:
-            raise ValueError(f"MDL file already exists: {path}")
+            raise MdlFileExistsError(f"MDL file already exists: {path}")
         file = _new_file(
             project_id=project_id,
             path=path,
@@ -205,7 +209,7 @@ class InMemoryMdlFileStore:
             path = normalize_mdl_path(request.path)
             existing = self._find_by_path(file.project_id, path, owner_id=owner_id)
             if existing is not None and existing.id != file.id:
-                raise ValueError(f"MDL file already exists: {path}")
+                raise MdlFileExistsError(f"MDL file already exists: {path}")
             updates["path"] = path
             updates["filename"] = PurePosixPath(path).name
         if request.content is not None:
@@ -334,7 +338,7 @@ class SqlAlchemyMdlFileStore:
                 include_deleted=True,
             )
             if existing is not None and existing.deleted_at is None:
-                raise ValueError(f"MDL file already exists: {path}")
+                raise MdlFileExistsError(f"MDL file already exists: {path}")
             file = _new_file(
                 project_id=project_id,
                 path=path,
@@ -372,7 +376,7 @@ class SqlAlchemyMdlFileStore:
                     include_deleted=False,
                 )
                 if existing is not None and existing.id != file_id:
-                    raise ValueError(f"MDL file already exists: {path}")
+                    raise MdlFileExistsError(f"MDL file already exists: {path}")
                 model.path = path
                 model.filename = PurePosixPath(path).name
             if request.content is not None:

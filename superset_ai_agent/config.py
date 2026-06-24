@@ -68,6 +68,7 @@ class AgentConfig:
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4.1-mini"
+    openai_structured_output: StructuredOutputMode = "json_schema"
     openai_compatible_api_key: str | None = None
     openai_compatible_base_url: str | None = None
     openai_compatible_model: str | None = None
@@ -264,6 +265,13 @@ class AgentConfig:
             openai_api_key=os.getenv("OPENAI_API_KEY") or cls.openai_api_key,
             openai_base_url=os.getenv("OPENAI_BASE_URL", cls.openai_base_url),
             openai_model=os.getenv("OPENAI_MODEL", cls.openai_model),
+            openai_structured_output=cast(
+                StructuredOutputMode,
+                os.getenv(
+                    "OPENAI_STRUCTURED_OUTPUT",
+                    cls.openai_structured_output,
+                ).strip().lower(),
+            ),
             openai_compatible_api_key=(
                 os.getenv("OPENAI_COMPATIBLE_API_KEY") or cls.openai_compatible_api_key
             ),

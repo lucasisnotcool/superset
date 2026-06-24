@@ -22,7 +22,10 @@ import json  # noqa: TID251 - standalone agent JSON contract
 from pathlib import Path
 from typing import Any
 
-from superset_ai_agent.semantic_layer.mdl_compile import compile_manifest
+from superset_ai_agent.semantic_layer.mdl_compile import (
+    compile_manifest,
+    dedupe_named_entities,
+)
 from superset_ai_agent.semantic_layer.mdl_files import normalize_mdl_path
 from superset_ai_agent.semantic_layer.mdl_validator import validate_project_manifest
 from superset_ai_agent.semantic_layer.schemas import (
@@ -82,6 +85,12 @@ def materialize_wren_project(
         checksum.update(file.content.encode("utf-8"))
         _merge_mdl_json(merged, file.content)
 
+    # Same dedupe contract as the compiled manifest: collapse same-named entities
+    # (onboarding base + enrichment overlay) so the readable sidecar matches the
+    # engine manifest and never double-registers a physical table.
+    for key in ("models", "relationships", "views", "metrics", "cubes"):
+        if isinstance(merged.get(key), list):
+            merged[key] = dedupe_named_entities(merged[key])
     sidecar_path = project_path / "mdl.json"
     sidecar_path.write_text(
         json.dumps(_drop_none(merged), indent=2, sort_keys=True),

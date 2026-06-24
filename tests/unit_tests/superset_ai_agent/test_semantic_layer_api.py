@@ -156,6 +156,43 @@ def _resolve_project(client: TestClient) -> dict:
     return response.json()
 
 
+def _seed_base_model(
+    client: TestClient,
+    project_id: str,
+    *,
+    model: str = "moves",
+    table: str = "moves",
+    columns: list[dict] | None = None,
+) -> dict:
+    """Create a draft base model so enrichment has structure to overlay (CR2).
+
+    Enrichment must work off drafts (CR1) — a draft is enough, since the enrich
+    precondition counts any non-deleted model regardless of status.
+    """
+
+    if columns is None:
+        columns = [{"name": "stage", "type": "varchar"}]
+    response = client.post(
+        f"/agent/semantic-layer/projects/{project_id}/mdl-files",
+        json={
+            "path": f"models/{model}.json",
+            "content": json.dumps(
+                {
+                    "models": [
+                        {
+                            "name": model,
+                            "tableReference": {"table": table},
+                            "columns": columns,
+                        }
+                    ]
+                }
+            ),
+        },
+    )
+    assert response.status_code in (200, 201), response.text
+    return response.json()
+
+
 def test_semantic_layer_returns_auth_status_when_scope_auth_fails(tmp_path) -> None:
     app = create_app(
         config=_local_config(agent_storage_dir=str(tmp_path)),
@@ -315,10 +352,31 @@ def test_semantic_project_mdl_and_document_flow(tmp_path) -> None:
     assert "models" in proposal["proposed_content"]
 
 
-def test_onboard_creates_draft_models_deterministic_fallback(tmp_path) -> None:
+def test_create_mdl_file_path_conflict_returns_409(tmp_path) -> None:
+    # Issue 4: a duplicate path is a conflict (409), distinct from a malformed
+    # request (400), so the client can recover (rename / auto-suffix).
+    client, _ = _client(tmp_path)
+    project = _resolve_project(client)
+    body = {
+        "path": "models/dupe.json",
+        "content": json.dumps({"models": [{"name": "dupe"}]}),
+    }
+    first = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/mdl-files", json=body
+    )
+    assert first.status_code == 200
+
+    conflict = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/mdl-files", json=body
+    )
+    assert conflict.status_code == 409
+    assert "already exists" in conflict.json()["detail"]
+
+
+def test_onboard_auto_activates_models_deterministic_fallback(tmp_path) -> None:
     # FakeModelClient has no chat(), so onboarding falls back to deterministic
     # schema introspection. The inline job runner completes the job before the
-    # 202 response returns.
+    # 202 response returns. Valid base models are auto-activated.
     client, _ = _client(tmp_path)
     project = _resolve_project(client)
 
@@ -333,8 +391,9 @@ def test_onboard_creates_draft_models_deterministic_fallback(tmp_path) -> None:
     result = job["result"]
     assert result["project_id"] == project["id"]
     assert result["model_count"] == 1
+    assert result["activated_count"] == 1
     assert result["files"][0]["source_type"] == "onboarding"
-    assert result["files"][0]["status"] == "draft"
+    assert result["files"][0]["status"] == "active"
     assert "moves" in result["files"][0]["content"]
 
     # The job is pollable.
@@ -343,6 +402,38 @@ def test_onboard_creates_draft_models_deterministic_fallback(tmp_path) -> None:
     )
     assert poll.status_code == 200
     assert poll.json()["status"] == "completed"
+
+
+def test_reset_deletes_all_mdl_then_reonboards(tmp_path) -> None:
+    # Reset is a clean slate: it soft-deletes every existing MDL file (base models,
+    # enrichment overlays, hand-edits) and re-onboards (auto-activating the base).
+    client, _ = _client(tmp_path)
+    project = _resolve_project(client)
+    # A hand-authored extra file + an enrichment-style file that reset must remove.
+    _seed_base_model(client, project["id"], model="legacy", table="legacy")
+    enrich_file = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/mdl-files",
+        json={
+            "path": "seagate/semantics.mdl.json",
+            "content": json.dumps({"models": [{"name": "moves"}]}),
+        },
+    ).json()
+
+    reset = client.post(f"/agent/semantic-layer/projects/{project['id']}/reset")
+
+    assert reset.status_code == 202
+    job = reset.json()
+    assert job["kind"] == "onboarding"
+    assert job["status"] == "completed"
+    # The library now holds only the re-onboarded base model(s); the legacy and
+    # enrichment files are gone, and the fresh base is active.
+    files = client.get(
+        f"/agent/semantic-layer/projects/{project['id']}/mdl-files"
+    ).json()
+    paths = {f["path"] for f in files}
+    assert "models/legacy.json" not in paths
+    assert enrich_file["path"] not in paths
+    assert any(f["status"] == "active" for f in files)
 
 
 def test_onboard_uses_llm_when_available(tmp_path) -> None:
@@ -381,7 +472,7 @@ def test_onboard_uses_llm_when_available(tmp_path) -> None:
 def test_onboard_seeding_ignores_invented_columns(tmp_path) -> None:
     # W3: onboarding structure is seeded from the catalog, not authored by the
     # model. An LLM that invents a column cannot inject it — the column is simply
-    # absent from the seeded draft, so the structural-hallucination class is gone.
+    # absent from the seeded model, so the structural-hallucination class is gone.
     payload = json.dumps(
         {
             "files": [
@@ -412,7 +503,7 @@ def test_onboard_seeding_ignores_invented_columns(tmp_path) -> None:
     assert response.status_code == 202
     result = response.json()["result"]
     assert result["model_count"] == 1
-    assert result["files"][0]["status"] == "draft"
+    assert result["files"][0]["status"] == "active"
     # The invented column never made it into the seeded model.
     assert "ghost_metric" not in result["files"][0]["content"]
 
@@ -440,6 +531,7 @@ def test_enrich_flags_hallucinated_columns(tmp_path) -> None:
     )
     client, _ = _client(tmp_path, model_client=ChatModelClient(payload))
     project = _resolve_project(client)
+    _seed_base_model(client, project["id"])
     document = client.post(
         f"/agent/semantic-layer/projects/{project['id']}/documents/text",
         json={"filename": "glossary.md", "text": "Ghost metric is a thing."},
@@ -634,6 +726,7 @@ def test_activation_blocked_for_hallucinated_column(tmp_path) -> None:
 def test_create_document_from_text_and_enrich(tmp_path) -> None:
     client, _ = _client(tmp_path)
     project = _resolve_project(client)
+    _seed_base_model(client, project["id"])
 
     text_response = client.post(
         f"/agent/semantic-layer/projects/{project['id']}/documents/text",
@@ -654,6 +747,25 @@ def test_create_document_from_text_and_enrich(tmp_path) -> None:
     )
     assert enrich_response.status_code == 200
     assert enrich_response.json()["source_document_id"] == document["id"]
+
+
+def test_enrich_without_base_models_returns_409(tmp_path) -> None:
+    # CR2: a project with no onboarded models cannot be enriched — fail closed with
+    # actionable copy instead of fabricating a schema-name blob.
+    client, _ = _client(tmp_path)
+    project = _resolve_project(client)
+    document = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/documents/text",
+        json={"filename": "glossary.md", "text": "Some business glossary."},
+    ).json()
+
+    enrich = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/documents/"
+        f"{document['id']}/enrich"
+    )
+
+    assert enrich.status_code == 409
+    assert "onboarding" in enrich.json()["detail"].lower()
 
 
 def _activatable_file(client, project_id: str) -> str:
@@ -875,6 +987,7 @@ def test_enrich_injects_scope_instructions_into_prompt(tmp_path) -> None:
     model = RecordingChatModelClient(payload)
     client, _ = _client(tmp_path, model_client=model)
     project = _resolve_project(client)
+    _seed_base_model(client, project["id"])
 
     # An operator instruction for this scope.
     assert (

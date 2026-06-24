@@ -171,6 +171,95 @@ def test_openai_client_sends_json_schema_response_format() -> None:
     assert "additionalProperties" not in SCHEMA
 
 
+class _BadRequestError(Exception):
+    """Stand-in for openai.BadRequestError (carries an HTTP status_code)."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.status_code = 400
+
+
+class _RejectsJsonSchemaCompletions:
+    """Fake completions that 400s on strict json_schema, succeeds on json_object."""
+
+    def __init__(self) -> None:
+        self.modes: list[str] = []
+
+    def create(self, **payload: Any) -> SimpleNamespace:
+        fmt = payload.get("response_format")
+        self.modes.append(fmt["type"] if fmt else "none")
+        if fmt and fmt["type"] == "json_schema":
+            raise _BadRequestError("Invalid schema for response_format")
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content='{"sql":"select 1"}')
+                )
+            ],
+            model_dump=lambda: {"id": "chatcmpl-test"},
+        )
+
+
+def test_openai_client_falls_back_to_json_object_on_schema_rejection() -> None:
+    # CR8 follow-up: strict structured outputs reject our open-ended schema; the client
+    # must degrade to json_object (carrying the schema in the prompt), not hard-fail.
+    completions = _RejectsJsonSchemaCompletions()
+    fake_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=completions),
+        models=FakeOpenAIModels(),
+    )
+    client = OpenAIModelClient(
+        AgentConfig(
+            model_provider="openai",
+            openai_api_key="test-key",
+            openai_model="gpt-test",
+        ),
+        client=fake_client,
+    )
+
+    result = client.chat(
+        [ChatMessage(role="user", content="return sql")],
+        format_schema=SCHEMA,
+    )
+
+    assert result.content == '{"sql":"select 1"}'
+    assert completions.modes == ["json_schema", "json_object"]  # degraded once
+
+
+def test_openai_client_does_not_retry_non_schema_errors() -> None:
+    # An auth/5xx error is not a schema problem and must surface immediately.
+    class _UnauthorizedError(Exception):
+        status_code = 401
+
+    class _AlwaysFails:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def create(self, **payload: Any) -> SimpleNamespace:
+            self.calls += 1
+            raise _UnauthorizedError()
+
+    completions = _AlwaysFails()
+    fake_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=completions),
+        models=FakeOpenAIModels(),
+    )
+    client = OpenAIModelClient(
+        AgentConfig(
+            model_provider="openai",
+            openai_api_key="test-key",
+            openai_model="gpt-test",
+        ),
+        client=fake_client,
+    )
+
+    with pytest.raises(Exception, match="OpenAI request failed"):
+        client.chat(
+            [ChatMessage(role="user", content="x")], format_schema=SCHEMA
+        )
+    assert completions.calls == 1  # no wasteful retries on a non-schema error
+
+
 def test_openai_compatible_client_posts_chat_completion_payload() -> None:
     requests: list[httpx.Request] = []
 

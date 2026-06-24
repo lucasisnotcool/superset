@@ -16,14 +16,31 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+import { useState } from 'react';
 import { t } from '@apache-superset/core/translation';
 import { css, styled } from '@apache-superset/core/theme';
-import type { AgentStep, AgentStepDetail as Detail } from './api';
+import {
+  Button,
+  Collapse,
+  Icons,
+  Radio,
+  Tag,
+} from '@superset-ui/core/components';
+import type {
+  AgentStep,
+  AgentStepDetail as Detail,
+  RecalledExample,
+  RetrievedChunk,
+} from './api';
+
+// Length past which a SQL block collapses by default so the timeline stays
+// scannable (B3); shorter SQL renders inline.
+const SQL_COLLAPSE_THRESHOLD = 160;
 
 const List = styled.dl`
   ${({ theme }) => css`
     display: grid;
-    grid-template-columns: max-content 1fr;
+    grid-template-columns: max-content minmax(0, 1fr);
     gap: ${theme.sizeUnit}px ${theme.sizeUnit * 2}px;
     margin: ${theme.sizeUnit}px 0 0;
     font-size: ${theme.fontSizeSM}px;
@@ -40,6 +57,12 @@ const List = styled.dl`
   `}
 `;
 
+// `display: contents` removes this wrapper from layout so its dt/dd become
+// direct grid items of the List dl, keeping the label/value column alignment.
+const Field = styled.div`
+  display: contents;
+`;
+
 const Code = styled.pre`
   ${({ theme }) => css`
     margin: ${theme.sizeUnit}px 0 0;
@@ -52,40 +75,416 @@ const Code = styled.pre`
   `}
 `;
 
+const CodeFrame = styled.div`
+  position: relative;
+`;
+
+const CopyAffordance = styled.div`
+  ${({ theme }) => css`
+    position: absolute;
+    top: ${theme.sizeUnit}px;
+    right: ${theme.sizeUnit}px;
+  `}
+`;
+
+const CollapsePanel = styled(Collapse)`
+  ${({ theme }) => css`
+    margin-top: ${theme.sizeUnit}px;
+    background: transparent;
+    font-size: ${theme.fontSizeSM}px;
+  `}
+`;
+
 const Row = ({ label, value }: { label: string; value: React.ReactNode }) =>
   value === null || value === undefined || value === '' ? null : (
-    <div>
+    <Field>
       <dt>{label}</dt>
       <dd>{value}</dd>
-    </div>
+    </Field>
   );
+
+// A small clipboard button with transient "Copied" feedback (B7). Degrades
+// silently when the Clipboard API is unavailable (e.g. insecure context).
+export const CopyButton = ({
+  text,
+  label = t('Copy'),
+}: {
+  text: string;
+  label?: string;
+}) => {
+  const [copied, setCopied] = useState(false);
+  const onCopy = () => {
+    navigator.clipboard
+      ?.writeText(text)
+      .then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+        return undefined;
+      })
+      .catch(() => undefined);
+  };
+  return (
+    <Button
+      buttonStyle="link"
+      buttonSize="xsmall"
+      aria-label={label}
+      onClick={onCopy}
+      icon={
+        copied ? (
+          <Icons.CheckOutlined iconSize="s" />
+        ) : (
+          <Icons.CopyOutlined iconSize="s" />
+        )
+      }
+    />
+  );
+};
+
+// A copyable code block; long SQL collapses behind a disclosure so a wide
+// rewrite doesn't dominate the timeline (B3 + B7).
+const CodeBlock = ({ code }: { code: string }) => {
+  const body = (
+    <CodeFrame>
+      <Code>{code}</Code>
+      <CopyAffordance>
+        <CopyButton text={code} />
+      </CopyAffordance>
+    </CodeFrame>
+  );
+  if (code.length <= SQL_COLLAPSE_THRESHOLD) {
+    return body;
+  }
+  return (
+    <CollapsePanel
+      ghost
+      items={[{ key: 'sql', label: t('Show SQL'), children: body }]}
+    />
+  );
+};
 
 const Sql = ({ label, sql }: { label: string; sql?: string | null }) =>
   sql ? (
-    <div>
+    <Field>
       <dt>{label}</dt>
       <dd>
-        <Code>{sql}</Code>
+        <CodeBlock code={sql} />
       </dd>
-    </div>
+    </Field>
   ) : null;
+
+const TagRow = styled.div`
+  ${({ theme }) => css`
+    display: flex;
+    flex-wrap: wrap;
+    gap: ${theme.sizeUnit}px;
+    margin-top: ${theme.sizeUnit}px;
+  `}
+`;
+
+const Warnings = styled.ul`
+  ${({ theme }) => css`
+    margin: ${theme.sizeUnit}px 0 0;
+    padding-left: ${theme.sizeUnit * 4}px;
+    color: ${theme.colorWarning};
+    font-size: ${theme.fontSizeSM}px;
+  `}
+`;
+
+const ChunkList = styled.div`
+  ${({ theme }) => css`
+    display: flex;
+    flex-direction: column;
+    gap: ${theme.sizeUnit}px;
+  `}
+`;
+
+const ChunkCard = styled.div`
+  ${({ theme }) => css`
+    padding: ${theme.sizeUnit}px ${theme.sizeUnit * 2}px;
+    background: ${theme.colorBgLayout};
+    border-radius: ${theme.borderRadius}px;
+    font-size: ${theme.fontSizeSM}px;
+  `}
+`;
+
+const ChunkHead = styled.div`
+  ${({ theme }) => css`
+    display: flex;
+    align-items: center;
+    gap: ${theme.sizeUnit}px;
+    margin-bottom: ${theme.sizeUnit / 2}px;
+    color: ${theme.colorTextSecondary};
+  `}
+`;
+
+const ChunkText = styled.div`
+  overflow-wrap: anywhere;
+`;
+
+// A wrapping list of names rendered as tags; renders nothing when empty so the
+// surrounding grid Row collapses (A2).
+const TagList = ({ items }: { items: string[] }) =>
+  items.length ? (
+    <TagRow>
+      {items.map(name => (
+        <Tag key={name}>{name}</Tag>
+      ))}
+    </TagRow>
+  ) : null;
+
+const WarningList = ({ messages }: { messages?: string[] | null }) =>
+  messages && messages.length ? (
+    <Warnings data-test="step-warnings">
+      {messages.map(message => (
+        <li key={message}>{message}</li>
+      ))}
+    </Warnings>
+  ) : null;
+
+const formatScore = (score?: number | null): string | null =>
+  score === null || score === undefined ? null : score.toFixed(2);
+
+const ChunkGroupHead = styled.div`
+  ${({ theme }) => css`
+    display: flex;
+    align-items: center;
+    gap: ${theme.sizeUnit}px;
+    margin-top: ${theme.sizeUnit}px;
+    color: ${theme.colorTextSecondary};
+    font-weight: ${theme.fontWeightStrong};
+  `}
+`;
+
+const GROUPLESS = '__ungrouped__';
+
+// Order chunks into stable model groups, preserving first-seen (rank) order so
+// the most relevant model leads. Modelless chunks (relationships) group last.
+const groupChunksByModel = (
+  chunks: RetrievedChunk[],
+): { model: string | null; items: RetrievedChunk[] }[] => {
+  const order: string[] = [];
+  const groups = new Map<string, RetrievedChunk[]>();
+  chunks.forEach(chunk => {
+    const key = chunk.model ?? GROUPLESS;
+    if (!groups.has(key)) {
+      groups.set(key, []);
+      order.push(key);
+    }
+    groups.get(key)?.push(chunk);
+  });
+  return order.map(key => ({
+    model: key === GROUPLESS ? null : key,
+    items: groups.get(key) ?? [],
+  }));
+};
+
+const ChunkRow = ({
+  chunk,
+  index,
+}: {
+  chunk: RetrievedChunk;
+  index: number;
+}) => {
+  const score = formatScore(chunk.score);
+  return (
+    <ChunkCard key={`${chunk.model ?? ''}.${chunk.name ?? index}`}>
+      <ChunkHead>
+        {chunk.kind ? <Tag>{chunk.kind}</Tag> : null}
+        {chunk.name || chunk.model}
+        {score ? <span>· {t('score %s', score)}</span> : null}
+      </ChunkHead>
+      <ChunkText>{chunk.text}</ChunkText>
+    </ChunkCard>
+  );
+};
+
+// Collapsible list of the MDL chunks the retriever ranked into the prompt,
+// grouped by their model so the question -> matched model -> columns path reads
+// (A1 + B2). Models that the draft actually matched get a "matched" badge.
+// Collapsed by default; the count + retriever mode read on the header.
+const RetrievedChunks = ({
+  chunks,
+  retriever,
+  matchedModels = [],
+}: {
+  chunks?: RetrievedChunk[] | null;
+  retriever?: string | null;
+  matchedModels?: string[];
+}) => {
+  if (!chunks || chunks.length === 0) {
+    return null;
+  }
+  const label = retriever
+    ? t('Retrieved chunks (%s · %s)', chunks.length, retriever)
+    : t('Retrieved chunks (%s)', chunks.length);
+  const matched = new Set(matchedModels);
+  const groups = groupChunksByModel(chunks);
+  return (
+    <CollapsePanel
+      ghost
+      data-test="retrieved-chunks"
+      items={[
+        {
+          key: 'chunks',
+          label,
+          children: (
+            <ChunkList>
+              {groups.map(group => (
+                <div key={group.model ?? GROUPLESS}>
+                  {group.model ? (
+                    <ChunkGroupHead>
+                      {group.model}
+                      {matched.has(group.model) ? (
+                        <Tag color="success">{t('matched')}</Tag>
+                      ) : null}
+                    </ChunkGroupHead>
+                  ) : null}
+                  {group.items.map((chunk, index) => (
+                    <ChunkRow
+                      key={`${chunk.name ?? index}`}
+                      chunk={chunk}
+                      index={index}
+                    />
+                  ))}
+                </div>
+              ))}
+            </ChunkList>
+          ),
+        },
+      ]}
+    />
+  );
+};
+
+// Collapsible list of the confirmed NL->SQL examples the memory seam recalled
+// into the prompt (B1). Collapsed by default; the count reads on the header.
+const RecalledExamples = ({
+  examples,
+}: {
+  examples?: RecalledExample[] | null;
+}) => {
+  if (!examples || examples.length === 0) {
+    return null;
+  }
+  return (
+    <CollapsePanel
+      ghost
+      data-test="recalled-examples"
+      items={[
+        {
+          key: 'examples',
+          label: t('Recalled examples (%s)', examples.length),
+          children: (
+            <ChunkList>
+              {examples.map((example, index) => (
+                <ChunkCard key={`${example.question}-${index}`}>
+                  <ChunkHead>{example.question}</ChunkHead>
+                  {example.native_sql ? (
+                    <Code>{example.native_sql}</Code>
+                  ) : null}
+                </ChunkCard>
+              ))}
+            </ChunkList>
+          ),
+        },
+      ]}
+    />
+  );
+};
+
+const ToggleRow = styled.div`
+  ${({ theme }) => css`
+    margin-top: ${theme.sizeUnit}px;
+  `}
+`;
+
+// Toggle between the SQL the model authored (semantic) and what the engine
+// rewrote and Superset executed (native), so the rewrite is legible without two
+// stacked blocks competing for space (B4). Defaults to the executed (native) form.
+const SqlToggle = ({
+  semanticSql,
+  nativeSql,
+}: {
+  semanticSql?: string | null;
+  nativeSql?: string | null;
+}) => {
+  const [view, setView] = useState<'native' | 'semantic'>(
+    nativeSql ? 'native' : 'semantic',
+  );
+  if (!semanticSql && !nativeSql) {
+    return null;
+  }
+  if (!semanticSql || !nativeSql) {
+    // Only one side exists — no toggle needed.
+    return <CodeBlock code={(nativeSql || semanticSql) as string} />;
+  }
+  return (
+    <>
+      <ToggleRow>
+        <Radio.GroupWrapper
+          size="small"
+          value={view}
+          onChange={event => setView(event.target.value)}
+          options={[
+            { label: t('Native (executed)'), value: 'native' },
+            { label: t('Semantic (authored)'), value: 'semantic' },
+          ]}
+          optionType="button"
+        />
+      </ToggleRow>
+      <CodeBlock code={view === 'native' ? nativeSql : semanticSql} />
+    </>
+  );
+};
 
 // Each branch renders only the fields the corresponding backend step produces
 // (api.ts AgentStepDetail union). Falls through to `null` for an unknown shape,
 // so a future detail kind never throws — the step still shows its summary.
 function DetailBody({ detail }: { detail: Detail }) {
   switch (detail.kind) {
-    case 'load_context':
+    case 'load_context': {
+      const retrieval = detail.retrieval;
+      const candidates = retrieval?.candidate_table_names ?? [];
+      const scanned = retrieval?.scanned_table_count;
+      const omitted = retrieval?.omitted_table_count;
       return (
         <List>
           <Row label={t('Datasets')} value={detail.dataset_count} />
           <Row label={t('Database')} value={detail.database_name} />
+          {candidates.length ? (
+            <Field>
+              <dt>{t('Candidate tables')}</dt>
+              <dd>
+                <TagList items={candidates} />
+              </dd>
+            </Field>
+          ) : null}
           <Row
-            label={t('Candidate tables')}
-            value={detail.retrieval?.candidate_table_names?.join(', ')}
+            label={t('Ranked / scanned')}
+            value={
+              scanned
+                ? omitted
+                  ? t(
+                      '%s of %s (%s omitted)',
+                      candidates.length,
+                      scanned,
+                      omitted,
+                    )
+                  : t('%s of %s', candidates.length, scanned)
+                : null
+            }
           />
+          {retrieval?.context_truncated ? (
+            <Field>
+              <dt>{t('Truncated')}</dt>
+              <dd>
+                <Tag color="warning">{t('schema scan truncated')}</Tag>
+              </dd>
+            </Field>
+          ) : null}
         </List>
       );
+    }
     case 'intent':
       return (
         <List>
@@ -95,38 +494,61 @@ function DetailBody({ detail }: { detail: Detail }) {
       );
     case 'wren_context':
       return (
-        <List>
-          <Row
-            label={t('Available')}
-            value={detail.available ? t('yes') : t('no')}
+        <>
+          <List>
+            <Row
+              label={t('Available')}
+              value={detail.available ? t('yes') : t('no')}
+            />
+            <Row
+              label={t('Matched models')}
+              value={detail.matched_models.join(', ')}
+            />
+            <Row label={t('Retriever')} value={detail.retrieval_mode} />
+            <Row
+              label={t('Retrieved chunks')}
+              value={detail.retrieved_item_count}
+            />
+            <Row label={t('Context items')} value={detail.context_item_count} />
+            <Row
+              label={t('Recalled examples')}
+              value={detail.recalled_example_count || null}
+            />
+            <Row label={t('MDL path')} value={detail.mdl_path} />
+          </List>
+          <RetrievedChunks
+            chunks={detail.retrieved_chunks}
+            retriever={detail.retrieval_mode}
+            matchedModels={detail.matched_models}
           />
-          <Row
-            label={t('Matched models')}
-            value={detail.matched_models.join(', ')}
+          <WarningList
+            messages={
+              detail.warnings && detail.warnings.length
+                ? detail.warnings
+                : detail.available
+                  ? null
+                  : [
+                      t(
+                        'No semantic layer is active for this scope — answered from raw schema only.',
+                      ),
+                    ]
+            }
           />
-          <Row label={t('Retriever')} value={detail.retrieval_mode} />
-          <Row
-            label={t('Retrieved chunks')}
-            value={detail.retrieved_item_count}
-          />
-          <Row label={t('Context items')} value={detail.context_item_count} />
-          <Row
-            label={t('Recalled examples')}
-            value={detail.recalled_example_count || null}
-          />
-          <Row label={t('MDL path')} value={detail.mdl_path} />
-        </List>
+        </>
       );
     case 'draft':
       return (
-        <List>
-          <Row label={t('Type')} value={detail.response_type} />
-          <Row label={t('Model')} value={detail.model} />
-          <Row
-            label={t('Recalled examples')}
-            value={detail.recalled_example_count || null}
-          />
-        </List>
+        <>
+          <List>
+            <Row label={t('Type')} value={detail.response_type} />
+            <Row label={t('Model')} value={detail.model} />
+            <Row
+              label={t('Recalled examples')}
+              value={detail.recalled_example_count || null}
+            />
+          </List>
+          <RecalledExamples examples={detail.recalled_examples} />
+        </>
       );
     case 'dry_plan':
       return (
@@ -143,27 +565,29 @@ function DetailBody({ detail }: { detail: Detail }) {
       );
     case 'plan_semantic_sql':
       return (
-        <List>
-          <Row label={t('Engine')} value={detail.engine} />
-          <Row
-            label={t('Rewritten')}
-            value={detail.rewritten ? t('yes') : t('no')}
-          />
-          <Row
-            label={t('Referenced tables')}
-            value={detail.referenced_tables.join(', ')}
-          />
+        <>
+          <List>
+            <Row label={t('Engine')} value={detail.engine} />
+            <Row
+              label={t('Rewritten')}
+              value={detail.rewritten ? t('yes') : t('no')}
+            />
+            <Row
+              label={t('Referenced tables')}
+              value={detail.referenced_tables.join(', ')}
+            />
+            <Row
+              label={t('Warnings')}
+              value={detail.warnings.join('; ') || null}
+            />
+          </List>
           {detail.rewritten ? (
-            <>
-              <Sql label={t('Semantic SQL')} sql={detail.semantic_sql} />
-              <Sql label={t('Native SQL')} sql={detail.native_sql} />
-            </>
+            <SqlToggle
+              semanticSql={detail.semantic_sql}
+              nativeSql={detail.native_sql}
+            />
           ) : null}
-          <Row
-            label={t('Warnings')}
-            value={detail.warnings.join('; ') || null}
-          />
-        </List>
+        </>
       );
     case 'validate_sql':
       return (

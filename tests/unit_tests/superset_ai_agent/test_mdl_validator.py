@@ -496,6 +496,26 @@ def test_metric_without_measure_is_warning() -> None:
     assert any(m.code == "metric_without_measure" for m in result.messages)
 
 
+def test_metric_with_native_singular_measure_not_flagged() -> None:
+    # Wren-native metrics use a singular `measure` array; the validator must recognize
+    # it and NOT false-warn "computes nothing".
+    result = validate_mdl(
+        mdl(
+            models=[_DEALS],
+            metrics=[
+                {
+                    "name": "good_revenue",
+                    "baseObject": "deals",
+                    "measure": [
+                        {"name": "rev", "type": "DOUBLE", "expression": "SUM(amount)"}
+                    ],
+                }
+            ],
+        )
+    )
+    assert not any(m.code == "metric_without_measure" for m in result.messages)
+
+
 def test_metric_unresolved_base_is_warning_per_file_error_in_project() -> None:
     content = mdl(
         models=[_DEALS],

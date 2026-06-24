@@ -106,9 +106,65 @@ def test_manifest_chunks_into_models_columns_relationships() -> None:
     assert any(i.kind == "relationship" and i.name == "deal_customer" for i in items)
 
 
+def test_chunk_text_carries_enriched_semantics_and_join_condition() -> None:
+    # CR9: enriched description/alias/synonyms and the relationship condition must be
+    # in the chunk *text* — that is what a colloquial question embeds/matches against.
+    mdl = json.dumps(
+        {
+            "models": [
+                {
+                    "name": "drives",
+                    "tableReference": {"schema": "seagate", "table": "drives"},
+                    "description": "One finished drive unit",
+                    "columns": [
+                        {
+                            "name": "drive_unit",
+                            "type": "VARCHAR",
+                            "description": "A single drive; floor term patty",
+                            "properties": {
+                                "displayName": "Drive Unit",
+                                "alias": "patty",
+                            },
+                        }
+                    ],
+                }
+            ],
+            "relationships": [
+                {
+                    "name": "wo_drives",
+                    "models": ["work_orders", "drives"],
+                    "joinType": "ONE_TO_MANY",
+                    "condition": "work_orders.id = drives.work_order_id",
+                }
+            ],
+        }
+    )
+    items = manifest_to_schema_items(compile_manifest(json_contents=[mdl]))
+    column = next(i for i in items if i.kind == "column" and i.name == "drive_unit")
+    assert "patty" in column.text  # alias/synonym retrievable
+    assert "floor term patty" in column.text  # description retrievable
+    model = next(i for i in items if i.kind == "model" and i.name == "drives")
+    assert "One finished drive unit" in model.text
+    relationship = next(i for i in items if i.kind == "relationship")
+    assert "work_orders.id = drives.work_order_id" in relationship.text
+
+
 def test_keyword_retriever_ranks_by_overlap() -> None:
     top = _rank(KeywordRetriever(), "which region are customers in", _items(), 1)
     assert top[0].name == "region" or top[0].model == "customers"
+
+
+def test_keyword_rank_attaches_normalized_score() -> None:
+    # A3: the top item carries a 0-1 score (token overlap / query token count).
+    top = _rank(KeywordRetriever(), "which region are customers in", _items(), 1)
+    assert top[0].score is not None
+    assert 0.0 < top[0].score <= 1.0
+
+
+def test_embedding_rank_attaches_cosine_score() -> None:
+    top = _rank(EmbeddingRetriever(_FakeEmbedder()), "region", _items(), 1)
+    assert top[0].score is not None
+    assert 0.0 <= top[0].score <= 1.0
 
 
 def test_embedding_retriever_uses_cosine() -> None:

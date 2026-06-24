@@ -23,6 +23,7 @@ import {
   screen,
   userEvent,
   waitFor,
+  within,
 } from 'spec/helpers/testing-library';
 import reducerIndex from 'spec/helpers/reducerIndex';
 import SemanticLayerEditor from '.';
@@ -95,23 +96,33 @@ const mockBaseRoutes = (files: unknown[] = []) => {
   );
 };
 
+const onboardingJob = (warnings: string[] = []) => ({
+  id: 'job-1',
+  kind: 'onboarding',
+  status: 'completed',
+  project_id: 'project-1',
+  created_at: '2026-06-19T00:00:00Z',
+  updated_at: '2026-06-19T00:00:00Z',
+  result: {
+    project_id: 'project-1',
+    model_count: 1,
+    activated_count: 1,
+    warnings,
+    files: [mdlFile('moves', 'models/moves.json')],
+  },
+});
+
 const mockOnboard = (warnings: string[] = []) => {
   fetchMock.post(
     'http://agent.local/agent/semantic-layer/projects/project-1/onboard',
-    {
-      id: 'job-1',
-      kind: 'onboarding',
-      status: 'completed',
-      project_id: 'project-1',
-      created_at: '2026-06-19T00:00:00Z',
-      updated_at: '2026-06-19T00:00:00Z',
-      result: {
-        project_id: 'project-1',
-        model_count: 1,
-        warnings,
-        files: [mdlFile('moves', 'models/moves.json')],
-      },
-    },
+    onboardingJob(warnings),
+  );
+};
+
+const mockReset = (warnings: string[] = []) => {
+  fetchMock.post(
+    'http://agent.local/agent/semantic-layer/projects/project-1/reset',
+    onboardingJob(warnings),
   );
 };
 
@@ -193,9 +204,9 @@ test('opens the Add dialog with a drop zone', async () => {
   });
 });
 
-test('manual Onboard button triggers onboarding', async () => {
+test('Reset button confirms before deleting and re-onboarding', async () => {
   mockBaseRoutes([mdlFile('a', 'models/a.json')]);
-  mockOnboard();
+  mockReset();
 
   render(
     <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="main" />,
@@ -206,12 +217,25 @@ test('manual Onboard button triggers onboarding', async () => {
     expect(screen.getByText('Database 1.prod.main')).toBeInTheDocument();
   });
 
-  await userEvent.click(screen.getByRole('button', { name: /Onboard/i }));
+  // Clicking Reset opens a confirmation dialog and does NOT call the endpoint yet.
+  await userEvent.click(screen.getByRole('button', { name: /Reset/i }));
+  await screen.findByText('Reset semantic layer?');
+  expect(
+    fetchMock.callHistory.calls(
+      'http://agent.local/agent/semantic-layer/projects/project-1/reset',
+    ),
+  ).toHaveLength(0);
+
+  // Confirming in the dialog fires the reset.
+  const dialog = await screen.findByRole('dialog');
+  await userEvent.click(
+    within(dialog).getByRole('button', { name: /^Reset$/i }),
+  );
 
   await waitFor(() => {
     expect(
       fetchMock.callHistory.calls(
-        'http://agent.local/agent/semantic-layer/projects/project-1/onboard',
+        'http://agent.local/agent/semantic-layer/projects/project-1/reset',
       ),
     ).toHaveLength(1);
   });

@@ -93,6 +93,57 @@ def test_compile_manifest_merges_multiple_files_in_order() -> None:
     assert manifest.model_names == ["deals", "customers"]
 
 
+def test_compile_manifest_dedupes_same_named_models_last_wins() -> None:
+    # Regression: an onboarding per-table file + an enrichment file overlaying the same
+    # model must not double-register the physical table (wren-core "table already
+    # exists"). The later (enrichment) definition wins.
+    base = json.dumps(
+        {
+            "models": [
+                {
+                    "name": "deals",
+                    "tableReference": {"schema": "sales", "table": "deals"},
+                    "columns": [{"name": "id", "type": "BIGINT"}],
+                }
+            ]
+        }
+    )
+    enriched = json.dumps(
+        {
+            "models": [
+                {
+                    "name": "deals",
+                    "tableReference": {"schema": "sales", "table": "deals"},
+                    "description": "enriched",
+                    "columns": [{"name": "id", "type": "BIGINT"}],
+                }
+            ]
+        }
+    )
+    manifest = compile_manifest(json_contents=[base, enriched])
+    assert manifest.model_names == ["deals"]  # not ["deals", "deals"]
+    assert manifest.models[0]["description"] == "enriched"  # last-wins
+
+
+def test_compile_manifest_dedupes_relationships_and_metrics_by_name() -> None:
+    dup = json.dumps(
+        {
+            "relationships": [
+                {
+                    "name": "r",
+                    "models": ["a", "b"],
+                    "joinType": "ONE_TO_MANY",
+                    "condition": "a.id = b.a_id",
+                }
+            ],
+            "metrics": [{"name": "m", "baseObject": "a"}],
+        }
+    )
+    manifest = compile_manifest(json_contents=[dup, dup])
+    assert len(manifest.relationships) == 1
+    assert len(manifest.metrics) == 1
+
+
 def test_to_engine_manifest_and_base64_roundtrip() -> None:
     manifest = compile_manifest(
         json_contents=[_DEALS_JSON], catalog="wren", schema="public"

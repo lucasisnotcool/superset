@@ -31,7 +31,7 @@ from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.context.base import ContextProvider
 from superset_ai_agent.conversations.schemas import ConversationScope
 from superset_ai_agent.conversations.store import DEFAULT_OWNER_ID
-from superset_ai_agent.explain import build_agent_timeline
+from superset_ai_agent.explain import build_agent_timeline, compact_recalled_examples
 from superset_ai_agent.integrations.superset.client import AgentContext, SupersetClient
 from superset_ai_agent.integrations.wren.client import DisabledWrenClient, WrenClient
 from superset_ai_agent.llm.base import ChatMessage, ModelClient
@@ -600,7 +600,10 @@ class TextToSqlGraph:
                 TraceEvent(
                     step="draft_sql",
                     summary="Generated an initial SQL draft.",
-                    details={"model": request.model or self.config.default_model()},
+                    details={
+                        "model": request.model or self.config.default_model(),
+                        "recalled_examples": compact_recalled_examples(recalled),
+                    },
                 ),
             ],
         }

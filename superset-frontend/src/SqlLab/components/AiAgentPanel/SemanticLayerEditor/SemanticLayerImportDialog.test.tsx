@@ -45,14 +45,31 @@ const makeFile = (content: string, name: string, type: string) => {
   return file;
 };
 
-const renderDialog = () => {
+const makeMdlFile = (overrides: Record<string, unknown> = {}) => ({
+  id: 'file-existing',
+  project_id: 'project-1',
+  path: 'models/model.json',
+  filename: 'model.json',
+  content: '{"models":[{"name":"model"}]}',
+  content_type: 'application/json',
+  source_type: 'uploaded_mdl',
+  status: 'draft',
+  checksum: 'x',
+  created_at: '2026-06-19T00:00:00Z',
+  updated_at: '2026-06-19T00:00:00Z',
+  ...overrides,
+});
+
+const renderDialog = (
+  props: { existingFiles?: ReturnType<typeof makeMdlFile>[] } = {},
+) => {
   const onApplied = jest.fn();
   render(
     <SemanticLayerImportDialog
       show
       onHide={jest.fn()}
       projectId="project-1"
-      existingFiles={[]}
+      existingFiles={(props.existingFiles ?? []) as never}
       canWrite
       onApplied={onApplied}
     />,
@@ -92,7 +109,7 @@ test('stages a dropped JSON file as a new MDL draft with a diff', async () => {
   });
   expect(screen.getByTestId('semantic-import-diff')).toBeInTheDocument();
 
-  await userEvent.click(screen.getByRole('button', { name: /Save draft/i }));
+  await userEvent.click(screen.getByRole('button', { name: 'Save' }));
 
   await waitFor(() => {
     const calls = fetchMock.callHistory.calls(
@@ -104,6 +121,88 @@ test('stages a dropped JSON file as a new MDL draft with a diff', async () => {
       source_type: 'uploaded_mdl',
     });
   });
+});
+
+test('the dialog has no activate controls and uses Save / Save all labels', async () => {
+  const { fileInput } = renderDialog();
+  fetchMock.post(
+    'http://agent.local/agent/semantic-layer/projects/project-1/mdl-files',
+    makeMdlFile({ id: 'file-new' }),
+  );
+  await userEvent.upload(
+    fileInput(),
+    makeFile('{"models":[{"name":"model"}]}', 'model.json', 'application/json'),
+  );
+  await screen.findByTestId('semantic-import-item');
+
+  expect(screen.getByRole('button', { name: 'Save' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Save all' })).toBeInTheDocument();
+  expect(
+    screen.queryByRole('button', { name: /Activate/i }),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole('button', { name: /Save draft/i }),
+  ).not.toBeInTheDocument();
+});
+
+test('re-saving the same item updates instead of creating a second file', async () => {
+  // Issue 1: after a create, a repeat save routes to an update (PATCH) via the
+  // optimistic session map, so no second create (and no "already exists" 409).
+  const { fileInput } = renderDialog();
+  fetchMock.post(
+    'http://agent.local/agent/semantic-layer/projects/project-1/mdl-files',
+    makeMdlFile({ id: 'file-new', path: 'models/model.json' }),
+  );
+  fetchMock.patch(
+    'http://agent.local/agent/semantic-layer/projects/project-1/mdl-files/file-new',
+    makeMdlFile({ id: 'file-new', path: 'models/model.json' }),
+  );
+
+  await userEvent.upload(
+    fileInput(),
+    makeFile('{"models":[{"name":"model"}]}', 'model.json', 'application/json'),
+  );
+  await screen.findByTestId('semantic-import-item');
+
+  await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+  await waitFor(() =>
+    expect(
+      fetchMock.callHistory.calls(
+        'http://agent.local/agent/semantic-layer/projects/project-1/mdl-files',
+      ),
+    ).toHaveLength(1),
+  );
+
+  await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+  await waitFor(() =>
+    expect(
+      fetchMock.callHistory.calls(
+        'http://agent.local/agent/semantic-layer/projects/project-1/mdl-files/file-new',
+      ),
+    ).toHaveLength(1),
+  );
+  // Still exactly one create — the second save updated.
+  expect(
+    fetchMock.callHistory.calls(
+      'http://agent.local/agent/semantic-layer/projects/project-1/mdl-files',
+    ),
+  ).toHaveLength(1);
+});
+
+test('a new JSON upload that collides with an existing file is auto-suffixed', async () => {
+  // Issue 4: dropping model.json when models/model.json already exists stages a
+  // distinct models/model_1.json rather than clobbering or 409-ing.
+  const { fileInput } = renderDialog({
+    existingFiles: [makeMdlFile({ path: 'models/model.json' })],
+  });
+
+  await userEvent.upload(
+    fileInput(),
+    makeFile('{"models":[{"name":"model"}]}', 'model.json', 'application/json'),
+  );
+
+  const item = await screen.findByTestId('semantic-import-item');
+  expect(item).toHaveTextContent('models/model_1.json');
 });
 
 test('routes a dropped Markdown file through the enrichment pipeline', async () => {

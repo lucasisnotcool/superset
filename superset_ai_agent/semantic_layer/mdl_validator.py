@@ -632,7 +632,12 @@ def _validate_metrics(
                     code="unresolved_metric_base",
                 )
             )
-        measures = metric.get("measures")
+        # Wren-native metrics carry a singular ``measure`` array (wren-core shape);
+        # tolerate a legacy ``measures`` alias. Checking only the plural form would
+        # false-warn on a correctly-formed metric.
+        measures = metric.get("measure")
+        if measures is None:
+            measures = metric.get("measures")
         has_measures = isinstance(measures, list) and bool(measures)
         if not metric.get("expression") and not has_measures:
             messages.append(

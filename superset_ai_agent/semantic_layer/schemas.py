@@ -241,11 +241,12 @@ class WrenMaterializationResult(BaseModel):
 
 
 class OnboardingResult(BaseModel):
-    """Result of generating draft base MDL from schema introspection."""
+    """Result of generating base MDL from schema introspection."""
 
     project_id: str
     files: list[MdlFile] = Field(default_factory=list)
     model_count: int = 0
+    activated_count: int = 0
     warnings: list[str] = Field(default_factory=list)
 
 

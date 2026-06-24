@@ -17,7 +17,8 @@
 
 from __future__ import annotations
 
-from typing import Any, TYPE_CHECKING
+import logging
+from typing import Any, Callable, TYPE_CHECKING, TypeVar
 
 from sqlalchemy.engine.url import make_url, URL
 
@@ -30,6 +31,34 @@ if TYPE_CHECKING:
         TableMetadataForeignKeysIndexesResponse,
         TableMetadataResponse,
     )
+
+logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+
+
+def _best_effort(
+    section: Callable[[], T],
+    default: T,
+    warnings: list[str],
+    label: str,
+) -> T:
+    """Run an auxiliary introspection step, degrading to ``default`` on failure.
+
+    A table's columns are essential (a failure there propagates and surfaces as a
+    structured error), but the auxiliary sections — primary key, foreign keys,
+    indexes, ``SELECT *`` — are best-effort: a single failing one (e.g. an engine
+    that can't compile a partition-aware ``SELECT *``, or flaky FK reflection)
+    should not fail the whole request. The detail is logged; a concise,
+    non-sensitive note is added to ``warnings`` so the caller can surface it.
+    """
+
+    try:
+        return section()
+    except Exception:  # pylint: disable=broad-except
+        logger.warning("Could not load %s for table metadata", label, exc_info=True)
+        warnings.append(f"Could not load {label}.")
+        return default
 
 
 def get_foreign_keys_metadata(
@@ -65,24 +94,41 @@ def get_col_type(col: dict[Any, Any]) -> str:
 def get_table_metadata(database: Any, table: Table) -> TableMetadataResponse:
     """
     Get table metadata information, including type, pk, fks.
-    This function raises SQLAlchemyError when a schema is not found.
+
+    Column reflection is essential and propagates on failure (e.g. an invalid
+    schema), so the caller can surface a structured error. The auxiliary sections
+    (primary key, foreign keys, indexes, ``SELECT *``) are best-effort: a single
+    failing one degrades to an empty default and is reported via ``warnings``
+    rather than failing the whole request.
 
     :param database: The database model
     :param table: Table instance
     :return: Dict table metadata ready for API response
     """
     keys = []
+    warnings: list[str] = []
     columns = database.get_columns(table)
-    primary_key = database.get_pk_constraint(table)
+    primary_key: Any = _best_effort(
+        lambda: database.get_pk_constraint(table), {}, warnings, "primary key"
+    )
     if primary_key and primary_key.get("constrained_columns"):
         primary_key["column_names"] = primary_key.pop("constrained_columns")
         primary_key["type"] = "pk"
         keys += [primary_key]
-    foreign_keys = get_foreign_keys_metadata(database, table)
-    indexes = get_indexes_metadata(database, table)
+    foreign_keys: list[TableMetadataForeignKeysIndexesResponse] = _best_effort(
+        lambda: get_foreign_keys_metadata(database, table),
+        [],
+        warnings,
+        "foreign keys",
+    )
+    indexes: list[TableMetadataForeignKeysIndexesResponse] = _best_effort(
+        lambda: get_indexes_metadata(database, table), [], warnings, "indexes"
+    )
     keys += foreign_keys + indexes
     payload_columns: list[TableMetadataColumnsResponse] = []
-    table_comment = database.get_table_comment(table)
+    table_comment = _best_effort(
+        lambda: database.get_table_comment(table), None, warnings, "table comment"
+    )
     for col in columns:
         dtype = get_col_type(col)
         payload_columns.append(
@@ -94,20 +140,27 @@ def get_table_metadata(database: Any, table: Table) -> TableMetadataResponse:
                 "comment": col.get("comment"),
             }
         )
-    return {
-        "name": table.table,
-        "columns": payload_columns,
-        "selectStar": database.select_star(
+    select_star = _best_effort(
+        lambda: database.select_star(
             table,
             show_cols=True if columns else False,
             indent=True,
             cols=columns,
             latest_partition=True,
         ),
+        "",
+        warnings,
+        "SELECT * statement",
+    )
+    return {
+        "name": table.table,
+        "columns": payload_columns,
+        "selectStar": select_star,
         "primaryKey": primary_key,
         "foreignKeys": foreign_keys,
         "indexes": keys,
         "comment": table_comment,
+        "warnings": warnings,
     }
 
 

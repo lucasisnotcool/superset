@@ -1,0 +1,126 @@
+{
+  "per_q": {
+    "Q1": {
+      "verdicts": [
+        "correct",
+        "wrong",
+        "correct"
+      ],
+      "correct_of_n": 2
+    },
+    "Q2": {
+      "verdicts": [
+        "wrong",
+        "wrong",
+        "wrong"
+      ],
+      "correct_of_n": 0
+    },
+    "Q3": {
+      "verdicts": [
+        "wrong",
+        "wrong",
+        "wrong"
+      ],
+      "correct_of_n": 0
+    },
+    "Q4": {
+      "verdicts": [
+        "wrong",
+        "wrong",
+        "wrong"
+      ],
+      "correct_of_n": 0
+    },
+    "Q5": {
+      "verdicts": [
+        "correct",
+        "correct",
+        "correct"
+      ],
+      "correct_of_n": 3
+    },
+    "Q6": {
+      "verdicts": [
+        "wrong",
+        "wrong",
+        "wrong"
+      ],
+      "correct_of_n": 0
+    },
+    "Q7": {
+      "verdicts": [
+        "wrong",
+        "wrong",
+        "wrong"
+      ],
+      "correct_of_n": 0
+    },
+    "Q8": {
+      "verdicts": [
+        "correct",
+        "correct",
+        "correct"
+      ],
+      "correct_of_n": 3
+    },
+    "Q9": {
+      "verdicts": [
+        "wrong",
+        "correct",
+        "correct"
+      ],
+      "correct_of_n": 2
+    },
+    "Q10": {
+      "verdicts": [
+        "wrong",
+        "wrong",
+        "wrong"
+      ],
+      "correct_of_n": 0
+    },
+    "Q11": {
+      "verdicts": [
+        "wrong",
+        "wrong",
+        "wrong"
+      ],
+      "correct_of_n": 0
+    },
+    "Q12": {
+      "verdicts": [
+        "trap_ok",
+        "trap_ok",
+        "trap_ok"
+      ],
+      "correct_of_n": 3
+    },
+    "Q13": {
+      "verdicts": [
+        "wrong",
+        "wrong",
+        "wrong"
+      ],
+      "correct_of_n": 0
+    },
+    "Q14": {
+      "verdicts": [
+        "wrong",
+        "wrong",
+        "wrong"
+      ],
+      "correct_of_n": 0
+    },
+    "Q15": {
+      "verdicts": [
+        "wrong",
+        "wrong",
+        "wrong"
+      ],
+      "correct_of_n": 0
+    }
+  },
+  "mean_correct": 4.333333333333333,
+  "n": 3
+}

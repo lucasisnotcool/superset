@@ -18,6 +18,8 @@
  */
 import {
   ChangeEvent,
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
   useMemo,
@@ -30,6 +32,7 @@ import { css, styled } from '@apache-superset/core/theme';
 import { Alert } from '@apache-superset/core/components';
 import {
   Button,
+  ConfirmModal,
   Flex,
   Input,
   Switch,
@@ -54,6 +57,7 @@ import {
   MdlFileStatus,
   resolveSemanticProject,
   runOnboarding,
+  runReset,
   SemanticLayerState,
   SemanticProject,
   updateMdlFile,
@@ -61,6 +65,10 @@ import {
 import SemanticLayerStateBadge from '../SemanticLayerStateBadge';
 import SemanticLayerImportDialog from './SemanticLayerImportDialog';
 import InstructionsPanel from './InstructionsPanel';
+
+// Lazy-loaded so the graph code + ECharts land in a separate async chunk fetched
+// only when the Graph tab is opened — zero cost otherwise (wren_graph_view.md D1).
+const SchemaGraph = lazy(() => import('./SchemaGraph/SchemaGraph'));
 
 const EditorRoot = styled.div`
   ${({ theme }) => css`
@@ -253,6 +261,8 @@ export default function SemanticLayerEditor({
   const [editorValue, setEditorValue] = useState(defaultMdl);
   const [showImportDialog, setShowImportDialog] = useState(false);
   const [isOnboarding, setIsOnboarding] = useState(false);
+  const [showResetConfirm, setShowResetConfirm] = useState(false);
+  const [isResetting, setIsResetting] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const onboardedProjectsRef = useRef<Set<string>>(new Set());
   // Mirror the active file id in a ref so `refresh` can read the current
@@ -408,11 +418,42 @@ export default function SemanticLayerEditor({
     [refresh, dispatch],
   );
 
-  const onboardProject = () => {
-    if (project) {
-      runOnboard(project.id);
+  // Destructive "start over": delete all MDL and re-onboard (auto-activated) from
+  // the live schema. Gated behind a confirmation dialog. Documents are kept.
+  const resetProject = useCallback(async () => {
+    if (!project) {
+      return;
     }
-  };
+    setShowResetConfirm(false);
+    setIsResetting(true);
+    try {
+      const job = await runReset(project.id);
+      if (job.status === 'failed') {
+        throw new Error(job.error || t('Reset failed'));
+      }
+      const warnings = job.result?.warnings ?? [];
+      if (warnings.length > 0) {
+        dispatch(
+          addWarningToast(
+            t('Reset completed with warnings: %s', warnings.join('; ')),
+          ),
+        );
+      } else {
+        dispatch(
+          addSuccessToast(t('Semantic layer reset and re-onboarded.')),
+        );
+      }
+      await refresh();
+    } catch (ex) {
+      dispatch(
+        addDangerToast(
+          ex instanceof Error ? ex.message : t('Unable to reset semantic layer'),
+        ),
+      );
+    } finally {
+      setIsResetting(false);
+    }
+  }, [project, refresh, dispatch]);
 
   // Toggle a single file between active (in the semantic layer) and draft.
   const toggleFileStatus = (file: MdlFile, activate: boolean) =>
@@ -574,14 +615,20 @@ export default function SemanticLayerEditor({
                     </Button>
                     <Button
                       buttonStyle="tertiary"
-                      loading={isOnboarding}
+                      loading={isOnboarding || isResetting}
                       disabled={
-                        !project || !canWrite || isLoading || isOnboarding
+                        !project ||
+                        !canWrite ||
+                        isLoading ||
+                        isOnboarding ||
+                        isResetting
                       }
-                      onClick={onboardProject}
-                      icon={<Icons.DatabaseOutlined iconSize="m" />}
+                      onClick={() => setShowResetConfirm(true)}
+                      icon={<Icons.ReloadOutlined iconSize="m" />}
                     >
-                      {isOnboarding ? t('Onboarding…') : t('Onboard')}
+                      {isOnboarding || isResetting
+                        ? t('Resetting…')
+                        : t('Reset')}
                     </Button>
                   </Flex>
                 </BrowserPane>
@@ -649,6 +696,20 @@ export default function SemanticLayerEditor({
             label: t('Instructions'),
             children: <InstructionsPanel scope={scope} canWrite={canWrite} />,
           },
+          {
+            key: 'graph',
+            label: t('Graph'),
+            children: (
+              <Suspense fallback={null}>
+                <SchemaGraph
+                  mdlFiles={mdlFiles}
+                  databaseId={databaseId}
+                  catalogName={catalogName}
+                  schemaName={schemaName}
+                />
+              </Suspense>
+            ),
+          },
         ]}
       />
       <SemanticLayerImportDialog
@@ -658,6 +719,21 @@ export default function SemanticLayerEditor({
         existingFiles={mdlFiles}
         canWrite={canWrite}
         onApplied={refresh}
+      />
+      <ConfirmModal
+        show={showResetConfirm}
+        onHide={() => setShowResetConfirm(false)}
+        onConfirm={resetProject}
+        loading={isResetting}
+        confirmText={t('Reset')}
+        confirmButtonStyle="danger"
+        title={t('Reset semantic layer?')}
+        body={t(
+          'This deletes every model in this project — including document ' +
+            'enrichments and any hand-edited files — and rebuilds the base models ' +
+            'from the current schema (auto-activated). Uploaded documents are kept, ' +
+            'so you can re-enrich afterward. This cannot be undone.',
+        )}
       />
     </EditorRoot>
   );

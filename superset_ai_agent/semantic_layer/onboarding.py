@@ -15,7 +15,14 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Schema onboarding: introspect a schema into draft base MDL models."""
+"""Schema onboarding: introspect a schema into base MDL models.
+
+Onboarding seeds one base model per catalog table (structure from the catalog,
+semantics optionally from the model) and — unless told otherwise — **auto-activates**
+every model that passes structural + physical validation, so a freshly onboarded (or
+reset) project lands on a populated, queryable semantic layer rather than a pile of
+drafts. Models that fail validation stay draft with a warning so a human can fix them.
+"""
 
 from __future__ import annotations
 
@@ -23,11 +30,15 @@ from typing import Protocol
 
 from superset_ai_agent.conversations.store import DEFAULT_OWNER_ID
 from superset_ai_agent.integrations.superset.client import AgentContext
-from superset_ai_agent.semantic_layer.mdl_files import MdlFileStore
+from superset_ai_agent.semantic_layer.mdl_files import (
+    MdlFileStore,
+    MdlFileValidationError,
+)
 from superset_ai_agent.semantic_layer.mdl_validator import SchemaIndex, validate_mdl
 from superset_ai_agent.semantic_layer.schemas import (
     MdlEnrichmentProposal,
     MdlFileCreateRequest,
+    MdlFileUpdateRequest,
     OnboardingResult,
     SemanticProject,
 )
@@ -52,10 +63,20 @@ def onboard_schema_project(
     wren_client: SupportsBaseModelGeneration,
     mdl_file_store: MdlFileStore,
     owner_id: str = DEFAULT_OWNER_ID,
+    auto_activate: bool = True,
 ) -> OnboardingResult:
-    """Generate draft base MDL files for a schema project.
+    """Generate base MDL files for a schema project.
 
-    Files are always written as drafts; activation remains a human decision.
+    When ``auto_activate`` is set (the default), every generated model that passes
+    structural + physical validation is activated so the layer is immediately
+    queryable; a model that fails validation stays draft with a warning. Set
+    ``auto_activate=False`` to keep the legacy draft-only behavior (review-first).
+
+    Note: activation here uses structural + physical (schema) validation — which
+    already rejects hallucinated columns/tables — but does **not** run the optional
+    deep wren-core compile gate enforced on the manual activation route. Introspected
+    base models (plain tables, no relationships) compile reliably, so this is a
+    deliberate, low-risk deviation for the onboarding path.
     """
 
     schema_index = SchemaIndex.from_agent_context(superset_context)
@@ -88,7 +109,6 @@ def onboard_schema_project(
         except ValueError as ex:
             warnings.append(f"Skipped {proposal.proposed_path}: {ex}")
             continue
-        files.append(created)
         if not validation.valid:
             warnings.append(
                 f"{proposal.proposed_path} has validation errors and cannot be "
@@ -99,11 +119,29 @@ def onboard_schema_project(
                     if message.severity == "error"
                 )
             )
+        elif auto_activate:
+            # Activate the freshly seeded model so the layer is queryable at once.
+            # Only valid models reach here; the store's activation gate is a final
+            # structural safety net, so a surprise failure degrades to draft.
+            try:
+                created = mdl_file_store.update(
+                    created.id,
+                    MdlFileUpdateRequest(status="active"),
+                    owner_id=owner_id,
+                    validation=validation,
+                )
+            except MdlFileValidationError as ex:
+                warnings.append(
+                    f"{proposal.proposed_path} could not be auto-activated: {ex}"
+                )
+        files.append(created)
         warnings.extend(proposal.warnings)
 
+    activated = sum(1 for file in files if file.status == "active")
     return OnboardingResult(
         project_id=project.id,
         files=files,
         model_count=len(files),
+        activated_count=activated,
         warnings=list(dict.fromkeys(warnings)),
     )

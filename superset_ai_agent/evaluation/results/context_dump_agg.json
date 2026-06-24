@@ -1,0 +1,126 @@
+{
+  "per_q": {
+    "Q1": {
+      "verdicts": [
+        "correct",
+        "correct",
+        "correct"
+      ],
+      "correct_of_n": 3
+    },
+    "Q2": {
+      "verdicts": [
+        "correct",
+        "correct",
+        "correct"
+      ],
+      "correct_of_n": 3
+    },
+    "Q3": {
+      "verdicts": [
+        "correct",
+        "correct",
+        "wrong"
+      ],
+      "correct_of_n": 2
+    },
+    "Q4": {
+      "verdicts": [
+        "correct",
+        "correct",
+        "correct"
+      ],
+      "correct_of_n": 3
+    },
+    "Q5": {
+      "verdicts": [
+        "correct",
+        "correct",
+        "correct"
+      ],
+      "correct_of_n": 3
+    },
+    "Q6": {
+      "verdicts": [
+        "correct",
+        "correct",
+        "correct"
+      ],
+      "correct_of_n": 3
+    },
+    "Q7": {
+      "verdicts": [
+        "correct",
+        "correct",
+        "correct"
+      ],
+      "correct_of_n": 3
+    },
+    "Q8": {
+      "verdicts": [
+        "correct",
+        "correct",
+        "correct"
+      ],
+      "correct_of_n": 3
+    },
+    "Q9": {
+      "verdicts": [
+        "correct",
+        "correct",
+        "correct"
+      ],
+      "correct_of_n": 3
+    },
+    "Q10": {
+      "verdicts": [
+        "correct",
+        "wrong",
+        "correct"
+      ],
+      "correct_of_n": 2
+    },
+    "Q11": {
+      "verdicts": [
+        "correct",
+        "correct",
+        "correct"
+      ],
+      "correct_of_n": 3
+    },
+    "Q12": {
+      "verdicts": [
+        "trap_ok",
+        "trap_ok",
+        "trap_ok"
+      ],
+      "correct_of_n": 3
+    },
+    "Q13": {
+      "verdicts": [
+        "correct",
+        "correct",
+        "correct"
+      ],
+      "correct_of_n": 3
+    },
+    "Q14": {
+      "verdicts": [
+        "correct",
+        "correct",
+        "partial"
+      ],
+      "correct_of_n": 2
+    },
+    "Q15": {
+      "verdicts": [
+        "correct",
+        "correct",
+        "wrong"
+      ],
+      "correct_of_n": 2
+    }
+  },
+  "mean_correct": 13.666666666666664,
+  "n": 3
+}

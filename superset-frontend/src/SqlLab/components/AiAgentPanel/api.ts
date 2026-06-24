@@ -144,6 +144,14 @@ export interface IntentDetail {
   intent?: string | null;
   reason?: string | null;
 }
+export interface RetrievedChunk {
+  kind?: string | null;
+  name?: string | null;
+  model?: string | null;
+  text: string;
+  retriever?: string | null;
+  score?: number | null;
+}
 export interface LoadWrenContextDetail {
   kind: 'wren_context';
   available: boolean;
@@ -154,12 +162,19 @@ export interface LoadWrenContextDetail {
   retrieved_item_count: number;
   context_item_count: number;
   recalled_example_count: number;
+  retrieved_chunks?: RetrievedChunk[] | null;
+  warnings?: string[] | null;
+}
+export interface RecalledExample {
+  question: string;
+  native_sql?: string | null;
 }
 export interface DraftDetail {
   kind: 'draft';
   response_type?: string | null;
   model?: string | null;
   recalled_example_count: number;
+  recalled_examples?: RecalledExample[] | null;
 }
 export interface DryPlanDetail {
   kind: 'dry_plan';
@@ -506,6 +521,7 @@ export interface OnboardingResult {
   project_id: string;
   files: MdlFile[];
   model_count: number;
+  activated_count?: number;
   warnings: string[];
 }
 
@@ -1019,30 +1035,56 @@ export const getSemanticJob = (projectId: string, jobId: string) =>
     { method: 'GET' },
   );
 
+export const resetSemanticProject = (projectId: string) =>
+  requestJson<SemanticJob>(
+    `/agent/semantic-layer/projects/${projectId}/reset`,
+    { method: 'POST' },
+  );
+
 /**
- * Start onboarding and resolve once the async job reaches a terminal state.
- * Polls the job endpoint; an inline backend completes on the first response.
+ * Poll a semantic job until it reaches a terminal state. An inline backend
+ * completes on the first response; a threaded backend is polled.
  */
-export const runOnboarding = async (
+const pollSemanticJob = async (
   projectId: string,
+  job: SemanticJob,
   {
     intervalMs = 1000,
     attempts = 60,
-  }: { intervalMs?: number; attempts?: number } = {},
+  }: { intervalMs?: number; attempts?: number },
 ): Promise<SemanticJob> => {
-  let job = await onboardSemanticProject(projectId);
+  let current = job;
   let remaining = attempts;
-  while (job.status === 'running' && remaining > 0) {
+  while (current.status === 'running' && remaining > 0) {
     // eslint-disable-next-line no-await-in-loop
     await new Promise(resolve => {
       setTimeout(resolve, intervalMs);
     });
     // eslint-disable-next-line no-await-in-loop
-    job = await getSemanticJob(projectId, job.id);
+    current = await getSemanticJob(projectId, current.id);
     remaining -= 1;
   }
-  return job;
+  return current;
 };
+
+/**
+ * Start onboarding and resolve once the async job reaches a terminal state.
+ */
+export const runOnboarding = async (
+  projectId: string,
+  opts: { intervalMs?: number; attempts?: number } = {},
+): Promise<SemanticJob> =>
+  pollSemanticJob(projectId, await onboardSemanticProject(projectId), opts);
+
+/**
+ * Reset a project (delete all MDL, then re-onboard + auto-activate) and resolve
+ * once the resulting onboarding job reaches a terminal state.
+ */
+export const runReset = async (
+  projectId: string,
+  opts: { intervalMs?: number; attempts?: number } = {},
+): Promise<SemanticJob> =>
+  pollSemanticJob(projectId, await resetSemanticProject(projectId), opts);
 
 export const materializeSemanticProject = (projectId: string) =>
   requestJson<WrenMaterializationResult>(

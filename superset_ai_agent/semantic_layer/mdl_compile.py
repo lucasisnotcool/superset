@@ -106,8 +106,10 @@ def compile_manifest(
     """Compile authored JSON files into one native engine manifest.
 
     Pass either ``mdl_files`` (their ``content`` is read) or raw ``json_contents``.
-    Files are merged in the given order; later files append, they do not override.
-    Entity bodies are passed through unchanged — they are already native.
+    Files are merged in the given order; same-named entities are deduped **last-wins**
+    (so an enrichment file overlaying a base model overrides it rather than producing a
+    duplicate that would double-register the physical table). Entity bodies are passed
+    through unchanged — they are already native.
     """
 
     if json_contents is None:
@@ -149,7 +151,29 @@ def _merge_json(json_contents: list[str]) -> dict[str, list[dict[str, Any]]]:
             continue
         for target, keys in key_map.items():
             merged[target].extend(_collect(payload, keys))
+    # A manifest must have uniquely-named entities: two files defining the same model
+    # (e.g. an onboarding per-table file + an enrichment file that overlays the same
+    # models) would otherwise register the physical table twice and wren-core rejects
+    # it ("table ... already exists"). Dedupe by name, last-wins — callers compile in
+    # path-sorted order, so the enrichment/semantics file (later path) overrides the
+    # base onboarding file.
+    for target in merged:
+        merged[target] = dedupe_named_entities(merged[target])
     return merged
+
+
+def dedupe_named_entities(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse same-``name`` entities, last occurrence winning; keep unnamed as-is."""
+
+    by_name: dict[str, dict[str, Any]] = {}
+    unnamed: list[dict[str, Any]] = []
+    for item in items:
+        name = item.get("name")
+        if isinstance(name, str) and name:
+            by_name[name] = item  # last-wins; first-seen position preserved
+        else:
+            unnamed.append(item)
+    return [*by_name.values(), *unnamed]
 
 
 def _collect(payload: dict[str, Any], keys: tuple[str, ...]) -> list[dict[str, Any]]:

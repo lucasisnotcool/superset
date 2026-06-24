@@ -2562,3 +2562,71 @@ def test_import_includes_configuration_method(
         f"'configuration_method' not found in database list response: {db_obj_api}"
     )
     assert db_obj_api["configuration_method"] == "dynamic_form"
+
+
+def test_table_metadata_essential_failure_returns_422(
+    mocker: MockerFixture,
+    client: Any,
+    full_api_access: None,
+) -> None:
+    """
+    A failing essential introspection (e.g. column reflection against an invalid
+    schema) is surfaced as a structured 422 via @handle_api_exception, not a raw
+    500. Regression for the graph view's table_metadata 500s.
+    """
+    from sqlalchemy.exc import OperationalError
+
+    database = mocker.MagicMock()
+    database.db_engine_spec.get_table_metadata.side_effect = OperationalError(
+        'PRAGMA "seagate".table_xinfo("t")',
+        {},
+        Exception('unknown database "seagate"'),
+    )
+    mocker.patch(
+        "superset.databases.api.DatabaseDAO.find_by_id", return_value=database
+    )
+    mocker.patch(
+        "superset.databases.api.DatabaseDAO.is_odps_partitioned_table",
+        return_value=(False, []),
+    )
+    mocker.patch("superset.databases.api.security_manager.raise_for_access")
+
+    response = client.get(
+        "/api/v1/database/1/table_metadata/?name=t&schema=seagate"
+    )
+    assert response.status_code == 422
+    assert response.status_code != 500
+
+
+def test_table_metadata_returns_warnings(
+    mocker: MockerFixture,
+    client: Any,
+    full_api_access: None,
+) -> None:
+    """
+    A best-effort auxiliary failure is returned as a 200 with a `warnings` list,
+    so the table still loads (degraded) instead of failing the whole request.
+    """
+    database = mocker.MagicMock()
+    database.db_engine_spec.get_table_metadata.return_value = {
+        "name": "t",
+        "columns": [],
+        "selectStar": "",
+        "primaryKey": {},
+        "foreignKeys": [],
+        "indexes": [],
+        "comment": None,
+        "warnings": ["Could not load SELECT * statement."],
+    }
+    mocker.patch(
+        "superset.databases.api.DatabaseDAO.find_by_id", return_value=database
+    )
+    mocker.patch(
+        "superset.databases.api.DatabaseDAO.is_odps_partitioned_table",
+        return_value=(False, []),
+    )
+    mocker.patch("superset.databases.api.security_manager.raise_for_access")
+
+    response = client.get("/api/v1/database/1/table_metadata/?name=t&schema=main")
+    assert response.status_code == 200
+    assert response.json["warnings"] == ["Could not load SELECT * statement."]

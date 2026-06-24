@@ -30,6 +30,7 @@ It never executes SQL. Generated MDL is always returned as a reviewable draft.
 from __future__ import annotations
 
 import json  # noqa: TID251 - keep the standalone agent independent of Superset
+import logging
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -58,6 +59,8 @@ from superset_ai_agent.semantic_layer.wren_core_validator import (
     validate_with_wren_core,
     wren_core_available,
 )
+
+logger = logging.getLogger(__name__)
 
 #: Surfaced to the UI when the model is invoked but returns no usable structured
 #: MDL, so the agent falls back to the deterministic (structure-only) draft. This
@@ -167,7 +170,7 @@ class LlmWrenClient:
         schema_types: dict[str, dict[str, str]] | None = None,
         instructions: list[str] | None = None,
     ) -> MdlEnrichmentProposal:
-        base_mdl = self._active_mdl_json(project)
+        base_mdl = self._effective_mdl_json(project)
         document_text = (
             document.extracted_text or document.extracted_text_preview or ""
         ).strip()
@@ -214,8 +217,15 @@ class LlmWrenClient:
             project, base_mdl, base_payload, schema_index=schema_index
         )
         if draft is None:
-            # The model was invoked (there *is* document text) but returned no
-            # usable structured proposal — surface the degradation, don't hide it.
+            # The model was invoked (there *is* document text) but returned no usable
+            # structured proposal. CR2: never fabricate the schema-name blob when a real
+            # base/schema exists — that masks the failure as a fake one-model
+            # "success". Return a no-op proposal (the effective base unchanged, or
+            # empty) plus a loud warning so the UI shows the degradation.
+            if base_mdl or schema:
+                return self._no_change_proposal(project, document)
+            # No base and no physical schema: nothing to anchor to. The deterministic
+            # draft (structure-only) is the honest degrade for a bare project.
             fallback = deterministic_mdl_proposal(project=project, document=document)
             return fallback.model_copy(
                 update={"warnings": [*fallback.warnings, _PROVIDER_FALLBACK_WARNING]}
@@ -242,6 +252,37 @@ class LlmWrenClient:
                 *response_warnings,
                 *drop_warning,
                 "LLM-generated MDL draft. Review before activation.",
+            ],
+        )
+
+    def _no_change_proposal(
+        self, project: SemanticProject, document: SemanticDocument
+    ) -> MdlEnrichmentProposal:
+        """A non-fabricating proposal for a provider that returned nothing (CR2).
+
+        Echoes the effective base MDL (the first effective file) unchanged, or an
+        empty manifest when there is none, so the review surface shows "no changes
+        applied" rather than a misleading new schema-named model. The
+        provider-fallback warning is attached so the degradation is visible.
+        """
+
+        effective = self._effective_files_content(project)
+        if effective:
+            path, content = effective[0]
+            proposed_content = json.dumps(content, indent=2)
+            proposed_path = path
+        else:
+            proposed_content = json.dumps({"models": []}, indent=2)
+            proposed_path = f"models/{_safe_name(project.schema_name)}.json"
+        return MdlEnrichmentProposal(
+            source_document_id=document.id,
+            proposed_path=proposed_path,
+            proposed_content=proposed_content,
+            validation=validate_mdl(proposed_content),
+            warnings=[
+                _PROVIDER_FALLBACK_WARNING,
+                "No enrichment changes were applied. The base models are unchanged; "
+                "review the configured model/provider before retrying.",
             ],
         )
 
@@ -273,6 +314,15 @@ class LlmWrenClient:
                 payload["previous_validation_errors"] = errors_feedback
             response = self._call_model("wren_enrichment", payload)
             if response is None or not response.files:
+                # CR8: separate "provider returned nothing usable" (response is None,
+                # already logged in _call_model) from "model returned an empty
+                # proposal" (a no-op the prompt should avoid when structure exists).
+                if response is not None:
+                    logger.info(
+                        "Enrichment model returned an empty files array (no changes); "
+                        "warnings=%s",
+                        list(response.warnings),
+                    )
                 break
             first = response.files[0]
             # F6: patch the enrichment into the file that owns its models, merging
@@ -413,10 +463,17 @@ class LlmWrenClient:
             )
         return proposals
 
-    def _active_files_content(
+    def _effective_files_content(
         self, project: SemanticProject
     ) -> list[tuple[str, dict[str, Any]]]:
-        """Return ``(path, parsed_content)`` for each active MDL file."""
+        """Return ``(path, parsed_content)`` for the **effective** MDL per path (CR1).
+
+        Wren enriches the *modeled* MDL; in this codebase the onboarded structure
+        exists as **drafts** before activation (``onboarding.py`` writes drafts only).
+        So the enrichment base is the effective file per path: the active file if one
+        exists, otherwise the latest draft. Deleted files are excluded. This is what
+        makes ``onboard → enrich`` work without a manual activation in between.
+        """
 
         if self.mdl_file_store is None:
             return []
@@ -424,10 +481,15 @@ class LlmWrenClient:
             files = self.mdl_file_store.list(project.id)
         except Exception:  # pylint: disable=broad-except
             return []
-        out: list[tuple[str, dict[str, Any]]] = []
+        effective: dict[str, Any] = {}
         for file in files:
-            if file.status != "active":
+            if file.status == "deleted":
                 continue
+            current = effective.get(file.path)
+            if current is None or _supersedes(file, current):
+                effective[file.path] = file
+        out: list[tuple[str, dict[str, Any]]] = []
+        for file in effective.values():
             try:
                 payload = json.loads(file.content)
             except (ValueError, TypeError):
@@ -439,17 +501,19 @@ class LlmWrenClient:
     def _patch_target(
         self, project: SemanticProject, overlay: dict[str, Any]
     ) -> tuple[str, str] | None:
-        """Route an enrichment overlay to the active file that owns its models (F6).
+        """Route an enrichment overlay to the effective file that owns its models (F6).
 
         Returns ``(path, merged_json)`` when the overlay's models all belong to a
-        single existing file (or there is exactly one active file), having merged
+        single existing file (or there is exactly one effective file), having merged
         the overlay into that file's full content so its untouched entities are
         preserved. Returns ``None`` when the overlay spans multiple files or there
         is no single clear target — leaving the caller's default-path plus the
         activation-time dedup net in charge, which still guarantees activatability.
+        Operates on the **effective** MDL (active, else latest draft) so an
+        onboarded-but-unactivated project still has a patch target (CR1).
         """
 
-        active = self._active_files_content(project)
+        active = self._effective_files_content(project)
         if not active:
             return None
 
@@ -487,29 +551,20 @@ class LlmWrenClient:
         merged = _merge_manifest_sections(base, overlay)
         return target_path, json.dumps(merged, indent=2)
 
-    def _active_mdl_json(self, project: SemanticProject) -> list[dict[str, Any]]:
-        """Return the active models as native dicts — read-only enrichment context."""
+    def _effective_mdl_json(self, project: SemanticProject) -> list[dict[str, Any]]:
+        """Return the effective models as native dicts — read-only enrichment context.
 
-        if self.mdl_file_store is None:
-            return []
-        try:
-            files = self.mdl_file_store.list(project.id)
-        except Exception:  # pylint: disable=broad-except
-            return []
+        Uses the effective MDL per path (active, else latest draft) so enrichment
+        grounds on the onboarded structure before activation (CR1).
+        """
+
         models: list[dict[str, Any]] = []
-        for file in files:
-            if file.status != "active":
-                continue
-            try:
-                payload = json.loads(file.content)
-            except (ValueError, TypeError):
-                continue
-            if isinstance(payload, dict):
-                models.extend(
-                    model
-                    for model in payload.get("models", [])
-                    if isinstance(model, dict)
-                )
+        for _path, payload in self._effective_files_content(project):
+            models.extend(
+                model
+                for model in payload.get("models", [])
+                if isinstance(model, dict)
+            )
         return models
 
     def _call_model(
@@ -520,6 +575,7 @@ class LlmWrenClient:
         try:
             prompt = get_prompt(prompt_name)
         except OSError:
+            logger.warning("MDL prompt %r could not be loaded.", prompt_name)
             return None
         try:
             result = self.model_client.chat(
@@ -536,13 +592,40 @@ class LlmWrenClient:
                 ],
                 format_schema=proposal_response_schema(),
             )
-        except Exception:  # pylint: disable=broad-except
+        except Exception as ex:  # pylint: disable=broad-except
+            # CR8: distinguish a provider/transport failure from a parse failure so
+            # the fallback's cause is diagnosable rather than uniformly silent.
+            logger.warning("MDL model call (%s) raised: %s", prompt_name, ex)
             return None
         try:
             data = json.loads(result.content)
             return MdlProposalResponse.model_validate(data)
-        except Exception:  # pylint: disable=broad-except
+        except Exception as ex:  # pylint: disable=broad-except
+            # CR8: the provider responded but the body was not schema-valid JSON —
+            # the classic "provider does not honor structured output" case.
+            logger.warning(
+                "MDL model call (%s) returned unparseable/invalid structured output "
+                "(%s); first 200 chars: %r",
+                prompt_name,
+                ex,
+                (getattr(result, "content", "") or "")[:200],
+            )
             return None
+
+
+def _supersedes(candidate: Any, current: Any) -> bool:
+    """Whether ``candidate`` is the more authoritative file for a path (CR1).
+
+    Active beats draft; within the same status the later ``updated_at`` wins. Used to
+    pick the effective MDL per path so enrichment grounds on the onboarded structure
+    (drafts) before activation while still preferring an activated file when present.
+    """
+
+    cand_active = candidate.status == "active"
+    cur_active = current.status == "active"
+    if cand_active != cur_active:
+        return cand_active
+    return candidate.updated_at >= current.updated_at
 
 
 def _load_mdl_json(mdl_path: str | None) -> dict[str, Any]:

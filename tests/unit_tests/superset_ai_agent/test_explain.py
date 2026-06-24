@@ -173,6 +173,92 @@ def test_carriers_backfill_sparse_steps() -> None:
     assert by_kind["execute_sql"].detail.query_id == 99
 
 
+def test_wren_context_surfaces_retrieved_chunks_and_warnings() -> None:
+    long_text = "x" * 400
+    context_items = [
+        {
+            "source": "retriever",
+            "retriever": "embedding",
+            "kind": "column",
+            "name": "patty_count",
+            "model": "grill_moves",
+            "text": "grill_moves.patty_count int — number of patties",
+            "score": 0.87,
+        },
+        # A legacy fetch_context bundle (no per-chunk text) is left to the count.
+        {"source": "fetch_context", "type": "relationships", "items": ["r1"]},
+        # An over-long retriever chunk is truncated for display.
+        {"source": "retriever", "kind": "model", "name": "wide", "text": long_text},
+    ]
+    trace = [
+        _event(
+            "load_wren_context",
+            "Loaded Wren semantic context.",
+            available=True,
+            retrieval_mode="embedding",
+            retrieved_item_count=2,
+            context_items=context_items,
+            warnings=["Semantic project has no active MDL files."],
+        ),
+    ]
+    detail = build_agent_timeline(trace)[0].detail
+
+    assert detail.context_item_count == 3
+    # Only the two retriever chunks become display chunks; the bundle is skipped.
+    assert len(detail.retrieved_chunks) == 2
+    first = detail.retrieved_chunks[0]
+    assert first.name == "patty_count"
+    assert first.model == "grill_moves"
+    assert first.retriever == "embedding"
+    assert first.score == 0.87
+    # The over-long chunk's text is bounded and ellipsized.
+    assert detail.retrieved_chunks[1].text.endswith("…")
+    assert len(detail.retrieved_chunks[1].text) <= 281
+    assert detail.warnings == ["Semantic project has no active MDL files."]
+
+
+def test_wren_context_without_retriever_items_has_no_chunks() -> None:
+    trace = [
+        _event(
+            "load_wren_context",
+            "Wren semantic context is unavailable.",
+            status="warning",
+            available=False,
+            context_items=[],
+            warnings=["Select a database schema before loading Wren context."],
+        ),
+    ]
+    detail = build_agent_timeline(trace)[0].detail
+    assert detail.retrieved_chunks == []
+    assert detail.available is False
+    assert detail.warnings == [
+        "Select a database schema before loading Wren context."
+    ]
+
+
+def test_draft_surfaces_recalled_examples_bounded() -> None:
+    trace = [
+        _event(
+            "draft_sql",
+            "Generated an initial SQL draft.",
+            response_type="sql",
+            model="gpt",
+            recalled_example_count=2,
+            recalled_examples=[
+                {"question": "patties 86'd?", "native_sql": "SELECT 1"},
+                {"question": "long sql", "native_sql": "S" * 400},
+                {"native_sql": "no question — dropped"},
+            ],
+        ),
+    ]
+    detail = build_agent_timeline(trace)[0].detail
+    # The questionless example is dropped; long SQL is truncated for display.
+    assert len(detail.recalled_examples) == 2
+    assert detail.recalled_examples[0].question == "patties 86'd?"
+    assert detail.recalled_examples[1].native_sql.endswith("…")
+    assert len(detail.recalled_examples[1].native_sql) <= 281
+
+
 def test_row_count_parsed_from_summary_when_detail_absent() -> None:
     trace = [_event("execute_sql", "Executed SQL and returned 12,001 row(s).")]
     assert build_agent_timeline(trace)[0].detail.row_count == 12001

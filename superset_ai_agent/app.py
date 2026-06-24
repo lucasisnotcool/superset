@@ -110,6 +110,7 @@ from superset_ai_agent.semantic_layer.jobs import (
 )
 from superset_ai_agent.semantic_layer.mdl_files import (
     InMemoryMdlFileStore,
+    MdlFileExistsError,
     MdlFileNotFoundError,
     MdlFileStore,
     MdlFileValidationError,
@@ -968,6 +969,10 @@ def create_app(  # noqa: C901
                     schema_index=_schema_index_for_project(project, fastapi_request),
                 ),
             )
+        except MdlFileExistsError as ex:
+            # A path conflict is distinct from a malformed request — 409 lets the
+            # client recover (rename/auto-suffix) rather than treating it as a 400.
+            raise HTTPException(status_code=409, detail=str(ex)) from ex
         except ValueError as ex:
             raise HTTPException(status_code=400, detail=str(ex)) from ex
 
@@ -1013,7 +1018,13 @@ def create_app(  # noqa: C901
             return None
         try:
             request_context_provider, _ = build_superset_runtime(fastapi_request)
-            context = request_context_provider.get_context(
+            # CR3: ground modeling/validation on the *complete* scope schema, not a
+            # relevance-ranked top-k against a placeholder question (which can silently
+            # drop the tables a document is about). Fall back to the ranked path only
+            # for providers that do not implement full-schema introspection.
+            fetch_full = getattr(request_context_provider, "get_full_schema", None)
+            fetch = fetch_full or request_context_provider.get_context
+            context = fetch(
                 AgentQueryRequest(
                     question="semantic layer validation",
                     database_id=project.default_database_id,
@@ -1041,6 +1052,28 @@ def create_app(  # noqa: C901
             # Snapshotting is best-effort; never block validation on it.
             pass
         return index
+
+    def _project_has_models(project_id: str, *, owner_id: str) -> bool:
+        """Whether the project has at least one non-deleted MDL model (CR2).
+
+        Enrichment requires onboarded structure to overlay onto (drafts count, since
+        onboarding writes drafts); a project with no models cannot be enriched.
+        """
+
+        try:
+            files = active_mdl_file_store.list(project_id, owner_id=owner_id)
+        except Exception:  # pylint: disable=broad-except
+            return False
+        for file in files:
+            if file.status == "deleted":
+                continue
+            try:
+                payload = json.loads(file.content)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(payload, dict) and payload.get("models"):
+                return True
+        return False
 
     def _enforce_activation(
         *,
@@ -1254,28 +1287,12 @@ def create_app(  # noqa: C901
             base_path=_wren_materialization_base(app_config),
         )
 
-    @api.post(
-        "/agent/semantic-layer/projects/{project_id}/onboard",
-        response_model=SemanticJob,
-        status_code=202,
-    )
-    def onboard_semantic_project(
-        project_id: str,
+    def _onboarding_context(
+        project: SemanticProject,
         fastapi_request: Request,
-        identity: AgentIdentity = identity_dependency,
-    ) -> SemanticJob:
-        """Start async schema onboarding; poll the returned job for the result.
+    ) -> Any:
+        """Fetch the full-scope schema for onboarding (CR3), mapping auth errors."""
 
-        The schema context is fetched synchronously (request-scoped auth); only
-        the slower LLM generation and MDL writes run in the background.
-        """
-
-        project = authorize_semantic_project(
-            fastapi_request,
-            project_id,
-            owner_id=identity.owner_id,
-            permission="write",
-        )
         if project.default_database_id is None:
             raise HTTPException(
                 status_code=400,
@@ -1283,7 +1300,11 @@ def create_app(  # noqa: C901
             )
         request_context_provider, _ = build_superset_runtime(fastapi_request)
         try:
-            context = request_context_provider.get_context(
+            # CR3: onboard the whole scope (full introspection), not a question-ranked
+            # subset — onboarding must seed every table as base structure.
+            fetch_full = getattr(request_context_provider, "get_full_schema", None)
+            fetch = fetch_full or request_context_provider.get_context
+            return fetch(
                 AgentQueryRequest(
                     question="semantic layer onboarding",
                     database_id=project.default_database_id,
@@ -1294,8 +1315,18 @@ def create_app(  # noqa: C901
         except SupersetAuthError as ex:
             raise HTTPException(status_code=ex.status_code, detail=str(ex)) from ex
 
+    def _start_onboarding_job(
+        project: SemanticProject,
+        context: Any,
+        owner_id: str,
+    ) -> SemanticJob:
+        """Create + submit the onboarding job, shared by onboard and reset.
+
+        Onboarding auto-activates valid base models; this also re-indexes retrieval
+        so the freshly active layer is searchable immediately (E6 deploy→reindex).
+        """
+
         job = active_job_store.create(kind="onboarding", project_id=project.id)
-        owner_id = identity.owner_id
         scope = _scope_from_project(project)
         _append_semantic_event(
             store=active_semantic_layer_store,
@@ -1328,6 +1359,14 @@ def create_app(  # noqa: C901
                     project_id=project.id,
                 )
                 return
+            # Auto-activation populated the layer; refresh the retrieval index so the
+            # active models are searchable now (best-effort, degrade-closed).
+            reindex_project_mdl(
+                retriever=active_retriever,
+                project_id=project.id,
+                owner_id=owner_id,
+                mdl_file_store=active_mdl_file_store,
+            )
             active_job_store.complete(job.id, result)
             _append_semantic_event(
                 store=active_semantic_layer_store,
@@ -1335,7 +1374,10 @@ def create_app(  # noqa: C901
                 event_type="onboarding_completed",
                 scope=scope,
                 document_id=None,
-                message=f"Onboarded {result.model_count} draft model(s).",
+                message=(
+                    f"Onboarded {result.model_count} model(s); "
+                    f"{result.activated_count} activated."
+                ),
                 project_id=project.id,
             )
 
@@ -1343,6 +1385,64 @@ def create_app(  # noqa: C901
         # Re-fetch so an inline runner reflects completion immediately while a
         # threaded runner returns the still-running job for the client to poll.
         return active_job_store.get(job.id)
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/onboard",
+        response_model=SemanticJob,
+        status_code=202,
+    )
+    def onboard_semantic_project(
+        project_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> SemanticJob:
+        """Start async schema onboarding; poll the returned job for the result.
+
+        The schema context is fetched synchronously (request-scoped auth); only
+        the slower LLM generation and MDL writes run in the background.
+        """
+
+        project = authorize_semantic_project(
+            fastapi_request,
+            project_id,
+            owner_id=identity.owner_id,
+            permission="write",
+        )
+        context = _onboarding_context(project, fastapi_request)
+        return _start_onboarding_job(project, context, identity.owner_id)
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/reset",
+        response_model=SemanticJob,
+        status_code=202,
+    )
+    def reset_semantic_project(
+        project_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> SemanticJob:
+        """Delete all MDL for a project, then re-onboard from the schema.
+
+        A destructive "start over": every MDL file (base models, enrichment overlays,
+        and hand-edits) is soft-deleted, then onboarding regenerates and auto-activates
+        the base models from the live catalog. Uploaded **documents are kept**, so the
+        operator can re-enrich without re-uploading. Returns the onboarding job to poll.
+        """
+
+        project = authorize_semantic_project(
+            fastapi_request,
+            project_id,
+            owner_id=identity.owner_id,
+            permission="write",
+        )
+        # Fetch the schema before deleting, so an auth/connection failure leaves the
+        # existing MDL intact rather than wiping it with nothing to rebuild from.
+        context = _onboarding_context(project, fastapi_request)
+        for file in active_mdl_file_store.list(
+            project_id, owner_id=identity.owner_id
+        ):
+            active_mdl_file_store.delete(file.id, owner_id=identity.owner_id)
+        return _start_onboarding_job(project, context, identity.owner_id)
 
     @api.get(
         "/agent/semantic-layer/projects/{project_id}/jobs/{job_id}",
@@ -1536,6 +1636,19 @@ def create_app(  # noqa: C901
             ) from ex
         if document.project_id != project_id:
             raise HTTPException(status_code=404, detail="Semantic document not found.")
+        # CR2: enrichment overlays semantics onto *introspected* structure (Wren's
+        # authority model) — the LLM never authors models. A project with no base models
+        # (onboarding never run, or its drafts never reviewed) has nothing to enrich, so
+        # fail closed with actionable copy instead of fabricating a schema-name blob.
+        if not _project_has_models(project.id, owner_id=identity.owner_id):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This semantic project has no base models to enrich. Run "
+                    "onboarding for the schema, then review the generated base "
+                    "models, before enriching a document."
+                ),
+            )
         # E2: ground the proposal on the authoritative physical schema up front so
         # the model avoids inventing columns/tables, and the modeling repair loop
         # can correct physical errors (E3) — then reuse the same index to re-validate.

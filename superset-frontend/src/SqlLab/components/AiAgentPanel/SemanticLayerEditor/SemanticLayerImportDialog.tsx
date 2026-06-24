@@ -42,6 +42,7 @@ type StagedStatus =
   | 'uploading'
   | 'enriching'
   | 'pending'
+  | 'saving'
   | 'draft'
   | 'active'
   | 'error';
@@ -118,15 +119,37 @@ const isMarkdown = (filename: string) => /\.(md|markdown|txt)$/i.test(filename);
 const isJson = (filename: string) => /\.json$/i.test(filename);
 
 const isProcessing = (status: StagedStatus) =>
-  status === 'uploading' || status === 'enriching';
+  status === 'uploading' || status === 'enriching' || status === 'saving';
 
 const STATUS_LABELS: Record<StagedStatus, string> = {
   uploading: t('Uploading…'),
   enriching: t('Enriching…'),
   pending: t('Ready'),
+  saving: t('Saving…'),
   draft: t('Draft'),
   active: t('Active'),
   error: t('Error'),
+};
+
+// Assign a collision-free path for a genuinely new file: if `base` is taken,
+// append the next free numeric suffix (`name_1.json`, `name_2.json`, …) before the
+// extension. Used only for new JSON uploads; re-enrichment keeps its path (updates).
+const uniqueMdlPath = (base: string, taken: Set<string>): string => {
+  if (!taken.has(base)) {
+    return base;
+  }
+  const slash = base.lastIndexOf('/');
+  const dot = base.lastIndexOf('.');
+  const hasExt = dot > slash;
+  const stem = hasExt ? base.slice(0, dot) : base;
+  const ext = hasExt ? base.slice(dot) : '';
+  let suffix = 1;
+  let candidate = `${stem}_${suffix}${ext}`;
+  while (taken.has(candidate)) {
+    suffix += 1;
+    candidate = `${stem}_${suffix}${ext}`;
+  }
+  return candidate;
 };
 
 export interface SemanticLayerImportDialogProps {
@@ -150,10 +173,22 @@ export default function SemanticLayerImportDialog({
   const [error, setError] = useState<string | null>(null);
   const [isBusy, setIsBusy] = useState(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  // Synchronous re-entry guard: a rapid double-click can fire two handlers before
+  // React re-renders the disabled button, so block by id at call time.
+  const savingIdsRef = useRef<Set<string>>(new Set());
+  // path -> fileId for files created in this session, so a repeat save routes to an
+  // update instead of a second create before the refreshed `existingFiles` prop
+  // arrives (the source of the "MDL file already exists" race).
+  const sessionFilesRef = useRef<Map<string, string>>(new Map());
   const theme = useTheme();
 
   const existingByPath = (path: string) =>
     existingFiles.find(file => file.path === path) || null;
+
+  // Resolve the id of an already-persisted file at `path`, consulting both the
+  // server-provided list and files created earlier in this session.
+  const resolveExistingId = (path: string): string | null =>
+    existingByPath(path)?.id ?? sessionFilesRef.current.get(path) ?? null;
 
   const patchItem = (id: string, patch: Partial<StagedItem>) =>
     setItems(current =>
@@ -188,17 +223,26 @@ export default function SemanticLayerImportDialog({
         };
       }),
     ]);
+    // Track paths already claimed (server-side files + items staged in this batch)
+    // so a new JSON upload that collides gets a numeric suffix instead of clobbering
+    // or 409-ing. Re-enrichment is excluded — it intentionally updates its own path.
+    const takenPaths = new Set<string>([
+      ...existingFiles.map(file => file.path),
+      ...items.map(item => item.path),
+    ]);
     try {
       for (const { file, id } of entries) {
         if (isJson(file.name)) {
-          // JSON is treated as a new/updated MDL file directly.
+          // JSON is treated as a new MDL file. Give a genuinely-new file a unique
+          // path so it does not collide with an unrelated existing file.
           // eslint-disable-next-line no-await-in-loop
           const text = await file.text();
-          patchItem(id, {
-            path: `models/${file.name.replace(/\.json$/i, '')}.json`,
-            content: text,
-            status: 'pending',
-          });
+          const path = uniqueMdlPath(
+            `models/${file.name.replace(/\.json$/i, '')}.json`,
+            takenPaths,
+          );
+          takenPaths.add(path);
+          patchItem(id, { path, content: text, status: 'pending' });
         } else if (isMarkdown(file.name)) {
           // Markdown goes through the enrichment pipeline.
           // eslint-disable-next-line no-await-in-loop
@@ -285,20 +329,22 @@ export default function SemanticLayerImportDialog({
 
   const persistItem = async (
     item: StagedItem,
-    activate: boolean,
     { refresh = true }: { refresh?: boolean } = {},
   ): Promise<boolean> => {
     if (!projectId) {
       return false;
     }
-    const existing = existingByPath(item.path);
+    // Block a concurrent submit of the same item (the repeat-press race).
+    if (savingIdsRef.current.has(item.id)) {
+      return false;
+    }
+    savingIdsRef.current.add(item.id);
+    patchItem(item.id, { status: 'saving', error: undefined });
+    const existingId = resolveExistingId(item.path);
     try {
-      let fileId: string;
-      if (existing) {
-        const updated = await updateMdlFile(projectId, existing.id, {
-          content: item.content,
-        });
-        fileId = updated.id;
+      if (existingId) {
+        // Same logical file (re-enrichment / repeat save) -> update in place.
+        await updateMdlFile(projectId, existingId, { content: item.content });
       } else {
         const created = await createMdlFile(projectId, {
           path: item.path,
@@ -306,15 +352,11 @@ export default function SemanticLayerImportDialog({
           source_type:
             item.kind === 'enrichment' ? 'enriched_markdown' : 'uploaded_mdl',
         });
-        fileId = created.id;
+        // Remember it so an immediate re-save updates instead of re-creating,
+        // even before the refreshed `existingFiles` prop arrives.
+        sessionFilesRef.current.set(item.path, created.id);
       }
-      if (activate) {
-        await updateMdlFile(projectId, fileId, { status: 'active' });
-      }
-      patchItem(item.id, {
-        status: activate ? 'active' : 'draft',
-        error: undefined,
-      });
+      patchItem(item.id, { status: 'draft', error: undefined });
       if (refresh) {
         await onApplied();
       }
@@ -323,10 +365,15 @@ export default function SemanticLayerImportDialog({
       const message = ex instanceof Error ? ex.message : t('Save failed');
       patchItem(item.id, { status: 'error', error: message });
       return false;
+    } finally {
+      savingIdsRef.current.delete(item.id);
     }
   };
 
-  const persistAll = async (activate: boolean) => {
+  const persistAll = async () => {
+    if (isBusy) {
+      return;
+    }
     setIsBusy(true);
     let allSucceeded = true;
     try {
@@ -338,7 +385,7 @@ export default function SemanticLayerImportDialog({
         // per file re-resolves the project (a backend database lookup) once per
         // file, which is the source of the GET /api/v1/database burst.
         // eslint-disable-next-line no-await-in-loop
-        const ok = await persistItem(item, activate, { refresh: false });
+        const ok = await persistItem(item, { refresh: false });
         allSucceeded = allSucceeded && ok;
       }
       // Single refresh so the main MDL browser reflects every new/updated file.
@@ -355,6 +402,8 @@ export default function SemanticLayerImportDialog({
   const close = () => {
     setItems([]);
     setError(null);
+    savingIdsRef.current.clear();
+    sessionFilesRef.current.clear();
     onHide();
   };
 
@@ -365,24 +414,19 @@ export default function SemanticLayerImportDialog({
       title={t('Add to semantic layer')}
       width="80vw"
       maxWidth="1100px"
-      footer={
-        <Flex justify="flex-end" gap="small">
-          <Button
-            buttonStyle="tertiary"
-            disabled={!canWrite || isBusy || items.length === 0}
-            onClick={() => persistAll(false)}
-          >
-            {t('Save all as draft')}
-          </Button>
-          <Button
-            buttonStyle="primary"
-            disabled={!canWrite || isBusy || items.length === 0}
-            onClick={() => persistAll(true)}
-          >
-            {t('Activate all')}
-          </Button>
-        </Flex>
-      }
+      footer={[
+        // An array footer (not a function-component element) so the Modal does not
+        // inject a `closeModal` prop that antd would forward onto a DOM node.
+        <Button
+          key="save-all"
+          buttonStyle="primary"
+          loading={isBusy}
+          disabled={!canWrite || isBusy || items.length === 0}
+          onClick={() => persistAll()}
+        >
+          {t('Save all')}
+        </Button>,
+      ]}
     >
       {error && <Alert type="error" message={error} />}
       <DropZone
@@ -460,20 +504,18 @@ export default function SemanticLayerImportDialog({
             )}
             <Flex gap="small" justify="flex-end">
               <Button
-                buttonStyle="tertiary"
-                buttonSize="small"
-                disabled={!canWrite || isBusy || !item.content}
-                onClick={() => persistItem(item, false)}
-              >
-                {t('Save draft')}
-              </Button>
-              <Button
                 buttonStyle="primary"
                 buttonSize="small"
-                disabled={!canWrite || isBusy || !item.content}
-                onClick={() => persistItem(item, true)}
+                loading={item.status === 'saving'}
+                disabled={
+                  !canWrite ||
+                  isBusy ||
+                  !item.content ||
+                  isProcessing(item.status)
+                }
+                onClick={() => persistItem(item)}
               >
-                {t('Activate')}
+                {t('Save')}
               </Button>
             </Flex>
           </StagedItemRoot>

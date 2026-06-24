@@ -1,0 +1,376 @@
+[
+  {
+    "id": "Q1",
+    "level": "L1",
+    "question": "How many patties got 86'd on 2025-10-30?",
+    "status": "ok",
+    "sql": "SELECT SUM(units_scrapped) AS patties_86d\nFROM seagate.seagate_production_events\nWHERE event_date::date = '2025-10-30'\nLIMIT 1000",
+    "answer_summary": "The result includes 1 row(s) with total patties 86d of 6.",
+    "result_rows": [
+      {
+        "patties_86d": 6
+      }
+    ],
+    "result_value": 6,
+    "row_count": 1,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": false,
+      "matched_models": [],
+      "retrieved_item_count": 0,
+      "warnings": [
+        "No materialized MDL is available for this scope."
+      ]
+    },
+    "error": null
+  },
+  {
+    "id": "Q2",
+    "level": "L1",
+    "question": "How many tickets are currently short order and not yet closed?",
+    "status": "ok",
+    "sql": "SELECT COUNT(*) AS short_order_not_closed_count\nFROM seagate.seagate_work_orders\nWHERE ticket_type = 'short order'\n  AND closed_at IS NULL\nLIMIT 1000",
+    "answer_summary": "The result includes 1 row(s) with total short order not closed count of 0.",
+    "result_rows": [
+      {
+        "short_order_not_closed_count": 0
+      }
+    ],
+    "result_value": 0,
+    "row_count": 1,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": false,
+      "matched_models": [],
+      "retrieved_item_count": 0,
+      "warnings": [
+        "No materialized MDL is available for this scope."
+      ]
+    },
+    "error": null
+  },
+  {
+    "id": "Q3",
+    "level": "L1",
+    "question": "How many patties are currently on the griddle, company-wide?",
+    "status": "ok",
+    "sql": "SELECT NULL AS patties_on_griddle LIMIT 0",
+    "answer_summary": "The query returned 1 row(s).",
+    "result_rows": [
+      {
+        "patties_on_griddle": null
+      }
+    ],
+    "result_value": null,
+    "row_count": 1,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": false,
+      "matched_models": [],
+      "retrieved_item_count": 0,
+      "warnings": [
+        "No materialized MDL is available for this scope."
+      ]
+    },
+    "error": null
+  },
+  {
+    "id": "Q4",
+    "level": "L1",
+    "question": "How many heat lamp tests have a garnish problem logged?",
+    "status": "ok",
+    "sql": "SELECT COUNT(*) AS heat_lamp_garnish_problem_count\nFROM seagate.seagate_quality_tests\nWHERE test_type = 'heat lamp' AND garnish_defect = TRUE\nLIMIT 1000",
+    "answer_summary": "The result includes 1 row(s) with total heat lamp garnish problem count of 0.",
+    "result_rows": [
+      {
+        "heat_lamp_garnish_problem_count": 0
+      }
+    ],
+    "result_value": 0,
+    "row_count": 1,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": false,
+      "matched_models": [],
+      "retrieved_item_count": 0,
+      "warnings": [
+        "No materialized MDL is available for this scope."
+      ]
+    },
+    "error": null
+  },
+  {
+    "id": "Q5",
+    "level": "L2",
+    "question": "Which sites currently have a line that's WARM?",
+    "status": "ok",
+    "sql": "SELECT seagate_sites.site_name\nFROM seagate.seagate_production_lines\nJOIN seagate.seagate_sites ON seagate_production_lines.site_id = seagate_sites.site_id\nWHERE seagate_production_lines.status = 'WARM'\nLIMIT 100",
+    "answer_summary": "The query returned 3 row(s).",
+    "result_rows": [
+      {
+        "site_name": "Shugart Yard"
+      },
+      {
+        "site_name": "Scotts Valley West"
+      },
+      {
+        "site_name": "Reef Hollow"
+      }
+    ],
+    "result_value": null,
+    "row_count": 3,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": false,
+      "matched_models": [],
+      "retrieved_item_count": 0,
+      "warnings": [
+        "No materialized MDL is available for this scope."
+      ]
+    },
+    "error": null
+  },
+  {
+    "id": "Q6",
+    "level": "L2",
+    "question": "How many patties has the Tigerline region plated in total?",
+    "status": "ok",
+    "sql": "SELECT SUM(qty_units) AS total_patties\nFROM seagate.seagate_shipments\nWHERE destination_region = 'Tigerline'\nLIMIT 1000",
+    "answer_summary": "The query returned 1 row(s).",
+    "result_rows": [
+      {
+        "total_patties": null
+      }
+    ],
+    "result_value": null,
+    "row_count": 1,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": false,
+      "matched_models": [],
+      "retrieved_item_count": 0,
+      "warnings": [
+        "No materialized MDL is available for this scope."
+      ]
+    },
+    "error": null
+  },
+  {
+    "id": "Q7",
+    "level": "L2",
+    "question": "How many To-Go units has the Reef region shipped, in total?",
+    "status": "ok",
+    "sql": "SELECT SUM(qty_units) AS total_to_go_units_shipped\nFROM seagate.seagate_shipments\nWHERE destination_region = 'Reef'\n  AND fulfillment_type = 'To-Go'\nLIMIT 1000",
+    "answer_summary": "The query returned 1 row(s).",
+    "result_rows": [
+      {
+        "total_to_go_units_shipped": null
+      }
+    ],
+    "result_value": null,
+    "row_count": 1,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": false,
+      "matched_models": [],
+      "retrieved_item_count": 0,
+      "warnings": [
+        "No materialized MDL is available for this scope."
+      ]
+    },
+    "error": null
+  },
+  {
+    "id": "Q8",
+    "level": "L2",
+    "question": "How many patties were plated between 2025-12-25 and 2025-12-31, broken down by drive family?",
+    "status": "ok",
+    "sql": "SELECT pl.drive_family AS drive_family, SUM(pe.units_completed) AS total_patties_placed\nFROM seagate.seagate_production_events pe\nJOIN seagate.seagate_work_orders wo ON pe.work_order_id = wo.work_order_id\nJOIN seagate.seagate_production_lines pl ON wo.line_id = pl.line_id\nWHERE pe.event_date >= '2025-12-25' AND pe.event_date <= '2025-12-31'\nGROUP BY pl.drive_family\nLIMIT 100",
+    "answer_summary": "Cobalt has the highest total patties placed in the result.",
+    "result_rows": [
+      {
+        "drive_family": "Cobalt",
+        "total_patties_placed": 193
+      },
+      {
+        "drive_family": "Nimbus",
+        "total_patties_placed": 40
+      },
+      {
+        "drive_family": "Vantage",
+        "total_patties_placed": 106
+      }
+    ],
+    "result_value": null,
+    "row_count": 3,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": false,
+      "matched_models": [],
+      "retrieved_item_count": 0,
+      "warnings": [
+        "No materialized MDL is available for this scope."
+      ]
+    },
+    "error": null
+  },
+  {
+    "id": "Q9",
+    "level": "L3",
+    "question": "What was the Golden Yield for the Cobalt drive family in December 2025?",
+    "status": "ok",
+    "sql": "SELECT\n  COALESCE(\n    SUM(se.units_completed) / NULLIF(SUM(se.units_completed + se.units_reworked + se.units_scrapped), 0),\n    0\n  ) AS golden_yield\nFROM seagate.seagate_production_events AS se\nJOIN seagate.seagate_work_orders AS wo ON se.work_order_id = wo.work_order_id\nJOIN seagate.seagate_drive_skus AS skus ON wo.sku_id = skus.sku_id\nWHERE skus.drive_family = 'Cobalt'\n  AND DATE_TRUNC('month', se.event_date) = DATE '2025-12-01'\nLIMIT 1",
+    "answer_summary": "The result includes 1 row(s) with total golden yield of 0.96.",
+    "result_rows": [
+      {
+        "golden_yield": 0.9624145785876993
+      }
+    ],
+    "result_value": 0.9624145785876993,
+    "row_count": 1,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": false,
+      "matched_models": [],
+      "retrieved_item_count": 0,
+      "warnings": [
+        "No materialized MDL is available for this scope."
+      ]
+    },
+    "error": null
+  },
+  {
+    "id": "Q10",
+    "level": "L3",
+    "question": "What is the True Pass Rate for Plate Spin tests at Tigerline Point?",
+    "status": "error",
+    "sql": "SELECT\n  COUNT(CASE WHEN result = 'Pass' THEN 1 END)::FLOAT / COUNT(*) AS true_pass_rate\nFROM\n  seagate.seagate_quality_tests qt\nJOIN\n  seagate.seagate_work_orders wo ON qt.work_order_id = wo.work_order_id\nJOIN\n  seagate.seagate_production_lines pl ON wo.line_id = pl.line_id\nWHERE\n  qt.test_type = 'Plate Spin'\n  AND pl.line_code = 'Tigerline Point'\nLIMIT 1000",
+    "answer_summary": null,
+    "result_rows": [],
+    "result_value": null,
+    "row_count": null,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": false,
+      "matched_models": [],
+      "retrieved_item_count": 0,
+      "warnings": [
+        "No materialized MDL is available for this scope."
+      ]
+    },
+    "error": null
+  },
+  {
+    "id": "Q11",
+    "level": "L3",
+    "question": "How many patties were plated during the Moonlight shift in the Diner Week of 2025-12-17 to 2025-12-23?",
+    "status": "ok",
+    "sql": "SELECT SUM(units_completed) AS patties_plated\nFROM seagate.seagate_production_events\nWHERE shift_code = 'Moonlight'\n  AND event_date >= '2025-12-17'::date\n  AND event_date < '2025-12-24'::date\nLIMIT 1000",
+    "answer_summary": "The query returned 1 row(s).",
+    "result_rows": [
+      {
+        "patties_plated": null
+      }
+    ],
+    "result_value": null,
+    "row_count": 1,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": false,
+      "matched_models": [],
+      "retrieved_item_count": 0,
+      "warnings": [
+        "No materialized MDL is available for this scope."
+      ]
+    },
+    "error": null
+  },
+  {
+    "id": "Q12",
+    "level": "L3",
+    "question": "What is the Golden Yield for Short Order tickets at Scotts Valley West?",
+    "status": "ok",
+    "sql": "SELECT\n  (SUM(COALESCE(se_production_events.units_completed, 0))::FLOAT / NULLIF(SUM(COALESCE(se_production_events.units_completed, 0) + COALESCE(se_production_events.units_reworked, 0) + COALESCE(se_production_events.units_scrapped, 0)), 0)) AS golden_yield\nFROM\n  seagate.seagate_work_orders wo\n  JOIN seagate.seagate_production_lines pl ON wo.line_id = pl.line_id\n  JOIN seagate.seagate_sites s ON pl.site_id = s.site_id\n  LEFT JOIN seagate.seagate_production_events se_production_events ON wo.work_order_id = se_production_events.work_order_id\nWHERE\n  wo.ticket_type = 'Short Order'\n  AND s.site_name = 'Scotts Valley West'\nLIMIT 1000",
+    "answer_summary": "The query returned 1 row(s).",
+    "result_rows": [
+      {
+        "golden_yield": null
+      }
+    ],
+    "result_value": null,
+    "row_count": 1,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": false,
+      "matched_models": [],
+      "retrieved_item_count": 0,
+      "warnings": [
+        "No materialized MDL is available for this scope."
+      ]
+    },
+    "error": null
+  },
+  {
+    "id": "Q13",
+    "level": "L4",
+    "question": "For Q4 2025 (2025-10-01 to 2025-12-31), compare the Tigerline and Reef regions on both Golden Yield and on units shipped via Combo pallets through Dine-In fulfillment.",
+    "status": "error",
+    "sql": "SELECT\n  ship.destination_region,\n  SUM(CASE WHEN ship.pallet_type = 'Combo' THEN ship.qty_units ELSE 0 END) AS units_shipped_via_combo_pallets,\n  AVG(COALESCE(CAST(prod.units_completed AS FLOAT) / NULLIF(prod.target_qty, 0), 0)) AS golden_yield\nFROM\n  seagate.seagate_shipments AS ship\nJOIN\n  seagate.seagate_work_orders AS prod ON ship.work_order_id = prod.work_order_id\nWHERE\n  ship.ship_date >= DATE '2025-10-01' AND ship.ship_date <= DATE '2025-12-31'\n  AND ship.destination_region IN ('Tigerline', 'Reef')\n  AND ship.fulfillment_type = 'Dine-In'\nGROUP BY\n  ship.destination_region\nLIMIT 100",
+    "answer_summary": null,
+    "result_rows": [],
+    "result_value": null,
+    "row_count": null,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": false,
+      "matched_models": [],
+      "retrieved_item_count": 0,
+      "warnings": [
+        "No materialized MDL is available for this scope."
+      ]
+    },
+    "error": null
+  },
+  {
+    "id": "Q14",
+    "level": "L4",
+    "question": "Which region had the higher True Pass Rate on Heat Lamp tests in Q4 2025, excluding Short Order tickets \u2014 Tigerline or Reef?",
+    "status": "ok",
+    "sql": "SELECT s.destination_region AS region,\n       SUM(CASE WHEN q.result = 'True Pass' THEN 1 ELSE 0 END)::FLOAT / COUNT(*) AS true_pass_rate\nFROM seagate.seagate_quality_tests q\nJOIN seagate.seagate_work_orders w ON q.work_order_id = w.work_order_id\nJOIN seagate.seagate_shipments s ON q.work_order_id = s.work_order_id\nWHERE q.test_type = 'Heat Lamp'\n  AND w.ticket_type <> 'Short Order'\n  AND q.tested_at >= DATE '2025-10-01'\n  AND q.tested_at < DATE '2026-01-01'\n  AND s.destination_region IN ('Tigerline', 'Reef')\nGROUP BY s.destination_region\nORDER BY true_pass_rate DESC\nLIMIT 2",
+    "answer_summary": "No rows were returned for this query.",
+    "result_rows": [],
+    "result_value": null,
+    "row_count": 0,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": false,
+      "matched_models": [],
+      "retrieved_item_count": 0,
+      "warnings": [
+        "No materialized MDL is available for this scope."
+      ]
+    },
+    "error": null
+  },
+  {
+    "id": "Q15",
+    "level": "L4",
+    "question": "For Nimbus-family shipments that went Dine-In in the last 60 days (2025-11-02 to 2025-12-31), what share of shipped units rode on Combo pallets, by region?",
+    "status": "ok",
+    "sql": "SELECT\n  s.destination_region,\n  SUM(CASE WHEN s.pallet_type = 'Combo' THEN s.qty_units ELSE 0 END)::FLOAT / NULLIF(SUM(s.qty_units), 0) AS share_combo_pallet_units\nFROM seagate.seagate_shipments s\nJOIN seagate.seagate_work_orders wo ON s.work_order_id = wo.work_order_id\nJOIN seagate.seagate_drive_skus sku ON wo.sku_id = sku.sku_id\nWHERE sku.drive_family = 'Nimbus'\n  AND s.fulfillment_type = 'Dine-In'\n  AND s.ship_date >= '2025-11-02'::TIMESTAMP\n  AND s.ship_date <= '2025-12-31'::TIMESTAMP\nGROUP BY s.destination_region\nLIMIT 100",
+    "answer_summary": "No rows were returned for this query.",
+    "result_rows": [],
+    "result_value": null,
+    "row_count": 0,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": false,
+      "matched_models": [],
+      "retrieved_item_count": 0,
+      "warnings": [
+        "No materialized MDL is available for this scope."
+      ]
+    },
+    "error": null
+  }
+]

@@ -238,6 +238,24 @@ class IntentDetail(BaseModel):
     reason: str | None = None
 
 
+class RetrievedChunk(BaseModel):
+    """One MDL schema chunk the Retriever seam ranked into the prompt.
+
+    Mirrors the ``context_items`` dict the retriever emits (schema_retriever.py),
+    surfaced in the explain timeline so users see *what* grounded the answer, not
+    just how many chunks were retrieved.
+    """
+
+    kind: str | None = None
+    name: str | None = None
+    model: str | None = None
+    text: str
+    retriever: str | None = None
+    #: Relevance score from the ranker (cosine for embedding, normalized token
+    #: overlap for keyword). ``None`` on the cold ANN path where it is unavailable.
+    score: float | None = None
+
+
 class LoadWrenContextDetail(BaseModel):
     """Semantic/MDL retrieval (``load_wren_context``)."""
 
@@ -250,6 +268,22 @@ class LoadWrenContextDetail(BaseModel):
     retrieved_item_count: int = 0
     context_item_count: int = 0
     recalled_example_count: int = 0
+    #: The ranked MDL chunks contributed by the retriever this turn (A1). Bounded
+    #: by ``retrieved_item_count``; ``text`` is truncated for display.
+    retrieved_chunks: list[RetrievedChunk] = Field(default_factory=list)
+    #: Why context is unavailable / degraded, surfaced verbatim (B6/B8).
+    warnings: list[str] = Field(default_factory=list)
+
+
+class RecalledExample(BaseModel):
+    """A confirmed NL->SQL example the memory seam recalled into the prompt (B1).
+
+    Surfaced in the explain timeline so users see *which* learned examples
+    grounded the draft, not just how many. ``native_sql`` is truncated for display.
+    """
+
+    question: str
+    native_sql: str | None = None
 
 
 class DraftDetail(BaseModel):
@@ -259,6 +293,9 @@ class DraftDetail(BaseModel):
     response_type: str | None = None
     model: str | None = None
     recalled_example_count: int = 0
+    #: The recalled examples that grounded this draft (B1); bounded by
+    #: ``recalled_example_count``.
+    recalled_examples: list[RecalledExample] = Field(default_factory=list)
 
 
 class DryPlanDetail(BaseModel):

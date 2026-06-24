@@ -328,6 +328,17 @@ def _active_file(path: str, models: list[dict[str, Any]]) -> MdlFile:
     )
 
 
+def _draft_file(path: str, models: list[dict[str, Any]]) -> MdlFile:
+    return MdlFile(
+        project_id="project-1",
+        path=path,
+        filename=path.split("/")[-1],
+        content=json.dumps({"models": models}),
+        checksum="c",
+        status="draft",
+    )
+
+
 def _model(name: str, **extra: Any) -> dict[str, Any]:
     model = {
         "name": name,
@@ -1092,3 +1103,72 @@ def test_enrichment_omits_instructions_when_none() -> None:
     client.propose_mdl_from_document(project=_project(), document=_document())
 
     assert "instructions" not in _payload_sent(model.calls[0])
+
+
+def test_enrichment_grounds_on_draft_base_before_activation() -> None:
+    # CR1: onboarding writes drafts; enrichment must overlay onto the draft base
+    # without a manual activation in between. The draft 'deals' is the patch target.
+    store = _FakeFileStore([_draft_file("models/deals.json", [_model("deals")])])
+    client = LlmWrenClient(
+        _config(),
+        FakeModelClient(_enrich_payload([_model("deals", description="enriched")])),
+        mdl_file_store=store,
+    )
+
+    proposal = client.propose_mdl_from_document(
+        project=_project(), document=_document()
+    )
+
+    assert proposal.proposed_path == "models/deals.json"
+    merged = json.loads(proposal.proposed_content)
+    assert merged["models"][0]["description"] == "enriched"
+
+
+def test_enrichment_prefers_active_over_draft_for_same_path() -> None:
+    # CR1: when both an active and a draft exist for a path, the active wins as base.
+    store = _FakeFileStore(
+        [
+            _draft_file("models/deals.json", [_model("deals", description="stale")]),
+            _active_file("models/deals.json", [_model("deals", description="live")]),
+        ]
+    )
+    client = LlmWrenClient(_config(), FakeModelClient(json.dumps({"files": []})),
+                           mdl_file_store=store)
+
+    proposal = client.propose_mdl_from_document(
+        project=_project(), document=_document()
+    )
+
+    # No-op proposal echoes the *active* base, not the stale draft.
+    assert json.loads(proposal.proposed_content)["models"][0]["description"] == "live"
+
+
+def test_no_change_proposal_when_provider_empty_and_base_exists() -> None:
+    # CR2: with a real base, an empty provider response must NOT fabricate a
+    # schema-named blob; it echoes the base unchanged with a loud warning.
+    store = _FakeFileStore([_draft_file("models/deals.json", [_model("deals")])])
+    client = LlmWrenClient(
+        _config(), FakeModelClient(json.dumps({"files": []})), mdl_file_store=store
+    )
+
+    proposal = client.propose_mdl_from_document(
+        project=_project(), document=_document()
+    )
+
+    parsed = json.loads(proposal.proposed_content)
+    names = [m["name"] for m in parsed["models"]]
+    assert names == ["deals"]  # echoed base — not a "sales" schema-name blob
+    assert "sales" not in names
+    assert any("no enrichment changes" in w.lower() for w in proposal.warnings)
+
+
+def test_bare_project_still_degrades_to_deterministic_draft() -> None:
+    # CR2: with no base and no physical schema there is nothing to anchor to, so the
+    # honest structure-only degrade (with the provider-fallback warning) still applies.
+    client = LlmWrenClient(_config(), FakeModelClient("not json at all"))
+
+    proposal = client.propose_mdl_from_document(
+        project=_project(), document=_document()
+    )
+
+    assert any("structured" in w.lower() for w in proposal.warnings)

@@ -314,6 +314,7 @@ the seed path.)
 | D14 | **Decoration-field node/edge model (S-C), default-absent** | Lets validation/status/provenance/etc. ride the same node objects, rendered only when populated — zero cost until a feature lands. | A bespoke render path per overlay — duplicated layout/hit-testing. |
 | D3 | **Hard node/edge caps + LRU windowing** | Force layout degrades super-linearly; caps are the FPS guarantee. | Unbounded canvas — unusable past a few hundred nodes. |
 | D4 | **Table-level LOD by default; columns in a side panel** | Columns-as-nodes is the dominant blow-up; tables+model edges stay legible at scale. | Columns-as-nodes globally (the concept's literal form) — collapses on big schemas. |
+| D15 | **Build tooltip/label content in a pure layer; ECharts only reads a prebuilt `tooltip` string + a `{b}` label** | Keeps node/edge detail rendering unit-testable without ECharts (mirrors the echartsOptions split) and puts the only formatter function in the single ECharts boundary (`echartsRender.ts`). | Inline ECharts `formatter` closures over domain objects — untestable, drags ECharts types into the pure layer. |
 | D5 | **Incremental reverse-FK index, no global crawl** | A global FK scan = N metadata calls up front; defeats laziness. | Pre-crawl all FKs — exactly the cost we avoid. |
 | D6 | **On-demand cache + concurrency cap + abort** | Bounds API fan-out and keeps the UI responsive while exploring. | Fire-and-forget per node — request storms on hubs. |
 | D7 | **Compute the semantic graph fully client-side; hydrate physical lazily** | MDL is small & already in memory; only physical detail is costly. | Treat both layers as remote — needless calls for data we hold. |
@@ -326,6 +327,149 @@ the seed path.)
 ## 6. Phased plan (dependency-ordered)
 
 Each item: **goal · files · depends-on · acceptance**. Frontend-only through G3.
+
+> **Increment 1 landed (2026-06-24).** Conflict-free foundation: lazy **Graph tab**
+> (G0.1), **seams** S-A `ids.ts` / S-C decoration model `types.ts` (G0.3), pure
+> data-layer helpers `graphData.ts` (G0.2), MDL overlay (G2.1) + `echartsOptions.ts`
+> + ECharts boundary `echartsRender.ts` (D1), `SchemaGraph.tsx` rendering the MDL
+> semantic graph.
+>
+> **Increment 2 landed (2026-06-24).** The full client-side viewer, re-anchored
+> after explain-and-audit was staged:
+> - **G1 physical layer** — `useSchemaGraphData.ts` over the existing RTK
+>   `tables.ts` resource (universe + D11 seed + bounded-concurrency hydrate +
+>   `buildPhysicalGraph`); search-to-load a table.
+> - **G2.2 combined view** — `composeCombined` (MDL relationships drawn onto
+>   physical tables) + coverage (modeled/unmodeled); **X3 validation overlay**
+>   `validationOverlay.ts` (best-effort entity match) wired from `MdlFile.validation`.
+> - **G2.3 caps** — `capGraph` applied to every layer (closes the unbounded-render
+>   risk); node/edge counts + "hidden (capped)" surfaced.
+> - **Layer toggle** Combined / Database / Semantic; richer semantic nodes
+>   (calculated-field flag, metric counts).
+> - Tests: **46** `SchemaGraph/*` (7 suites; incl. an RTK hook test via
+>   `renderHook`+`fetchMock`+store); full AiAgentPanel **99 passed**; `npm run type`
+>   clean. Touched only `SemanticLayerEditor/index.tsx` + `SchemaGraph/**` — **zero**
+>   edits to explain-staged files.
+>
+> **Fixes from first app run (2026-06-24).** Reported: canvas oversized/overflowing
+> (744×1411) and only 4 of 7 tables visible. Root cause: the ECharts container was
+> not bounded to the visible panel and never resized after the lazy/tab pane reached
+> its real size, so the canvas grew to content height and force-layout nodes were
+> clipped off-screen. Fixes: bounded container (`position:relative` wrap +
+> `position:absolute; inset:0` canvas + `overflow:hidden`), a `ResizeObserver` +
+> deferred `requestAnimationFrame` resize, single-instance chart reused across
+> model updates (no re-init per hydrate), and tighter force params
+> (gravity 0.08→0.15) so small graphs stay centred/visible. Added a "loaded X of Y
+> tables" counter so any tables dropped by degrade-closed introspection are visible
+> rather than looking like a render bug. **Note:** still not browser-re-verified by
+> this agent — see risk #1.
+>
+> **Fix — missing tables were `table_metadata` 500s (2026-06-24).** The reported
+> "4 of 7 tables" was a backend cause, not layout: `GET …/table_metadata/` returns
+> **500** for some tables (e.g. `seagate_production_events`), and the hook's
+> degrade-closed `catch` silently dropped them. Fix: `buildPhysicalGraph` now
+> renders a node for **every** selected table (seed/searched) regardless of
+> metadata success — metadata enriches a node when it loads; a failed table is
+> kept and **marked** (warning border via S-C decoration) and listed in a
+> "metadata could not be loaded for: …" alert; search re-tries a failed table.
+> So the graph shows all tables and names the ones whose introspection failed,
+> rather than hiding them. Tests: `graphData`/`useSchemaGraphData`/`SchemaGraph`
+> cover the failed-node path (50 `SchemaGraph/*`; 103 AiAgentPanel; type-clean).
+> **Root cause CONFIRMED + fixed at source (2026-06-24, 2nd pass).** The 500
+> reproduced again in the browser under the graph view's concurrent seed-hydrate.
+> The live traceback (captured from `superset-superset-1`) is
+> `RuntimeError: deque mutated during iteration` at
+> `sqlalchemy/event/attr.py` `for fn in self.listeners`, reached via
+> `databases/utils.py` `get_table_comment` → `models/core.py` `get_inspector` →
+> `engine.connect()`. Root cause: engines are **process-cached and shared across
+> request threads** ([`models/core.py`](../superset/models/core.py) `_ENGINE_CACHE`),
+> and `get_sqla_engine` **mutated that shared engine's `connect` listener deque
+> per call** (`event.listen`/`event.remove` of `run_prequeries`, for PostgreSQL
+> `SET search_path`). A concurrent `engine.connect()` iterating that deque while
+> another thread add/removed a listener → the race. The graph view's
+> `MAX_INFLIGHT` concurrent `table_metadata` calls made it routine (logs show the
+> same tables returning 200 and 500 within the same second — the race signature).
+> **Fix (root):** a single `connect` listener (`_run_contextual_prequeries`)
+> attached **once per engine at creation** (while still thread-local), reading the
+> per-request prequeries from a `ContextVar` (`_ENGINE_PREQUERIES`) instead of
+> mutating the shared engine's listeners. Per-engine (not class-wide) so one DB's
+> prequeries never run on another's connection; ContextVar-scoped so concurrent
+> requests with different schemas don't collide. **Fix (interim/defense):**
+> `get_table_comment` is now `_best_effort` (the exact unguarded line in the
+> traceback), and the graph `MAX_INFLIGHT` lowered 5→3. Tests: `models/core_test.py`
+> rewritten for the new design (attach-once, ContextVar publish, listener exec /
+> noop / cursor-close-on-error, raw-connection exactly-once) + `utils_test.py`
+> table-comment degrade; mypy + ruff clean. (Live concurrent re-verification in
+> the container was out of authorization scope — confirm via browser hard-refresh.)
+>
+> **Prior note (superseded): root cause unconfirmed — CORRECTION (2026-06-24).**
+> An earlier note here claimed the cause was a missing `seagate` schema on SQLite.
+> **That was wrong** — it came from a local CLI hitting a *different* metadata DB
+> (local SQLite `~/.superset/superset.db`) than the running server. Verified in the
+> actual environment (`docker exec superset-superset-1`): the live server uses a
+> **Postgres** metadata DB; **DB id 1 = `examples`, backend `postgresql`, and
+> `seagate` IS a real schema**. With current code, `get_table_metadata` and every
+> introspection step **succeed** for all 5 reported tables (5–8 columns each), and
+> the live endpoint returns **200** (or 404 via the security path under a JWT test
+> harness) — **the 500 no longer reproduces**. The container restarted at the time
+> the fix landed and no original 500 traceback survives in the logs, so the exact
+> original cause is **unconfirmed** (most likely transient — dev-server hot-reload
+> mid-request, or a transient connection/transaction state — since introspection is
+> now clean). The two-tier backend change below is therefore a **valid robustness
+> improvement and safety net**, but is **not proven** to be what resolved the 500.
+> - **Tier 1** `superset/databases/api.py`: added `@handle_api_exception` to the
+>   `table_metadata` route → an essential-introspection failure now returns a
+>   structured **422** (SQLAlchemy DBAPI errors ⊂ `DatabaseError` → 422) with the
+>   real message, instead of an opaque 500. (If this recurs, the browser/graph will
+>   now show *why*.)
+> - **Tier 2** `superset/databases/utils.py`: `get_table_metadata` runs the
+>   **auxiliary** sections (primary key, foreign keys, indexes, `SELECT *`) as
+>   best-effort via `_best_effort(...)` — a single failing one degrades to empty +
+>   a `warnings` entry rather than failing the whole request; **column reflection
+>   stays essential** (propagates → 422). `warnings: list[str]` added to
+>   `TableMetadataResponse` (+ marshmallow schema).
+> - Tests: `tests/unit_tests/databases/utils_test.py` (+5) and `api_test.py` (+2:
+>   422-on-essential-failure, 200+warnings); `124 passed`; ruff + utils.py mypy clean.
+> - **Open item:** re-confirm in the browser (hard refresh) that the seagate tables
+>   now load with columns; if any still fail, the new structured error/warnings will
+>   reveal the real cause to capture. The 404-for-some-tables seen under the JWT test
+>   harness is likely an auth-context artifact, not the browser's behavior.
+>
+> **Finding — readability gap from app run (2026-06-24).** The viewer is
+> performant and conflict-free but **under-informative** (feature-owner feedback):
+> 1. **Node labels are not shown.** ECharts `graph` series renders **no** node
+>    label unless `label.show:true` is set; `echartsOptions.ts` omits it, so nodes
+>    are unlabeled bubbles — the user cannot tell what each object is. Table/model
+>    names must be **always visible** (at minimum).
+> 2. **Node hover shows the table name twice.** `tooltip:{trigger:'item'}` has **no
+>    formatter**, so ECharts uses its default `name / value` rendering, and we set
+>    *both* `name` and `value` to the table name (`echartsOptions.ts:105-112`).
+>    Expected on hover: **column names + types** (and PK/FK badges, kind, modeled
+>    status, metric/calc-field counts).
+> 3. **Edge hover is uninformative.** Links carry only a hidden `label.formatter`
+>    and no tooltip; the user cannot see **which column joins to which**, nor what
+>    the edge was derived from. Expected: FK `column_names → referred_columns`;
+>    for MDL relationships the relationship **name, joinType/cardinality, and
+>    `condition`** (the actual semantic-modelling source of the edge).
+> **Root-cause is purely presentational + a model-carry gap, no backend blocker:**
+> the data already exists in hand — columns in `useSchemaGraphData.metaByTable`
+> (`PhysicalTableMetadata.columns` = `{name,type,keys}`), FK `column_names`/
+> `referred_columns` at `buildPhysicalGraph` time, and relationship
+> `condition`/`joinType`/`name` at `buildSemanticGraph`/`composeCombined` time.
+> The domain model just **drops** these today (`GraphNode` keeps only
+> `columnCount`; `GraphEdge` keeps only `label`+`cardinality`). Fix is to carry the
+> detail onto the node/edge and render it — scheduled as **G1.4 below**, ahead of
+> the deferred G1.3 side panel and all of G2/G3, because it is the highest-value,
+> lowest-risk, no-blocker increment and addresses the owner feedback directly.
+>
+> **Deferred (audited cause):** **G3.1 agent highlight** and **G3.3 X2 query tool**
+> — conversation/artifact state is local `useState` in `AiAgentPanel/index.tsx`
+> (line ~625), so the editor surface cannot read the agent's last answer without
+> lifting that state to a shared store — an architecture change touching the
+> just-staged explain feature, and needing browser verification. S-B seam is ready.
+> Also deferred: multi-hop expand UX + node-click detail panel (ECharts-canvas
+> interactions need browser verification), and the X2 backend `focus_tables` seam
+> (would edit explain-staged `schemas.py`/`graph.py`).
 
 ### Phase G0 — Lazy scaffolding + perf harness `[TODO]`
 - [ ] **G0.1 — Graph tab, lazy-mounted, zero hot-bundle cost** `P1`
@@ -404,10 +548,76 @@ Each item: **goal · files · depends-on · acceptance**. Frontend-only through 
 - [ ] **G1.3 — Column detail side panel + column LOD on focus** `P2`
   - Goal: selecting a node shows columns (reuse `ColumnElement` iconography);
     optional column-level child nodes for a focused table only.
+  - Note: this is the **click**/pinned-detail surface (richer, scrollable, with
+    icons). The **hover** quick-look (columns/types/edge join) lands earlier and
+    independently in **G1.4**; G1.3 deepens it (interaction + ECharts-canvas
+    selection needs browser verification, hence the later slot).
   - Files: `SchemaGraph/NodeDetailPanel.tsx`.
   - Depends-on: G1.1.
   - Acceptance: columns render from cache (no extra call); column LOD bounded to
     the focused neighborhood.
+
+- [x] **G1.4 — Always-on labels + informative hover (node columns; edge join detail)** `[DONE]` *(addresses owner feedback; no blocker)*
+  - **Landed (2026-06-24):** node names always shown (`series.label.show=true`,
+    `formatter:'{b}'`, truncated); pure `tooltips.ts` builds escaped node/edge
+    hover HTML (columns name:type + PK/FK badges, modeled/metric/calc summary,
+    metadata-failure note; FK `col→referred_col`; MDL relationship name +
+    cardinality + `condition` + parsed refs); the single tooltip `formatter` lives
+    in `echartsRender.ts` (D15); domain model carries `GraphNode.columns` and
+    `GraphEdge.{columnRefs,relationshipName,condition}`; `parseConditionRefs`
+    best-effort-parses `a.x = b.y [AND …]`. Tests: **+11** (61 `SchemaGraph/*`,
+    8 suites; new `tooltips.test.ts`); `tsc --noEmit` clean; prettier clean.
+    **Touched only `SchemaGraph/**`** — zero edits to `index.tsx`, the dialog, or
+    any file in the parallel MDL-fix agent's set.
+  - Goal: make the graph self-explanatory at the table level without a click —
+    (a) **node names always visible**; (b) **node hover** = columns (name + type)
+    with PK/FK badges, kind, modeled status, metric/calc-field counts;
+    (c) **edge hover** = the join detail it represents.
+  - Data (verified, already in hand — no new fetch, no backend):
+    - node columns: `useSchemaGraphData.metaByTable` → `PhysicalTableMetadata.columns`
+      (`{name, type, keys[]}`), passed through `buildPhysicalGraph` (today it uses
+      only `columns.length`);
+    - FK edge mapping: `meta.foreignKeys[].column_names` / `referred_columns` at
+      `buildPhysicalGraph` (today only `column_names.join(', ')` → label; referred
+      columns dropped);
+    - MDL edge derivation: `rel.name` / `rel.joinType` / `rel.condition` at
+      `buildSemanticGraph` + `composeCombined` (today only name→label,
+      joinType→cardinality; `condition` dropped).
+  - Files / shape (keeps the pure/testable split, D15):
+    - `types.ts` — add render-time carry fields: `GraphNode.columns?: PhysicalColumn[]`
+      (bounded, e.g. ≤ a cap for tooltip), `GraphNode.modeled`/counts already exist;
+      `GraphEdge.columnRefs?: {from:string; to:string}[]`, `GraphEdge.condition?`,
+      `GraphEdge.relationshipName?`.
+    - `graphData.ts` / `mdlOverlay.ts` — populate the new fields when building.
+    - new `tooltips.ts` (pure) — `nodeTooltipHtml(node)` / `edgeTooltipHtml(edge)`
+      build escaped HTML strings; **unit-testable without ECharts**.
+    - `echartsOptions.ts` — set `series.label = { show: true, position:'right',
+      formatter:'{b}' }` (and a bounded width/overflow:'truncate' for long names);
+      attach `tooltip` HTML string onto each series node/link
+      (`GraphSeriesNode.tooltip`, `GraphSeriesLink.tooltip`); stop setting `value`
+      to the duplicate table name.
+    - `echartsRender.ts` — set `tooltip.formatter = p => p.data?.tooltip ?? p.name`
+      (the one place a function touches ECharts; works for both nodes and links).
+  - Depends-on: G1.1 (landed). No backend; no C0 file.
+  - Acceptance: every node shows its name; hovering a hydrated node lists its
+    columns with types + key badges; hovering an FK edge shows `col → referred_col`;
+    hovering an MDL edge shows relationship name, cardinality, and `condition`;
+    a failed/unhydrated node hover still shows name + the "metadata unavailable"
+    note; pure tooltip builders covered by unit tests; `npm run type` clean.
+
+- [x] **G1.5 — UI polish to Superset visual language** `[DONE]` *(owner feedback)*
+  - **Landed (2026-06-24):** node labels restyled to **light fill + dark outline**
+    (`series.label` `color`/`textBorderColor`/`textBorderWidth`) for legibility on
+    any backdrop; tooltips rebuilt with **Superset theme tokens** (threaded as a
+    `GraphPalette` from `useTheme()` into the pure builders) — header (name · kind ·
+    coverage) + divider, **column rows with name left-aligned and type
+    right-aligned** (monospace, muted), **glyph key icons** (🔑 PK / 🔗 FK), and a
+    themed global tooltip surface (`backgroundColor`/`borderColor`/`textStyle`).
+    Pure/testable split preserved (D15); `GraphPalette` optional with safe
+    defaults. Tests: 61 `SchemaGraph/*` green; tsc + prettier clean.
+  - **Follow-up (not blocking):** the richer **click** detail panel (G1.3) with
+    real antd `ColumnElement` icons + type-mismatch flags remains the deeper
+    Superset-native surface; the hover quick-look here is the minimum bar.
 
 ### Phase G2 — MDL overlay (combined view) `[TODO]`
 - [ ] **G2.1 — Parse manifest → semantic graph (instant, client-side)** `P1`

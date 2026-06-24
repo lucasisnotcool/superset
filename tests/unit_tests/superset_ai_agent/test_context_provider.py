@@ -133,3 +133,31 @@ def test_context_provider_keeps_explicit_dataset_request() -> None:
 
     assert client.list_limits == []
     assert provider.last_retrieval is None
+
+
+def test_get_full_schema_returns_whole_scope_ignoring_ranking() -> None:
+    # CR3: modeling-time grounding must see EVERY in-scope table, independent of any
+    # question ranking/cap — even with candidate_limit=1, both datasets come through.
+    client = FakeSupersetClient()
+    provider = SupersetMetadataContextProvider(
+        client,
+        config=AgentConfig(
+            max_context_datasets=1,
+            wren_schema_table_scan_limit=50,
+            wren_schema_table_candidate_limit=1,
+        ),
+    )
+
+    context = provider.get_full_schema(
+        AgentQueryRequest(
+            question="semantic layer validation",  # placeholder, must be ignored
+            database_id=1,
+            schema_name="sales",
+        )
+    )
+
+    assert sorted(d.table_name for d in context.datasets) == [
+        "customers",
+        "pipeline_moves",
+    ]
+    assert client.list_limits == [50]  # bounded by the scan limit, not the cap

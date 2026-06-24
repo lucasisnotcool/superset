@@ -47,6 +47,7 @@ from superset_ai_agent.conversations.store import (
 from superset_ai_agent.explain import (
     attempt_index_at,
     build_agent_timeline,
+    compact_recalled_examples,
     step_from_event,
 )
 from superset_ai_agent.integrations.superset.client import (
@@ -1025,6 +1026,7 @@ class ConversationGraph:
                     details={
                         "response_type": draft.response_type,
                         "model": state["request"].model or self.config.default_model(),
+                        "recalled_examples": compact_recalled_examples(recalled),
                     },
                 ),
             ],

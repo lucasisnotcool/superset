@@ -44,8 +44,10 @@ from superset_ai_agent.schemas import (
     LoadContextDetail,
     LoadWrenContextDetail,
     PlanSemanticSqlDetail,
+    RecalledExample,
     ReflectDetail,
     RepairDetail,
+    RetrievedChunk,
     TraceEvent,
     ValidateSqlDetail,
     WrenContextArtifact,
@@ -54,6 +56,35 @@ from superset_ai_agent.schemas import (
 
 _ROW_COUNT_RE = re.compile(r"returned\s+([\d,]+)\s+row")
 _DB_NAME_RE = re.compile(r"from\s+database\s+(.+?)\.?$")
+
+#: Max characters of a retrieved chunk's text surfaced to the explain UI. The
+#: full text already ships on ``wren_context``; the timeline copy is for display,
+#: so it is bounded to keep the response payload small (A1 risk note).
+_CHUNK_TEXT_LIMIT = 280
+
+#: Max characters of a recalled example's SQL surfaced to the explain UI (B1).
+_EXAMPLE_SQL_LIMIT = 280
+
+
+def compact_recalled_examples(recalled: list[Any]) -> list[dict[str, Any]]:
+    """Trim recalled NL->SQL pairs to the display payload for trace details (B1).
+
+    Called at trace-emission time so the draft step is self-describing (the same
+    contract as every other node), keeping ``native_sql`` bounded.
+    """
+
+    compact: list[dict[str, Any]] = []
+    for example in recalled or []:
+        if not isinstance(example, dict):
+            continue
+        question = example.get("question")
+        if not isinstance(question, str) or not question.strip():
+            continue
+        native_sql = example.get("native_sql")
+        if isinstance(native_sql, str) and len(native_sql) > _EXAMPLE_SQL_LIMIT:
+            native_sql = native_sql[:_EXAMPLE_SQL_LIMIT].rstrip() + "…"
+        compact.append({"question": question, "native_sql": native_sql})
+    return compact
 
 
 def build_agent_timeline(
@@ -148,10 +179,18 @@ def _detail_intent(event: TraceEvent, _wc: Any, _audit: Any) -> Any:
 
 def _detail_draft(event: TraceEvent, wren_context: Any, _audit: Any) -> Any:
     details = event.details or {}
+    raw_examples = details.get("recalled_examples")
+    examples = [
+        RecalledExample.model_validate(item)
+        for item in compact_recalled_examples(
+            raw_examples if isinstance(raw_examples, list) else []
+        )
+    ]
     return DraftDetail(
         response_type=details.get("response_type"),
         model=details.get("model"),
         recalled_example_count=_recalled_count(details, wren_context),
+        recalled_examples=examples,
     )
 
 
@@ -253,6 +292,8 @@ def _wren_context_detail(
     # so prefer the event's own snapshot (live) and fall back to the carrier.
     merged = {**source, **details} if details else source
     context_items = merged.get("context_items") or []
+    if not isinstance(context_items, list):
+        context_items = []
     return LoadWrenContextDetail(
         available=bool(merged.get("available", False)),
         project_id=merged.get("project_id"),
@@ -260,9 +301,42 @@ def _wren_context_detail(
         matched_models=_str_list(merged.get("matched_models")),
         retrieval_mode=merged.get("retrieval_mode"),
         retrieved_item_count=int(merged.get("retrieved_item_count", 0) or 0),
-        context_item_count=len(context_items) if isinstance(context_items, list) else 0,
+        context_item_count=len(context_items),
         recalled_example_count=int(merged.get("recalled_example_count", 0) or 0),
+        retrieved_chunks=_retrieved_chunks(context_items),
+        warnings=_str_list(merged.get("warnings")),
     )
+
+
+def _retrieved_chunks(context_items: list[Any]) -> list[RetrievedChunk]:
+    """Map retriever ``context_items`` into bounded display chunks (A1).
+
+    Only items the Retriever seam produced (``source == "retriever"``) carry
+    rankable schema text; legacy ``fetch_context`` items (e.g. relationship
+    bundles) have no per-chunk text and are left to the count badge.
+    """
+
+    chunks: list[RetrievedChunk] = []
+    for item in context_items:
+        if not isinstance(item, dict) or item.get("source") != "retriever":
+            continue
+        text = item.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        if len(text) > _CHUNK_TEXT_LIMIT:
+            text = text[:_CHUNK_TEXT_LIMIT].rstrip() + "…"
+        score = item.get("score")
+        chunks.append(
+            RetrievedChunk(
+                kind=item.get("kind"),
+                name=item.get("name"),
+                model=item.get("model"),
+                text=text,
+                retriever=item.get("retriever"),
+                score=float(score) if isinstance(score, (int, float)) else None,
+            )
+        )
+    return chunks
 
 
 def _plan_semantic_detail(

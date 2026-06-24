@@ -699,6 +699,9 @@ class TableMetadataResponse(TypedDict):
     primaryKey: TableMetadataPrimaryKeyResponse
     selectStar: str
     comment: str | None
+    # Best-effort introspection notes: an auxiliary section (pk/fk/indexes/
+    # SELECT *) that could not be loaded is reported here instead of failing.
+    warnings: list[str]
 
 
 class TableMetadataOptionsResponseSchema(Schema):
@@ -769,6 +772,16 @@ class TableMetadataResponseSchema(Schema):
         metadata={"description": "Primary keys metadata"},
     )
     selectStar = fields.String(metadata={"description": "SQL select star"})  # noqa: N815
+    warnings = fields.List(
+        fields.String(),
+        metadata={
+            "description": (
+                "Best-effort introspection notes for auxiliary sections "
+                "(primary key, foreign keys, indexes, SELECT *) that could not "
+                "be loaded"
+            )
+        },
+    )
 
 
 class TableExtraMetadataResponseSchema(Schema):
