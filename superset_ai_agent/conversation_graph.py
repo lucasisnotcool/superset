@@ -44,6 +44,11 @@ from superset_ai_agent.conversations.store import (
     ConversationStore,
     DEFAULT_OWNER_ID,
 )
+from superset_ai_agent.explain import (
+    attempt_index_at,
+    build_agent_timeline,
+    step_from_event,
+)
 from superset_ai_agent.integrations.superset.client import (
     AgentContext,
     SupersetAuthError,
@@ -56,6 +61,7 @@ from superset_ai_agent.llm.embeddings import create_embedder
 from superset_ai_agent.prompts.registry import get_prompt
 from superset_ai_agent.schemas import (
     AgentQueryRequest,
+    AgentStep,
     AuditInfo,
     ChartSpec,
     ExecutionResult,
@@ -243,6 +249,7 @@ class ConversationGraph:
             message=assistant_message,
             artifacts=assistant_message.artifacts,
             trace=state.get("trace", []),
+            timeline=self._turn_timeline(state),
             conversation=conversation,
         )
 
@@ -349,8 +356,11 @@ class ConversationGraph:
             status=status,
             conversation_id=conversation_id,
             message=assistant_message,
-            artifacts=response_artifacts,
+            artifacts=[
+                _with_artifact_timeline(artifact) for artifact in response_artifacts
+            ],
             trace=state.get("trace", []),
+            timeline=self._turn_timeline(state),
             conversation=conversation,
         )
 
@@ -526,6 +536,7 @@ class ConversationGraph:
             message=assistant_message,
             artifacts=assistant_message.artifacts,
             trace=final_state.get("trace", []),
+            timeline=self._turn_timeline(final_state),
             conversation=conversation,
         )
         yield {"type": "complete", "response": response}
@@ -542,7 +553,7 @@ class ConversationGraph:
 
         trace = state.get("trace", [])
         while emitted < len(trace):
-            yield _progress_event(trace[emitted])
+            yield _progress_event(trace[emitted], attempt_index_at(trace, emitted))
             emitted += 1
         return emitted
 
@@ -797,11 +808,15 @@ class ConversationGraph:
         retrieval_artifact = (
             retrieval.retrieval if retrieval is not None else None
         )
-        details = (
-            retrieval_artifact.model_dump()
-            if retrieval_artifact is not None
-            else {}
-        )
+        details = {
+            "dataset_count": len(context.datasets),
+            "database_name": context.database.name,
+            "retrieval": (
+                retrieval_artifact.model_dump()
+                if retrieval_artifact is not None
+                else None
+            ),
+        }
         return {
             **state,
             "context": context,
@@ -1104,6 +1119,8 @@ class ConversationGraph:
                     details={
                         "engine": result.engine,
                         "rewritten": result.rewritten,
+                        "semantic_sql": result.semantic_sql,
+                        "native_sql": result.native_sql,
                         "referenced_tables": result.referenced_tables,
                         "warnings": result.warnings,
                     },
@@ -1180,6 +1197,7 @@ class ConversationGraph:
                 details={
                     "insight_card_count": len(bundle.insight_cards),
                     "chart_type": chart_spec.type if chart_spec else None,
+                    "has_data_preview": bundle.data_preview is not None,
                 },
             ),
         ]
@@ -1352,6 +1370,7 @@ class ConversationGraph:
             TraceEvent(
                 step="execute_sql",
                 summary=f"Executed SQL and returned {result.row_count} row(s).",
+                details={"row_count": result.row_count},
             ),
         ]
         pending_artifact = state.get("pending_artifact")
@@ -1705,7 +1724,16 @@ class ConversationGraph:
             artifacts.append(
                 pending_artifact.model_copy(update={"trace": state.get("trace", [])})
             )
-        return artifacts
+        return [_with_artifact_timeline(artifact) for artifact in artifacts]
+
+    @staticmethod
+    def _turn_timeline(state: ConversationState) -> list[AgentStep]:
+        return build_agent_timeline(
+            state.get("trace", []),
+            wren_context=state.get("wren_context"),
+            audit=state.get("audit"),
+            artifacts=state.get("artifacts"),
+        )
 
     @staticmethod
     def _status_from_state(
@@ -1733,14 +1761,33 @@ class ConversationGraph:
         return "error"
 
 
-def _progress_event(event: TraceEvent) -> dict[str, Any]:
-    """Serialize a trace event as a streaming ``progress`` payload."""
+def _with_artifact_timeline(artifact: ConversationArtifact) -> ConversationArtifact:
+    """Stamp a per-artifact explain-and-audit timeline for history re-render."""
 
+    timeline = build_agent_timeline(
+        artifact.trace,
+        wren_context=artifact.wren_context,
+        audit=artifact.audit,
+        artifacts=[artifact],
+    )
+    return artifact.model_copy(update={"timeline": timeline})
+
+
+def _progress_event(event: TraceEvent, attempt_index: int = 0) -> dict[str, Any]:
+    """Serialize a trace event as a streaming ``progress`` payload.
+
+    Carries the legacy ``step``/``status``/``summary`` keys (the one-line progress
+    bubble) plus the full typed ``agent_step`` so the explain-and-audit dialog can
+    fill its sequence live, losslessly (ai_agent_explain_and_audit.md Seam 1).
+    """
+
+    step = step_from_event(event, attempt_index=attempt_index)
     return {
         "type": "progress",
-        "step": event.step,
-        "status": event.status,
-        "summary": event.summary,
+        "step": step.kind,
+        "status": step.status,
+        "summary": step.summary,
+        "agent_step": step.model_dump(mode="json"),
     }
 
 

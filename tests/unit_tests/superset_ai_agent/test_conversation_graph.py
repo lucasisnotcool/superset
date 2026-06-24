@@ -290,6 +290,18 @@ def test_conversation_graph_run_stream_emits_progress_then_complete() -> None:
     response = complete_events[0]["response"]
     assert response.status == "needs_review"
     assert response.artifacts[0].sql.endswith("LIMIT 25")
+    # Each streamed progress frame carries the full typed step (Seam 1): the
+    # plan_semantic_sql frame exposes the semantic/native rewrite live.
+    assert all("agent_step" in event for event in progress_events)
+    plan_frame = next(
+        event for event in progress_events if event["step"] == "plan_semantic_sql"
+    )
+    assert plan_frame["agent_step"]["detail"]["kind"] == "plan_semantic_sql"
+    # The terminal complete frame carries the assembled turn timeline.
+    assert [step.kind for step in response.timeline][:2] == [
+        "load_conversation",
+        "load_context",
+    ]
     # The user message and the streamed assistant turn are both persisted.
     assert [message.role for message in response.conversation.messages] == [
         "user",
@@ -395,6 +407,18 @@ def test_conversation_graph_executes_valid_sql_when_requested() -> None:
         "build_artifacts",
         "reflect_sql_outcome",
     ]
+    # The explain-and-audit timeline mirrors the trace one-for-one and carries
+    # typed details + the per-artifact copy for history re-render.
+    assert [step.kind for step in response.timeline] == [
+        event.step for event in response.trace
+    ]
+    execute_step = next(s for s in response.timeline if s.kind == "execute_sql")
+    assert execute_step.detail.row_count == 1
+    # The per-artifact timeline (for history re-render) covers that artifact's
+    # own trace, which ends when the artifact was finalized in build_artifacts.
+    artifact_kinds = [step.kind for step in response.artifacts[0].timeline]
+    assert "execute_sql" in artifact_kinds
+    assert artifact_kinds[-1] == "build_artifacts"
 
 
 def test_conversation_graph_updates_approved_sql_artifact_in_manual_mode() -> None:

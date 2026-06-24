@@ -31,6 +31,7 @@ from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.context.base import ContextProvider
 from superset_ai_agent.conversations.schemas import ConversationScope
 from superset_ai_agent.conversations.store import DEFAULT_OWNER_ID
+from superset_ai_agent.explain import build_agent_timeline
 from superset_ai_agent.integrations.superset.client import AgentContext, SupersetClient
 from superset_ai_agent.integrations.wren.client import DisabledWrenClient, WrenClient
 from superset_ai_agent.llm.base import ChatMessage, ModelClient
@@ -306,13 +307,14 @@ class TextToSqlGraph:
         else:
             status = "error"
 
+        trace = state.get("trace", [])
         return AgentQueryResponse(
             status=status,
             sql=state.get("sql"),
             explanation=state.get("explanation"),
             validation=validation,
             execution_result=state.get("execution_result"),
-            trace=state.get("trace", []),
+            trace=trace,
             answer_summary=state.get("answer_summary"),
             insight_cards=state.get("insight_cards", []),
             chart_spec=state.get("chart_spec"),
@@ -320,6 +322,11 @@ class TextToSqlGraph:
             audit=state.get("audit"),
             recommended_followups=state.get("recommended_followups", []),
             wren_context=state.get("wren_context"),
+            timeline=build_agent_timeline(
+                trace,
+                wren_context=state.get("wren_context"),
+                audit=state.get("audit"),
+            ),
         )
 
     def _compile_graph(self) -> Any:
@@ -366,11 +373,15 @@ class TextToSqlGraph:
         retrieval_artifact = (
             retrieval.retrieval if retrieval is not None else None
         )
-        details = (
-            retrieval_artifact.model_dump()
-            if retrieval_artifact is not None
-            else {}
-        )
+        details = {
+            "dataset_count": len(context.datasets),
+            "database_name": context.database.name,
+            "retrieval": (
+                retrieval_artifact.model_dump()
+                if retrieval_artifact is not None
+                else None
+            ),
+        }
         return {
             **state,
             "context": context,
@@ -680,6 +691,8 @@ class TextToSqlGraph:
                     details={
                         "engine": result.engine,
                         "rewritten": result.rewritten,
+                        "semantic_sql": result.semantic_sql,
+                        "native_sql": result.native_sql,
                         "referenced_tables": result.referenced_tables,
                         "warnings": result.warnings,
                     },
@@ -814,6 +827,7 @@ class TextToSqlGraph:
                 TraceEvent(
                     step="execute_sql",
                     summary=f"Executed SQL and returned {result.row_count} row(s).",
+                    details={"row_count": result.row_count},
                 ),
             ],
         }
@@ -861,6 +875,7 @@ class TextToSqlGraph:
                     details={
                         "insight_card_count": len(bundle.insight_cards),
                         "chart_type": chart_spec.type if chart_spec else None,
+                        "has_data_preview": bundle.data_preview is not None,
                     },
                 ),
             ],

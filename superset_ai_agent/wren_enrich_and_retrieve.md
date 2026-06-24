@@ -506,7 +506,35 @@ retrieval refactor). The rest are parallelizable.
 - **Acceptance:** prod guidance published; code defaults unchanged; degrade-closed
   contract intact.
 
-## B.10 — Risk register
+## B.10 — Memory scope realignment to canonical project scope `P2` `[TODO]`
+
+- **Goal:** apply the canonical scope rule (adopted in
+  [`wren_graph_view.md`](wren_graph_view.md) §7.3, Option 2): durable agent
+  knowledge is partitioned by the **project** (`database`+`catalog`+`schema`);
+  `dataset_ids` is a *relevance signal*, never a partition key. Instructions
+  (`instruction_scope_hash`) and MDL retrieval (project-keyed) already conform;
+  **memory is the only knowledge still partitioned by `dataset_ids`** (full
+  `scope_hash` in [`store.py`](semantic_layer/store.py) `scope_hash`, used by
+  `memory_store` recall).
+- **Change:** recall memory at the project scope (drop `dataset_ids` from the
+  partition), and pass `dataset_ids` / caller-supplied focus tables as an
+  **overlap boost** in `memory_store._semantic_rank` (relevance, not visibility).
+- **Files:** `semantic_layer/memory_store.py` (recall + ranking), `graph.py`
+  (`_request_scope_hash` use for memory), a re-key/dual-read **migration** of
+  stored example rows; optionally fold `instruction_scope_hash` →
+  `project_scope_hash` for one shared concept.
+- **Depends-on / risk:** **backend-owner sign-off** — this is a behavior change
+  (recall set widens) and touches `memory_store.py` (**C0-contended**); schedule
+  with C0, not under the graph-view work. The current `scope_hash` "memory is
+  legitimately dataset-scoped" comment must be revised with this change.
+- **Note:** the graph **semantic query tool (X2)** does **not** depend on this —
+  X2 passes a focus hint and never mutates `dataset_ids`, so it is unblocked
+  regardless. This item only improves memory recall consistency.
+- **Acceptance:** an example confirmed under one dataset selection is recalled for
+  a same-project query with a different/empty selection; dataset overlap still
+  boosts ranking; migration preserves existing examples; degrade-closed intact.
+
+## B.11 — Risk register
 
 - **Overlay removal (B.1) is destructive and product-facing** — it touches live,
   authorized endpoints (`/documents/{id}/review`, `/index/rebuild`) and persisted

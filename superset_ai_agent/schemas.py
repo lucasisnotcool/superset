@@ -17,9 +17,14 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from datetime import datetime, timezone
+from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, Field
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class TraceEvent(BaseModel):
@@ -29,6 +34,10 @@ class TraceEvent(BaseModel):
     status: Literal["ok", "warning", "error"] = "ok"
     summary: str
     details: dict[str, Any] = Field(default_factory=dict)
+    #: When the node emitted this event. Used to derive per-step durations for
+    #: the explain-and-audit timeline (ai_agent_explain_and_audit.md). Defaults so
+    #: every existing construction site stays valid without change.
+    created_at: datetime = Field(default_factory=_utc_now)
 
 
 class AgentQueryRequest(BaseModel):
@@ -166,6 +175,194 @@ class WrenContextArtifact(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+# --- Explain & audit timeline (ai_agent_explain_and_audit.md) -----------------
+#
+# One typed, ordered timeline of what happened between a user message and the
+# agent's final response. Assembled post hoc from the graph's TraceEvents plus
+# the late-bound WrenContextArtifact/AuditInfo carriers by
+# ``superset_ai_agent.explain.build_agent_timeline`` — the graphs are unchanged.
+#
+# ``AgentStep.kind`` is the graph node name (kept as ``str`` so a newly added
+# node never breaks rendering — it degrades to its bare summary). Each step's
+# ``detail`` is a discriminated union keyed on a *shape tag* (``detail.kind``),
+# decoupled from the node name so several nodes (e.g. repair/correct) can share
+# one shape while staying unambiguous on JSON round-trip through the store.
+
+#: Every step name the two graphs emit. The drift-guard test asserts the graph
+#: source only emits names in this set (ai_agent_explain_and_audit.md R4).
+KNOWN_AGENT_STEP_KINDS: frozenset[str] = frozenset(
+    {
+        "load_conversation",
+        "classify_intent",
+        "answer_directly",
+        "load_context",
+        "load_wren_context",
+        "draft_sql",
+        "draft_response",
+        "approved_sql",
+        "dry_plan_with_wren",
+        "plan_semantic_sql",
+        "validate_sql",
+        "repair_sql",
+        "correct_semantic_sql",
+        "execute_sql",
+        "duplicate_sql",
+        "build_artifacts",
+        "reflect_sql_outcome",
+        "conversation_error",
+        "agent_error",
+    }
+)
+
+#: Node names that start a fresh drafting cycle, used to group steps into SQL
+#: attempts for the UI (ai_agent_explain_and_audit.md Seam 5).
+DRAFT_STEP_KINDS: frozenset[str] = frozenset(
+    {"draft_sql", "draft_response", "approved_sql", "answer_directly"}
+)
+
+
+class LoadContextDetail(BaseModel):
+    """Schema/context load (``load_context``)."""
+
+    kind: Literal["load_context"] = "load_context"
+    dataset_count: int = 0
+    database_name: str | None = None
+    retrieval: WrenRetrievalArtifact | None = None
+
+
+class IntentDetail(BaseModel):
+    """Intent classification (``classify_intent``)."""
+
+    kind: Literal["intent"] = "intent"
+    intent: str | None = None
+    reason: str | None = None
+
+
+class LoadWrenContextDetail(BaseModel):
+    """Semantic/MDL retrieval (``load_wren_context``)."""
+
+    kind: Literal["wren_context"] = "wren_context"
+    available: bool = False
+    project_id: str | None = None
+    mdl_path: str | None = None
+    matched_models: list[str] = Field(default_factory=list)
+    retrieval_mode: str | None = None
+    retrieved_item_count: int = 0
+    context_item_count: int = 0
+    recalled_example_count: int = 0
+
+
+class DraftDetail(BaseModel):
+    """Model draft (``draft_sql``/``draft_response``/``approved_sql``/answer)."""
+
+    kind: Literal["draft"] = "draft"
+    response_type: str | None = None
+    model: str | None = None
+    recalled_example_count: int = 0
+
+
+class DryPlanDetail(BaseModel):
+    """Engine dry-plan diagnostics (``dry_plan_with_wren``)."""
+
+    kind: Literal["dry_plan"] = "dry_plan"
+    available: bool = True
+    diagnostics: list[str] = Field(default_factory=list)
+
+
+class PlanSemanticSqlDetail(BaseModel):
+    """Semantic->native rewrite (``plan_semantic_sql``)."""
+
+    kind: Literal["plan_semantic_sql"] = "plan_semantic_sql"
+    engine: str | None = None
+    rewritten: bool = False
+    semantic_sql: str | None = None
+    native_sql: str | None = None
+    referenced_tables: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ValidateSqlDetail(BaseModel):
+    """Read-only validation (``validate_sql``)."""
+
+    kind: Literal["validate_sql"] = "validate_sql"
+    is_valid: bool = False
+    dialect: str | None = None
+    errors: list[str] = Field(default_factory=list)
+
+
+class RepairDetail(BaseModel):
+    """Repair/correction re-draft (``repair_sql``/``correct_semantic_sql``)."""
+
+    kind: Literal["repair"] = "repair"
+    errors: list[str] = Field(default_factory=list)
+    dry_plan_diagnostics: list[str] = Field(default_factory=list)
+    attempt: int | None = None
+
+
+class ExecuteSqlDetail(BaseModel):
+    """Governed execution (``execute_sql``/``duplicate_sql``)."""
+
+    kind: Literal["execute"] = "execute"
+    row_count: int | None = None
+    sql: str | None = None
+    executed_sql: str | None = None
+    query_id: int | str | None = None
+    adapter: str | None = None
+    error: str | None = None
+    is_duplicate: bool = False
+
+
+class BuildArtifactsDetail(BaseModel):
+    """Artifact synthesis (``build_artifacts``)."""
+
+    kind: Literal["build_artifacts"] = "build_artifacts"
+    insight_card_count: int = 0
+    chart_type: str | None = None
+    has_data_preview: bool = False
+
+
+class ReflectDetail(BaseModel):
+    """SQL reflection decision (``reflect_sql_outcome``)."""
+
+    kind: Literal["reflect"] = "reflect"
+    outcome: str | None = None
+    remaining_sql_iterations: int | None = None
+    retry_feedback: str | None = None
+
+
+AgentStepDetail = Annotated[
+    Union[
+        LoadContextDetail,
+        IntentDetail,
+        LoadWrenContextDetail,
+        DraftDetail,
+        DryPlanDetail,
+        PlanSemanticSqlDetail,
+        ValidateSqlDetail,
+        RepairDetail,
+        ExecuteSqlDetail,
+        BuildArtifactsDetail,
+        ReflectDetail,
+    ],
+    Field(discriminator="kind"),
+]
+
+
+class AgentStep(BaseModel):
+    """One ordered step in the message->response explain-and-audit timeline."""
+
+    kind: str
+    status: Literal["ok", "warning", "error"] = "ok"
+    summary: str
+    started_at: datetime = Field(default_factory=_utc_now)
+    duration_ms: int | None = None
+    #: Which SQL drafting cycle this step belongs to (0-based), so retries group.
+    attempt_index: int = 0
+    #: The SQL artifact this step produced/acted on, when it can be matched.
+    artifact_id: str | None = None
+    detail: AgentStepDetail | None = None
+
+
 class ExecutionResult(BaseModel):
     """Small, model-safe SQL execution result."""
 
@@ -192,6 +389,9 @@ class AgentQueryResponse(BaseModel):
     audit: AuditInfo | None = None
     recommended_followups: list[str] = Field(default_factory=list)
     wren_context: WrenContextArtifact | None = None
+    #: Ordered explain-and-audit timeline of the message->response chain
+    #: (ai_agent_explain_and_audit.md). Assembled by ``explain.build_agent_timeline``.
+    timeline: list[AgentStep] = Field(default_factory=list)
 
 
 class ValidateSqlRequest(BaseModel):

@@ -127,6 +127,113 @@ export interface ExecutionResult {
   is_truncated?: boolean;
 }
 
+// --- Explain & audit timeline (ai_agent_explain_and_audit.md) ----------------
+// One typed, ordered step in the message->response chain. `detail` is a
+// discriminated union keyed on `detail.kind` (a shape tag decoupled from the
+// node name `step.kind`, so several nodes can share one shape). An unknown
+// `step.kind` carries `detail: null` and renders as its bare summary.
+
+export interface LoadContextDetail {
+  kind: 'load_context';
+  dataset_count: number;
+  database_name?: string | null;
+  retrieval?: WrenRetrievalArtifact | null;
+}
+export interface IntentDetail {
+  kind: 'intent';
+  intent?: string | null;
+  reason?: string | null;
+}
+export interface LoadWrenContextDetail {
+  kind: 'wren_context';
+  available: boolean;
+  project_id?: string | null;
+  mdl_path?: string | null;
+  matched_models: string[];
+  retrieval_mode?: string | null;
+  retrieved_item_count: number;
+  context_item_count: number;
+  recalled_example_count: number;
+}
+export interface DraftDetail {
+  kind: 'draft';
+  response_type?: string | null;
+  model?: string | null;
+  recalled_example_count: number;
+}
+export interface DryPlanDetail {
+  kind: 'dry_plan';
+  available: boolean;
+  diagnostics: string[];
+}
+export interface PlanSemanticSqlDetail {
+  kind: 'plan_semantic_sql';
+  engine?: string | null;
+  rewritten: boolean;
+  semantic_sql?: string | null;
+  native_sql?: string | null;
+  referenced_tables: string[];
+  warnings: string[];
+}
+export interface ValidateSqlDetail {
+  kind: 'validate_sql';
+  is_valid: boolean;
+  dialect?: string | null;
+  errors: string[];
+}
+export interface RepairDetail {
+  kind: 'repair';
+  errors: string[];
+  dry_plan_diagnostics: string[];
+  attempt?: number | null;
+}
+export interface ExecuteSqlDetail {
+  kind: 'execute';
+  row_count?: number | null;
+  sql?: string | null;
+  executed_sql?: string | null;
+  query_id?: number | string | null;
+  adapter?: string | null;
+  error?: string | null;
+  is_duplicate: boolean;
+}
+export interface BuildArtifactsDetail {
+  kind: 'build_artifacts';
+  insight_card_count: number;
+  chart_type?: string | null;
+  has_data_preview: boolean;
+}
+export interface ReflectDetail {
+  kind: 'reflect';
+  outcome?: string | null;
+  remaining_sql_iterations?: number | null;
+  retry_feedback?: string | null;
+}
+
+export type AgentStepDetail =
+  | LoadContextDetail
+  | IntentDetail
+  | LoadWrenContextDetail
+  | DraftDetail
+  | DryPlanDetail
+  | PlanSemanticSqlDetail
+  | ValidateSqlDetail
+  | RepairDetail
+  | ExecuteSqlDetail
+  | BuildArtifactsDetail
+  | ReflectDetail;
+
+export interface AgentStep {
+  kind: string;
+  status: 'ok' | 'warning' | 'error';
+  summary: string;
+  started_at: string;
+  duration_ms?: number | null;
+  attempt_index: number;
+  artifact_id?: string | null;
+  detail?: AgentStepDetail | null;
+}
+
 export interface AgentQueryRequest {
   question: string;
   database_id: number;
@@ -151,6 +258,8 @@ export interface AgentQueryResponse {
   audit?: AuditInfo | null;
   recommended_followups?: string[];
   wren_context?: WrenContextArtifact | null;
+  // Ordered explain-and-audit timeline of the message->response chain.
+  timeline?: AgentStep[];
 }
 
 export interface ConversationScope {
@@ -178,6 +287,8 @@ export interface ConversationArtifact {
   audit?: AuditInfo | null;
   recommended_followups?: string[];
   wren_context?: WrenContextArtifact | null;
+  // Per-artifact explain-and-audit timeline so reopened chats re-render.
+  timeline?: AgentStep[];
 }
 
 export type SemanticDocumentStatus =
@@ -269,6 +380,8 @@ export interface ConversationTurnResponse {
   message: ConversationMessage;
   artifacts: ConversationArtifact[];
   trace: AgentTraceEvent[];
+  // Turn-level explain-and-audit timeline of the whole message->response chain.
+  timeline?: AgentStep[];
   conversation: Conversation;
 }
 
@@ -540,6 +653,9 @@ export interface ConversationProgressEvent {
   step: string;
   status: 'ok' | 'warning' | 'error';
   summary: string;
+  // Full typed step for the explain-and-audit dialog to fill its sequence live
+  // (ai_agent_explain_and_audit.md Seam 1). Optional for backward compatibility.
+  agent_step?: AgentStep;
 }
 
 /**

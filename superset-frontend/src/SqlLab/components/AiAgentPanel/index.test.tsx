@@ -167,6 +167,24 @@ test('sends a conversation message and renders SQL artifact', async () => {
                 details: {},
               },
             ],
+            timeline: [
+              {
+                kind: 'plan_semantic_sql',
+                status: 'ok',
+                summary: 'Rewrote semantic SQL to native SQL.',
+                started_at: '2026-06-19T00:00:00Z',
+                attempt_index: 0,
+                detail: {
+                  kind: 'plan_semantic_sql',
+                  engine: 'wren',
+                  rewritten: true,
+                  semantic_sql: 'SELECT name FROM birth_names',
+                  native_sql: 'SELECT name FROM main.birth_names',
+                  referenced_tables: ['birth_names'],
+                  warnings: [],
+                },
+              },
+            ],
           },
         ],
       },
@@ -257,6 +275,21 @@ test('sends a conversation message and renders SQL artifact', async () => {
   const executedButton = screen.getByRole('button', { name: 'Executed' });
   expect(executedButton).toBeInTheDocument();
   expect(executedButton).toBeEnabled();
+
+  // The Explain affordance opens the sequential explain-and-audit dialog, which
+  // renders the executed turn's typed timeline (e.g. the semantic->native
+  // rewrite carried on the artifact's `timeline`).
+  await userEvent.click(screen.getByRole('button', { name: 'Explain' }));
+  expect(await screen.findByTestId('explain-dialog')).toBeInTheDocument();
+  expect(screen.getByText('Rewrote semantic SQL')).toBeInTheDocument();
+  expect(
+    screen.getByText('SELECT name FROM main.birth_names'),
+  ).toBeInTheDocument();
+  // Close the dialog before continuing so it does not trap focus.
+  await userEvent.click(screen.getAllByLabelText('Close')[0]);
+  await waitFor(() => {
+    expect(screen.queryByTestId('explain-dialog')).not.toBeInTheDocument();
+  });
   const [executeCall] = fetchMock.callHistory.calls(
     'http://agent.local/agent/conversations/conversation-1/execute-sql',
   );

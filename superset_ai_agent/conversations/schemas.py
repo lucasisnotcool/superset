@@ -24,6 +24,7 @@ from uuid import uuid4
 from pydantic import BaseModel, Field
 
 from superset_ai_agent.schemas import (
+    AgentStep,
     AuditInfo,
     ChartSpec,
     ExecutionResult,
@@ -75,6 +76,9 @@ class ConversationArtifact(BaseModel):
     audit: AuditInfo | None = None
     recommended_followups: list[str] = Field(default_factory=list)
     wren_context: WrenContextArtifact | None = None
+    #: Per-artifact explain-and-audit timeline so reopened conversations
+    #: re-render the message->response chain (ai_agent_explain_and_audit.md).
+    timeline: list[AgentStep] = Field(default_factory=list)
 
 
 class ConversationMessage(BaseModel):
@@ -163,4 +167,7 @@ class ConversationTurnResponse(BaseModel):
     message: ConversationMessage
     artifacts: list[ConversationArtifact] = Field(default_factory=list)
     trace: list[TraceEvent] = Field(default_factory=list)
+    #: Turn-level explain-and-audit timeline of the whole message->response chain
+    #: (ai_agent_explain_and_audit.md).
+    timeline: list[AgentStep] = Field(default_factory=list)
     conversation: Conversation

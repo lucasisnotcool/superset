@@ -71,6 +71,7 @@ import {
   StreamInterruptedError,
   StreamUnavailableError,
   updateConversationTitle,
+  type AgentStep,
   type ConversationProgressEvent,
   type ConversationTurnResponse,
   type ExecutionMode,
@@ -78,6 +79,7 @@ import {
 } from './api';
 import AiChartPreview from './AiChartPreview';
 import AuditInfoPanel from './AuditInfoPanel';
+import ExplainDialog from './ExplainDialog';
 import DatasetSelect from './DatasetSelect';
 import DataPreviewToggle from './DataPreviewToggle';
 import MarkdownCodeBlock from './MarkdownCodeBlock';
@@ -462,24 +464,6 @@ const MetaText = styled(Typography.Text)`
   `}
 `;
 
-const TraceDetails = styled.details`
-  ${({ theme }) => css`
-    color: ${theme.colorTextSecondary};
-    font-size: ${theme.fontSizeSM}px;
-
-    summary {
-      cursor: pointer;
-    }
-  `}
-`;
-
-const TraceList = styled.ul`
-  ${({ theme }) => css`
-    margin: ${theme.sizeUnit}px 0 0;
-    padding-left: ${theme.sizeUnit * 4}px;
-  `}
-`;
-
 const getActiveQueryEditor = ({
   sqlLab: {
     queryEditors,
@@ -650,6 +634,15 @@ const AiAgentPanel = () => {
     null,
   );
   const [progress, setProgress] = useState<string | null>(null);
+  // Steps streamed during the in-flight turn, so the explain dialog can fill its
+  // sequence live (ai_agent_explain_and_audit.md F2).
+  const [liveSteps, setLiveSteps] = useState<AgentStep[]>([]);
+  // The explain-and-audit dialog target: the user message + its step timeline.
+  const [explainTarget, setExplainTarget] = useState<{
+    message: string;
+    steps: AgentStep[];
+    live?: boolean;
+  } | null>(null);
   const [isPinnedToBottom, setIsPinnedToBottom] = useState(true);
   const [feedback, setFeedback] = useState<Record<string, 'up' | 'down'>>({});
   const [semanticLayerState, setSemanticLayerState] =
@@ -840,8 +833,13 @@ const AiAgentPanel = () => {
     }
   };
 
-  const onProgressUpdate = (event: ConversationProgressEvent) =>
+  const onProgressUpdate = (event: ConversationProgressEvent) => {
     setProgress(event.summary);
+    if (event.agent_step) {
+      const { agent_step: step } = event;
+      setLiveSteps(prev => [...prev, step]);
+    }
+  };
 
   // Run a turn over the streaming endpoint, falling back to the buffered request
   // only when streaming never started (StreamUnavailableError). A mid-stream
@@ -876,6 +874,7 @@ const AiAgentPanel = () => {
     setIsLoading(true);
     setError(null);
     setProgress(null);
+    setLiveSteps([]);
     // Show the user's message immediately instead of a placeholder while the
     // agent works; it is reconciled once the turn response arrives.
     setPendingUserMessage(message);
@@ -1319,25 +1318,25 @@ const AiAgentPanel = () => {
                     disabled={isLoading}
                     onSelect={question => onSend(question)}
                   />
-                  {artifact.wren_context && (
-                    <TraceDetails>
-                      <summary>{t('Wren context')}</summary>
-                      <SqlBlock>
-                        {JSON.stringify(artifact.wren_context, null, 2)}
-                      </SqlBlock>
-                    </TraceDetails>
-                  )}
-                  {artifact.trace.length > 0 && (
-                    <TraceDetails>
-                      <summary>{t('Trace')}</summary>
-                      <TraceList>
-                        {artifact.trace.map((event, index) => (
-                          <li key={`${event.step}-${index}`}>
-                            {event.step}: {event.summary}
-                          </li>
-                        ))}
-                      </TraceList>
-                    </TraceDetails>
+                  {(artifact.timeline?.length || artifact.trace.length) > 0 && (
+                    <Button
+                      aria-label={t('Explain')}
+                      buttonStyle="link"
+                      onClick={() =>
+                        setExplainTarget({
+                          message:
+                            messages
+                              .slice(0, messageIndex)
+                              .reverse()
+                              .find(item => item.role === 'user')?.content ||
+                            '',
+                          steps: artifact.timeline ?? [],
+                        })
+                      }
+                      icon={<Icons.InfoCircleOutlined iconSize="m" />}
+                    >
+                      {t('Explain')}
+                    </Button>
                   )}
                 </ArtifactBlock>
               );
@@ -1438,6 +1437,22 @@ const AiAgentPanel = () => {
               <ProgressBubble data-test="agent-progress">
                 <Icons.LoadingOutlined iconSize="m" spin />
                 {progress || t('Working…')}
+                {liveSteps.length > 0 && (
+                  <Button
+                    aria-label={t('Explain')}
+                    buttonStyle="link"
+                    onClick={() =>
+                      setExplainTarget({
+                        message: pendingUserMessage || '',
+                        steps: [],
+                        live: true,
+                      })
+                    }
+                    icon={<Icons.InfoCircleOutlined iconSize="s" />}
+                  >
+                    {t('Explain')}
+                  </Button>
+                )}
               </ProgressBubble>
             </MessageBlock>
           )}
@@ -1454,6 +1469,13 @@ const AiAgentPanel = () => {
           </JumpToLatestButton>
         )}
       </TranscriptWrapper>
+
+      <ExplainDialog
+        open={Boolean(explainTarget)}
+        onClose={() => setExplainTarget(null)}
+        userMessage={explainTarget?.message}
+        steps={explainTarget?.live ? liveSteps : (explainTarget?.steps ?? [])}
+      />
 
       <Composer>
         <ComposerInput data-loading={isLoading}>

@@ -106,6 +106,27 @@ exists**. Drawing MDL joins over an FK-less schema is the high-signal case.
 - `table_metadata` is **per-table and introspection-costly**; this is the cost we
   engineer around (§4). An optional bulk endpoint is deferred (§6 G4).
 
+### 2.1 Pre-flight: verified anchors & findings (2026-06-24)
+
+Implementation-readiness pass over current source (the codebase moved as C0
+progressed). Each plan assumption re-checked:
+
+| Anchor | Verified state | Implication |
+| --- | --- | --- |
+| Editor tabs | `ContentTabs` with `items=[{key:'models'},{key:'instructions'}]` ([`SemanticLayerEditor/index.tsx`](../superset-frontend/src/SqlLab/components/AiAgentPanel/SemanticLayerEditor/index.tsx)) | Add a third lazy `'graph'` item (G0.1); no structural change. |
+| Table fetch/cache | [`src/hooks/apiResources/tables.ts`](../superset-frontend/src/hooks/apiResources/tables.ts) RTK Query: `useLazyTablesQuery`, `useLazyTableMetadataQuery`, `tableEndpoints.tableMetadata.initiate`, `tableApiUtil`; typed `Table`/`Column`/`TableMetaData` | **Reuse — don't hand-roll caching/dedup** (G0.2). Graph adds only throttle/LRU/reverse-FK/seed. |
+| Column key icons | `ColumnElement` (pk/fk/index) + `TablePreview` consume the same metadata | Reuse for the detail panel (G1.3). |
+| ECharts minimal import | plugin imports types from `echarts/core` + `echarts/charts` (`GraphChart`); `ZoomConfigsChart` uses full `echarts` (lazy-chunked) | Minimal `echarts/core`+`GraphChart` import is precedented (D1). |
+| Seed signals | `state.sqlLab.tables` (Redux) + `artifact.wren_context.matched_models` (in panel) | Both zero-cost (D11, §4.8). |
+| Instruction scope | `instruction_scope_hash` drops `dataset_ids` ([`store.py:178`](semantic_layer/store.py#L178)); wired in graph/enrich/routes | X8 needs no scope work; §7.3 confirmed. |
+| MDL retrieval scope | project-keyed `"{owner}:{project_id}"` ([`schema_retriever.py:573`](semantic_layer/schema_retriever.py#L573)) | dataset-independent already; §7.3 confirmed. |
+| X2 plumbing | `AgentQueryRequest` ([`schemas.py:34`](schemas.py#L34)); retrieval refactored to `build_unified_context` (C1.2/C1.3) + `select_relevant_models`/`llm_select_models` ([`runtime.py`](semantic_layer/runtime.py), [`graph.py`](graph.py)) | Add `focus_tables` and thread as a boost into `build_unified_context` (G3.3). |
+| **Finding — X3 mapping gap** | `MdlValidationMessage` = `{line,column,severity,message,code}`, **no entity ref** ([`schemas.py:168`](semantic_layer/schemas.py#L168)); entity only in message text | Best-effort name+`code` mapping first, or small additive backend field (G2.2). Not C0-contended. |
+
+**Net:** no blocking drift. The biggest change vs. the original plan is a
+*simplification* — G0.2 rides the existing RTK table resource instead of a custom
+cache. The only new finding is the X3 validation→node mapping gap (G2.2).
+
 ---
 
 ## 3. Data model & the overlay mapping
@@ -316,17 +337,26 @@ Each item: **goal · files · depends-on · acceptance**. Frontend-only through 
   - Acceptance: SQL Lab entry chunk unchanged (bundle check); ECharts appears only
     in an async chunk fetched on tab open; opening the editor issues **no** graph
     network calls.
-- [ ] **G0.2 — `graphConfig.ts` constants + data layer skeleton** `P1`
+- [ ] **G0.2 — `graphConfig.ts` constants + data layer over the existing RTK resource** `P1`
   - Goal: `SEED_LIMIT`, `MAX_NODES`, `MAX_EDGES`, `EXPAND_FANOUT_CAP`,
-    `MAX_INFLIGHT`; a `useSchemaGraphData` hook owning the name-universe fetch, the
-    `table_metadata` cache, the concurrency queue, and the reverse-FK index.
-  - Files: `SchemaGraph/graphConfig.ts`, `SchemaGraph/useSchemaGraphData.ts`,
-    api wrappers (reuse SQL Lab's `SupersetClient` table fetchers; add typed thin
-    wrappers in [`api.ts`](../superset-frontend/src/SqlLab/components/AiAgentPanel/api.ts)
-    only if not already exposed).
+    `MAX_INFLIGHT`; a `useSchemaGraphData` hook for the name-universe fetch, the
+    concurrency throttle, the LRU window, and the reverse-FK index.
+  - **Reuse (verified):** fetching + caching + dedup + `force` refresh are already
+    provided by [`src/hooks/apiResources/tables.ts`](../superset-frontend/src/hooks/apiResources/tables.ts)
+    (RTK Query): `useLazyTablesQuery` (the cheap name universe),
+    `useLazyTableMetadataQuery` / `tableEndpoints.tableMetadata.initiate(...)` for
+    **dynamic-N** per-table fetches dispatched imperatively, and the exported
+    `Table` / `Column` (`ColumnKeyTypeType = 'pk'|'fk'|'index'`) / `TableMetaData`
+    types. **Do not hand-roll a metadata cache** — RTK caches and dedups identical
+    requests; the graph layer adds only what RTK does not: a **concurrency throttle**
+    (`MAX_INFLIGHT`), **LRU windowing** (`MAX_NODES`), the **reverse-FK index**, and
+    **seed selection**. Abort-on-evict = unsubscribe the RTK query.
+  - Files: `SchemaGraph/graphConfig.ts`, `SchemaGraph/useSchemaGraphData.ts`
+    (wraps `tables.ts`); no new `api.ts` wrappers needed for physical data.
   - Depends-on: G0.1.
-  - Acceptance: unit tests for the queue (≤ `MAX_INFLIGHT` in flight), the LRU
-    eviction, the cache hit/miss, and abort-on-evict.
+  - Acceptance: unit tests for the throttle (≤ `MAX_INFLIGHT` concurrent initiates),
+    LRU eviction (+ unsubscribe), reverse-FK index population, and seed selection;
+    no bespoke metadata cache introduced (RTK is the cache).
 - [ ] **G0.3 — Generic integration seams (prerequisite for §7)** `P1`
   - Goal: bake the three seams every extension depends on into graph-core, so
     later features attach **without graph-core changes** (full spec in §7.1):
@@ -395,8 +425,17 @@ Each item: **goal · files · depends-on · acceptance**. Frontend-only through 
     validation results the editor already surfaces).
   - Files: `SchemaGraph/mdlOverlay.ts`, `SchemaGraph/echartsOptions.ts`.
   - Depends-on: G2.1, G1.3 (needs hydrated columns to detect missing refs).
-  - Acceptance: a hallucinated column ref shows red on the node; coverage legend
-    explains the styles.
+  - **Finding (X3 mapping gap):** `MdlValidationMessage` carries only
+    `{line, column, severity, message, code}` — **no structured entity ref**; the
+    model/column name lives in the message *text* ([`schemas.py:168`](semantic_layer/schemas.py#L168);
+    e.g. `code="duplicate_model"`, `message="Duplicate model name: {name}."`). So
+    node-level highlighting needs either (a) **best-effort** mapping by `code` +
+    name extracted from the message, or (b) a small **additive** backend field
+    (`entity`/`model`/`column`) on `MdlValidationMessage` + the emit sites in
+    `mdl_validator.py`. Both files are **not C0-contended**. Recommend shipping (a)
+    for the common codes first; do (b) if precision is insufficient.
+  - Acceptance: a hallucinated column ref shows red on the node (via (a) or (b));
+    coverage legend explains the styles.
 - [ ] **G2.3 — Seed/expand parity for the combined view** `P2`
   - Goal: the seed/search/expand model (§4.2) applies to model nodes too (since
     onboarding may model everything) — never render all models eagerly.
@@ -426,18 +465,25 @@ Each item: **goal · files · depends-on · acceptance**. Frontend-only through 
     `select_relevant_models`), and the resulting answer's
     `matched_models`/`candidate_table_names` highlight back on the graph (reuses
     G3.1). Closes the loop your "highlight tables identified" example described.
-  - Files: `SchemaGraph/SchemaGraph.tsx` (uses S-B `onSelectionQuery`),
-    `AiAgentPanel/index.tsx` (accept a selection hint into the query scope),
-    seam into the agent query path.
+  - Files / plumbing (verified anchors):
+    - frontend: `SchemaGraph/SchemaGraph.tsx` (S-B `onSelectionQuery`),
+      `AiAgentPanel/index.tsx` + `api.ts` `AgentQueryRequest` — add optional
+      `focus_tables?: string[]`;
+    - backend: `schemas.py` `AgentQueryRequest` ([:34](schemas.py#L34)) — add
+      `focus_tables: list[str] = []`; thread into the context node
+      ([`graph.py`](graph.py)) where retrieval was refactored to
+      `build_unified_context` (C1.2/C1.3) — pass the focus set as a **boost/seed**
+      so focused tables lead the merged list and survive table-selection
+      (`select_relevant_models` heuristic / `llm_select_models` selector).
   - Depends-on: G0.3 (S-B), G3.1.
-  - **Prerequisite/risk:** a table/model selection maps to a `dataset_ids`-bearing
-    scope whose `scope_hash` differs from the schema-level scope MDL/instructions
-    are authored at (the same mismatch flagged for C5.1 instructions, see
-    `wren_enrich_and_retrieve.md` C5.1 residual). **Decide the scope-normalization
-    story once** (§7.3) before wiring; until then the hint is advisory (re-ranking
-    only), not a scope change.
-  - Acceptance: selecting nodes + asking routes the hint to the agent; the answer
-    re-highlights the used nodes; no scope-hash regression for instructions/memory.
+  - **Scope rule (§7.3, adopted Option 2):** the selection is a **retrieval focus
+    hint** fed to `select_relevant_models` as a boost/seed — it **never** mutates
+    `dataset_ids` or the scope identity, so no recall (instructions/MDL/memory) is
+    re-partitioned. This makes X2 **independent of the memory realignment** (no
+    backend prerequisite).
+  - Acceptance: selecting nodes + asking passes the focus hint to the agent and
+    biases retrieval toward those tables; the answer re-highlights the used nodes;
+    `scope_hash` / `instruction_scope_hash` are unchanged by a graph selection.
 
 ### Phase G4 — Optional backend bulk adjacency (deferred) `[TODO]`
 - [ ] **G4.1 — Bulk schema-graph endpoint** `P3`
@@ -486,7 +532,7 @@ backend) before it can attach.
 | # | Feature (source) | Entrypoint (UI) | Seam / API left | Prerequisite | Status |
 | --- | --- | --- | --- | --- | --- |
 | X1 | **Agent grounding highlight** — R2 `select_relevant_models` + `WrenContextArtifact.matched_models`/`candidate_table_names` (enrich&retrieve) | auto on each answer + "focus on these" button | S-B `highlightNodes`/`focusNodes`; consume latest artifact ([`api.ts:84-122`](../superset-frontend/src/SqlLab/components/AiAgentPanel/api.ts#L84)); S-C `agentUsage` (candidate vs matched, `retrieval_mode`) | S-A, S-B | **Committed — G3.1** |
-| X2 | **Semantic query tool** (your example) — graph ⇄ chat | node multi-select → "Ask about these"; answer re-highlights | S-B `onSelectionQuery(ids)` → query path in `AiAgentPanel/index.tsx`; return path = X1 | S-B + §7.3 scope decision | **Committed — G3.3 (flagship)** |
+| X2 | **Semantic query tool** (your example) — graph ⇄ chat | node multi-select → "Ask about these"; answer re-highlights | S-B `onSelectionQuery(ids)` → `focus_tables` hint in `AiAgentPanel/index.tsx` → `select_relevant_models`; return path = X1 | S-B (scope rule §7.3 adopted — focus hint, no `dataset_ids` change) | **Committed — G3.3 (flagship)** |
 | X3 | **Validation overlay** — W5 (`column_without_type`, dedup), F4 cube/metric errors, E5; later C2 deep-engine (`wren_full.md`/enrich&retrieve) | red node/edge styling + tooltip; legend | S-A entity→node map; S-C `validation` populated from the editor's existing `MdlValidationResult` | S-A, S-C | **Committed — G2.2**; deep-engine (C2) lands when available |
 | X4 | **Node-level enrich / add-to-MDL** — F6 per-entity patch `_patch_target`, E4 (enrich&retrieve) | unmodeled node → "Add to MDL / enrich" | S-B `onNodeAction(id,'enrich')` → existing `enrichProjectDocument`/`onboard`; gated by `canWrite` | S-B; `canWrite` | **Committed — G3.2** (F6 makes single-entity patch safe) |
 | X5 | **Activation status + activate-from-graph** — F0.1 engine gate + `MdlFile.status` (`wren_full.md`) | model node badge draft/active; node → "Activate" | S-C `status` from owning `MdlFile`; S-B action → existing `updateMdlFile`; surface 409 gate | S-C; G2.1 (model↔file map) | **Seam-ready** (P2) |
@@ -498,24 +544,59 @@ backend) before it can attach.
 | X11 | **Examples/memory badges** — R6 confirmed NL→SQL pairs (enrich&retrieve) | node badge "N examples" | S-C count field | **needs backend**: a by-table examples endpoint (memory is keyed by `scope_hash`, not table) | **Deferred** |
 | X12 | **Bulk adjacency data source** — perf (this doc G4) | transparent (data-layer swap) | `useSchemaGraphData` source switch behind the same hook | **needs backend G4.1** | **Deferred — G4** |
 
-### 7.3 Shared prerequisite — scope normalization (decide once)
+### 7.3 Scope-normalization rule — **ADOPTED: Option 2 (canonical project scope + selection-as-signal)**
 
-Three features (X2 query tool, X8 instructions, and X11 examples) collide with the
-same issue already recorded for C5.1: a **selection of specific tables/models maps
-to a `dataset_ids`-bearing scope**, whose `scope_hash` differs from the
-**schema-level scope** (`dataset_ids: []`) that MDL and instructions are authored
-at (`store.py` `scope_hash`; recall in `graph.py`/`instructions.py`). Until a
-scope-normalization rule is chosen (e.g., recall at schema scope regardless of
-dataset selection, or hash that ignores `dataset_ids` for instructions/MDL):
+**Decision (2026-06-24):** evaluated against industry practice (vector-DB
+multi-tenancy: partition for isolation, metadata-filter + rerank for relevance —
+Pinecone/Weaviate; semantic-layer scoping: stable hierarchical levels — LookML
+multi-scope resolution). The rule:
 
-- **X2** treats the graph selection as an **advisory re-rank hint only** (feeds
-  `select_relevant_models`), **not** a scope change — so it never silently drops
-  instructions/examples.
-- **X8** surfaces **scope-level** instructions for the node's schema, not a
-  per-model list, and labels them as such.
+> **The canonical scope identity is the project (`database` + `catalog` +
+> `schema`). All durable agent knowledge (instructions, MDL, memory) is
+> partitioned by it. A `dataset_ids` chat filter or a graph table-selection is a
+> *retrieval relevance signal* (a filter/boost in ranking) — never part of the
+> partition key.**
 
-This is a **backend decision** (C0/`instructions.py`/`scope_hash` territory) and
-should be settled before X2/X8 graduate from seam-ready to wired.
+This confirms what is already true (instructions schema-level via
+`instruction_scope_hash`; MDL retrieval project-keyed) and resolves the one
+remaining divergence (memory is the only knowledge still partitioned by
+`dataset_ids` — over-partitioning by the industry rule).
+
+**Rejected:** per-resource ad-hoc (incoherent; re-litigated per feature);
+hierarchical cascade (Option 3 — over-engineered until dataset-specific authoring
+is actually requested; recorded as the future extension if so); tag/label scoping
+(Option 4 — duplicates semantic similarity).
+
+**Engineering shape (where each piece lands):**
+1. **Instructions / MDL** — already conform. Optionally fold `instruction_scope_hash`
+   into a shared `project_scope_hash` name for one concept. *(no behavior change)*
+2. **Memory (NL→SQL)** — realign recall partition from full `scope_hash`
+   (incl. `dataset_ids`) to the **project scope**, and pass `dataset_ids` /
+   selected tables as an **overlap boost** in `memory_store._semantic_rank`.
+   Requires a re-key/dual-read migration of stored examples. **Backend owner
+   sign-off required** — this is the only behavior change, and it touches
+   `memory_store.py` (**C0-contended**), so schedule it with the backend owner,
+   *not* under the graph-view work. Tracked as a sub-task in
+   [`wren_enrich_and_retrieve.md`](wren_enrich_and_retrieve.md) (see X-ref below).
+3. **X2 (graph query tool)** — add `focus_tables`/`focus_models` to the agent query
+   request and feed them to `select_relevant_models` as a boost/seed. **Never write
+   graph selection into `dataset_ids`** (also avoids the table≠dataset coercion:
+   graph nodes are physical `{catalog,schema,table}`, `dataset_ids` are Superset
+   dataset IDs that may not exist for a raw table).
+
+**Crucial sequencing consequence:** because X2 passes a *focus hint* and never
+mutates `dataset_ids`, **the graph feature does not depend on the memory
+realignment**. X2 and X8 (already schema-level) are unblocked under this rule
+immediately; the memory migration ships independently. So G0–G3 carry **no backend
+prerequisite** — the only C0-contended item (memory realignment) is decoupled.
+
+**Per-feature effect under the adopted rule:**
+- **X2** — selection is an advisory re-rank/seed hint to `select_relevant_models`;
+  scope identity (and thus all recall) is unchanged. No silent drops.
+- **X8** — instructions are already project/schema-level; the node action surfaces
+  the schema's instructions (correct by construction, no per-model partition).
+- **X11** — unchanged status (still needs a by-table examples endpoint); the rule
+  makes "examples for this project" well-defined once that endpoint exists.
 
 ## 8. Performance budget & strategy summary
 
@@ -567,12 +648,13 @@ working tree): `semantic_layer/memory_store.py`, `semantic_layer/instructions.py
 | G0–G2 + G3.1 | `../superset-frontend/.../SemanticLayerEditor/index.tsx` (modify: tab + shared MDL state G0.4), new `SemanticLayerEditor/SchemaGraph/**` (incl. `types.ts`, `ids.ts`, `GraphController.ts` for the seams), optional thin wrappers in `AiAgentPanel/api.ts` | **None** — frontend only |
 | G3.3 (semantic query tool) | `AiAgentPanel/index.tsx` (modify: accept a selection hint into the query path) | **None** — frontend only |
 | G4 (deferred) | `app.py` (additive route), new `semantic_layer/schema_graph.py`, reads `mdl_validator.py` (`SchemaIndex`) | **None of the contended files**; `app.py` is shared but additive. Explicitly **avoid** `config.py` (keep limits in `graphConfig.ts`). |
-| §7.3 scope decision (gates X2/X8 wiring) | backend `scope_hash`/`instructions.py`/`graph.py` recall | **Overlaps C0** (`instructions.py`). Do **not** start under C0; it is a shared decision to settle with the backend owner, not graph-view code. |
+| Memory realignment (§7.3, decoupled) | backend `memory_store.py` recall + migration | **Overlaps C0** (`memory_store.py`). **Not required by the graph feature** — X2 uses a focus hint, not `dataset_ids`. Schedule with the backend owner independently. |
 
 **Verdict:** G0–G3 are fully parallelizable with C0 (frontend-only, mirrors the
 C5.1 isolation). G4 stays clear of every C0-contended backend file by design. The
-only C0-contended surface is the §7.3 scope-normalization decision, which is a
-prerequisite for *wiring* X2/X8, not for building the graph or leaving their seams.
+§7.3 scope rule is **adopted (Option 2)**; its only C0-contended piece (memory
+realignment) is **decoupled** from the graph feature, so G0–G3 carry no backend
+prerequisite.
 
 `index.tsx` is clean in the working tree; `SemanticLayerImportDialog.tsx` is
 already dirty (C5.x) — this feature does not touch it.
@@ -599,7 +681,8 @@ G0 (lazy scaffold + data layer + seams S-A/S-B/S-C + shared MDL state)
         │                                              │
         └─► G3.1 (X1 agent highlight) ─► G3.3 (X2 semantic query tool, flagship)
                                           │
-                                          └─ gated on §7.3 scope decision (advisory until then)
+                                          └─ §7.3 rule adopted: focus hint, not a
+                                             scope change → no backend prerequisite
 G4 (bulk endpoint) ── deferred, gated on measured need
 Seam-ready extensions X5–X10 attach via S-A/S-B/S-C with no graph-core change.
 ```

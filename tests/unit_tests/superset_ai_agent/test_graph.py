@@ -437,6 +437,13 @@ def test_graph_executes_valid_sql_when_requested() -> None:
         "execute_sql",
         "build_artifacts",
     ]
+    # The one-shot response carries the explain-and-audit timeline mirroring the
+    # trace, with the executed row count surfaced as a typed step detail.
+    assert [step.kind for step in response.timeline] == [
+        event.step for event in response.trace
+    ]
+    execute_step = next(s for s in response.timeline if s.kind == "execute_sql")
+    assert execute_step.detail.row_count == 1
 
 
 def test_instruction_scope_hash_ignores_dataset_selection() -> None:
