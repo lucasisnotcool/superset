@@ -42,6 +42,7 @@ import {
   streamCopilot,
 } from '../api';
 import CopilotInspectorDialog from './CopilotInspectorDialog';
+import CoverageDialog from './CoverageDialog';
 
 export interface CopilotPanelProps {
   projectId: string;
@@ -88,6 +89,7 @@ const CopilotPanel = ({
   const [error, setError] = useState<string | null>(null);
   const [inspector, setInspector] = useState<CopilotInspector | null>(null);
   const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [coverageOpen, setCoverageOpen] = useState(false);
   const [liveSteps, setLiveSteps] = useState<AgentStep[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -243,15 +245,26 @@ const CopilotPanel = ({
         `}
       >
         <Typography.Text strong>{t('MDL Copilot')}</Typography.Text>
-        <Button
-          buttonStyle="link"
-          buttonSize="small"
-          icon={<Icons.SettingOutlined />}
-          onClick={openInspector}
-          data-test="copilot-inspector-toggle"
-        >
-          {t('Inspector')}
-        </Button>
+        <Flex gap={theme.sizeUnit}>
+          <Button
+            buttonStyle="link"
+            buttonSize="small"
+            icon={<Icons.CheckSquareOutlined />}
+            onClick={() => setCoverageOpen(true)}
+            data-test="copilot-coverage-toggle"
+          >
+            {t('Coverage')}
+          </Button>
+          <Button
+            buttonStyle="link"
+            buttonSize="small"
+            icon={<Icons.SettingOutlined />}
+            onClick={openInspector}
+            data-test="copilot-inspector-toggle"
+          >
+            {t('Inspector')}
+          </Button>
+        </Flex>
       </Flex>
 
       <Flex
@@ -530,6 +543,11 @@ const CopilotPanel = ({
         open={inspectorOpen}
         inspector={inspector}
         onClose={() => setInspectorOpen(false)}
+      />
+      <CoverageDialog
+        projectId={projectId}
+        open={coverageOpen}
+        onClose={() => setCoverageOpen(false)}
       />
     </Flex>
   );

@@ -1099,6 +1099,70 @@ export const getCopilotDeployPreview = (projectId: string) =>
     { method: 'GET' },
   );
 
+export type CoverageClaimKind =
+  | 'definition'
+  | 'metric'
+  | 'synonym'
+  | 'relationship'
+  | 'filter'
+  | 'dimension'
+  | 'rule'
+  | 'other';
+
+export type CoverageStatus = 'covered' | 'partial' | 'missing';
+
+export interface CoverageClaim {
+  kind: CoverageClaimKind;
+  subject: string;
+  statement: string;
+  source_quote?: string;
+}
+
+export interface CoverageFinding {
+  claim: CoverageClaim;
+  status: CoverageStatus;
+  matched?: string;
+  rationale?: string;
+  suggestion?: string;
+}
+
+export interface OverreachFinding {
+  fact_ref: string;
+  fact_kind?: string;
+  supported: boolean;
+  rationale?: string;
+}
+
+export interface CoverageReport {
+  document_id?: string | null;
+  document_filename: string;
+  findings: CoverageFinding[];
+  total: number;
+  covered: number;
+  partial: number;
+  missing: number;
+  score: number;
+  overreach: OverreachFinding[];
+  unsupported: number;
+  warnings: string[];
+}
+
+export const runCoverage = (
+  projectId: string,
+  documentId: string,
+  includeOverreach = false,
+) =>
+  requestJson<CoverageReport>(
+    `/agent/semantic-layer/projects/${projectId}/copilot/coverage`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        document_id: documentId,
+        include_overreach: includeOverreach,
+      }),
+    },
+  );
+
 export const runCopilot = (projectId: string, payload: CopilotTurnRequest) =>
   requestJson<Changeset>(
     `/agent/semantic-layer/projects/${projectId}/copilot`,
@@ -1199,6 +1263,12 @@ export const uploadMdlFile = (
     formData,
   );
 };
+
+export const listProjectDocuments = (projectId: string) =>
+  requestJson<SemanticDocument[]>(
+    `/agent/semantic-layer/projects/${projectId}/documents`,
+    { method: 'GET' },
+  );
 
 export const uploadProjectSourceDocument = (projectId: string, file: File) => {
   const formData = new FormData();

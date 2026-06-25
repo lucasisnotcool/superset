@@ -23,6 +23,7 @@ import {
   getCopilotInspector,
   getProjectWorkspace,
   runCopilot,
+  runCoverage,
   createMdlFile,
   createConversation,
   createSemanticLayerEventSource,
@@ -549,6 +550,27 @@ test('MDL Copilot helpers call workspace, run, apply, and inspector', async () =
   });
   const preview = await getCopilotDeployPreview('project-1');
   expect(preview.items[0].path).toBe('models/orders.json');
+
+  fetchMock.post(`${base}/copilot/coverage`, {
+    document_id: 'doc-1',
+    document_filename: 'glossary.md',
+    findings: [],
+    total: 3,
+    covered: 2,
+    partial: 0,
+    missing: 1,
+    score: 0.667,
+    warnings: [],
+  });
+  const coverage = await runCoverage('project-1', 'doc-1');
+  expect(coverage.missing).toBe(1);
+  const coverageCall = fetchMock.callHistory.calls(
+    `${base}/copilot/coverage`,
+  )[0];
+  expect(JSON.parse(String(coverageCall.options.body))).toEqual({
+    document_id: 'doc-1',
+    include_overreach: false,
+  });
 
   const [runCall] = fetchMock.callHistory.calls(`${base}/copilot`);
   expect(JSON.parse(String(runCall.options.body))).toEqual({

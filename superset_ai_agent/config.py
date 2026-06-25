@@ -191,6 +191,9 @@ class AgentConfig:
     # Ceiling for inline conversation attachments (long-context, no RAG). Oversize
     # text is truncated with a visible warning rather than rejected.
     wren_copilot_attachment_max_chars: int = 200_000
+    # Coverage audit: judge votes per run (majority wins, ties break conservatively).
+    # >1 trades cost for stability against LLM non-determinism. Default 1.
+    wren_copilot_coverage_votes: int = 1
     # Wren full-parity seams (see wren_full.md). All default to the
     # zero-dependency binding so the service starts unchanged; turning any of
     # these on requires durable semantic persistence (semantic_layer_store=
@@ -272,7 +275,9 @@ class AgentConfig:
     )
     log_level: str = "INFO"
     suppress_superset_logs: bool = True
-    local_superset_secret_key: str = "ai-agent-local-dev-secret-key-not-for-production"  # noqa: S105
+    local_superset_secret_key: str = (
+        "ai-agent-local-dev-secret-key-not-for-production"  # noqa: S105
+    )
 
     @classmethod
     def from_env(cls) -> "AgentConfig":
@@ -617,6 +622,12 @@ class AgentConfig:
                 os.getenv(
                     "WREN_COPILOT_ATTACHMENT_MAX_CHARS",
                     str(cls.wren_copilot_attachment_max_chars),
+                )
+            ),
+            wren_copilot_coverage_votes=int(
+                os.getenv(
+                    "WREN_COPILOT_COVERAGE_VOTES",
+                    str(cls.wren_copilot_coverage_votes),
                 )
             ),
             wren_engine=cast(

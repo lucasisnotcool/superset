@@ -155,4 +155,81 @@ class ChangesetApplyRequest(BaseModel):
     items: list[ChangesetItem] = Field(default_factory=list)
 
 
+# -- Coverage audit (markdown → MDL information-loss detection) --------------
+
+CoverageClaimKind = Literal[
+    "definition",
+    "metric",
+    "synonym",
+    "relationship",
+    "filter",
+    "dimension",
+    "rule",
+    "other",
+]
+
+CoverageStatus = Literal["covered", "partial", "missing"]
+
+
+class CoverageClaim(BaseModel):
+    """One atomic, checkable assertion extracted from a source document."""
+
+    kind: CoverageClaimKind = "other"
+    subject: str = ""
+    statement: str
+    source_quote: str = ""
+
+
+class CoverageFinding(BaseModel):
+    """A claim aligned against the MDL: is its information captured?"""
+
+    claim: CoverageClaim
+    status: CoverageStatus = "missing"
+    #: The MDL element/instruction that captures the claim, if any.
+    matched: str = ""
+    rationale: str = ""
+    #: How to close the gap (feeds the copilot remediation loop).
+    suggestion: str = ""
+
+
+class OverreachFinding(BaseModel):
+    """An MDL fact not supported by any claim in the document (over-reach)."""
+
+    fact_ref: str
+    fact_kind: str = ""
+    supported: bool = True
+    rationale: str = ""
+
+
+class CoverageReport(BaseModel):
+    """Coverage of a document's information by the project's MDL.
+
+    ``score`` weights ``partial`` as 0.5. Advisory, not a gate: findings are
+    LLM-judged and confidence varies (see wren_mdl_copilot.md coverage risks).
+    ``overreach`` is the reverse direction — MDL claims unsupported by the document
+    — populated only when the audit requests it.
+    """
+
+    document_id: str | None = None
+    document_filename: str = ""
+    findings: list[CoverageFinding] = Field(default_factory=list)
+    total: int = 0
+    covered: int = 0
+    partial: int = 0
+    missing: int = 0
+    score: float = 0.0
+    overreach: list[OverreachFinding] = Field(default_factory=list)
+    unsupported: int = 0
+    warnings: list[str] = Field(default_factory=list)
+
+
+class CoverageRequest(BaseModel):
+    """Run a coverage audit for one uploaded project document."""
+
+    document_id: str
+    model: str | None = None
+    #: Also flag MDL facts unsupported by the document (reverse direction).
+    include_overreach: bool = False
+
+
 WorkspaceNode.model_rebuild()

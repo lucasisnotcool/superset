@@ -88,11 +88,17 @@ from superset_ai_agent.semantic_layer.access import (
     SemanticAccessService,
     SemanticPermission,
 )
+from superset_ai_agent.semantic_layer.copilot.coverage import (
+    InMemoryCoverageCache,
+    run_coverage_audit,
+)
 from superset_ai_agent.semantic_layer.copilot.schemas import (
     Changeset,
     ChangesetApplyRequest,
     CopilotInspector,
     CopilotTurnRequest,
+    CoverageReport,
+    CoverageRequest,
     InstructionView,
     MessageAttachment,
     WorkspaceNode,
@@ -320,6 +326,8 @@ def create_app(  # noqa: C901
     # Document-chunk RAG index — shares the app embedder + vector-index mode, built
     # once so the LanceDB connection is reused. Degrades closed to keyword recall.
     active_document_index = create_document_index(app_config, active_embedder)
+    # Per-worker coverage-report cache (determinism on repeat audits).
+    active_coverage_cache = InMemoryCoverageCache()
     active_vector_index = effective_vector_index(app_config, active_retriever)
     if active_vector_index == "memory_fallback":
         logger.warning(
@@ -1413,6 +1421,65 @@ def create_app(  # noqa: C901
         )
 
     @api.post(
+        "/agent/semantic-layer/projects/{project_id}/copilot/coverage",
+        response_model=CoverageReport,
+    )
+    def run_project_coverage(
+        project_id: str,
+        request: CoverageRequest,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> CoverageReport:
+        """Audit a document for information lost in markdown → MDL conversion."""
+
+        _require_copilot_enabled()
+        project = authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="read"
+        )
+        # Assemble the document text from its persisted chunks (the extracted text).
+        chunks = active_semantic_layer_store.list_project_chunks(
+            project_id, owner_id=identity.owner_id
+        )
+        doc_chunks = sorted(
+            (c for c in chunks if c.document_id == request.document_id),
+            key=lambda c: c.chunk_index,
+        )
+        document_text = "\n\n".join(chunk.text for chunk in doc_chunks)
+        filename = ""
+        # Fall back to the document's extracted text when chunks are absent (e.g.
+        # document indexing disabled), so coverage does not require the RAG index.
+        try:
+            document = active_semantic_layer_store.get_document(
+                request.document_id, owner_id=identity.owner_id
+            )
+            filename = document.filename
+            if not document_text:
+                document_text = document.extracted_text or ""
+        except SemanticDocumentNotFoundError as ex:
+            raise HTTPException(status_code=404, detail="Document not found.") from ex
+        files = active_mdl_file_store.list(project_id, owner_id=identity.owner_id)
+        instructions = [
+            view.instruction
+            for view in _project_instruction_views(project, identity.owner_id)
+        ]
+        try:
+            return run_coverage_audit(
+                active_model_client,
+                document_text=document_text,
+                files=files,
+                instructions=instructions,
+                document_id=request.document_id,
+                document_filename=filename,
+                model=request.model,
+                embedder=active_embedder,
+                votes=app_config.wren_copilot_coverage_votes,
+                cache=active_coverage_cache,
+                include_overreach=request.include_overreach,
+            )
+        except Exception as ex:  # pylint: disable=broad-except
+            raise HTTPException(status_code=502, detail=str(ex)) from ex
+
+    @api.post(
         "/agent/semantic-layer/projects/{project_id}/copilot",
         response_model=Changeset,
     )
@@ -1807,6 +1874,24 @@ def create_app(  # noqa: C901
             ) from ex
         except ValueError as ex:
             raise HTTPException(status_code=400, detail=str(ex)) from ex
+
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}/documents",
+        response_model=list[SemanticDocument],
+    )
+    def list_project_source_documents(
+        project_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> list[SemanticDocument]:
+        """List the uploaded source documents for a governed semantic project."""
+
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="read"
+        )
+        return active_semantic_layer_store.list_project_documents(
+            project_id, owner_id=identity.owner_id
+        )
 
     @api.post(
         "/agent/semantic-layer/projects/{project_id}/documents",

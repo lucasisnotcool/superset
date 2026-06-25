@@ -15,88 +15,212 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# Wren MDL Copilot — Implementation Plan
+# Wren MDL Copilot — Implementation Plan & As-Built Log
 
-> Status: **Backend + core frontend implemented & tested.** This document is the
-> authoritative implementation plan and a checklist for future passes.
->
-> Frontend done (130 AiAgentPanel jest tests pass, prettier clean):
-> - `api.ts` copilot client (`getProjectWorkspace`, `runCopilot`,
->   `applyCopilotChangeset`, `getCopilotInspector`) + types (+ tests).
-> - `CopilotPanel.tsx` — embedded chat, per-file **diff Accept/Reject**, Apply,
->   agent-step timeline, **attachment composer** (long-context). (+ tests)
-> - `CopilotInspectorDrawer.tsx` — read-only Prompt/Skills/Tools + Instructions.
-> - Editor (`SemanticLayerEditor/index.tsx`) — **Copilot tab**, **dirty-state
->   indicator**, **on-demand Validate** button.
->
-> Also done since: **SSE streaming** — `POST /copilot/stream` (thread+queue over
-> the loop's `on_step` sink) and `streamCopilot` in `api.ts`; CopilotPanel shows
-> live agent steps. **Inline Ace gutter diagnostics** — `useJsonValidation`
-> (live JSON syntax) merged with the stored file's line/column validation
-> messages, rendered as editor annotations.
->
-> Also done since: **workspace-tree folder browser** — `WorkspaceTree.tsx`
-> (antd Tree, folder hierarchy from path prefixes, per-file activate Switch
-> preserved, draft/active/invalid tags, selection → open file) replaces the flat
-> file list in the editor. Built client-side via `treeFromFiles` so it works
-> regardless of the copilot flag; backend `GET /workspace` returns the same shape
-> (plus virtual sibling nodes) for other consumers.
->
-> Also done since: **split-pane layout** — the editor's Models view is now
-> Files │ Editor │ **Copilot rail** (toggleable via the header), the Cursor
-> layout (replaced the Copilot tab). **Deploy preview** — `build_deploy_preview`
-> + `GET /copilot/deploy-preview` + `getCopilotDeployPreview` return the aggregate
-> drafts-vs-active diff with resulting manifest validation (Wren "Deploy" review).
->
-> Deliberately deferred (with rationale):
-> - **`ConversationTurnRequest.attachments`** on the legacy SqlLab *text-to-SQL*
->   chat — out of scope: attachments are fully delivered in the Copilot (MDL)
->   conversation; the SQL chat is a separate agent.
-> - **Snapshot/revert versioning** behind `current_version_id` — requires a new
->   table + Alembic migration that cannot be fully exercised in this environment;
->   left for a migration-verified pass. The deploy-preview delivers the
->   review-before-Deploy half of Phase 7.
-> - **Deploy-preview UI affordance** (a "Preview deploy" button/modal in the
->   editor) — backend + client are done and tested; the editor button is pending.
->
-> Verified: backend **502 unit tests pass** (ruff/black clean); frontend
-> **133 AiAgentPanel jest tests pass** (prettier clean).
+> **This top section (§AB) is the authoritative as-built record** — the single
+> source of truth for current behavior, files, endpoints, and gaps. Sections
+> §0–§11 below are the **original plan (intent)**; consult them for rationale, but
+> where they disagree with §AB, §AB wins.
 
-## Implementation status (live)
+---
 
-**Done + tested (backend, 29 new unit tests, ruff/black/mypy clean on new code):**
-- Phase 0.1/0.2 — tool-calling across the LLM contract and all four providers
-  (`llm/base.py`, `openai_client.py`, `openai_compatible.py`, `azure_openai.py`,
-  `ollama.py`), with assistant-tool-call replay; structured-output callers
-  unaffected. Tests: `test_model_client_tools.py`.
-- Phase 0.3 — `MdlToolset` working-set CRUD + validate + schema tools →
-  reviewable changeset (`semantic_layer/copilot/tools.py`). Tests:
-  `test_copilot_tools.py`.
-- Phase 0.4 — schemas (`copilot/schemas.py`). Phase 0.5 — config flags
-  (`config.py`: `wren_copilot_enabled`, `wren_copilot_autopilot_enabled`,
-  `wren_copilot_attachment_max_chars`).
-- Phase 1 (backend) — `build_workspace_tree` (`copilot/workspace.py`) +
-  `GET .../workspace`. Tests: `test_copilot_service.py`, `test_copilot_api.py`.
-- Phase 3 (backend) — agentic loop with engine validation + bounded correction
-  (`copilot/loop.py`), service layer (`copilot/service.py`),
-  `POST .../copilot` and `POST .../copilot/apply`. Tests: `test_copilot_loop.py`,
-  `test_copilot_api.py`. **Note:** synchronous (returns full `Changeset` incl.
-  `steps`); SSE streaming variant is deferred (see Remaining).
-- Phase 5 (backend) — `build_inspector` + `GET .../copilot/inspector`, skills
-  activated. Phase 6 (backend) — `attachments` accepted by the copilot request +
-  truncation enforcement in the route.
+# §AB. AS-BUILT IMPLEMENTATION LOG
 
-**Remaining:**
-- SSE streaming for `POST .../copilot/stream` (sync endpoint works; `on_step`
-  sink already exists in the loop to feed it).
-- Phase 2 & 4 & FE of 1/5/6 — all frontend (workspace tree, inline diagnostics,
-  embedded Copilot chat, per-file diff Accept/Reject, inspector drawer,
-  attachment composer). Not started.
-- Phase 6 (conversation route attachments) — only the copilot request carries
-  attachments today; extending `ConversationTurnRequest` is pending.
-- Phase 7 — versioning/snapshot-before-deploy. Phase 8 — frontend tests + docs.
+**Status:** MDL Copilot (agentic CRUD + validation/correction loop) **and** the
+Coverage Audit (md→MDL information-loss detection) are **implemented, wired UI→API,
+and tested**. Verified green: **backend 547 unit tests** (`ruff`/`black`/`mypy`
+clean on new code), **frontend 144 `AiAgentPanel` jest tests / 22 suites**
+(`prettier` clean). Everything is gated behind `WREN_COPILOT_ENABLED` (404 when
+off).
 
-See the per-phase checklist in §8 for the authoritative item list.
+## AB.1 How to run / verify
+
+```bash
+# Backend (from repo root), venv has the deps incl. wren_core 0.7.1 wheel
+source venv/bin/activate
+python -m pytest tests/unit_tests/superset_ai_agent/            # full agent suite
+python -m pytest tests/unit_tests/superset_ai_agent/test_copilot_*.py
+ruff check superset_ai_agent/semantic_layer/copilot/
+mypy superset_ai_agent/semantic_layer/copilot/<module>.py        # whole-repo mypy has 2k+ pre-existing errs; scope to files
+
+# Frontend
+cd superset-frontend
+npx jest src/SqlLab/components/AiAgentPanel
+npx prettier --write <files>     # eslint v9 CLI can't load the legacy config standalone; use prettier + project `npm run lint`/pre-commit
+```
+
+## AB.2 Backend file map (`superset_ai_agent/`)
+
+- `llm/base.py` — `ModelClient.chat(..., tools=)` + `ModelResult.tool_calls`;
+  `ToolSpec`/`ToolCall`; helpers `tools_to_openai`, `parse_openai_tool_calls`,
+  `message_to_openai` (renders assistant tool-call **replay** + `role="tool"`
+  results). `ChatMessage` gained `tool_call_id`, `name`, `tool_calls`.
+- `llm/openai_client.py`, `openai_compatible.py`, `azure_openai.py`, `ollama.py`
+  — all 4 providers thread `tools`, return `tool_calls`; structured-output
+  (`format_schema`) callers unaffected. ollama parses object-args; others JSON-str.
+- `semantic_layer/copilot/schemas.py` — `Changeset`/`ChangesetItem`,
+  `ChangesetApplyRequest`, `WorkspaceNode`, `CopilotInspector`/`ToolDescriptor`/
+  `SkillDescriptor`/`InstructionView`, `MessageAttachment`, `CopilotTurnRequest`,
+  and coverage: `CoverageClaim`/`CoverageFinding`/`CoverageReport`/
+  `OverreachFinding`/`CoverageRequest`.
+- `semantic_layer/copilot/tools.py` — `MdlToolset`: in-memory **working-set**
+  CRUD (never writes the store), tools `list/read/write/delete_mdl_file`,
+  `validate_project`, `get_physical_schema`, plus RAG `list_documents`/
+  `search_documents`/`find_duplicate_documents`; `build_changeset()` diffs working
+  vs originals (JSON-normalized) → `Changeset`. `DocumentReader` protocol.
+- `semantic_layer/copilot/loop.py` — `run_copilot_loop` (bounded tool-calling +
+  engine-validation + correction loop; emits `AgentStep`s via `on_step`),
+  `build_system_prompt` (base prompt + skills + project instructions).
+- `semantic_layer/copilot/service.py` — `run_copilot`, `apply_changeset_items`
+  (persists accepted items as **drafts** via existing CRUD, `source_type="copilot"`),
+  `build_deploy_preview`, `build_inspector`. FastAPI-free (unit-testable).
+- `semantic_layer/copilot/workspace.py` — `build_workspace_tree` (folders from
+  path prefixes + virtual `instructions.md`/`queries.yml`/`raw/`/`target/mdl.json`/
+  `.wren/memory`).
+- `semantic_layer/copilot/coverage.py` — Coverage Audit: `extract_claims` (A),
+  `build_mdl_facts` (B), `_FactRanker` (embedding cosine → keyword fallback),
+  `judge_coverage(..., votes=N)` (C, multi-vote majority, conservative ties),
+  `judge_overreach` (bidirectional), `aggregate_report` + `run_coverage_audit` (D),
+  `InMemoryCoverageCache` + `audit_cache_key`.
+- `semantic_layer/copilot/coverage_eval.py` — `score_coverage(predicted, gold)` →
+  accuracy + per-status P/R/F1 (`GoldLabel`, `CoverageEvalMetrics`). Offline eval.
+- `prompts/mdl_copilot.md`, `coverage_extract.md`, `coverage_judge.md`,
+  `coverage_overreach.md` — loaded via `prompts/registry.get_prompt`.
+- `app.py` — routes (see AB.4), nested in `create_app` closing over `active_*`
+  deps (`active_model_client`, `active_mdl_file_store`, `active_semantic_layer_store`,
+  `active_embedder`, `active_instruction_store`, `active_coverage_cache`,
+  `_schema_index_for_project`, `_project_instruction_views`, `_attachments_text`,
+  `authorize_semantic_project(request, pid, owner_id=, permission=)`).
+- `config.py` — flags in AB.5. `schemas.py` — `MdlFileSourceType` gained
+  `"copilot"`.
+
+## AB.3 Frontend file map (`superset-frontend/src/SqlLab/components/AiAgentPanel/`)
+
+- `api.ts` — clients: `getProjectWorkspace`, `runCopilot`, `streamCopilot` (SSE),
+  `applyCopilotChangeset`, `getCopilotInspector`, `getCopilotDeployPreview`,
+  `listProjectDocuments`, `runCoverage(projectId, docId, includeOverreach)`; types
+  mirror backend (`Changeset`, `WorkspaceNode`, `CopilotInspector`,
+  `CoverageReport`, `OverreachFinding`, …). SSE helpers `splitSseFrames`/
+  `parseSseData` reused.
+- `SemanticLayerEditor/index.tsx` — the editor: **split-pane** Files │ Editor │
+  Copilot **rail** (toggle in header, `showCopilot`), `WorkspaceTree` browser,
+  Ace editor with **inline gutter diagnostics** (`useJsonValidation` + stored
+  validation line/col), **dirty-state** tag, **Validate** button. Tabs: Models /
+  Instructions / Graph.
+- `SemanticLayerEditor/WorkspaceTree.tsx` — antd `Tree`; `treeFromFiles(mdlFiles)`
+  builds the tree client-side (works regardless of copilot flag); per-file activate
+  `Switch` via `renderActions`.
+- `SemanticLayerEditor/CopilotPanel.tsx` — embedded chat: streaming live steps,
+  per-file **diff Accept/Reject** (`react-diff-viewer-continued`), Apply, attachment
+  composer (UTF-8 long-context), header buttons **Coverage** + **Inspector**.
+- `SemanticLayerEditor/CopilotInspectorDialog.tsx` — read-only Prompt/Skills/Tools
+  + Instructions (note: file is `...Dialog`, not `...Drawer`).
+- `SemanticLayerEditor/CoverageReportModal.tsx` — exports `CoverageReportBody`
+  (presentational: score, counts, per-claim findings, over-reach section) +
+  `CoverageReportModal` wrapper.
+- `SemanticLayerEditor/CoverageDialog.tsx` — document picker (`listProjectDocuments`)
+  + over-reach checkbox + Run → `runCoverage` → `CoverageReportBody`.
+
+## AB.4 HTTP endpoints (all under `/agent/semantic-layer/projects/{pid}`, copilot-gated)
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/workspace` | Unified workspace tree (`WorkspaceNode`). |
+| GET | `/copilot/inspector` | Prompt/skills/tools/instructions. |
+| GET | `/copilot/deploy-preview` | Aggregate drafts-vs-active diff + manifest validation. |
+| POST | `/copilot` | Run agentic edit turn → `Changeset` (sync). |
+| POST | `/copilot/stream` | Same, SSE: `progress` steps then `complete` changeset (thread+queue over `on_step`). |
+| POST | `/copilot/apply` | Persist accepted `ChangesetItem`s as drafts. |
+| POST | `/copilot/coverage` | Coverage audit (`CoverageRequest{document_id, model?, include_overreach}`) → `CoverageReport`. |
+| GET | `/documents` | List project source documents (added for the coverage picker). |
+
+Reused existing: `mdl-files` CRUD+validate, `documents`/`documents/text`+`enrich`,
+`onboard`/`reset`/`materialize`, `jobs/{id}`, `instructions`, `projects/resolve`,
+conversations + `messages[/stream]`.
+
+## AB.5 Config flags (`config.py`, `WREN_*` env)
+
+- `wren_copilot_enabled` (default False) — gates all copilot routes (404 off).
+- `wren_copilot_autopilot_enabled` (False) — reserved for auto-pilot (unbuilt).
+- `wren_copilot_attachment_max_chars` (200_000) — inline attachment truncation.
+- `wren_copilot_coverage_votes` (1) — coverage judge votes (majority).
+- Reused: `wren_modeling_max_correction_retries`, `wren_modeling_deep_validation`,
+  `wren_core_validation_enabled`, `wren_document_indexing_enabled`,
+  `wren_document_vector_index`, `wren_instruction_recall_k`.
+
+## AB.6 Key contracts, decisions & declared breaks
+
+- **Tool-calling** added to `ModelClient` (the one foundational contract change;
+  additive — structured-output path untouched). Loop degrades closed: a model that
+  returns no tool calls yields an empty changeset + warning.
+- **Propose, don't persist** — the copilot mutates a working-set copy and returns a
+  `Changeset`; nothing hits the store until the user Accepts → `apply` writes
+  **drafts**. Activation/Deploy stays a separate human action.
+- **Skills are now active** — `skills/*.md` injected into the copilot system prompt
+  (previously inert). Surfaced read-only in the inspector.
+- **Authoring is JSON** (not Wren YAML); we mirror Wren's **folder organization**
+  via `path` prefixes only (no storage change — `normalize_mdl_path` already allows
+  subfolders).
+- **`MdlFileSourceType` gained `"copilot"`** (provenance).
+- **Coverage is advisory, degrade-closed** — extraction/judge failure → `missing`
+  (loss-surfacing). Reads chunks, **falls back to `SemanticDocument.extracted_text`**
+  when indexing is off.
+- **Attachments**: inline long-context on the **copilot** request only; bypass the
+  document/RAG pipeline by design. The legacy SqlLab chat does NOT take attachments
+  (out of scope — separate agent).
+
+## AB.7 Codebase facts / gotchas discovered (load-bearing for future work)
+
+- `MdlFileStore` = whole-file `content` per row, **soft-delete**; `normalize_mdl_path`
+  enforces `.json`, blocks `..`/absolute, **allows subfolders**.
+- `SemanticProject.current_version_id` is a **dangling column — no version table**
+  exists → snapshot/revert versioning is unbuilt (deferred, needs a migration).
+- Document **chunks only exist when `wren_document_indexing_enabled`**; coverage
+  falls back to `extracted_text` (a real `SemanticDocument` field) otherwise.
+- wren-core validation = constructing `SessionContext(base64(manifest))` and
+  catching the raise (`wren_core_validator.py`); `SessionContext.dry_run` exists but
+  is unused. `validate_project_manifest(contents, schema_index, deep_validate,
+  dedup_models)` is the manifest gate.
+- `SchemaIndex` (`mdl_validator.py`) is the "never invent columns" physical index;
+  `.to_tables()`, `.typed_tables()`, `.has_types()`.
+- Icons that DON'T exist in `@superset-ui/core/components/Icons`: `PaperClipOutlined`,
+  `RobotOutlined`, `AuditOutlined`, `FileSearchOutlined`. Used instead:
+  `UploadOutlined`, `CommentOutlined`, `CheckSquareOutlined`. `Empty`/`Drawer`/
+  `Tree`/`Checkbox`/`Tabs` are exported from `@superset-ui/core/components`.
+- antd `Modal` uses `show`/`onHide` (not `open`/`onClose`) in this repo.
+- jest env: `TextEncoder`/`ReadableStream` available; SSE component tests stub
+  `global.fetch` with a `body.getReader()` chunk reader.
+
+## AB.8 Test inventory (`tests/unit_tests/superset_ai_agent/`)
+
+`test_model_client_tools.py` (tool-calling, 4 providers) · `test_copilot_tools.py`
+(toolset/changeset) · `test_copilot_loop.py` (agentic loop, correction, degrade) ·
+`test_copilot_service.py` (workspace tree, apply, deploy-preview, inspector) ·
+`test_copilot_api.py` (routes: run/apply/workspace/inspector/stream/deploy-preview/
+coverage + 404-gating + extracted-text fallback) · `test_copilot_coverage.py`
+(A/B/C/D, embedder, caching, multi-vote, over-reach, eval). FE: `api.test.ts`,
+`CopilotPanel.test.tsx`, `WorkspaceTree.test.tsx`, `CoverageReportModal.test.tsx`,
+`CoverageDialog.test.tsx`, `SemanticLayerEditor/index.test.tsx`.
+
+## AB.9 Remaining / deferred (with rationale)
+
+- **Snapshot/revert versioning** (`current_version_id`) — needs a new table +
+  Alembic migration not verifiable here. Deploy-**preview** delivers the
+  review-before-Deploy half.
+- **Persistent (cross-worker) coverage cache** — current cache is per-worker
+  in-memory (determinism holds within a worker, lost on restart).
+- **Temp-0 / first-run determinism** — needs a `temperature` arg on
+  `ModelClient.chat` (cross-provider change, not yet made). Multi-vote mitigates.
+- **Live-model coverage eval** — `score_coverage` is tested; no committed gold
+  md↔MDL fixtures or live-model runner, so real detector accuracy is unmeasured.
+- **"Fix gap" action** — coverage suggestions are text; not yet a one-click
+  pipe into the copilot changeset loop.
+- **Auto-pilot mode** over `raw/` (background `JobStore` run) — unbuilt.
+- **`ConversationTurnRequest.attachments`** on the SqlLab SQL chat — intentionally
+  out of scope.
+- Minor UI polish: deploy-preview has no editor button yet; coverage picker lists
+  all documents regardless of extraction status; toggling the Copilot rail remounts
+  (chat transcript not persisted — conversations store integration is the fix).
 
 
 ## 0. Summary & intent

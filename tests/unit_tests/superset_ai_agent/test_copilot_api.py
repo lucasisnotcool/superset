@@ -96,7 +96,7 @@ class ToolCallingModel:
         return ModelResult(content="Created the moves model.")
 
 
-def _client(tmp_path, *, model_client=None, enabled=True) -> TestClient:
+def _client(tmp_path, *, model_client=None, enabled=True, **config) -> TestClient:
     app = create_app(
         config=AgentConfig(
             identity_provider="static",
@@ -107,6 +107,7 @@ def _client(tmp_path, *, model_client=None, enabled=True) -> TestClient:
             wren_core_validation_enabled=False,
             wren_copilot_enabled=enabled,
             agent_storage_dir=str(tmp_path),
+            **config,
         ),
         model_client=model_client or ToolCallingModel(),
         text_to_sql_graph=object(),
@@ -220,6 +221,116 @@ def test_copilot_deploy_preview_lists_pending_drafts(tmp_path) -> None:
     assert len(body["items"]) == 1
     assert body["items"][0]["op"] == "create"
     assert body["items"][0]["path"] == "models/moves.json"
+
+
+class CoverageModel:
+    """Returns claim-extraction JSON, then coverage-judgement JSON."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def is_reachable(self) -> bool:
+        return True
+
+    def list_models(self) -> list[ModelInfo]:
+        return [ModelInfo(name="test-model")]
+
+    def chat(self, messages: list[ChatMessage], **kwargs: Any) -> ModelResult:
+        self.calls += 1
+        if self.calls == 1:
+            return ModelResult(
+                content=json.dumps(
+                    {
+                        "claims": [
+                            {
+                                "kind": "definition",
+                                "subject": "id",
+                                "statement": "id is the order id",
+                                "source_quote": "id = order id",
+                            },
+                            {
+                                "kind": "synonym",
+                                "subject": "patty",
+                                "statement": "a drive unit is a patty",
+                            },
+                        ]
+                    }
+                )
+            )
+        return ModelResult(
+            content=json.dumps(
+                {
+                    "findings": [
+                        {"claim_id": "c0", "status": "covered", "matched": "x"},
+                        {"claim_id": "c1", "status": "missing"},
+                    ]
+                }
+            )
+        )
+
+
+def test_copilot_coverage_audits_a_document(tmp_path) -> None:
+    client = _client(
+        tmp_path,
+        model_client=CoverageModel(),
+        wren_document_indexing_enabled=True,
+    )
+    project = _resolve(client)
+    pid = project["id"]
+
+    client.post(
+        f"/agent/semantic-layer/projects/{pid}/mdl-files",
+        json={"path": "models/moves.json", "content": MOVES},
+    )
+    document = client.post(
+        f"/agent/semantic-layer/projects/{pid}/documents/text",
+        json={
+            "filename": "glossary.md",
+            "text": "id = order id. A drive unit is a patty.",
+            "content_type": "text/markdown",
+        },
+    )
+    assert document.status_code == 200, document.text
+    document_id = document.json()["id"]
+
+    report = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot/coverage",
+        json={"document_id": document_id},
+    )
+    assert report.status_code == 200, report.text
+    body = report.json()
+    assert body["total"] == 2
+    assert body["covered"] == 1
+    assert body["missing"] == 1
+    assert body["score"] == 0.5
+    assert body["document_filename"] == "glossary.md"
+
+
+def test_copilot_coverage_falls_back_to_extracted_text_without_indexing(
+    tmp_path,
+) -> None:
+    # Indexing OFF → no chunks; coverage must use the document's extracted text.
+    client = _client(tmp_path, model_client=CoverageModel())
+    project = _resolve(client)
+    pid = project["id"]
+
+    document = client.post(
+        f"/agent/semantic-layer/projects/{pid}/documents/text",
+        json={
+            "filename": "glossary.md",
+            "text": "id = order id. A drive unit is a patty.",
+            "content_type": "text/markdown",
+        },
+    )
+    document_id = document.json()["id"]
+
+    report = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot/coverage",
+        json={"document_id": document_id},
+    )
+    assert report.status_code == 200, report.text
+    # The model extracted 2 claims from the fallback text → report is populated.
+    assert report.json()["total"] == 2
 
 
 def test_copilot_routes_404_when_disabled(tmp_path) -> None:

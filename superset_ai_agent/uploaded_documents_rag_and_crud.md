@@ -1,8 +1,10 @@
 # Uploaded Documents: RAG, Viewer & Agentic CRUD — Implementation Plan
 
-> Status: **Phase 0–1 implemented & green; Phase 2–4 ready to build.** Source-backed
-> checklist for turning uploaded documents into first-class, RAG-enabled, viewable,
-> agent-mutable artifacts.
+> Status: **IMPLEMENTED & green (Phases 0–4), Docker-enabled, embedding-backed.**
+> Source-backed checklist + as-built log for turning uploaded documents into
+> first-class, RAG-enabled, viewable, agent-mutable artifacts. The full
+> implementation log, key findings, and verification are in **§8** — read that
+> first if you're picking this up; §0–§7 are the original plan (kept for intent).
 >
 > **Coordinated with [`wren_mdl_copilot.md`](wren_mdl_copilot.md)** — the "Wren MDL
 > Copilot" effort is now **finished** (uncommitted in the shared tree). This plan is
@@ -469,61 +471,68 @@ scoped `Edit`s. `[ ]` = todo, `[x]` = done. Insertion points reference §0.6.
 - [ ] **Deferred to Phase 2** (needs shared `config.py`): extend
       `wren_allowed_document_types` so HTML/PDF/DOCX pass the upload gate end-to-end.
 
-### Phase 2 — Wire-up + CRUD/RAG endpoints (🟢 ready; shared files now stable)
-- [ ] `config.py`: add `wren_document_indexing_enabled` (gate, default off),
-      `wren_document_retrieve_k`, `wren_document_dup_threshold`, and the
-      HTML/PDF/DOCX additions to `wren_allowed_document_types` (+ `from_env`)
-- [ ] `app.py`: `active_document_index = create_document_index(app_config,
-      active_embedder)` after `active_retriever` (~305); `_create_document_index`
-      helper if needed
-- [ ] `documents.py`: chunk+index hook in `create_document` (best-effort,
-      `index_failed` event on failure) + `delete_document_cascade`
-      (vectors → chunks → blob → row)
-- [ ] Endpoints (mirror existing doc-route auth for `{id}` routes,
-      `authorize_semantic_project` for project routes): `chunks`, `content`
-      (download), `DELETE`, `reindex`, `duplicates`, `summarize`, `retrieve`
-      (§3.7) — R3, R5, R6, R7
-- [ ] `api.ts`: `deleteDocument`, `downloadDocument`, `listDocumentChunks`,
-      `retrieveDocumentChunks`, `findDuplicateChunks`, `summarizeDocument` +
-      `DocumentChunk` type (additive)
-- [ ] Tests: upload→chunk→index (R1); download bytes; perms; dedup; reindex
-      idempotent; HTML upload end-to-end
+### Phase 2 — Wire-up + CRUD/RAG endpoints ✅ DONE
+- [x] `config.py`: `wren_document_indexing_enabled`, `wren_document_retrieve_k`,
+      `wren_document_dup_threshold` (+ `from_env`); broadened
+      `wren_allowed_document_types` with HTML/PDF/DOCX
+- [x] `app.py`: `active_document_index = create_document_index(app_config,
+      active_embedder)` after `active_retriever`; `document_index=` threaded into
+      all 3 `create_document` call sites
+- [x] `documents.py`: `_index_document_chunks` hook in `create_document`
+      (best-effort), `delete_document_cascade` (vectors → chunk rows + doc row →
+      blob), `reindex_document`
+- [x] 7 endpoints: `GET …/chunks`, `GET …/content` (download), `DELETE …`,
+      `POST …/reindex`, `GET …/retrieve?q=`, `POST …/summarize`,
+      `POST …/projects/{pid}/documents/duplicates`. RAG routes gated behind
+      `_require_document_indexing`; download/delete/summarize ungated
+- [x] `api.ts`: `DocumentChunk`/`DocumentChunkMatch` types + 7 client fns
+- [x] Tests: `test_document_indexing.py`, `test_document_api.py`
 
-### Phase 3 — Agent tools via `MdlToolset` (🟢 ready)
-- [ ] Extend `MdlToolset.__init__` (`copilot/tools.py`) with
-      `document_index/document_store/project_id/owner_id`; add `specs()` +
-      `_handler`s + `dispatch()` entries for `retrieve_document_chunks`,
-      `find_duplicate_documents`, `summarize_document`, `delete_document` — R8
-- [ ] Thread document deps through `run_copilot` (`copilot/service.py`) → toolset
-- [ ] Tools surface in the Copilot Inspector Tools tab automatically
-- [ ] Tests: dispatch round-trip; tool appears in `specs()`; mirror
-      `test_copilot_tools.py`
+### Phase 3 — Agent tools via `MdlToolset` ✅ DONE (read-only)
+- [x] Extended `MdlToolset.__init__` with
+      `document_store/document_index/project_id/owner_id/retrieve_k`; added specs +
+      handlers + dispatch for `list_documents`, `search_documents`,
+      `find_duplicate_documents` (a `DocumentReader` Protocol decouples the store)
+- [x] Threaded document deps through `run_copilot` (both call sites in `app.py`)
+- [x] **Decision:** mutating doc ops (delete/summarize) are NOT agent tools —
+      they persist immediately and break the "propose, don't persist" contract;
+      they stay as explicit user endpoints. Tools are read-only grounding only.
+- [x] Tests: `test_copilot_document_tools.py`; updated `test_copilot_tools.py`
+      tool-surface assertion to 9 tools
 
-### Phase 4 — Document node + detail pane UI (🟢 ready; build on Copilot shell)
-- [ ] Backend: `WorkspaceNode.document_id` field (`copilot/schemas.py`);
-      `build_workspace_tree` enumerates `documents` as `kind="document"` children
-      under `raw/` (`copilot/workspace.py`); `get_project_workspace` passes
-      `documents=active_semantic_layer_store.list_project_documents(...)`
-- [ ] `WorkspaceTree.tsx`: make `kind==='document'` selectable; surface
-      `onSelectDocument(documentId)`; `api.ts` `WorkspaceNode.document_id`
-- [ ] `index.tsx`: `selectedDocumentId` state + center-pane branch →
-      `DocumentDetailPane` (new) with Text / Chunks / Summary sub-tabs (§2.1)
-- [ ] Header actions: Download / Re-index / Summarize / Delete (`ConfirmModal`);
-      chunk cards w/ dup badge + scroll-to-range; project "Find duplicates" modal
-- [ ] Tests (Jest/RTL): document node selectable → detail renders; delete refreshes
-      tree; chunk click scrolls — R6
+### Phase 4 — Document node + detail pane UI ✅ DONE
+- [x] Backend: `WorkspaceNode.document_id`; `build_workspace_tree(documents=…)`
+      enumerates `raw/` document child nodes; `get_project_workspace` passes
+      `list_project_documents(...)`
+- [x] `WorkspaceTree.tsx`: document nodes selectable; `onSelectDocument`;
+      `api.ts` `WorkspaceNode.document_id`
+- [x] `index.tsx`: `selectedDocumentId` + center-pane branch → `DocumentDetailPane`
+- [x] `DocumentDetailPane.tsx` (new): Text / Chunks / Summary tabs + Download /
+      Re-index / Summarize / Delete actions
+- [x] Tests: `WorkspaceTree.test.tsx`, `DocumentDetailPane.test.tsx`
 
-### Phase 5 — Optional: RAG-fed enrichment (behind flag; hot path default)
-- [ ] `wren_document_selection = keyword | embedding` (default `keyword`); when
-      `embedding`, `propose_mdl_from_document` consults `document_retriever` —
-      **same prompt shape + response contract**, only chosen sections differ
+### Phase 5 — LanceDB isolation + Docker enablement ✅ DONE (closed the embedder gap)
+- [x] **Independent document vector backend**: `wren_document_vector_index`
+      (default `lancedb`) + `wren_document_lancedb_path` so documents are
+      embedding-backed even when MDL retrieval is in-memory, in their **own**
+      LanceDB directory (`{agent_storage_dir}/lancedb_documents`) — the
+      MDL/sql_pairs/instructions store (`wren_lancedb`) is never touched
+- [x] `create_document_index` gated on `wren_document_indexing_enabled` so a
+      feature-off deploy opens **no** LanceDB connection (fixed a `.data/`
+      pollution bug found in testing)
+- [x] Docker: `.env` + `.env.example` turn it on (`WREN_DOCUMENT_INDEXING_ENABLED`,
+      `WREN_DOCUMENT_VECTOR_INDEX=lancedb`, `WREN_DOCUMENT_LANCEDB_PATH`,
+      broadened `WREN_ALLOWED_DOCUMENT_TYPES`, `WREN_COPILOT_ENABLED=true`);
+      `requirements-ai-agent.txt` adds `pypdf` + `python-docx`
+- [x] Test: `test_lancedb_embedding_round_trip_is_isolated_from_mdl` (real
+      LanceDB cosine + isolation), `test_factory_disabled_builds_no_vector_backend`
 
-### Phase 5 — Optional: RAG-fed enrichment (behind flag, hot path default)
+### Phase 6 — Optional: RAG-fed enrichment (NOT done; behind a future flag)
 - [ ] Flag `wren_document_selection = keyword | embedding` (default `keyword`)
-- [ ] When `embedding`, `propose_mdl_from_document` section selection consults
-      `document_retriever` instead of `select_relevant_sections` — **same prompt
-      shape, same response contract**; only chosen sections differ
-- [ ] This is the *only* touch near the hot path; opt-in, reversible
+- [ ] When `embedding`, `propose_mdl_from_document` consults `document_retriever`
+      instead of `select_relevant_sections` — **same prompt shape + response
+      contract**; only chosen sections differ. The *only* touch near the hot path;
+      opt-in, reversible. (Deferred — the hot path stays keyword-selected.)
 
 ---
 
@@ -567,3 +576,120 @@ component (+ chunk/dup sub-components), rendered inside the Copilot shell for
 *Frontend (edit — shared 🟡)*: `AiAgentPanel/api.ts` (additive fns + types).
 **Not touched:** `SemanticLayerEditor/index.tsx` directly — the detail pane plugs
 into the Copilot-rebuilt shell rather than the current ScrollList layout.
+
+---
+
+## 8. As-built log & key findings (READ FIRST)
+
+Everything below reflects what actually shipped. Nothing is committed yet — it all
+lives in the shared working tree alongside the Copilot work.
+
+### 8.1 Backend — files & symbols (final)
+
+| File | What's in it |
+| --- | --- |
+| [`semantic_layer/document_chunks.py`](semantic_layer/document_chunks.py) | `DocumentChunk`, `DocumentChunkMatch` (pydantic), `build_chunk_records`, `chunk_id` (deterministic `uuid5(ns, "{doc}:{idx}")` → idempotent reindex), `chunk_checksum`, `keyword_rank_chunks` |
+| [`semantic_layer/document_retriever.py`](semantic_layer/document_retriever.py) | `DocumentChunkIndex` (over `LanceVectorCache`, degrade-closed to keyword), `find_exact_duplicate_matches`, `document_scope_key(project_id, scope=None)`, `create_document_index`, `_document_lancedb_path` |
+| [`semantic_layer/documents.py`](semantic_layer/documents.py) | `create_document(document_index=…)` + `_index_document_chunks` hook, `delete_document_cascade`, `reindex_document` |
+| [`semantic_layer/extractors.py`](semantic_layer/extractors.py) | HTML (stdlib `HTMLParser`), PDF (`pypdf`), DOCX (`python-docx`); missing dep → `ValueError` → `status="error"` |
+| [`semantic_layer/store.py`](semantic_layer/store.py) + `sqlalchemy_store.py` + `memory.py` | `delete_document` (cascade), `save_chunks`, `list_chunks`, `delete_chunks`, `list_project_chunks` + chunk mappers |
+| [`persistence/models.py`](persistence/models.py) | `AiAgentDocumentChunk` (unique `(document_id, chunk_index)`) |
+| `persistence/migrations/versions/0007_document_chunks.py` | sole alembic head (no fork with Copilot) |
+| [`config.py`](config.py) | `wren_document_indexing_enabled` (default **False** in code), `wren_document_retrieve_k`, `wren_document_dup_threshold`, `wren_document_vector_index` (default `lancedb`), `wren_document_lancedb_path`; broadened `wren_allowed_document_types` |
+| [`app.py`](app.py) | `active_document_index` singleton; 7 document routes; `_require_document_indexing` gate; `run_copilot(document_store=…, document_index=…, project_id=…, owner_id=…, retrieve_k=…)` |
+| [`semantic_layer/copilot/tools.py`](semantic_layer/copilot/tools.py) | `MdlToolset` extended with read-only document tools + `DocumentReader` protocol |
+| [`semantic_layer/copilot/workspace.py`](semantic_layer/copilot/workspace.py) + `schemas.py` | `build_workspace_tree(documents=…)` emits `kind="document"` `raw/` nodes; `WorkspaceNode.document_id` |
+
+### 8.2 Frontend — files & symbols (final)
+
+All under `superset-frontend/src/SqlLab/components/AiAgentPanel/`:
+- `api.ts` — `DocumentChunk`/`DocumentChunkMatch` types + `deleteSemanticDocument`,
+  `listDocumentChunks`, `retrieveDocumentChunks`, `reindexSemanticDocument`,
+  `summarizeSemanticDocument`, `findProjectDuplicateChunks`, `downloadDocumentUrl`;
+  `WorkspaceNode.document_id`.
+- `SemanticLayerEditor/DocumentDetailPane.tsx` (new) — Text/Chunks/Summary tabs;
+  bottom action bar.
+- `SemanticLayerEditor/CopilotInspectorDialog.tsx` (new, **replaced**
+  `CopilotInspectorDrawer.tsx`) — `Modal` matching `ExplainDialog`.
+- `SemanticLayerEditor/WorkspaceTree.tsx`, `index.tsx` — see §8.4.
+
+### 8.3 Key design decisions / gotchas (don't relearn the hard way)
+
+1. **Document RAG store is fully isolated from MDL RAG.** Documents use their own
+   LanceDB dir (`lancedb_documents`) AND a distinct collection (`document_chunks`).
+   `wren_document_vector_index` is independent of `wren_vector_index`. Verified by
+   `test_lancedb_embedding_round_trip_is_isolated_from_mdl`.
+2. **`create_document_index` must stay gated on `wren_document_indexing_enabled`.**
+   Otherwise `LanceVectorCache.__init__` opens a LanceDB connection at app build for
+   *every* deploy (incl. tests), creating stray `.data/lancedb_documents` dirs.
+3. **Three stores, one choke point.** blob (`file_storage`) + chunk rows (DB) +
+   vectors (LanceDB) are kept consistent only via `create_document` /
+   `delete_document_cascade` / `reindex_document`. Don't mutate them elsewhere.
+4. **Degrade-closed is load-bearing.** No embedder / no LanceDB → keyword recall;
+   chunks still persist (viewer + dedup work). Code default `…_indexing_enabled =
+   False`; the **`.env` turns it on** for Docker (don't flip the code default —
+   tests rely on it being off).
+5. **Agent document tools are read-only.** Mutating ops (delete/summarize) would
+   break the copilot "propose, don't persist" changeset model, so they're endpoints
+   only. If you add a mutating tool, route it through a changeset, not direct CRUD.
+6. **PDF/DOCX are optional deps.** Added to `requirements-ai-agent.txt`; HTML is
+   stdlib. A missing dep is `status="error"` with a clear message, never a crash.
+7. **`config.py` `from_env` cast.** `wren_document_vector_index` uses
+   `cast(WrenVectorIndexMode, os.getenv(...).strip().lower())` — match the existing
+   `wren_vector_index` pattern.
+
+### 8.4 UI redesign of `SemanticLayerEditor` (7 changes) + the Splitter fill fix
+
+A later pass reworked the editor shell. Files: `WorkspaceTree.tsx`,
+`DocumentDetailPane.tsx`, `index.tsx`, `CopilotInspectorDialog.tsx`.
+- **Inline tree icons** — `TreeWrapper` forces `.ant-tree-node-content-wrapper`
+  to `inline-flex`; antd's `blockNode` was stacking the icon above the name.
+- **Removed redundant active/draft status tag** from MDL nodes (the Active/Draft
+  toggle already shows it); kept the `invalid` tag.
+- **Ellipsis, no wrap** on file names (`NodeName` + `ellipsis={{tooltip}}`).
+- **File-browser parity** — right-click context menu (Open / Duplicate / Delete),
+  `multiple` shift/ctrl select, bulk "Delete N files"; `duplicateFile` /
+  `deleteFiles` handlers in `index.tsx`.
+- **Document actions moved to a bottom bar** (matching the MDL editor); Re-index &
+  Summarize have hover `Tooltip`s; Download & Delete intentionally don't.
+- **Inspector is now a dialog** (`Modal`, matches `ExplainDialog`), not a drawer.
+- **Collapsible/resizable panels** — the editor body is an antd `Splitter`
+  (`EditorSplitter`) with collapsible left (browser) and right (Copilot) panels.
+
+> ⚠️ **Splitter fill bug + fix (important).** antd `Splitter` gives every panel
+> `flex-grow: 0` + a JS-measured `flex-basis` px, so the center panel grows only
+> when antd's `ResizeObserver` recomputes — which is **unreliable nested in Tabs**
+> (antd #51106). Result: collapsing the outer SqlLab DB browser / AI panel left a
+> gap instead of expanding the editor. **Fix:** force the center
+> `Splitter.Panel` (class `semantic-editor-center-panel`) to `flex: 1 1 0%
+> !important; min-width: 0` in `EditorSplitter` so it fills freed space natively
+> (like the old grid `1fr`), independent of antd's recompute. Side panels keep
+> their measured basis → still collapsible/resizable. If you touch the Splitter,
+> keep that override.
+
+### 8.5 Verification (last green run)
+
+- **Python:** full `tests/unit_tests/superset_ai_agent/` suite green (~529 passed,
+  6 skipped — the skips are PDF/DOCX positive round-trips needing optional deps).
+  ruff + ruff-format clean; mypy clean on the new files (the SQLAlchemy `Base`
+  mypy noise is pre-existing/environmental).
+- **Frontend:** `AiAgentPanel` Jest suites green (≈139 tests); `tsc --noEmit` 0
+  errors; prettier clean. `oxlint` could not run in the sandbox (native-binding
+  install issue) — **run it in CI**.
+- Migration chain: single head `0007_document_chunks` (no alembic fork).
+
+### 8.6 Open items / not done
+- **Phase 6** (RAG-fed enrichment behind `wren_document_selection`) — not started;
+  the upload→MDL hot path stays keyword-selected by design.
+- **Dedup is exact-checksum only** (UI + tool + endpoint); cosine near-duplicate
+  detection is deferred.
+- **Chunk "scroll-to-range" highlight** and a project-level "Find duplicates"
+  modal in the detail pane were scoped out — chunks render as a list; dedup is
+  API/agent-tool only.
+- **Not committed**; **secret hygiene:** a real `OPENAI_API_KEY` sits in the local
+  working-tree `superset_ai_agent/.env` (pre-existing). Correction: that file is
+  gitignored and was never committed (`git ls-files`/`check-ignore`/`log --all`),
+  so it is NOT a VCS leak — only `.env.example` is tracked (key empty there). No
+  history scrub needed; just keep the local key out of shared contexts.
+- **Visual QA pending** — the Splitter fill fix and tree CSS are verified by
+  tests/types/antd-source tracing, not by eye.

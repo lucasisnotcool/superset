@@ -137,9 +137,22 @@ const ContentTabs = styled(Tabs)`
 // The three panes live in an antd Splitter: the file browser (left) and Copilot
 // (right) are collapsible and width-adjustable like SqlLab's database browser and
 // AI panel; the Splitter gutters provide the separators (so no pane borders).
+//
+// antd assigns every panel `flex-grow: 0` + a JS-measured `flex-basis`, so the
+// center panel only grows when antd's ResizeObserver recomputes — which is
+// unreliable when nested inside Tabs (antd #51106). Forcing the center panel to
+// `flex: 1 1 0` makes it fill freed space natively (like the old CSS grid's
+// `1fr`) whenever a side panel collapses or the outer SqlLab panels collapse,
+// independent of antd's recompute. The side panels keep their measured basis, so
+// they stay collapsible and width-adjustable.
 const EditorSplitter = styled(Splitter)`
   flex: 1;
   min-height: 0;
+
+  .ant-splitter-panel.semantic-editor-center-panel {
+    flex: 1 1 0% !important;
+    min-width: 0;
+  }
 `;
 
 const CopilotRail = styled.div`
@@ -766,7 +779,7 @@ export default function SemanticLayerEditor({
                     </Flex>
                   </BrowserPane>
                 </Splitter.Panel>
-                <Splitter.Panel>
+                <Splitter.Panel className="semantic-editor-center-panel">
                   <EditorPane>
                     {selectedDocument ? (
                       <DocumentDetailPane
