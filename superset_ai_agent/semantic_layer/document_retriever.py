@@ -39,12 +39,14 @@ from pathlib import Path
 from typing import Protocol
 
 from superset_ai_agent.config import AgentConfig
+from superset_ai_agent.conversations.schemas import ConversationScope
 from superset_ai_agent.llm.embeddings import Embedder
 from superset_ai_agent.semantic_layer.document_chunks import (
     DocumentChunk,
     DocumentChunkMatch,
     keyword_rank_chunks,
 )
+from superset_ai_agent.semantic_layer.store import scope_hash
 from superset_ai_agent.semantic_layer.vector_cache import LanceVectorCache
 
 logger = logging.getLogger(__name__)
@@ -52,6 +54,24 @@ logger = logging.getLogger(__name__)
 #: Collection name for document-chunk vectors (namespaced separately from the
 #: ``sql_pairs`` / ``instructions`` collections in the same LanceDB store).
 DOCUMENT_CHUNK_COLLECTION = "document_chunks"
+
+
+def document_scope_key(
+    project_id: str | None, scope: ConversationScope | None = None
+) -> str:
+    """Vector-cache partition key for a document's chunks.
+
+    Project-scoped when the document belongs to a project, else the scope hash.
+    Indexing and retrieval must derive this identically or recall misses. ``scope``
+    is only required for project-less documents (it is ignored when ``project_id``
+    is present, so project-scoped callers may omit it).
+    """
+
+    if project_id:
+        return f"doc:{project_id}"
+    if scope is None:
+        raise ValueError("document_scope_key requires a scope when project_id is None.")
+    return f"doc:{scope_hash(scope)}"
 
 
 class VectorCache(Protocol):
@@ -171,25 +191,39 @@ def find_exact_duplicate_matches(
     return matches
 
 
-def _lancedb_path(config: AgentConfig) -> str:
-    if config.wren_lancedb_path:
-        return config.wren_lancedb_path
-    return str(Path(config.agent_storage_dir) / "lancedb")
+def _document_lancedb_path(config: AgentConfig) -> str:
+    """Dedicated LanceDB directory for document chunks.
+
+    Deliberately distinct from the MDL/sql_pairs/instructions store
+    (``wren_lancedb_path``) so document vectors live in their own database and can
+    never affect — or be affected by — the existing MDL retrieval index.
+    """
+
+    if config.wren_document_lancedb_path:
+        return config.wren_document_lancedb_path
+    return str(Path(config.agent_storage_dir) / "lancedb_documents")
 
 
 def create_document_index(
     config: AgentConfig, embedder: Embedder
 ) -> DocumentChunkIndex:
-    """Build the document chunk index from config (shares the vector-index mode).
+    """Build the document chunk index from config.
 
-    ``lancedb`` mode (with an available embedder) yields a persistent, embedding-
-    ranked index; any other mode yields the keyword-fallback index. Mirrors the
-    schema-retriever / memory factories so documents follow the same knob.
+    Honors ``wren_document_vector_index`` (independent of the MDL ``wren_vector_index``
+    knob): ``lancedb`` + an available embedder yields a persistent, embedding-ranked
+    index in the documents-only LanceDB directory; otherwise the keyword-fallback
+    index. Degrades closed when LanceDB or the embedder is unavailable.
+
+    No vector backend is constructed when document indexing is disabled, so a
+    deployment with the feature off never opens a LanceDB connection.
     """
 
-    if config.wren_vector_index == "lancedb":
+    if (
+        config.wren_document_indexing_enabled
+        and config.wren_document_vector_index == "lancedb"
+    ):
         cache = LanceVectorCache(
-            embedder, _lancedb_path(config), DOCUMENT_CHUNK_COLLECTION
+            embedder, _document_lancedb_path(config), DOCUMENT_CHUNK_COLLECTION
         )
         return DocumentChunkIndex(cache)
     return DocumentChunkIndex(None)

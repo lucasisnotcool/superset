@@ -41,6 +41,14 @@ wren-core-py>=0.7,<0.8
 # retrieval degrades to the in-process index when this is absent.
 lancedb>=0.13,<1.0
 #
+# Document extractors for the uploaded-document RAG suite
+# (uploaded_documents_rag_and_crud.md): PDF + DOCX text extraction. The code
+# import-guards their absence and records the document with status="error" and a
+# clear message, so they are only required to actually extract those formats
+# (HTML extraction is stdlib, no dependency).
+pypdf>=4.0,<6.0
+python-docx>=1.1,<2.0
+#
 # Optional (production): PostgreSQL driver for durable agent persistence
 # (AI_AGENT_DATABASE_URL=postgresql+psycopg://...). The default
 # sqlite:///./.data/ai_agent.db needs no driver; install this only when pointing

@@ -58,11 +58,12 @@ def test_create_document_extracts_text(tmp_path) -> None:
 
 
 def test_create_document_rejects_disallowed_content_type(tmp_path) -> None:
+    # image/png is not in wren_allowed_document_types (html/pdf/docx now are).
     with pytest.raises(ValueError, match="Unsupported document content type"):
         create_document(
-            filename="notes.html",
-            content_type="text/html",
-            content=b"<b>unsafe</b>",
+            filename="logo.png",
+            content_type="image/png",
+            content=b"\x89PNG\r\n",
             scope=_scope(),
             owner_id="user-1",
             config=AgentConfig(),
@@ -70,6 +71,22 @@ def test_create_document_rejects_disallowed_content_type(tmp_path) -> None:
             storage=LocalDocumentStorage(str(tmp_path)),
             extractor=CompositeDocumentExtractor(),
         )
+
+
+def test_create_document_extracts_html_now_allowed(tmp_path) -> None:
+    document = create_document(
+        filename="notes.html",
+        content_type="text/html",
+        content=b"<html><body><p>Gross moves by stage.</p></body></html>",
+        scope=_scope(),
+        owner_id="user-1",
+        config=AgentConfig(),
+        store=InMemorySemanticLayerStore(),
+        storage=LocalDocumentStorage(str(tmp_path)),
+        extractor=CompositeDocumentExtractor(),
+    )
+    assert document.status == "extracted"
+    assert "Gross moves by stage." in (document.extracted_text or "")
 
 
 def test_create_document_rejects_oversized_content(tmp_path) -> None:

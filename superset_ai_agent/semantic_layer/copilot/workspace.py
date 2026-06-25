@@ -27,18 +27,20 @@ own backing store; this is presentation-layer unification only (see
 from __future__ import annotations
 
 from superset_ai_agent.semantic_layer.copilot.schemas import WorkspaceNode
-from superset_ai_agent.semantic_layer.schemas import MdlFile
+from superset_ai_agent.semantic_layer.schemas import MdlFile, SemanticDocument
 
 
 def build_workspace_tree(
     files: list[MdlFile],
     *,
     instruction_count: int = 0,
-    document_count: int = 0,
+    documents: list[SemanticDocument] | None = None,
     has_compiled: bool = False,
     has_memory: bool = False,
 ) -> WorkspaceNode:
     """Build the unified workspace tree from the project's stores."""
+
+    documents = documents or []
 
     root = WorkspaceNode(path="", name="workspace", kind="folder", editable=False)
     folders: dict[str, WorkspaceNode] = {"": root}
@@ -84,16 +86,26 @@ def build_workspace_tree(
             path="queries.yml", name="queries.yml", kind="queries", editable=True
         )
     )
-    if document_count:
-        root.children.append(
-            WorkspaceNode(
-                path="raw",
-                name="raw",
-                kind="folder",
-                editable=False,
-                status=f"{document_count} document(s)",
-            )
+    if documents:
+        raw_folder = WorkspaceNode(
+            path="raw",
+            name="raw",
+            kind="folder",
+            editable=False,
+            status=f"{len(documents)} document(s)",
         )
+        for document in sorted(documents, key=lambda d: d.filename):
+            raw_folder.children.append(
+                WorkspaceNode(
+                    path=f"raw/{document.id}",
+                    name=document.filename,
+                    kind="document",
+                    editable=False,
+                    status=document.status,
+                    document_id=document.id,
+                )
+            )
+        root.children.append(raw_folder)
     if has_compiled:
         root.children.append(
             WorkspaceNode(

@@ -53,18 +53,23 @@ def _file(path: str, content: str) -> MdlFile:
     )
 
 
-def test_specs_expose_the_six_primitives() -> None:
+def test_specs_expose_the_tool_surface() -> None:
     toolset = MdlToolset([], schema_index=SCHEMA)
 
     names = {spec.name for spec in toolset.specs()}
 
     assert names == {
+        # MDL authoring primitives
         "list_mdl_files",
         "read_mdl_file",
         "write_mdl_file",
         "delete_mdl_file",
         "validate_project",
         "get_physical_schema",
+        # read-only document grounding tools
+        "list_documents",
+        "search_documents",
+        "find_duplicate_documents",
     }
 
 

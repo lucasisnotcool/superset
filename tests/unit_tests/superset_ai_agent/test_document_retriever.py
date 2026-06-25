@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.llm.embeddings import NullEmbedder
 from superset_ai_agent.semantic_layer.document_chunks import (
@@ -121,6 +123,82 @@ def test_find_exact_duplicate_matches_pairs_identical_chunks() -> None:
     assert match.other_chunk_id == chunks[2].id
 
 
-def test_factory_memory_mode_is_keyword_only() -> None:
+def test_factory_disabled_builds_no_vector_backend() -> None:
+    # Feature off (default) -> never opens a LanceDB connection.
     index = create_document_index(AgentConfig(), NullEmbedder())
     assert index.is_embedding_backed is False
+
+
+def test_factory_memory_mode_is_keyword_only() -> None:
+    index = create_document_index(
+        AgentConfig(
+            wren_document_indexing_enabled=True,
+            wren_document_vector_index="memory",
+        ),
+        NullEmbedder(),
+    )
+    assert index.is_embedding_backed is False
+
+
+def test_factory_lancedb_without_embedder_degrades_closed(tmp_path) -> None:
+    # lancedb mode + no embedder must NOT serve embedding recall (degrade closed),
+    # whether or not lancedb is importable. Uses a tmp dir so no repo state leaks.
+    index = create_document_index(
+        AgentConfig(
+            wren_document_indexing_enabled=True,
+            wren_document_vector_index="lancedb",
+            wren_document_lancedb_path=str(tmp_path / "docs_lancedb"),
+        ),
+        NullEmbedder(),
+    )
+    assert index.is_embedding_backed is False
+
+
+class _FakeEmbedder:
+    """Deterministic in-process embedder (bag-of-chars) — no network."""
+
+    def is_available(self) -> bool:
+        return True
+
+    def dimensions(self) -> int:
+        return 8
+
+    def signature(self) -> str:
+        return "fake:test:8"
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        vectors = []
+        for text in texts:
+            vector = [0.0] * 8
+            for char in text.lower():
+                if char.isalpha():
+                    vector[(ord(char) - 97) % 8] += 1.0
+            vectors.append(vector)
+        return vectors
+
+
+def test_lancedb_embedding_round_trip_is_isolated_from_mdl(tmp_path) -> None:
+    # Closes the "keyword-only" gap: with lancedb + an available embedder the index
+    # serves real cosine recall, and it does so in a DEDICATED documents directory
+    # that never touches the MDL/sql_pairs/instructions store.
+    pytest.importorskip("lancedb")
+    config = AgentConfig(
+        wren_document_indexing_enabled=True,
+        wren_document_vector_index="lancedb",
+        agent_storage_dir=str(tmp_path),
+    )
+    index = create_document_index(config, _FakeEmbedder())
+    assert index.is_embedding_backed is True
+
+    chunks = build_chunk_records(
+        "doc-A",
+        "revenue by region\n\nweather is sunny today\n\ncustomer churn analysis",
+    )
+    assert len(index.index(chunks, scope_key="doc:projX")) == 3
+    hits = index.retrieve("customer churn", chunks, scope_key="doc:projX", k=1)
+    assert hits
+    assert "churn" in hits[0].text
+
+    # Documents get their own LanceDB dir; the MDL store dir is never created here.
+    assert (tmp_path / "lancedb_documents").is_dir()
+    assert not (tmp_path / "wren_lancedb").exists()

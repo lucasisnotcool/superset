@@ -137,7 +137,25 @@ class AgentConfig:
         "text/markdown",
         "text/csv",
         "application/json",
+        "text/html",
+        "application/pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
+    # Document RAG + CRUD (uploaded_documents_rag_and_crud.md). Gated off by
+    # default; when on, uploaded documents are chunked + embedded at ingestion and
+    # the chunk/retrieve/dedup/CRUD routes are exposed. With no embedder it degrades
+    # closed to keyword recall.
+    wren_document_indexing_enabled: bool = False
+    wren_document_retrieve_k: int = 8
+    wren_document_dup_threshold: float = 0.92
+    # Document-chunk vector backend — independent of ``wren_vector_index`` so the
+    # document index can be embedding-backed even when MDL retrieval is in-memory.
+    # ``lancedb`` + an embedder gives cosine recall; otherwise keyword (degrade
+    # closed). Documents live in their OWN LanceDB directory
+    # (``wren_document_lancedb_path``) so they never share tables with the MDL /
+    # sql_pairs / instructions store.
+    wren_document_vector_index: WrenVectorIndexMode = "lancedb"
+    wren_document_lancedb_path: str | None = None
     semantic_access_mode: SemanticAccessMode = "superset_or_uri"
     semantic_full_access_grants_write: bool = False
     semantic_activation_requires_live_schema: bool = False
@@ -254,9 +272,7 @@ class AgentConfig:
     )
     log_level: str = "INFO"
     suppress_superset_logs: bool = True
-    local_superset_secret_key: str = (
-        "ai-agent-local-dev-secret-key-not-for-production"  # noqa: S105
-    )
+    local_superset_secret_key: str = "ai-agent-local-dev-secret-key-not-for-production"  # noqa: S105
 
     @classmethod
     def from_env(cls) -> "AgentConfig":
@@ -527,6 +543,32 @@ class AgentConfig:
             wren_allowed_document_types=_env_list(
                 "WREN_ALLOWED_DOCUMENT_TYPES",
                 cls.wren_allowed_document_types,
+            ),
+            wren_document_indexing_enabled=_env_bool(
+                "WREN_DOCUMENT_INDEXING_ENABLED",
+                cls.wren_document_indexing_enabled,
+            ),
+            wren_document_retrieve_k=int(
+                os.getenv(
+                    "WREN_DOCUMENT_RETRIEVE_K",
+                    str(cls.wren_document_retrieve_k),
+                )
+            ),
+            wren_document_dup_threshold=float(
+                os.getenv(
+                    "WREN_DOCUMENT_DUP_THRESHOLD",
+                    str(cls.wren_document_dup_threshold),
+                )
+            ),
+            wren_document_vector_index=cast(
+                WrenVectorIndexMode,
+                os.getenv("WREN_DOCUMENT_VECTOR_INDEX", cls.wren_document_vector_index)
+                .strip()
+                .lower(),
+            ),
+            wren_document_lancedb_path=(
+                os.getenv("WREN_DOCUMENT_LANCEDB_PATH")
+                or cls.wren_document_lancedb_path
             ),
             semantic_access_mode=cast(
                 SemanticAccessMode,

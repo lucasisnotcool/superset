@@ -67,6 +67,7 @@ from superset_ai_agent.integrations.superset.client import SupersetAuthError
 from superset_ai_agent.integrations.superset.factory import create_superset_client
 from superset_ai_agent.integrations.wren.client import WrenClient
 from superset_ai_agent.integrations.wren.factory import create_wren_client
+from superset_ai_agent.llm.base import ChatMessage
 from superset_ai_agent.llm.embeddings import create_embedder
 from superset_ai_agent.llm.factory import create_model_client
 from superset_ai_agent.persistence.database import (
@@ -103,7 +104,20 @@ from superset_ai_agent.semantic_layer.copilot.service import (
     run_copilot,
 )
 from superset_ai_agent.semantic_layer.copilot.workspace import build_workspace_tree
-from superset_ai_agent.semantic_layer.documents import create_document
+from superset_ai_agent.semantic_layer.document_chunks import (
+    DocumentChunk,
+    DocumentChunkMatch,
+)
+from superset_ai_agent.semantic_layer.document_retriever import (
+    create_document_index,
+    document_scope_key,
+    find_exact_duplicate_matches,
+)
+from superset_ai_agent.semantic_layer.documents import (
+    create_document,
+    delete_document_cascade,
+    reindex_document,
+)
 from superset_ai_agent.semantic_layer.events import to_sse
 from superset_ai_agent.semantic_layer.extractors import (
     CompositeDocumentExtractor,
@@ -303,6 +317,9 @@ def create_app(  # noqa: C901
         embedder=active_embedder,
     )
     active_retriever = retriever or create_retriever(app_config, active_embedder)
+    # Document-chunk RAG index — shares the app embedder + vector-index mode, built
+    # once so the LanceDB connection is reused. Degrades closed to keyword recall.
+    active_document_index = create_document_index(app_config, active_embedder)
     active_vector_index = effective_vector_index(app_config, active_retriever)
     if active_vector_index == "memory_fallback":
         logger.warning(
@@ -806,6 +823,7 @@ def create_app(  # noqa: C901
                 store=active_semantic_layer_store,
                 storage=active_document_storage,
                 extractor=active_document_extractor,
+                document_index=active_document_index,
             )
         except ValueError as ex:
             raise HTTPException(status_code=400, detail=str(ex)) from ex
@@ -1340,12 +1358,16 @@ def create_app(  # noqa: C901
         )
         files = active_mdl_file_store.list(project_id, owner_id=identity.owner_id)
         instructions = _project_instruction_views(project, identity.owner_id)
+        documents = active_semantic_layer_store.list_project_documents(
+            project_id, owner_id=identity.owner_id
+        )
         has_active = any(
             file.status == "active" for file in files if file.status != "deleted"
         )
         return build_workspace_tree(
             files,
             instruction_count=len(instructions),
+            documents=documents,
             has_compiled=has_active,
         )
 
@@ -1421,6 +1443,11 @@ def create_app(  # noqa: C901
                 model=request.model,
                 max_steps=request.max_steps,
                 deep_validate=app_config.wren_modeling_deep_validation,
+                document_store=active_semantic_layer_store,
+                document_index=active_document_index,
+                project_id=project_id,
+                owner_id=identity.owner_id,
+                retrieve_k=app_config.wren_document_retrieve_k,
             )
         except Exception as ex:  # pylint: disable=broad-except
             raise HTTPException(status_code=502, detail=str(ex)) from ex
@@ -1467,6 +1494,11 @@ def create_app(  # noqa: C901
                         max_steps=request.max_steps,
                         deep_validate=app_config.wren_modeling_deep_validation,
                         on_step=on_step,
+                        document_store=active_semantic_layer_store,
+                        document_index=active_document_index,
+                        project_id=project_id,
+                        owner_id=identity.owner_id,
+                        retrieve_k=app_config.wren_document_retrieve_k,
                     )
                 except Exception as ex:  # pylint: disable=broad-except
                     holder["error"] = str(ex)
@@ -1808,6 +1840,7 @@ def create_app(  # noqa: C901
                 store=active_semantic_layer_store,
                 storage=active_document_storage,
                 extractor=active_document_extractor,
+                document_index=active_document_index,
             )
         except ValueError as ex:
             raise HTTPException(status_code=400, detail=str(ex)) from ex
@@ -1856,6 +1889,7 @@ def create_app(  # noqa: C901
                 store=active_semantic_layer_store,
                 storage=active_document_storage,
                 extractor=active_document_extractor,
+                document_index=active_document_index,
             )
         except ValueError as ex:
             raise HTTPException(status_code=400, detail=str(ex)) from ex
@@ -2047,6 +2081,221 @@ def create_app(  # noqa: C901
             permission=SemanticPermission.READ,
         )
         return document
+
+    # -- Document RAG + CRUD (uploaded_documents_rag_and_crud.md) ----------
+
+    def _require_document_indexing() -> None:
+        if not app_config.wren_document_indexing_enabled:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "Document indexing is disabled "
+                    "(set WREN_DOCUMENT_INDEXING_ENABLED=true)."
+                ),
+            )
+
+    def _load_authorized_document(
+        document_id: str,
+        request: Request,
+        identity: AgentIdentity,
+        permission: SemanticPermission,
+    ) -> SemanticDocument:
+        """Load a document and enforce object-level scope auth (404 then access)."""
+
+        try:
+            document = active_semantic_layer_store.get_document(
+                document_id, owner_id=identity.owner_id
+            )
+        except SemanticDocumentNotFoundError as ex:
+            raise HTTPException(
+                status_code=404, detail="Semantic document not found."
+            ) from ex
+        authorize_semantic_scope(
+            request, document.scope, identity=identity, permission=permission
+        )
+        return document
+
+    @api.get(
+        "/agent/semantic-layer/documents/{document_id}/chunks",
+        response_model=list[DocumentChunk],
+    )
+    def list_document_chunks(
+        document_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> list[DocumentChunk]:
+        """List a document's persisted chunks in document order."""
+
+        _require_document_indexing()
+        _load_authorized_document(
+            document_id, fastapi_request, identity, SemanticPermission.READ
+        )
+        return active_semantic_layer_store.list_chunks(
+            document_id, owner_id=identity.owner_id
+        )
+
+    @api.get("/agent/semantic-layer/documents/{document_id}/content")
+    def download_document(
+        document_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> StreamingResponse:
+        """Stream the raw uploaded bytes of a document (original file download)."""
+
+        document = _load_authorized_document(
+            document_id, fastapi_request, identity, SemanticPermission.READ
+        )
+        try:
+            content = active_document_storage.read(document.storage_uri)
+        except Exception as ex:  # pylint: disable=broad-except
+            raise HTTPException(
+                status_code=404, detail="Document content is unavailable."
+            ) from ex
+        disposition = f'attachment; filename="{document.filename}"'
+        return StreamingResponse(
+            iter([content]),
+            media_type=document.content_type or "application/octet-stream",
+            headers={"Content-Disposition": disposition},
+        )
+
+    @api.delete(
+        "/agent/semantic-layer/documents/{document_id}",
+        response_model=SemanticDocument,
+    )
+    def delete_semantic_document(
+        document_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> SemanticDocument:
+        """Delete a document everywhere (vectors, chunk rows, blob, row)."""
+
+        _load_authorized_document(
+            document_id, fastapi_request, identity, SemanticPermission.WRITE
+        )
+        return delete_document_cascade(
+            document_id,
+            owner_id=identity.owner_id,
+            store=active_semantic_layer_store,
+            storage=active_document_storage,
+            document_index=active_document_index,
+        )
+
+    @api.post(
+        "/agent/semantic-layer/documents/{document_id}/reindex",
+        response_model=list[DocumentChunk],
+    )
+    def reindex_semantic_document(
+        document_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> list[DocumentChunk]:
+        """Re-chunk + re-embed a document (idempotent)."""
+
+        _require_document_indexing()
+        _load_authorized_document(
+            document_id, fastapi_request, identity, SemanticPermission.WRITE
+        )
+        return reindex_document(
+            document_id,
+            owner_id=identity.owner_id,
+            store=active_semantic_layer_store,
+            document_index=active_document_index,
+        )
+
+    @api.get(
+        "/agent/semantic-layer/documents/{document_id}/retrieve",
+        response_model=list[DocumentChunk],
+    )
+    def retrieve_document_chunks(
+        document_id: str,
+        q: str,
+        fastapi_request: Request,
+        k: int | None = None,
+        identity: AgentIdentity = identity_dependency,
+    ) -> list[DocumentChunk]:
+        """Return the document's chunks most relevant to ``q`` (RAG; degrade-closed)."""
+
+        _require_document_indexing()
+        _load_authorized_document(
+            document_id, fastapi_request, identity, SemanticPermission.READ
+        )
+        chunks = active_semantic_layer_store.list_chunks(
+            document_id, owner_id=identity.owner_id
+        )
+        document = active_semantic_layer_store.get_document(
+            document_id, owner_id=identity.owner_id
+        )
+        scope_key = document_scope_key(document.project_id, document.scope)
+        return active_document_index.retrieve(
+            q,
+            chunks,
+            scope_key=scope_key,
+            k=k or app_config.wren_document_retrieve_k,
+        )
+
+    @api.post(
+        "/agent/semantic-layer/documents/{document_id}/summarize",
+        response_model=SemanticDocument,
+    )
+    def summarize_semantic_document(
+        document_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> SemanticDocument:
+        """Regenerate a document's summary with the model (degrade-closed)."""
+
+        document = _load_authorized_document(
+            document_id, fastapi_request, identity, SemanticPermission.WRITE
+        )
+        text = (document.extracted_text or "").strip()
+        if not text:
+            return document
+        budget = app_config.wren_document_prompt_char_budget or 20_000
+        messages = [
+            ChatMessage(
+                role="system",
+                content=(
+                    "Summarize the document for a data analyst in 3-5 sentences. "
+                    "Focus on the business entities, metrics, and rules it describes."
+                ),
+            ),
+            ChatMessage(role="user", content=text[:budget]),
+        ]
+        try:
+            summary = active_model_client.chat(messages).content.strip()
+        except Exception as ex:  # pylint: disable=broad-except
+            raise HTTPException(
+                status_code=502, detail=f"Summarization failed: {ex}"
+            ) from ex
+        if not summary:
+            return document
+        updated = document.model_copy(update={"summary": summary})
+        return active_semantic_layer_store.update_document(
+            updated, owner_id=identity.owner_id
+        )
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/documents/duplicates",
+        response_model=list[DocumentChunkMatch],
+    )
+    def find_project_duplicate_chunks(
+        project_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> list[DocumentChunkMatch]:
+        """Find exact-duplicate chunk pairs across a project's documents."""
+
+        _require_document_indexing()
+        authorize_semantic_project(
+            fastapi_request,
+            project_id,
+            owner_id=identity.owner_id,
+            permission="read",
+        )
+        chunks = active_semantic_layer_store.list_project_chunks(
+            project_id, owner_id=identity.owner_id
+        )
+        return find_exact_duplicate_matches(chunks)
 
     @api.post(
         "/agent/semantic-layer/instructions",

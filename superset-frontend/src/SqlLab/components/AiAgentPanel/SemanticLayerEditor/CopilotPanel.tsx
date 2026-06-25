@@ -41,7 +41,7 @@ import {
   MessageAttachment,
   streamCopilot,
 } from '../api';
-import CopilotInspectorDrawer from './CopilotInspectorDrawer';
+import CopilotInspectorDialog from './CopilotInspectorDialog';
 
 export interface CopilotPanelProps {
   projectId: string;
@@ -526,7 +526,7 @@ const CopilotPanel = ({
         </Flex>
       </Flex>
 
-      <CopilotInspectorDrawer
+      <CopilotInspectorDialog
         open={inspectorOpen}
         inspector={inspector}
         onClose={() => setInspectorOpen(false)}

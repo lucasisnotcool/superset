@@ -18,12 +18,21 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from datetime import datetime, timezone
 
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.conversations.schemas import ConversationScope
 from superset_ai_agent.conversations.store import DEFAULT_OWNER_ID
-from superset_ai_agent.semantic_layer.document_chunks import truncate_to_sections
+from superset_ai_agent.semantic_layer.document_chunks import (
+    build_chunk_records,
+    DocumentChunk,
+    truncate_to_sections,
+)
+from superset_ai_agent.semantic_layer.document_retriever import (
+    document_scope_key,
+    DocumentChunkIndex,
+)
 from superset_ai_agent.semantic_layer.extractors import (
     DocumentExtractor,
     normalize_content_type,
@@ -31,6 +40,8 @@ from superset_ai_agent.semantic_layer.extractors import (
 from superset_ai_agent.semantic_layer.file_storage import DocumentStorage
 from superset_ai_agent.semantic_layer.schemas import SemanticDocument
 from superset_ai_agent.semantic_layer.store import SemanticLayerStore
+
+logger = logging.getLogger(__name__)
 
 
 def create_document(
@@ -45,8 +56,14 @@ def create_document(
     store: SemanticLayerStore,
     storage: DocumentStorage,
     extractor: DocumentExtractor,
+    document_index: DocumentChunkIndex | None = None,
 ) -> SemanticDocument:
-    """Validate, store, and extract text from a semantic source document."""
+    """Validate, store, and extract text from a semantic source document.
+
+    When document indexing is enabled, a successfully-extracted document is split
+    into persisted chunks and (if a vector cache is available) embedded for
+    retrieval. Chunking is best-effort: a failure never fails the upload.
+    """
 
     normalized_type = normalize_content_type(content_type)
     _validate_document(
@@ -105,7 +122,106 @@ def create_document(
                 "updated_at": _utc_now(),
             }
         )
-    return store.update_document(document, owner_id=owner_id)
+    saved = store.update_document(document, owner_id=owner_id)
+    if saved.status == "extracted" and config.wren_document_indexing_enabled:
+        _index_document_chunks(
+            saved,
+            store=store,
+            document_index=document_index,
+            owner_id=owner_id,
+        )
+    return saved
+
+
+def _index_document_chunks(
+    document: SemanticDocument,
+    *,
+    store: SemanticLayerStore,
+    document_index: DocumentChunkIndex | None,
+    owner_id: str,
+) -> None:
+    """Persist (and best-effort embed) a document's chunks. Never raises.
+
+    Chunks are persisted even without an embedder — they back the viewer, keyword
+    retrieval, and exact-duplicate detection; embedding only adds semantic recall.
+    """
+
+    try:
+        records = build_chunk_records(document.id, document.extracted_text or "")
+        if document_index is not None and records:
+            scope_key = document_scope_key(document.project_id, document.scope)
+            embedded = set(document_index.index(records, scope_key=scope_key))
+            if embedded:
+                records = [
+                    record.model_copy(update={"embedded": record.id in embedded})
+                    for record in records
+                ]
+        store.save_chunks(
+            document.id,
+            records,
+            owner_id=owner_id,
+            project_id=document.project_id,
+        )
+    except Exception as ex:  # pylint: disable=broad-except
+        logger.warning("Document chunk indexing failed for %s: %s", document.id, ex)
+
+
+def delete_document_cascade(
+    document_id: str,
+    *,
+    owner_id: str,
+    store: SemanticLayerStore,
+    storage: DocumentStorage,
+    document_index: DocumentChunkIndex | None = None,
+) -> SemanticDocument:
+    """Delete a document everywhere: vectors → chunk rows + document row → blob.
+
+    The single mutation choke point for document deletion. Raises
+    ``SemanticDocumentNotFoundError`` if the document is missing / not owned (before
+    any mutation). Vector and blob removal are best-effort; the authoritative DB
+    rows are removed transactionally by ``store.delete_document``. Returns the
+    deleted document (for the response / audit event).
+    """
+
+    document = store.get_document(document_id, owner_id=owner_id)
+    chunks = store.list_chunks(document_id, owner_id=owner_id)
+    if document_index is not None and chunks:
+        scope_key = document_scope_key(document.project_id, document.scope)
+        document_index.remove([chunk.id for chunk in chunks], scope_key=scope_key)
+    # Removes chunk rows + the document row in one transaction (cascade-in-code).
+    store.delete_document(document_id, owner_id=owner_id)
+    try:
+        storage.delete(document.storage_uri)
+    except Exception as ex:  # pylint: disable=broad-except
+        logger.warning(
+            "Document blob delete failed for %s (%s); rows already removed.",
+            document_id,
+            ex,
+        )
+    return document
+
+
+def reindex_document(
+    document_id: str,
+    *,
+    owner_id: str,
+    store: SemanticLayerStore,
+    document_index: DocumentChunkIndex | None = None,
+) -> list[DocumentChunk]:
+    """Re-chunk + re-embed a document from its stored extracted text.
+
+    Idempotent: chunk ids are deterministic per ``(document_id, index)`` so vectors
+    are replaced in place. Returns the persisted chunks.
+    """
+
+    document = store.get_document(document_id, owner_id=owner_id)
+    _index_document_chunks(
+        document,
+        store=store,
+        document_index=document_index,
+        owner_id=owner_id,
+    )
+    return store.list_chunks(document_id, owner_id=owner_id)
 
 
 def _validate_document(

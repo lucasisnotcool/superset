@@ -19,15 +19,15 @@
 import { t } from '@apache-superset/core/translation';
 import { css, useTheme } from '@apache-superset/core/theme';
 import {
-  Drawer,
   Empty,
   Flex,
+  Modal,
   Tabs,
   Typography,
 } from '@superset-ui/core/components';
 import { CopilotInspector } from '../api';
 
-export interface CopilotInspectorDrawerProps {
+export interface CopilotInspectorDialogProps {
   open: boolean;
   inspector: CopilotInspector | null;
   onClose: () => void;
@@ -53,11 +53,16 @@ const Pre = ({ children }: { children: string }) => {
   );
 };
 
-const CopilotInspectorDrawer = ({
+/**
+ * The agent inspector, shown as a dialog (mirroring the AI "How this answer was
+ * produced" explain dialog) — but surfacing the agent's effective parameters
+ * (prompt, instructions, skills, tools) instead of a query's reasoning steps.
+ */
+const CopilotInspectorDialog = ({
   open,
   inspector,
   onClose,
-}: CopilotInspectorDrawerProps) => {
+}: CopilotInspectorDialogProps) => {
   const theme = useTheme();
 
   const body = inspector ? (
@@ -130,16 +135,18 @@ const CopilotInspectorDrawer = ({
   );
 
   return (
-    <Drawer
-      title={t('Agent inspector')}
-      open={open}
-      onClose={onClose}
-      width={480}
-      data-test="copilot-inspector-drawer"
+    <Modal
+      show={open}
+      onHide={onClose}
+      title={t('How the agent is configured')}
+      hideFooter
+      destroyOnHidden
+      responsive
+      data-test="copilot-inspector-dialog"
     >
       {body}
-    </Drawer>
+    </Modal>
   );
 };
 
-export default CopilotInspectorDrawer;
+export default CopilotInspectorDialog;

@@ -50,17 +50,20 @@ import {
   addWarningToast,
 } from 'src/components/MessageToasts/actions';
 import { EditorHost } from 'src/core/editors';
+import { Splitter } from 'src/components/Splitter';
 import {
   ConversationScope,
   createMdlFile,
   deleteMdlFile,
   getProjectSemanticLayerState,
   listMdlFiles,
+  listSemanticDocuments,
   MdlFile,
   MdlFileStatus,
   resolveSemanticProject,
   runOnboarding,
   runReset,
+  SemanticDocument,
   SemanticLayerState,
   SemanticProject,
   updateMdlFile,
@@ -70,6 +73,7 @@ import SemanticLayerStateBadge from '../SemanticLayerStateBadge';
 import SemanticLayerImportDialog from './SemanticLayerImportDialog';
 import InstructionsPanel from './InstructionsPanel';
 import CopilotPanel from './CopilotPanel';
+import DocumentDetailPane from './DocumentDetailPane';
 import WorkspaceTree, { treeFromFiles } from './WorkspaceTree';
 
 // Lazy-loaded so the graph code + ECharts land in a separate async chunk fetched
@@ -130,49 +134,45 @@ const ContentTabs = styled(Tabs)`
   `}
 `;
 
-const EditorBody = styled.div<{ $copilot?: boolean }>`
-  ${({ theme, $copilot }) => css`
-    display: grid;
-    flex: 1;
-    min-height: 0;
-    grid-template-columns:
-      minmax(220px, 280px) minmax(0, 1fr)
-      ${$copilot ? 'minmax(320px, 400px)' : ''};
-    gap: ${theme.sizeUnit * 3}px;
-    padding: ${theme.sizeUnit * 3}px;
-    overflow: hidden;
-  `}
+// The three panes live in an antd Splitter: the file browser (left) and Copilot
+// (right) are collapsible and width-adjustable like SqlLab's database browser and
+// AI panel; the Splitter gutters provide the separators (so no pane borders).
+const EditorSplitter = styled(Splitter)`
+  flex: 1;
+  min-height: 0;
 `;
 
 const CopilotRail = styled.div`
   ${({ theme }) => css`
     display: flex;
+    height: 100%;
     min-height: 0;
     min-width: 0;
     flex-direction: column;
-    border-left: 1px solid ${theme.colorBorderSecondary};
-    padding-left: ${theme.sizeUnit * 3}px;
+    padding: ${theme.sizeUnit * 3}px;
   `}
 `;
 
 const BrowserPane = styled.div`
   ${({ theme }) => css`
     display: flex;
+    height: 100%;
     min-height: 0;
     flex-direction: column;
     gap: ${theme.sizeUnit * 2}px;
-    border-right: 1px solid ${theme.colorBorderSecondary};
-    padding-right: ${theme.sizeUnit * 3}px;
+    padding: ${theme.sizeUnit * 3}px;
   `}
 `;
 
 const EditorPane = styled.div`
   ${({ theme }) => css`
     display: flex;
+    height: 100%;
     min-width: 0;
     min-height: 0;
     flex-direction: column;
     gap: ${theme.sizeUnit * 2}px;
+    padding: ${theme.sizeUnit * 3}px;
   `}
 `;
 
@@ -235,8 +235,12 @@ export default function SemanticLayerEditor({
 
   const [project, setProject] = useState<SemanticProject | null>(null);
   const [mdlFiles, setMdlFiles] = useState<MdlFile[]>([]);
+  const [documents, setDocuments] = useState<SemanticDocument[]>([]);
   const [state, setState] = useState<SemanticLayerState | null>(null);
   const [activeFileId, setActiveFileId] = useState<string | null>(null);
+  const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(
+    null,
+  );
   const [editorPath, setEditorPath] = useState('models/new_model.json');
   const [editorValue, setEditorValue] = useState(defaultMdl);
   const [showImportDialog, setShowImportDialog] = useState(false);
@@ -254,6 +258,8 @@ export default function SemanticLayerEditor({
   activeFileIdRef.current = activeFileId;
 
   const activeFile = mdlFiles.find(file => file.id === activeFileId) || null;
+  const selectedDocument =
+    documents.find(document => document.id === selectedDocumentId) || null;
   const canWrite =
     project?.permission === 'write' || project?.permission === 'admin';
   const [isValidating, setIsValidating] = useState(false);
@@ -294,12 +300,16 @@ export default function SemanticLayerEditor({
   // The file browser renders a folder tree built client-side from the project's
   // MDL files (path prefixes → folders), so it works regardless of the copilot
   // flag. The backend GET /workspace returns the same shape for other consumers.
-  const workspaceRoot = useMemo(() => treeFromFiles(mdlFiles), [mdlFiles]);
+  const workspaceRoot = useMemo(
+    () => treeFromFiles(mdlFiles, documents),
+    [mdlFiles, documents],
+  );
 
   const refresh = useCallback(async () => {
     if (!scope.schema_name) {
       setProject(null);
       setMdlFiles([]);
+      setDocuments([]);
       setState(null);
       return;
     }
@@ -309,13 +319,23 @@ export default function SemanticLayerEditor({
       schema_name: scope.schema_name,
       create_if_missing: true,
     });
-    const [nextFiles, nextState] = await Promise.all([
+    const [nextFiles, nextState, nextDocuments] = await Promise.all([
       listMdlFiles(nextProject.id),
       getProjectSemanticLayerState(nextProject.id),
+      // Documents are scope-governed; an empty list is fine when none uploaded.
+      listSemanticDocuments(scope).catch(() => [] as SemanticDocument[]),
     ]);
     setProject(nextProject);
     setMdlFiles(nextFiles);
+    setDocuments(nextDocuments);
     setState(nextState);
+    // Drop a stale document selection if it no longer exists (functional update
+    // so `refresh` need not depend on the selection — see the activeFileId note).
+    setSelectedDocumentId(prev =>
+      prev && nextDocuments.some(document => document.id === prev)
+        ? prev
+        : null,
+    );
     // Initialize the selection only when nothing valid is selected yet; never
     // override the user's current file/edits on a background refresh.
     const current = activeFileIdRef.current;
@@ -376,10 +396,17 @@ export default function SemanticLayerEditor({
   };
 
   const selectFile = (file: MdlFile) => {
+    setSelectedDocumentId(null);
     activeFileIdRef.current = file.id;
     setActiveFileId(file.id);
     setEditorPath(file.path);
     setEditorValue(file.content);
+  };
+
+  const selectDocument = (documentId: string) => {
+    activeFileIdRef.current = null;
+    setActiveFileId(null);
+    setSelectedDocumentId(documentId);
   };
 
   const startNewFile = () => {
@@ -425,6 +452,50 @@ export default function SemanticLayerEditor({
       startNewFile();
       await refresh();
     }, t('Unable to delete MDL file'));
+
+  // Bulk delete (context menu / multi-select) — parity with a file browser.
+  const deleteFiles = (fileIds: string[]) =>
+    withLoading(async () => {
+      if (!project || fileIds.length === 0) {
+        return;
+      }
+      await Promise.all(fileIds.map(id => deleteMdlFile(project.id, id)));
+      startNewFile();
+      await refresh();
+    }, t('Unable to delete MDL file(s)'));
+
+  // Duplicate an MDL file as a new draft, with a unique "… copy" path.
+  const duplicateFile = (fileId: string) =>
+    withLoading(async () => {
+      if (!project) {
+        return;
+      }
+      const file = mdlFiles.find(item => item.id === fileId);
+      if (!file) {
+        return;
+      }
+      const dot = file.path.lastIndexOf('.');
+      const base = dot === -1 ? file.path : file.path.slice(0, dot);
+      const ext = dot === -1 ? '' : file.path.slice(dot);
+      const taken = new Set(mdlFiles.map(item => item.path));
+      let candidate = `${base} copy${ext}`;
+      let suffix = 2;
+      while (taken.has(candidate)) {
+        candidate = `${base} copy ${suffix}${ext}`;
+        suffix += 1;
+      }
+      const created = await createMdlFile(project.id, {
+        path: candidate,
+        content: file.content,
+        source_type: 'manual',
+      });
+      setSelectedDocumentId(null);
+      activeFileIdRef.current = created.id;
+      setActiveFileId(created.id);
+      setEditorPath(created.path);
+      setEditorValue(created.content);
+      await refresh();
+    }, t('Unable to duplicate MDL file'));
 
   const runOnboard = useCallback(
     async (targetProjectId: string) => {
@@ -571,150 +642,23 @@ export default function SemanticLayerEditor({
             key: 'models',
             label: t('Models'),
             children: (
-              <EditorBody $copilot={showCopilot && !!project}>
-                <BrowserPane>
-                  {!scope.schema_name && (
-                    <Alert
-                      type="warning"
-                      message={t('Select a database and schema.')}
-                    />
-                  )}
-                  <Flex gap="small" wrap="wrap">
-                    <Button
-                      buttonStyle="primary"
-                      disabled={!project || !canWrite || isLoading}
-                      onClick={() => saveFile()}
-                      icon={<Icons.SaveOutlined iconSize="m" />}
-                    >
-                      {t('Save')}
-                    </Button>
-                    <Button
-                      buttonStyle="tertiary"
-                      disabled={!project || !canWrite || isLoading}
-                      onClick={startNewFile}
-                      icon={<Icons.PlusOutlined iconSize="m" />}
-                    >
-                      {t('New')}
-                    </Button>
-                  </Flex>
-                  <ScrollList>
-                    <WorkspaceTree
-                      root={workspaceRoot}
-                      activeFileId={activeFileId}
-                      onSelectFile={fileId => {
-                        const file = mdlFiles.find(item => item.id === fileId);
-                        if (file) {
-                          selectFile(file);
-                        }
-                      }}
-                      renderActions={node => {
-                        const file = mdlFiles.find(
-                          item => item.id === node.file_id,
-                        );
-                        if (!file) {
-                          return null;
-                        }
-                        return (
-                          <Tooltip title={STATUS_TOGGLE_HELP}>
-                            <Switch
-                              size="small"
-                              checked={file.status === 'active'}
-                              disabled={!canWrite || isLoading}
-                              checkedChildren={t('Active')}
-                              unCheckedChildren={t('Draft')}
-                              onChange={checked =>
-                                toggleFileStatus(file, checked)
-                              }
-                            />
-                          </Tooltip>
-                        );
-                      }}
-                    />
-                  </ScrollList>
-                  <Button
-                    block
-                    buttonStyle="tertiary"
-                    disabled={
-                      !project ||
-                      !canWrite ||
-                      isLoading ||
-                      mdlFiles.length === 0
-                    }
-                    onClick={() => setAllStatuses(!allActive)}
-                    icon={
-                      allActive ? (
-                        <Icons.MinusCircleOutlined iconSize="m" />
-                      ) : (
-                        <Icons.CheckCircleOutlined iconSize="m" />
-                      )
-                    }
-                  >
-                    {allActive ? t('Deactivate all') : t('Activate all')}
-                  </Button>
-                  <Flex gap="small" wrap="wrap">
-                    <Button
-                      buttonStyle="tertiary"
-                      disabled={!project || !canWrite || isLoading}
-                      onClick={() => setShowImportDialog(true)}
-                      icon={<Icons.UploadOutlined iconSize="m" />}
-                    >
-                      {t('Add…')}
-                    </Button>
-                    <Button
-                      buttonStyle="tertiary"
-                      loading={isOnboarding || isResetting}
-                      disabled={
-                        !project ||
-                        !canWrite ||
-                        isLoading ||
-                        isOnboarding ||
-                        isResetting
-                      }
-                      onClick={() => setShowResetConfirm(true)}
-                      icon={<Icons.ReloadOutlined iconSize="m" />}
-                    >
-                      {isOnboarding || isResetting
-                        ? t('Resetting…')
-                        : t('Reset')}
-                    </Button>
-                  </Flex>
-                </BrowserPane>
-                <EditorPane>
-                  <Flex align="center" gap="small">
-                    <Input
-                      value={editorPath}
-                      disabled={!canWrite || isLoading}
-                      onChange={(event: ChangeEvent<HTMLInputElement>) =>
-                        setEditorPath(event.target.value)
-                      }
-                    />
-                    {isDirty && (
-                      <Tooltip title={t('You have unsaved changes')}>
-                        <Tag color="warning" data-test="mdl-dirty-indicator">
-                          {t('Unsaved')}
-                        </Tag>
-                      </Tooltip>
+              <EditorSplitter>
+                <Splitter.Panel
+                  collapsible={{
+                    start: true,
+                    end: true,
+                    showCollapsibleIcon: true,
+                  }}
+                  defaultSize={260}
+                  min={180}
+                >
+                  <BrowserPane>
+                    {!scope.schema_name && (
+                      <Alert
+                        type="warning"
+                        message={t('Select a database and schema.')}
+                      />
                     )}
-                  </Flex>
-                  <StyledEditorHost
-                    id={`semantic-mdl-${project?.id || 'empty'}`}
-                    height="100%"
-                    language="json"
-                    onChange={setEditorValue}
-                    readOnly={!canWrite || isLoading}
-                    value={editorValue}
-                    width="100%"
-                    annotations={editorAnnotations}
-                  />
-                  {activeFile?.validation && !activeFile.validation.valid && (
-                    <Alert
-                      type="warning"
-                      message={activeFile.validation.messages
-                        .map(message => message.message)
-                        .join('\n')}
-                    />
-                  )}
-                  <Flex justify="space-between" gap="small" wrap="wrap">
                     <Flex gap="small" wrap="wrap">
                       <Button
                         buttonStyle="primary"
@@ -722,49 +666,224 @@ export default function SemanticLayerEditor({
                         onClick={() => saveFile()}
                         icon={<Icons.SaveOutlined iconSize="m" />}
                       >
-                        {t('Save draft')}
+                        {t('Save')}
                       </Button>
                       <Button
                         buttonStyle="tertiary"
                         disabled={!project || !canWrite || isLoading}
-                        onClick={() => saveFile('active')}
-                        icon={<Icons.CheckCircleOutlined iconSize="m" />}
+                        onClick={startNewFile}
+                        icon={<Icons.PlusOutlined iconSize="m" />}
                       >
-                        {t('Activate')}
+                        {t('New')}
+                      </Button>
+                    </Flex>
+                    <ScrollList>
+                      <WorkspaceTree
+                        root={workspaceRoot}
+                        activeFileId={activeFileId}
+                        activeDocumentId={selectedDocumentId}
+                        onSelectFile={fileId => {
+                          const file = mdlFiles.find(
+                            item => item.id === fileId,
+                          );
+                          if (file) {
+                            selectFile(file);
+                          }
+                        }}
+                        onSelectDocument={selectDocument}
+                        onDuplicateFile={duplicateFile}
+                        onDeleteFiles={deleteFiles}
+                        renderActions={node => {
+                          const file = mdlFiles.find(
+                            item => item.id === node.file_id,
+                          );
+                          if (!file) {
+                            return null;
+                          }
+                          return (
+                            <Tooltip title={STATUS_TOGGLE_HELP}>
+                              <Switch
+                                size="small"
+                                checked={file.status === 'active'}
+                                disabled={!canWrite || isLoading}
+                                checkedChildren={t('Active')}
+                                unCheckedChildren={t('Draft')}
+                                onChange={checked =>
+                                  toggleFileStatus(file, checked)
+                                }
+                              />
+                            </Tooltip>
+                          );
+                        }}
+                      />
+                    </ScrollList>
+                    <Button
+                      block
+                      buttonStyle="tertiary"
+                      disabled={
+                        !project ||
+                        !canWrite ||
+                        isLoading ||
+                        mdlFiles.length === 0
+                      }
+                      onClick={() => setAllStatuses(!allActive)}
+                      icon={
+                        allActive ? (
+                          <Icons.MinusCircleOutlined iconSize="m" />
+                        ) : (
+                          <Icons.CheckCircleOutlined iconSize="m" />
+                        )
+                      }
+                    >
+                      {allActive ? t('Deactivate all') : t('Activate all')}
+                    </Button>
+                    <Flex gap="small" wrap="wrap">
+                      <Button
+                        buttonStyle="tertiary"
+                        disabled={!project || !canWrite || isLoading}
+                        onClick={() => setShowImportDialog(true)}
+                        icon={<Icons.UploadOutlined iconSize="m" />}
+                      >
+                        {t('Add…')}
                       </Button>
                       <Button
                         buttonStyle="tertiary"
-                        disabled={!activeFile || isLoading || isValidating}
-                        loading={isValidating}
-                        onClick={validateActiveFile}
-                        icon={<Icons.CheckCircleOutlined iconSize="m" />}
-                        data-test="mdl-validate"
+                        loading={isOnboarding || isResetting}
+                        disabled={
+                          !project ||
+                          !canWrite ||
+                          isLoading ||
+                          isOnboarding ||
+                          isResetting
+                        }
+                        onClick={() => setShowResetConfirm(true)}
+                        icon={<Icons.ReloadOutlined iconSize="m" />}
                       >
-                        {t('Validate')}
+                        {isOnboarding || isResetting
+                          ? t('Resetting…')
+                          : t('Reset')}
                       </Button>
                     </Flex>
-                    <Button
-                      buttonStyle="danger"
-                      disabled={
-                        !activeFile || !project || !canWrite || isLoading
-                      }
-                      onClick={() => activeFile && deleteFile(activeFile)}
-                      icon={<Icons.DeleteOutlined iconSize="m" />}
-                    >
-                      {t('Delete')}
-                    </Button>
-                  </Flex>
-                </EditorPane>
+                  </BrowserPane>
+                </Splitter.Panel>
+                <Splitter.Panel>
+                  <EditorPane>
+                    {selectedDocument ? (
+                      <DocumentDetailPane
+                        document={selectedDocument}
+                        canWrite={canWrite}
+                        onDeleted={() => {
+                          setSelectedDocumentId(null);
+                          refresh();
+                        }}
+                        onChanged={refresh}
+                      />
+                    ) : (
+                      <>
+                        <Flex align="center" gap="small">
+                          <Input
+                            value={editorPath}
+                            disabled={!canWrite || isLoading}
+                            onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                              setEditorPath(event.target.value)
+                            }
+                          />
+                          {isDirty && (
+                            <Tooltip title={t('You have unsaved changes')}>
+                              <Tag
+                                color="warning"
+                                data-test="mdl-dirty-indicator"
+                              >
+                                {t('Unsaved')}
+                              </Tag>
+                            </Tooltip>
+                          )}
+                        </Flex>
+                        <StyledEditorHost
+                          id={`semantic-mdl-${project?.id || 'empty'}`}
+                          height="100%"
+                          language="json"
+                          onChange={setEditorValue}
+                          readOnly={!canWrite || isLoading}
+                          value={editorValue}
+                          width="100%"
+                          annotations={editorAnnotations}
+                        />
+                        {activeFile?.validation &&
+                          !activeFile.validation.valid && (
+                            <Alert
+                              type="warning"
+                              message={activeFile.validation.messages
+                                .map(message => message.message)
+                                .join('\n')}
+                            />
+                          )}
+                        <Flex justify="space-between" gap="small" wrap="wrap">
+                          <Flex gap="small" wrap="wrap">
+                            <Button
+                              buttonStyle="primary"
+                              disabled={!project || !canWrite || isLoading}
+                              onClick={() => saveFile()}
+                              icon={<Icons.SaveOutlined iconSize="m" />}
+                            >
+                              {t('Save draft')}
+                            </Button>
+                            <Button
+                              buttonStyle="tertiary"
+                              disabled={!project || !canWrite || isLoading}
+                              onClick={() => saveFile('active')}
+                              icon={<Icons.CheckCircleOutlined iconSize="m" />}
+                            >
+                              {t('Activate')}
+                            </Button>
+                            <Button
+                              buttonStyle="tertiary"
+                              disabled={
+                                !activeFile || isLoading || isValidating
+                              }
+                              loading={isValidating}
+                              onClick={validateActiveFile}
+                              icon={<Icons.CheckCircleOutlined iconSize="m" />}
+                              data-test="mdl-validate"
+                            >
+                              {t('Validate')}
+                            </Button>
+                          </Flex>
+                          <Button
+                            buttonStyle="danger"
+                            disabled={
+                              !activeFile || !project || !canWrite || isLoading
+                            }
+                            onClick={() => activeFile && deleteFile(activeFile)}
+                            icon={<Icons.DeleteOutlined iconSize="m" />}
+                          >
+                            {t('Delete')}
+                          </Button>
+                        </Flex>
+                      </>
+                    )}
+                  </EditorPane>
+                </Splitter.Panel>
                 {showCopilot && project ? (
-                  <CopilotRail data-test="copilot-rail">
-                    <CopilotPanel
-                      projectId={project.id}
-                      canWrite={canWrite}
-                      onApplied={refresh}
-                    />
-                  </CopilotRail>
+                  <Splitter.Panel
+                    collapsible={{
+                      start: true,
+                      end: true,
+                      showCollapsibleIcon: true,
+                    }}
+                    defaultSize={360}
+                    min={280}
+                  >
+                    <CopilotRail data-test="copilot-rail">
+                      <CopilotPanel
+                        projectId={project.id}
+                        canWrite={canWrite}
+                        onApplied={refresh}
+                      />
+                    </CopilotRail>
+                  </Splitter.Panel>
                 ) : null}
-              </EditorBody>
+              </EditorSplitter>
             ),
           },
           {

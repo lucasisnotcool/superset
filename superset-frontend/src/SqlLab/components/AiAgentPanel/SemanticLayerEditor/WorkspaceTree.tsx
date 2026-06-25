@@ -16,10 +16,11 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { t } from '@apache-superset/core/translation';
-import { useTheme } from '@apache-superset/core/theme';
+import { css, styled } from '@apache-superset/core/theme';
 import {
+  Dropdown,
   Empty,
   Flex,
   Tag,
@@ -27,15 +28,24 @@ import {
   Typography,
 } from '@superset-ui/core/components';
 import { Icons } from '@superset-ui/core/components/Icons';
-import { MdlFile, MdlValidationResult, WorkspaceNode } from '../api';
+import type { MenuProps } from 'antd';
+import {
+  MdlFile,
+  MdlValidationResult,
+  SemanticDocument,
+  WorkspaceNode,
+} from '../api';
 
 /**
  * Build a workspace tree from the editor's MDL files (folders from path
- * prefixes). Used by the editor so the browser works regardless of the
- * `WREN_COPILOT_ENABLED` flag; the backend `GET /workspace` produces the same
- * shape (plus virtual sibling artifacts) for other consumers.
+ * prefixes) plus any uploaded `raw/` documents. Used by the editor so the
+ * browser works regardless of the `WREN_COPILOT_ENABLED` flag; the backend
+ * `GET /workspace` produces the same shape for other consumers.
  */
-export const treeFromFiles = (files: MdlFile[]): WorkspaceNode => {
+export const treeFromFiles = (
+  files: MdlFile[],
+  documents: SemanticDocument[] = [],
+): WorkspaceNode => {
   const root: WorkspaceNode = {
     path: '',
     name: 'workspace',
@@ -87,14 +97,45 @@ export const treeFromFiles = (files: MdlFile[]): WorkspaceNode => {
       });
     });
 
+  if (documents.length) {
+    const rawFolder: WorkspaceNode = {
+      path: 'raw',
+      name: 'raw',
+      kind: 'folder',
+      editable: false,
+      status: t('%s document(s)', documents.length),
+      children: documents
+        .slice()
+        .sort((a, b) => a.filename.localeCompare(b.filename))
+        .map(document => ({
+          path: `raw/${document.id}`,
+          name: document.filename,
+          kind: 'document' as const,
+          editable: false,
+          status: document.status,
+          document_id: document.id,
+          children: [],
+        })),
+    };
+    root.children.push(rawFolder);
+  }
+
   return root;
 };
 
 export interface WorkspaceTreeProps {
   root: WorkspaceNode | null;
   activeFileId?: string | null;
-  /** Called with the MDL file id when an editable MDL leaf is selected. */
+  /** The selected document id (raw/ node), if a document is open. */
+  activeDocumentId?: string | null;
+  /** Called with the MDL file id when an editable MDL leaf is opened. */
   onSelectFile: (fileId: string) => void;
+  /** Called with the document id when a raw/ document node is opened. */
+  onSelectDocument?: (documentId: string) => void;
+  /** Duplicate an MDL file (context menu). */
+  onDuplicateFile?: (fileId: string) => void;
+  /** Delete one or more MDL files (context menu / multi-select). */
+  onDeleteFiles?: (fileIds: string[]) => void;
   /** Optional per-MDL-file trailing actions (e.g. an activate Switch). */
   renderActions?: (node: WorkspaceNode) => React.ReactNode;
 }
@@ -105,12 +146,43 @@ interface TreeDataNode {
   selectable: boolean;
   isLeaf: boolean;
   fileId?: string | null;
+  documentId?: string | null;
   children?: TreeDataNode[];
 }
+
+// Tree node row: icon and title inline (not stacked), with the file name
+// truncated by ellipsis instead of wrapping when the panel is narrow.
+const TreeWrapper = styled.div`
+  ${({ theme }) => css`
+    min-width: 0;
+    .ant-tree .ant-tree-node-content-wrapper {
+      display: inline-flex;
+      align-items: center;
+      gap: ${theme.sizeUnit}px;
+      min-width: 0;
+      flex: 1;
+    }
+    .ant-tree .ant-tree-node-content-wrapper .ant-tree-iconEle {
+      display: inline-flex;
+      align-items: center;
+      vertical-align: middle;
+    }
+    .ant-tree .ant-tree-node-content-wrapper .ant-tree-title {
+      flex: 1;
+      min-width: 0;
+    }
+  `}
+`;
+
+const NodeName = styled(Typography.Text)`
+  flex: 1;
+  min-width: 0;
+`;
 
 const kindIcon = (kind: WorkspaceNode['kind']) => {
   if (kind === 'folder') return <Icons.FolderOutlined />;
   if (kind === 'instructions') return <Icons.FileTextOutlined />;
+  if (kind === 'document') return <Icons.FileTextOutlined />;
   if (kind === 'compiled' || kind === 'memory') return <Icons.LockOutlined />;
   return <Icons.FileOutlined />;
 };
@@ -125,13 +197,26 @@ const NodeTitle = ({
   const invalid = node.validation?.valid === false;
   const actions = node.kind === 'mdl' ? renderActions?.(node) : null;
   return (
-    <Flex align="center" gap={4} justify="space-between">
-      <Flex align="center" gap={4}>
-        <Typography.Text>{node.name}</Typography.Text>
-        {node.status === 'draft' ? <Tag>{t('draft')}</Tag> : null}
-        {node.status === 'active' ? (
-          <Tag color="success">{t('active')}</Tag>
-        ) : null}
+    <Flex
+      align="center"
+      gap={4}
+      justify="space-between"
+      css={css`
+        min-width: 0;
+      `}
+    >
+      <Flex
+        align="center"
+        gap={4}
+        css={css`
+          min-width: 0;
+          flex: 1;
+        `}
+      >
+        {/* Name truncates with an ellipsis rather than wrapping (item 5). The
+            redundant active/draft status badge is intentionally omitted for MDL
+            files — the Active/Draft toggle already shows that state (item 2). */}
+        <NodeName ellipsis={{ tooltip: node.name }}>{node.name}</NodeName>
         {invalid ? <Tag color="error">{t('invalid')}</Tag> : null}
       </Flex>
       {actions ? (
@@ -153,12 +238,13 @@ const toTreeData = (
   renderActions?: (node: WorkspaceNode) => React.ReactNode,
 ): TreeDataNode[] =>
   nodes.map(node => ({
-    key: node.file_id || node.path || node.name,
+    key: node.file_id || node.document_id || node.path || node.name,
     title: <NodeTitle node={node} renderActions={renderActions} />,
     icon: kindIcon(node.kind),
-    selectable: node.kind === 'mdl',
+    selectable: node.kind === 'mdl' || node.kind === 'document',
     isLeaf: node.kind !== 'folder',
     fileId: node.file_id,
+    documentId: node.document_id,
     children: node.children.length
       ? toTreeData(node.children, renderActions)
       : undefined,
@@ -167,14 +253,38 @@ const toTreeData = (
 const WorkspaceTree = ({
   root,
   activeFileId,
+  activeDocumentId,
   onSelectFile,
+  onSelectDocument,
+  onDuplicateFile,
+  onDeleteFiles,
   renderActions,
 }: WorkspaceTreeProps) => {
-  useTheme();
   const treeData = useMemo(
     () => (root ? toTreeData(root.children, renderActions) : []),
     [root, renderActions],
   );
+  // Multi-selection (shift/ctrl-click) is owned here; the active open file/doc
+  // seeds the highlight so programmatic selection (after open/delete) stays in sync.
+  const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
+  useEffect(() => {
+    const active = activeFileId || activeDocumentId;
+    setSelectedKeys(active ? [active] : []);
+  }, [activeFileId, activeDocumentId]);
+
+  // The set of currently-selected MDL file ids (documents excluded from bulk ops).
+  const selectedFileIds = useMemo(() => {
+    const fileKeys = new Set<string>();
+    const walk = (nodes: TreeDataNode[]) =>
+      nodes.forEach(node => {
+        if (node.fileId && selectedKeys.includes(node.key)) {
+          fileKeys.add(node.fileId);
+        }
+        if (node.children) walk(node.children);
+      });
+    walk(treeData);
+    return Array.from(fileKeys);
+  }, [selectedKeys, treeData]);
 
   if (!root || treeData.length === 0) {
     return (
@@ -185,21 +295,76 @@ const WorkspaceTree = ({
     );
   }
 
+  const contextMenu = (node: TreeDataNode): MenuProps | undefined => {
+    if (!node.fileId) {
+      return undefined;
+    }
+    const targetIds =
+      selectedFileIds.length > 1 && selectedFileIds.includes(node.fileId)
+        ? selectedFileIds
+        : [node.fileId];
+    return {
+      items: [
+        { key: 'open', label: t('Open') },
+        { key: 'duplicate', label: t('Duplicate') },
+        { type: 'divider' },
+        {
+          key: 'delete',
+          danger: true,
+          label:
+            targetIds.length > 1
+              ? t('Delete %s files', targetIds.length)
+              : t('Delete'),
+        },
+      ],
+      onClick: ({ key, domEvent }) => {
+        domEvent.stopPropagation();
+        if (key === 'open' && node.fileId) onSelectFile(node.fileId);
+        if (key === 'duplicate' && node.fileId) onDuplicateFile?.(node.fileId);
+        if (key === 'delete') onDeleteFiles?.(targetIds);
+      },
+    };
+  };
+
   return (
-    <Tree
-      showIcon
-      blockNode
-      defaultExpandAll
-      treeData={treeData}
-      selectedKeys={activeFileId ? [activeFileId] : []}
-      data-test="workspace-tree"
-      onSelect={(_keys, info) => {
-        const fileId = (info.node as unknown as TreeDataNode).fileId;
-        if (fileId) {
-          onSelectFile(fileId);
-        }
-      }}
-    />
+    <TreeWrapper>
+      <Tree
+        showIcon
+        blockNode
+        multiple
+        defaultExpandAll
+        treeData={treeData}
+        selectedKeys={selectedKeys}
+        data-test="workspace-tree"
+        titleRender={(node: unknown) => {
+          const typed = node as TreeDataNode;
+          const menu = contextMenu(typed);
+          if (!menu) {
+            return <>{typed.title}</>;
+          }
+          return (
+            <Dropdown menu={menu} trigger={['contextMenu']}>
+              <div
+                css={css`
+                  min-width: 0;
+                `}
+              >
+                {typed.title}
+              </div>
+            </Dropdown>
+          );
+        }}
+        onSelect={(keys, info) => {
+          setSelectedKeys(keys as string[]);
+          const clicked = info.node as unknown as TreeDataNode;
+          if (clicked.documentId) {
+            onSelectDocument?.(clicked.documentId);
+          } else if (clicked.fileId) {
+            onSelectFile(clicked.fileId);
+          }
+        }}
+      />
+    </TreeWrapper>
   );
 };
 

@@ -89,6 +89,8 @@ class WorkspaceNode(BaseModel):
     #: draft|active for MDL files; None otherwise.
     status: str | None = None
     file_id: str | None = None
+    #: Set on ``kind="document"`` nodes — the SemanticDocument id (selection key).
+    document_id: str | None = None
     validation: MdlValidationResult | None = None
     children: list["WorkspaceNode"] = Field(default_factory=list)
 

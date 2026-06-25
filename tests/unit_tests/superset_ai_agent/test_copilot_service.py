@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json  # noqa: TID251 - standalone agent JSON contract
 
+from superset_ai_agent.conversations.schemas import ConversationScope
 from superset_ai_agent.semantic_layer.copilot.schemas import (
     Changeset,
     ChangesetItem,
@@ -36,7 +37,21 @@ from superset_ai_agent.semantic_layer.mdl_files import InMemoryMdlFileStore
 from superset_ai_agent.semantic_layer.schemas import (
     MdlFile,
     MdlFileCreateRequest,
+    SemanticDocument,
 )
+
+
+def _document(filename: str = "glossary.md") -> SemanticDocument:
+    return SemanticDocument(
+        filename=filename,
+        content_type="text/markdown",
+        size_bytes=10,
+        scope=ConversationScope(database_id=1, dataset_ids=[]),
+        checksum="abc",
+        storage_uri="mem://doc",
+        status="extracted",
+    )
+
 
 VALID = json.dumps(
     {
@@ -70,7 +85,7 @@ def test_workspace_tree_nests_folders_and_appends_siblings() -> None:
             _file("rel.json"),
         ],
         instruction_count=2,
-        document_count=1,
+        documents=[_document("glossary.md")],
         has_compiled=True,
     )
 
@@ -86,6 +101,12 @@ def test_workspace_tree_nests_folders_and_appends_siblings() -> None:
     assert names["instructions.md"].kind == "instructions"
     assert names["queries.yml"].kind == "queries"
     assert names["raw"].status == "1 document(s)"
+    # documents are enumerated as selectable child nodes under raw/
+    raw_children = names["raw"].children
+    assert len(raw_children) == 1
+    assert raw_children[0].kind == "document"
+    assert raw_children[0].name == "glossary.md"
+    assert raw_children[0].document_id is not None
     assert names["target/mdl.json"].editable is False
 
 

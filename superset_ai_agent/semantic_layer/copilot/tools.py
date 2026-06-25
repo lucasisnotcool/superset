@@ -28,12 +28,22 @@ from __future__ import annotations
 
 import json  # noqa: TID251 - standalone agent JSON contract
 import logging
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
+from superset_ai_agent.conversations.store import DEFAULT_OWNER_ID
 from superset_ai_agent.llm.base import ToolSpec
 from superset_ai_agent.semantic_layer.copilot.schemas import (
     Changeset,
     ChangesetItem,
+)
+from superset_ai_agent.semantic_layer.document_chunks import (
+    DocumentChunk,
+    keyword_rank_chunks,
+)
+from superset_ai_agent.semantic_layer.document_retriever import (
+    document_scope_key,
+    DocumentChunkIndex,
+    find_exact_duplicate_matches,
 )
 from superset_ai_agent.semantic_layer.mdl_files import normalize_mdl_path
 from superset_ai_agent.semantic_layer.mdl_validator import (
@@ -41,9 +51,25 @@ from superset_ai_agent.semantic_layer.mdl_validator import (
     validate_mdl,
     validate_project_manifest,
 )
-from superset_ai_agent.semantic_layer.schemas import MdlFile, MdlValidationResult
+from superset_ai_agent.semantic_layer.schemas import (
+    MdlFile,
+    MdlValidationResult,
+    SemanticDocument,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class DocumentReader(Protocol):
+    """The read-only document access the copilot toolset needs (project-scoped)."""
+
+    def list_project_documents(
+        self, project_id: str, *, owner_id: str = ...
+    ) -> list[SemanticDocument]: ...
+
+    def list_project_chunks(
+        self, project_id: str, *, owner_id: str = ...
+    ) -> list[DocumentChunk]: ...
 
 
 class MdlToolset:
@@ -66,6 +92,11 @@ class MdlToolset:
         *,
         schema_index: SchemaIndex | None = None,
         deep_validate: bool = False,
+        document_store: DocumentReader | None = None,
+        document_index: DocumentChunkIndex | None = None,
+        project_id: str | None = None,
+        owner_id: str | None = None,
+        retrieve_k: int = 8,
     ) -> None:
         self._originals: dict[str, MdlFile] = {f.path: f for f in files}
         #: Mutable staging copy seeded with every original file's content.
@@ -73,6 +104,19 @@ class MdlToolset:
         self._summaries: dict[str, str] = {}
         self._schema_index = schema_index
         self._deep_validate = deep_validate
+        # Read-only document corpus the agent grounds MDL authoring on. Mutating
+        # document ops (delete/summarize) are deliberately NOT exposed here — they
+        # persist immediately and so break the "propose, don't persist" contract;
+        # they remain explicit user-driven endpoints.
+        self._document_store = document_store
+        self._document_index = document_index
+        self._project_id = project_id
+        self._owner_id = owner_id or DEFAULT_OWNER_ID
+        self._retrieve_k = retrieve_k
+
+    @property
+    def _documents_available(self) -> bool:
+        return self._document_store is not None and self._project_id is not None
 
     # -- LLM-facing surface ------------------------------------------------
 
@@ -145,6 +189,44 @@ class MdlToolset:
                 ),
                 parameters={"type": "object", "properties": {}},
             ),
+            ToolSpec(
+                name="list_documents",
+                description=(
+                    "List the uploaded reference documents (glossaries, specs) for "
+                    "this project — filename, status, and summary."
+                ),
+                parameters={"type": "object", "properties": {}},
+            ),
+            ToolSpec(
+                name="search_documents",
+                description=(
+                    "Search the uploaded documents for passages relevant to a query "
+                    "(business definitions, metric rules, synonyms) to ground MDL "
+                    "edits in the operator's own docs."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "What to look for in the documents.",
+                        },
+                        "k": {
+                            "type": "integer",
+                            "description": "Max passages to return.",
+                        },
+                    },
+                    "required": ["query"],
+                },
+            ),
+            ToolSpec(
+                name="find_duplicate_documents",
+                description=(
+                    "Find exact-duplicate passages across the uploaded documents "
+                    "(redundant or conflicting context to reconcile)."
+                ),
+                parameters={"type": "object", "properties": {}},
+            ),
         ]
 
     def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -157,6 +239,9 @@ class MdlToolset:
             "delete_mdl_file": self._delete_mdl_file,
             "validate_project": self._validate_project,
             "get_physical_schema": self._get_physical_schema,
+            "list_documents": self._list_documents,
+            "search_documents": self._search_documents,
+            "find_duplicate_documents": self._find_duplicate_documents,
         }.get(name)
         if handler is None:
             return {"error": f"Unknown tool {name!r}."}
@@ -219,6 +304,79 @@ class MdlToolset:
         if self._schema_index.has_types():
             result["column_types"] = self._schema_index.typed_tables()
         return result
+
+    # -- document tools (read-only RAG over the uploaded corpus) -----------
+
+    def _list_documents(self, _args: dict[str, Any]) -> dict[str, Any]:
+        if not self._documents_available:
+            return {"documents": [], "note": "No documents available."}
+        assert self._document_store is not None
+        assert self._project_id is not None
+        documents = self._document_store.list_project_documents(
+            self._project_id, owner_id=self._owner_id
+        )
+        return {
+            "documents": [
+                {
+                    "id": document.id,
+                    "filename": document.filename,
+                    "status": document.status,
+                    "summary": document.summary,
+                }
+                for document in documents
+            ]
+        }
+
+    def _search_documents(self, args: dict[str, Any]) -> dict[str, Any]:
+        query = args.get("query")
+        if not isinstance(query, str) or not query.strip():
+            return {"error": "search_documents requires a 'query' string."}
+        if not self._documents_available:
+            return {"passages": [], "note": "No documents available."}
+        assert self._document_store is not None
+        assert self._project_id is not None
+        k = args.get("k")
+        limit = k if isinstance(k, int) and k > 0 else self._retrieve_k
+        chunks = self._document_store.list_project_chunks(
+            self._project_id, owner_id=self._owner_id
+        )
+        if self._document_index is not None:
+            scope_key = document_scope_key(self._project_id)
+            ranked = self._document_index.retrieve(
+                query, chunks, scope_key=scope_key, k=limit
+            )
+        else:
+            ranked = keyword_rank_chunks(query, chunks, limit)
+        return {
+            "passages": [
+                {
+                    "document_id": chunk.document_id,
+                    "chunk_index": chunk.chunk_index,
+                    "text": chunk.text,
+                }
+                for chunk in ranked
+            ]
+        }
+
+    def _find_duplicate_documents(self, _args: dict[str, Any]) -> dict[str, Any]:
+        if not self._documents_available:
+            return {"duplicates": [], "note": "No documents available."}
+        assert self._document_store is not None
+        assert self._project_id is not None
+        chunks = self._document_store.list_project_chunks(
+            self._project_id, owner_id=self._owner_id
+        )
+        matches = find_exact_duplicate_matches(chunks)
+        return {
+            "duplicates": [
+                {
+                    "document_id": match.document_id,
+                    "other_document_id": match.other_document_id,
+                    "exact": match.exact,
+                }
+                for match in matches
+            ]
+        }
 
     # -- changeset rendering ----------------------------------------------
 

@@ -41,7 +41,8 @@ from superset_ai_agent.semantic_layer.copilot.schemas import (
     SkillDescriptor,
     ToolDescriptor,
 )
-from superset_ai_agent.semantic_layer.copilot.tools import MdlToolset
+from superset_ai_agent.semantic_layer.copilot.tools import DocumentReader, MdlToolset
+from superset_ai_agent.semantic_layer.document_retriever import DocumentChunkIndex
 from superset_ai_agent.semantic_layer.mdl_validator import (
     SchemaIndex,
     validate_project_manifest,
@@ -107,6 +108,11 @@ def run_copilot(
     max_correction_retries: int = 1,
     deep_validate: bool = False,
     on_step: StepSink | None = None,
+    document_store: DocumentReader | None = None,
+    document_index: DocumentChunkIndex | None = None,
+    project_id: str | None = None,
+    owner_id: str | None = None,
+    retrieve_k: int = 8,
 ) -> Changeset:
     """Run one agentic MDL-editing turn against the project's files."""
 
@@ -114,6 +120,11 @@ def run_copilot(
         [f for f in files if f.status != "deleted"],
         schema_index=schema_index,
         deep_validate=deep_validate,
+        document_store=document_store,
+        document_index=document_index,
+        project_id=project_id,
+        owner_id=owner_id,
+        retrieve_k=retrieve_k,
     )
     return run_copilot_loop(
         model_client=model_client,

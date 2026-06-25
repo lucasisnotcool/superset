@@ -333,6 +333,26 @@ export interface SemanticDocument {
   updated_at: string;
 }
 
+export interface DocumentChunk {
+  id: string;
+  document_id: string;
+  chunk_index: number;
+  text: string;
+  checksum: string;
+  char_start: number;
+  char_end: number;
+  embedded: boolean;
+}
+
+export interface DocumentChunkMatch {
+  chunk_id: string;
+  other_chunk_id: string;
+  document_id: string;
+  other_document_id: string;
+  score: number;
+  exact: boolean;
+}
+
 export interface SemanticLayerState {
   project_id?: string | null;
   database_id: number;
@@ -1000,6 +1020,7 @@ export interface WorkspaceNode {
   editable: boolean;
   status?: string | null;
   file_id?: string | null;
+  document_id?: string | null;
   validation?: MdlValidationResult | null;
   children: WorkspaceNode[];
 }
@@ -1293,6 +1314,55 @@ export const getSemanticDocument = (documentId: string) =>
     `/agent/semantic-layer/documents/${documentId}`,
     { method: 'GET' },
   );
+
+export const deleteSemanticDocument = (documentId: string) =>
+  requestJson<SemanticDocument>(
+    `/agent/semantic-layer/documents/${documentId}`,
+    { method: 'DELETE' },
+  );
+
+export const listDocumentChunks = (documentId: string) =>
+  requestJson<DocumentChunk[]>(
+    `/agent/semantic-layer/documents/${documentId}/chunks`,
+    { method: 'GET' },
+  );
+
+export const retrieveDocumentChunks = (
+  documentId: string,
+  query: string,
+  k?: number,
+) => {
+  const params = new URLSearchParams({ q: query });
+  if (k != null) {
+    params.set('k', String(k));
+  }
+  return requestJson<DocumentChunk[]>(
+    `/agent/semantic-layer/documents/${documentId}/retrieve?${params}`,
+    { method: 'GET' },
+  );
+};
+
+export const reindexSemanticDocument = (documentId: string) =>
+  requestJson<DocumentChunk[]>(
+    `/agent/semantic-layer/documents/${documentId}/reindex`,
+    { method: 'POST' },
+  );
+
+export const summarizeSemanticDocument = (documentId: string) =>
+  requestJson<SemanticDocument>(
+    `/agent/semantic-layer/documents/${documentId}/summarize`,
+    { method: 'POST' },
+  );
+
+export const findProjectDuplicateChunks = (projectId: string) =>
+  requestJson<DocumentChunkMatch[]>(
+    `/agent/semantic-layer/projects/${projectId}/documents/duplicates`,
+    { method: 'POST' },
+  );
+
+// Raw-file download bypasses the JSON helper (binary body, Content-Disposition).
+export const downloadDocumentUrl = (documentId: string) =>
+  `${getAgentBaseUrl()}/agent/semantic-layer/documents/${documentId}/content`;
 
 export const getSemanticLayerState = (scope: ConversationScope) =>
   requestJson<SemanticLayerState>(
