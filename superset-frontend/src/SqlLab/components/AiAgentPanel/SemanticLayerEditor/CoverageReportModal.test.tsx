@@ -28,6 +28,8 @@ const report: CoverageReport = {
   partial: 0,
   missing: 1,
   score: 0.5,
+  overreach: [],
+  unsupported: 0,
   warnings: [],
   findings: [
     {
