@@ -95,20 +95,23 @@ services:
         /docker-entrypoint.d/20-envsubst-on-templates.sh
         node_upstream="$${SUPERSET_NODE_UPSTREAM:-superset-node:9000}"
         url="http://$${node_upstream}/static/assets/manifest.json"
-        max_attempts=150  # ~5 minutes at 2s intervals
+        max_attempts=300  # ~10 minutes at 2s intervals; first build can be slow
         echo "Waiting for webpack dev server at $$url..."
         attempt=0
         until curl -sf --max-time 5 -H 'Host: localhost' -o /dev/null "$$url"; do
           attempt=$$((attempt + 1))
           if [ "$$attempt" -ge "$$max_attempts" ]; then
-            echo "ERROR: webpack dev server did not serve $$url after $$max_attempts attempts (~5 minutes)." >&2
+            echo "ERROR: webpack dev server did not serve $$url after $$max_attempts attempts (~10 minutes)." >&2
             echo "Is the dev server running? With BUILD_SUPERSET_FRONTEND_IN_DOCKER=false you must start it on the host and set SUPERSET_NODE_UPSTREAM to that address in docker/.env-local." >&2
             exit 1
+          fi
+          if [ $$((attempt % 15)) -eq 0 ]; then
+            echo "Still waiting for webpack dev server... ($$attempt/$$max_attempts)"
           fi
           sleep 2
         done
         echo "Webpack dev server is ready; starting nginx."
-        exec nginx -g 'daemon off;'
+        exec /docker-entrypoint.sh nginx -g 'daemon off;'
 
   redis:
     image: redis:7
