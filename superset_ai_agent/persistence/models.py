@@ -46,9 +46,7 @@ class AiAgentConversation(Base):
     catalog_name = Column(String(255), nullable=True)
     schema_name = Column(String(255), nullable=True)
     scope = Column(JSON, nullable=False)
-    created_at = Column(
-        DateTime(timezone=True), nullable=False
-    )
+    created_at = Column(DateTime(timezone=True), nullable=False)
     updated_at = Column(
         DateTime(timezone=True),
         index=True,
@@ -86,9 +84,7 @@ class AiAgentMessage(Base):
     role = Column(String(32), nullable=False)
     content = Column(Text, nullable=False)
     sequence = Column(Integer, nullable=False)
-    created_at = Column(
-        DateTime(timezone=True), nullable=False
-    )
+    created_at = Column(DateTime(timezone=True), nullable=False)
 
     conversation = relationship(
         "AiAgentConversation",
@@ -117,12 +113,8 @@ class AiAgentArtifact(Base):
     type = Column(String(64), nullable=False)
     sql = Column(Text, nullable=True)
     payload = Column(JSON, nullable=False)
-    created_at = Column(
-        DateTime(timezone=True), nullable=False
-    )
-    updated_at = Column(
-        DateTime(timezone=True), nullable=False
-    )
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
 
     message = relationship(
         "AiAgentMessage",
@@ -153,11 +145,41 @@ class AiAgentSemanticDocument(Base):
     extracted_text_preview = Column(Text, nullable=True)
     warnings = Column(JSON, nullable=False)
     error = Column(Text, nullable=True)
-    created_at = Column(
-        DateTime(timezone=True), nullable=False
-    )
-    updated_at = Column(
-        DateTime(timezone=True), nullable=False
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class AiAgentDocumentChunk(Base):
+    """Persisted, retrievable slice of an extracted semantic-layer document.
+
+    The durable system-of-record for document RAG: chunk text + offsets live here,
+    while the derived vectors live in the document vector store (keyed by ``id``).
+    Wholly owned by its parent document — deleted with it (cascade-in-code).
+    """
+
+    __tablename__ = "ai_agent_document_chunks"
+
+    id = Column(String(36), primary_key=True)
+    # Logical FK to ai_agent_semantic_documents.id. The codebase models do not use
+    # DB-level foreign keys for agent tables; the parent cascade is enforced in the
+    # store (delete_document removes chunks in the same transaction).
+    document_id = Column(String(36), index=True, nullable=False)
+    owner_id = Column(String(255), index=True, nullable=False)
+    project_id = Column(String(36), index=True, nullable=True)
+    chunk_index = Column(Integer, nullable=False)
+    text = Column(Text, nullable=False)
+    checksum = Column(String(128), index=True, nullable=False)
+    char_start = Column(Integer, nullable=False)
+    char_end = Column(Integer, nullable=False)
+    embedded = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "document_id",
+            "chunk_index",
+            name="uq_ai_agent_document_chunks_document_index",
+        ),
     )
 
 

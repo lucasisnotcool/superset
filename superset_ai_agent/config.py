@@ -164,6 +164,15 @@ class AgentConfig:
     # opt-in, since it adds an engine compile per draft and can surface validation
     # failures earlier than before.
     wren_modeling_deep_validation: bool = False
+    # MDL Copilot (wren_mdl_copilot.md): the agentic CRUD editor over a
+    # schema-scoped MDL project. Gated off by default; turning it on exposes the
+    # copilot routes (workspace, copilot/stream, inspector). Auto-pilot mode (the
+    # agent reads raw/ and proposes without a question) is a further opt-in.
+    wren_copilot_enabled: bool = False
+    wren_copilot_autopilot_enabled: bool = False
+    # Ceiling for inline conversation attachments (long-context, no RAG). Oversize
+    # text is truncated with a visible warning rather than rejected.
+    wren_copilot_attachment_max_chars: int = 200_000
     # Wren full-parity seams (see wren_full.md). All default to the
     # zero-dependency binding so the service starts unchanged; turning any of
     # these on requires durable semantic persistence (semantic_layer_store=
@@ -270,7 +279,9 @@ class AgentConfig:
                 os.getenv(
                     "OPENAI_STRUCTURED_OUTPUT",
                     cls.openai_structured_output,
-                ).strip().lower(),
+                )
+                .strip()
+                .lower(),
             ),
             openai_compatible_api_key=(
                 os.getenv("OPENAI_COMPATIBLE_API_KEY") or cls.openai_compatible_api_key
@@ -552,6 +563,20 @@ class AgentConfig:
                 "WREN_MODELING_DEEP_VALIDATION",
                 cls.wren_modeling_deep_validation,
             ),
+            wren_copilot_enabled=_env_bool(
+                "WREN_COPILOT_ENABLED",
+                cls.wren_copilot_enabled,
+            ),
+            wren_copilot_autopilot_enabled=_env_bool(
+                "WREN_COPILOT_AUTOPILOT_ENABLED",
+                cls.wren_copilot_autopilot_enabled,
+            ),
+            wren_copilot_attachment_max_chars=int(
+                os.getenv(
+                    "WREN_COPILOT_ATTACHMENT_MAX_CHARS",
+                    str(cls.wren_copilot_attachment_max_chars),
+                )
+            ),
             wren_engine=cast(
                 WrenEngineMode,
                 os.getenv("WREN_ENGINE", cls.wren_engine).strip().lower(),
@@ -581,9 +606,7 @@ class AgentConfig:
                 )
             ),
             wren_max_context_items=int(
-                os.getenv(
-                    "WREN_MAX_CONTEXT_ITEMS", str(cls.wren_max_context_items)
-                )
+                os.getenv("WREN_MAX_CONTEXT_ITEMS", str(cls.wren_max_context_items))
             ),
             wren_table_selection_limit=int(
                 os.getenv(
@@ -612,9 +635,7 @@ class AgentConfig:
                 )
             ),
             wren_memory_max_examples=int(
-                os.getenv(
-                    "WREN_MEMORY_MAX_EXAMPLES", str(cls.wren_memory_max_examples)
-                )
+                os.getenv("WREN_MEMORY_MAX_EXAMPLES", str(cls.wren_memory_max_examples))
             ),
             wren_intent_classification_enabled=_env_bool(
                 "WREN_INTENT_CLASSIFICATION_ENABLED",
@@ -649,9 +670,7 @@ class AgentConfig:
             ),
             superset_auth_mode=cast(
                 SupersetAuthMode,
-                os.getenv("SUPERSET_AUTH_MODE", cls.superset_auth_mode)
-                .strip()
-                .lower(),
+                os.getenv("SUPERSET_AUTH_MODE", cls.superset_auth_mode).strip().lower(),
             ),
             superset_base_url=os.getenv("SUPERSET_BASE_URL", cls.superset_base_url),
             superset_mcp_url=os.getenv("SUPERSET_MCP_URL", cls.superset_mcp_url),

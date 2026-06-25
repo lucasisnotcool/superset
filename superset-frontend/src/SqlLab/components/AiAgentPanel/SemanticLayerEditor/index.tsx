@@ -28,8 +28,10 @@ import {
 } from 'react';
 import { useDispatch } from 'react-redux';
 import { t } from '@apache-superset/core/translation';
+import type { editors } from '@apache-superset/core';
 import { css, styled } from '@apache-superset/core/theme';
 import { Alert } from '@apache-superset/core/components';
+import { useJsonValidation } from '@superset-ui/core/components/AsyncAceEditor';
 import {
   Button,
   ConfirmModal,
@@ -37,6 +39,7 @@ import {
   Input,
   Switch,
   Tabs,
+  Tag,
   Tooltip,
   Typography,
 } from '@superset-ui/core/components';
@@ -61,10 +64,13 @@ import {
   SemanticLayerState,
   SemanticProject,
   updateMdlFile,
+  validateMdlFile,
 } from '../api';
 import SemanticLayerStateBadge from '../SemanticLayerStateBadge';
 import SemanticLayerImportDialog from './SemanticLayerImportDialog';
 import InstructionsPanel from './InstructionsPanel';
+import CopilotPanel from './CopilotPanel';
+import WorkspaceTree, { treeFromFiles } from './WorkspaceTree';
 
 // Lazy-loaded so the graph code + ECharts land in a separate async chunk fetched
 // only when the Graph tab is opened — zero cost otherwise (wren_graph_view.md D1).
@@ -124,15 +130,28 @@ const ContentTabs = styled(Tabs)`
   `}
 `;
 
-const EditorBody = styled.div`
-  ${({ theme }) => css`
+const EditorBody = styled.div<{ $copilot?: boolean }>`
+  ${({ theme, $copilot }) => css`
     display: grid;
     flex: 1;
     min-height: 0;
-    grid-template-columns: minmax(220px, 280px) minmax(0, 1fr);
+    grid-template-columns:
+      minmax(220px, 280px) minmax(0, 1fr)
+      ${$copilot ? 'minmax(320px, 400px)' : ''};
     gap: ${theme.sizeUnit * 3}px;
     padding: ${theme.sizeUnit * 3}px;
     overflow: hidden;
+  `}
+`;
+
+const CopilotRail = styled.div`
+  ${({ theme }) => css`
+    display: flex;
+    min-height: 0;
+    min-width: 0;
+    flex-direction: column;
+    border-left: 1px solid ${theme.colorBorderSecondary};
+    padding-left: ${theme.sizeUnit * 3}px;
   `}
 `;
 
@@ -166,45 +185,6 @@ const ScrollList = styled.div`
     gap: ${theme.sizeUnit}px;
     overflow: auto;
   `}
-`;
-
-const FileButton = styled.div<{ 'data-active': boolean }>`
-  ${({ theme, 'data-active': active }) => css`
-    display: flex;
-    width: 100%;
-    min-height: 36px;
-    align-items: center;
-    justify-content: space-between;
-    gap: ${theme.sizeUnit}px;
-    padding: ${theme.sizeUnit * 2}px;
-    border: 1px solid
-      ${active ? theme.colorPrimary : theme.colorBorderSecondary};
-    border-radius: ${theme.borderRadius}px;
-    background: ${active ? theme.colorPrimaryBg : theme.colorBgContainer};
-    color: ${theme.colorText};
-    cursor: pointer;
-    text-align: left;
-
-    &:focus-visible {
-      outline: 2px solid ${theme.colorPrimaryBorder};
-      outline-offset: -1px;
-    }
-  `}
-`;
-
-const FilePath = styled.span`
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-`;
-
-// The status toggle keeps a constant width across every row: antd sizes the
-// Switch to the wider of its two labels, and the cell never flexes, so the file
-// name (which does flex) is what absorbs the remaining space.
-const ToggleCell = styled.div`
-  flex: 0 0 auto;
-  display: flex;
-  justify-content: flex-end;
 `;
 
 const STATUS_TOGGLE_HELP = t(
@@ -264,6 +244,7 @@ export default function SemanticLayerEditor({
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [showCopilot, setShowCopilot] = useState(true);
   const onboardedProjectsRef = useRef<Set<string>>(new Set());
   // Mirror the active file id in a ref so `refresh` can read the current
   // selection without depending on it (which would re-create the callback and
@@ -275,6 +256,45 @@ export default function SemanticLayerEditor({
   const activeFile = mdlFiles.find(file => file.id === activeFileId) || null;
   const canWrite =
     project?.permission === 'write' || project?.permission === 'admin';
+  const [isValidating, setIsValidating] = useState(false);
+  // Unsaved-changes tracking: compare the editor buffer to the loaded file
+  // (or the new-file template when nothing is selected).
+  const isDirty = activeFile
+    ? editorValue !== activeFile.content
+    : editorValue.trim() !== defaultMdl.trim();
+
+  // Inline gutter diagnostics: live JSON-syntax errors from the buffer, plus the
+  // stored file's structural/physical/engine validation messages (which carry
+  // 1-based line/column) when the buffer matches the saved file.
+  const jsonAnnotations = useJsonValidation(editorValue, {
+    errorPrefix: t('Invalid MDL JSON'),
+  });
+  const editorAnnotations = useMemo<editors.EditorAnnotation[]>(() => {
+    const fromJson = jsonAnnotations.map(annotation => ({
+      severity: annotation.type as editors.EditorAnnotation['severity'],
+      line: annotation.row,
+      column: annotation.column,
+      message: annotation.text,
+    }));
+    const fromValidation =
+      !isDirty && activeFile?.validation
+        ? activeFile.validation.messages
+            .filter(message => typeof message.line === 'number')
+            .map(message => ({
+              severity:
+                message.severity as editors.EditorAnnotation['severity'],
+              line: Math.max(0, (message.line ?? 1) - 1),
+              column: Math.max(0, (message.column ?? 1) - 1),
+              message: message.message,
+            }))
+        : [];
+    return [...fromJson, ...fromValidation];
+  }, [jsonAnnotations, isDirty, activeFile]);
+
+  // The file browser renders a folder tree built client-side from the project's
+  // MDL files (path prefixes → folders), so it works regardless of the copilot
+  // flag. The backend GET /workspace returns the same shape for other consumers.
+  const workspaceRoot = useMemo(() => treeFromFiles(mdlFiles), [mdlFiles]);
 
   const refresh = useCallback(async () => {
     if (!scope.schema_name) {
@@ -330,6 +350,28 @@ export default function SemanticLayerEditor({
       dispatch(addDangerToast(ex instanceof Error ? ex.message : fallback));
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  // On-demand validation of the *stored* file (re-runs structural + physical +
+  // engine checks and persists the result for the editor's annotations). A dirty
+  // buffer should be saved first — surfaced via the unsaved indicator.
+  const validateActiveFile = async () => {
+    if (!project || !activeFile) {
+      return;
+    }
+    setIsValidating(true);
+    try {
+      await validateMdlFile(project.id, activeFile.id);
+      await refresh();
+    } catch (ex) {
+      dispatch(
+        addDangerToast(
+          ex instanceof Error ? ex.message : t('Validation failed.'),
+        ),
+      );
+    } finally {
+      setIsValidating(false);
     }
   };
 
@@ -439,15 +481,15 @@ export default function SemanticLayerEditor({
           ),
         );
       } else {
-        dispatch(
-          addSuccessToast(t('Semantic layer reset and re-onboarded.')),
-        );
+        dispatch(addSuccessToast(t('Semantic layer reset and re-onboarded.')));
       }
       await refresh();
     } catch (ex) {
       dispatch(
         addDangerToast(
-          ex instanceof Error ? ex.message : t('Unable to reset semantic layer'),
+          ex instanceof Error
+            ? ex.message
+            : t('Unable to reset semantic layer'),
         ),
       );
     } finally {
@@ -512,6 +554,15 @@ export default function SemanticLayerEditor({
           </Typography.Title>
           <SemanticLayerStateBadge state={state} />
         </Flex>
+        <Button
+          buttonStyle={showCopilot ? 'primary' : 'tertiary'}
+          buttonSize="small"
+          icon={<Icons.CommentOutlined iconSize="m" />}
+          onClick={() => setShowCopilot(value => !value)}
+          data-test="toggle-copilot"
+        >
+          {t('Copilot')}
+        </Button>
       </EditorHeader>
       <ContentTabs
         defaultActiveKey="models"
@@ -520,7 +571,7 @@ export default function SemanticLayerEditor({
             key: 'models',
             label: t('Models'),
             children: (
-              <EditorBody>
+              <EditorBody $copilot={showCopilot && !!project}>
                 <BrowserPane>
                   {!scope.schema_name && (
                     <Alert
@@ -547,27 +598,23 @@ export default function SemanticLayerEditor({
                     </Button>
                   </Flex>
                   <ScrollList>
-                    {mdlFiles.map(file => (
-                      <FileButton
-                        key={file.id}
-                        role="button"
-                        tabIndex={0}
-                        data-active={file.id === activeFileId}
-                        onClick={() => selectFile(file)}
-                        onKeyDown={event => {
-                          if (event.key === 'Enter' || event.key === ' ') {
-                            event.preventDefault();
-                            selectFile(file);
-                          }
-                        }}
-                      >
-                        <FilePath>{file.path}</FilePath>
-                        <ToggleCell
-                          // Keep clicks/keys on the toggle from selecting the row.
-                          onClick={event => event.stopPropagation()}
-                          onKeyDown={event => event.stopPropagation()}
-                          role="presentation"
-                        >
+                    <WorkspaceTree
+                      root={workspaceRoot}
+                      activeFileId={activeFileId}
+                      onSelectFile={fileId => {
+                        const file = mdlFiles.find(item => item.id === fileId);
+                        if (file) {
+                          selectFile(file);
+                        }
+                      }}
+                      renderActions={node => {
+                        const file = mdlFiles.find(
+                          item => item.id === node.file_id,
+                        );
+                        if (!file) {
+                          return null;
+                        }
+                        return (
                           <Tooltip title={STATUS_TOGGLE_HELP}>
                             <Switch
                               size="small"
@@ -580,9 +627,9 @@ export default function SemanticLayerEditor({
                               }
                             />
                           </Tooltip>
-                        </ToggleCell>
-                      </FileButton>
-                    ))}
+                        );
+                      }}
+                    />
                   </ScrollList>
                   <Button
                     block
@@ -633,13 +680,22 @@ export default function SemanticLayerEditor({
                   </Flex>
                 </BrowserPane>
                 <EditorPane>
-                  <Input
-                    value={editorPath}
-                    disabled={!canWrite || isLoading}
-                    onChange={(event: ChangeEvent<HTMLInputElement>) =>
-                      setEditorPath(event.target.value)
-                    }
-                  />
+                  <Flex align="center" gap="small">
+                    <Input
+                      value={editorPath}
+                      disabled={!canWrite || isLoading}
+                      onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                        setEditorPath(event.target.value)
+                      }
+                    />
+                    {isDirty && (
+                      <Tooltip title={t('You have unsaved changes')}>
+                        <Tag color="warning" data-test="mdl-dirty-indicator">
+                          {t('Unsaved')}
+                        </Tag>
+                      </Tooltip>
+                    )}
+                  </Flex>
                   <StyledEditorHost
                     id={`semantic-mdl-${project?.id || 'empty'}`}
                     height="100%"
@@ -648,6 +704,7 @@ export default function SemanticLayerEditor({
                     readOnly={!canWrite || isLoading}
                     value={editorValue}
                     width="100%"
+                    annotations={editorAnnotations}
                   />
                   {activeFile?.validation && !activeFile.validation.valid && (
                     <Alert
@@ -675,6 +732,16 @@ export default function SemanticLayerEditor({
                       >
                         {t('Activate')}
                       </Button>
+                      <Button
+                        buttonStyle="tertiary"
+                        disabled={!activeFile || isLoading || isValidating}
+                        loading={isValidating}
+                        onClick={validateActiveFile}
+                        icon={<Icons.CheckCircleOutlined iconSize="m" />}
+                        data-test="mdl-validate"
+                      >
+                        {t('Validate')}
+                      </Button>
                     </Flex>
                     <Button
                       buttonStyle="danger"
@@ -688,6 +755,15 @@ export default function SemanticLayerEditor({
                     </Button>
                   </Flex>
                 </EditorPane>
+                {showCopilot && project ? (
+                  <CopilotRail data-test="copilot-rail">
+                    <CopilotPanel
+                      projectId={project.id}
+                      canWrite={canWrite}
+                      onApplied={refresh}
+                    />
+                  </CopilotRail>
+                ) : null}
               </EditorBody>
             ),
           },

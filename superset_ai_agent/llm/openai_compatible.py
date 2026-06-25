@@ -23,7 +23,15 @@ from typing import Any
 import httpx
 
 from superset_ai_agent.config import AgentConfig, StructuredOutputMode
-from superset_ai_agent.llm.base import ChatMessage, ModelProviderError, ModelResult
+from superset_ai_agent.llm.base import (
+    ChatMessage,
+    message_to_openai,
+    ModelProviderError,
+    ModelResult,
+    parse_openai_tool_calls,
+    tools_to_openai,
+    ToolSpec,
+)
 from superset_ai_agent.llm.schema import to_strict_json_schema
 from superset_ai_agent.schemas import ModelInfo
 
@@ -55,6 +63,7 @@ class OpenAICompatibleModelClient:
         *,
         model: str | None = None,
         format_schema: dict[str, Any] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> ModelResult:
         last_error: Exception | None = None
         modes = FALLBACK_ORDER[self.config.openai_compatible_structured_output]
@@ -65,6 +74,7 @@ class OpenAICompatibleModelClient:
                     model=model,
                     format_schema=format_schema,
                     mode=mode,
+                    tools=tools,
                 )
             except httpx.HTTPStatusError as ex:
                 last_error = ex
@@ -111,11 +121,12 @@ class OpenAICompatibleModelClient:
         model: str | None,
         format_schema: dict[str, Any] | None,
         mode: StructuredOutputMode,
+        tools: list[ToolSpec] | None = None,
     ) -> ModelResult:
         payload: dict[str, Any] = {
             "model": model or self.model,
             "messages": [
-                message.model_dump()
+                message_to_openai(message)
                 for message in self._messages_for_mode(messages, format_schema, mode)
             ],
             "stream": False,
@@ -123,6 +134,9 @@ class OpenAICompatibleModelClient:
         response_format = self._response_format(format_schema, mode)
         if response_format:
             payload["response_format"] = response_format
+        tool_payload = tools_to_openai(tools)
+        if tool_payload:
+            payload["tools"] = tool_payload
 
         with httpx.Client(
             timeout=self.timeout,
@@ -134,12 +148,18 @@ class OpenAICompatibleModelClient:
             data = response.json()
 
         try:
-            content = data["choices"][0]["message"]["content"] or ""
+            message = data["choices"][0]["message"]
         except (KeyError, IndexError, TypeError) as ex:
             raise ModelProviderError(
-                "OpenAI-compatible response did not include choices[0].message.content."
+                "OpenAI-compatible response did not include choices[0].message."
             ) from ex
-        return ModelResult(content=content, raw=data)
+        tool_calls = parse_openai_tool_calls(message)
+        content = message.get("content") or ""
+        if not content and not tool_calls:
+            raise ModelProviderError(
+                "OpenAI-compatible response had neither content nor tool_calls."
+            )
+        return ModelResult(content=content, raw=data, tool_calls=tool_calls)
 
     def _headers(self) -> dict[str, str]:
         headers = {
@@ -147,9 +167,7 @@ class OpenAICompatibleModelClient:
             "User-Agent": "superset-ai-agent/0.1",
         }
         if self.config.openai_compatible_api_key:
-            headers["Authorization"] = (
-                f"Bearer {self.config.openai_compatible_api_key}"
-            )
+            headers["Authorization"] = f"Bearer {self.config.openai_compatible_api_key}"
         return headers
 
     @staticmethod

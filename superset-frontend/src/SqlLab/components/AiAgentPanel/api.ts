@@ -979,6 +979,190 @@ export const validateMdlFile = (projectId: string, fileId: string) =>
     { method: 'POST' },
   );
 
+// -- MDL Copilot (wren_mdl_copilot.md) --------------------------------------
+
+export type ChangesetOp = 'create' | 'update' | 'delete';
+
+export type WorkspaceNodeKind =
+  | 'folder'
+  | 'mdl'
+  | 'instructions'
+  | 'queries'
+  | 'document'
+  | 'compiled'
+  | 'memory'
+  | 'config';
+
+export interface WorkspaceNode {
+  path: string;
+  name: string;
+  kind: WorkspaceNodeKind;
+  editable: boolean;
+  status?: string | null;
+  file_id?: string | null;
+  validation?: MdlValidationResult | null;
+  children: WorkspaceNode[];
+}
+
+export interface ChangesetItem {
+  op: ChangesetOp;
+  path: string;
+  file_id?: string | null;
+  current_content?: string | null;
+  proposed_content?: string | null;
+  validation?: MdlValidationResult | null;
+  summary: string;
+}
+
+export interface Changeset {
+  items: ChangesetItem[];
+  manifest_validation?: MdlValidationResult | null;
+  warnings: string[];
+  steps: AgentStep[];
+  message: string;
+}
+
+export interface MessageAttachment {
+  filename: string;
+  content_type: string;
+  text: string;
+  truncated?: boolean;
+}
+
+export interface CopilotTurnRequest {
+  message: string;
+  attachments?: MessageAttachment[];
+  conversation_id?: string | null;
+  model?: string | null;
+  max_steps?: number;
+}
+
+export interface CopilotToolDescriptor {
+  name: string;
+  description: string;
+}
+
+export interface CopilotSkillDescriptor {
+  name: string;
+  text: string;
+}
+
+export interface CopilotInstructionView {
+  id: string;
+  instruction: string;
+  is_global: boolean;
+}
+
+export interface CopilotInspector {
+  system_prompt: string;
+  skills: CopilotSkillDescriptor[];
+  tools: CopilotToolDescriptor[];
+  instructions: CopilotInstructionView[];
+}
+
+export const getProjectWorkspace = (projectId: string) =>
+  requestJson<WorkspaceNode>(
+    `/agent/semantic-layer/projects/${projectId}/workspace`,
+    { method: 'GET' },
+  );
+
+export const getCopilotInspector = (projectId: string) =>
+  requestJson<CopilotInspector>(
+    `/agent/semantic-layer/projects/${projectId}/copilot/inspector`,
+    { method: 'GET' },
+  );
+
+export const getCopilotDeployPreview = (projectId: string) =>
+  requestJson<Changeset>(
+    `/agent/semantic-layer/projects/${projectId}/copilot/deploy-preview`,
+    { method: 'GET' },
+  );
+
+export const runCopilot = (projectId: string, payload: CopilotTurnRequest) =>
+  requestJson<Changeset>(
+    `/agent/semantic-layer/projects/${projectId}/copilot`,
+    { method: 'POST', body: JSON.stringify(payload) },
+  );
+
+export const applyCopilotChangeset = (
+  projectId: string,
+  items: ChangesetItem[],
+) =>
+  requestJson<MdlFile[]>(
+    `/agent/semantic-layer/projects/${projectId}/copilot/apply`,
+    { method: 'POST', body: JSON.stringify({ items }) },
+  );
+
+/**
+ * Stream the agentic edit loop. Each `progress` event delivers an AgentStep via
+ * `onStep`; resolves with the final Changeset carried by the `complete` event.
+ */
+export const streamCopilot = async (
+  projectId: string,
+  payload: CopilotTurnRequest,
+  onStep?: (step: AgentStep) => void,
+): Promise<Changeset> => {
+  const response = await fetch(
+    `${getAgentBaseUrl()}/agent/semantic-layer/projects/${projectId}/copilot/stream`,
+    {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+  );
+  if (!response.ok || !response.body) {
+    throw new Error(await getAgentErrorMessage(response));
+  }
+
+  let changeset: Changeset | undefined;
+  let streamError: string | undefined;
+  const handleFrame = (frame: string) => {
+    const data = parseSseData(frame) as
+      | {
+          type?: string;
+          agent_step?: AgentStep;
+          changeset?: Changeset;
+          detail?: string;
+        }
+      | undefined;
+    if (!data || typeof data !== 'object') {
+      return;
+    }
+    if (data.type === 'progress' && data.agent_step) {
+      onStep?.(data.agent_step);
+    } else if (data.type === 'complete' && data.changeset) {
+      changeset = data.changeset;
+    } else if (data.type === 'error') {
+      streamError = data.detail || 'Copilot stream failed.';
+    }
+  };
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  for (;;) {
+    // eslint-disable-next-line no-await-in-loop
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    const { frames, rest } = splitSseFrames(buffer);
+    buffer = rest;
+    frames.forEach(handleFrame);
+  }
+  splitSseFrames(`${buffer}\n\n`).frames.forEach(handleFrame);
+
+  if (streamError) {
+    throw new Error(streamError);
+  }
+  if (!changeset) {
+    throw new Error('Copilot stream ended without a changeset.');
+  }
+  return changeset;
+};
+
 export const uploadMdlFile = (
   projectId: string,
   file: File,

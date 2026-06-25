@@ -22,8 +22,32 @@ from typing import Any
 import httpx
 
 from superset_ai_agent.config import AgentConfig
-from superset_ai_agent.llm.base import ChatMessage, ModelResult
+from superset_ai_agent.llm.base import (
+    ChatMessage,
+    message_to_openai,
+    ModelResult,
+    ToolCall,
+    tools_to_ollama,
+    ToolSpec,
+)
 from superset_ai_agent.schemas import ModelInfo
+
+
+def _parse_ollama_tool_calls(message: dict[str, Any]) -> list[ToolCall]:
+    """Extract tool calls from an Ollama ``message`` (arguments are objects)."""
+
+    calls: list[ToolCall] = []
+    for raw in message.get("tool_calls") or []:
+        if not isinstance(raw, dict):
+            continue
+        function = raw.get("function") or {}
+        name = function.get("name") or ""
+        if not name:
+            continue
+        arguments = function.get("arguments")
+        parsed = arguments if isinstance(arguments, dict) else {}
+        calls.append(ToolCall(id=str(raw.get("id") or ""), name=name, arguments=parsed))
+    return calls
 
 
 class OllamaModelClient:
@@ -43,22 +67,31 @@ class OllamaModelClient:
         *,
         model: str | None = None,
         format_schema: dict[str, Any] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> ModelResult:
         payload: dict[str, Any] = {
             "model": model or self.config.ollama_model,
-            "messages": [message.model_dump() for message in messages],
+            "messages": [message_to_openai(message) for message in messages],
             "stream": False,
         }
         if format_schema:
             payload["format"] = format_schema
+        tool_payload = tools_to_ollama(tools)
+        if tool_payload:
+            payload["tools"] = tool_payload
 
         with httpx.Client(timeout=120.0) as client:
             response = client.post(f"{self.base_url}/api/chat", json=payload)
             response.raise_for_status()
             data = response.json()
 
-        content = data.get("message", {}).get("content", "")
-        return ModelResult(content=content, raw=data)
+        message = data.get("message", {}) or {}
+        content = message.get("content", "") or ""
+        return ModelResult(
+            content=content,
+            raw=data,
+            tool_calls=_parse_ollama_tool_calls(message),
+        )
 
     def is_reachable(self) -> bool:
         try:

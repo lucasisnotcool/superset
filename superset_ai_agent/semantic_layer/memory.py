@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from superset_ai_agent.conversations.schemas import ConversationScope
 from superset_ai_agent.conversations.store import DEFAULT_OWNER_ID
+from superset_ai_agent.semantic_layer.document_chunks import DocumentChunk
 from superset_ai_agent.semantic_layer.schemas import (
     SemanticDocument,
     SemanticLayerEvent,
@@ -36,6 +37,10 @@ class InMemorySemanticLayerStore:
     def __init__(self) -> None:
         self._documents: dict[str, tuple[str, SemanticDocument]] = {}
         self._events: list[tuple[str, SemanticLayerEvent]] = []
+        # owner_id -> document_id -> ordered chunks
+        self._chunks: dict[str, dict[str, list[DocumentChunk]]] = {}
+        # document_id -> project_id (for cross-document project scans)
+        self._chunk_projects: dict[str, str | None] = {}
 
     def save_document(
         self,
@@ -91,6 +96,63 @@ class InMemorySemanticLayerStore:
         self._documents[document.id] = (owner_id, document.model_copy(deep=True))
         return document.model_copy(deep=True)
 
+    def delete_document(
+        self,
+        document_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> None:
+        self.get_document(document_id, owner_id=owner_id)
+        self._documents.pop(document_id, None)
+        self._chunks.get(owner_id, {}).pop(document_id, None)
+        self._chunk_projects.pop(document_id, None)
+
+    def save_chunks(
+        self,
+        document_id: str,
+        chunks: list[DocumentChunk],
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+        project_id: str | None = None,
+    ) -> list[DocumentChunk]:
+        owned = self._chunks.setdefault(owner_id, {})
+        owned[document_id] = [chunk.model_copy(deep=True) for chunk in chunks]
+        self._chunk_projects[document_id] = project_id
+        return self.list_chunks(document_id, owner_id=owner_id)
+
+    def list_chunks(
+        self,
+        document_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> list[DocumentChunk]:
+        chunks = self._chunks.get(owner_id, {}).get(document_id, [])
+        return [
+            chunk.model_copy(deep=True)
+            for chunk in sorted(chunks, key=lambda chunk: chunk.chunk_index)
+        ]
+
+    def delete_chunks(
+        self,
+        document_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> None:
+        self._chunks.get(owner_id, {}).pop(document_id, None)
+
+    def list_project_chunks(
+        self,
+        project_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> list[DocumentChunk]:
+        result: list[DocumentChunk] = []
+        for document_id, chunks in self._chunks.get(owner_id, {}).items():
+            if self._chunk_projects.get(document_id) != project_id:
+                continue
+            result.extend(chunk.model_copy(deep=True) for chunk in chunks)
+        return sorted(result, key=lambda chunk: (chunk.document_id, chunk.chunk_index))
+
     def get_state(
         self,
         scope: ConversationScope,
@@ -119,9 +181,13 @@ class InMemorySemanticLayerStore:
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> SemanticLayerState:
         documents = self.list_project_documents(project_id, owner_id=owner_id)
-        first_scope = documents[0].scope if documents else ConversationScope(
-            database_id=0,
-            dataset_ids=[],
+        first_scope = (
+            documents[0].scope
+            if documents
+            else ConversationScope(
+                database_id=0,
+                dataset_ids=[],
+            )
         )
         last_error = next(
             (document.error for document in documents if document.status == "error"),

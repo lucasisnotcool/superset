@@ -18,6 +18,11 @@
  */
 import fetchMock from 'fetch-mock';
 import {
+  applyCopilotChangeset,
+  getCopilotDeployPreview,
+  getCopilotInspector,
+  getProjectWorkspace,
+  runCopilot,
   createMdlFile,
   createConversation,
   createSemanticLayerEventSource,
@@ -467,6 +472,90 @@ test('semantic project API helpers use project and MDL endpoints', async () => {
     catalog_name: 'prod',
     schema_name: 'pipeline',
   });
+});
+
+test('MDL Copilot helpers call workspace, run, apply, and inspector', async () => {
+  const base = 'http://agent.local/agent/semantic-layer/projects/project-1';
+  fetchMock.get(`${base}/workspace`, {
+    path: '',
+    name: 'workspace',
+    kind: 'folder',
+    editable: false,
+    children: [
+      {
+        path: 'models',
+        name: 'models',
+        kind: 'folder',
+        editable: false,
+        children: [],
+      },
+    ],
+  });
+  fetchMock.post(`${base}/copilot`, {
+    items: [
+      {
+        op: 'create',
+        path: 'models/orders.json',
+        proposed_content: '{"models":[]}',
+        summary: 'Add orders',
+      },
+    ],
+    manifest_validation: { valid: true, messages: [] },
+    warnings: [],
+    steps: [],
+    message: 'Created orders.',
+  });
+  fetchMock.post(`${base}/copilot/apply`, [
+    {
+      id: 'file-1',
+      project_id: 'project-1',
+      path: 'models/orders.json',
+      filename: 'orders.json',
+      content: '{"models":[]}',
+      content_type: 'application/json',
+      source_type: 'copilot',
+      status: 'draft',
+      checksum: 'c',
+      created_at: '2026-06-19T00:00:00Z',
+      updated_at: '2026-06-19T00:00:00Z',
+    },
+  ]);
+  fetchMock.get(`${base}/copilot/inspector`, {
+    system_prompt: 'You are MDL Copilot.',
+    skills: [{ name: 'generate-mdl', text: '...' }],
+    tools: [{ name: 'write_mdl_file', description: '...' }],
+    instructions: [],
+  });
+
+  const workspace = await getProjectWorkspace('project-1');
+  expect(workspace.children[0].name).toBe('models');
+
+  const changeset = await runCopilot('project-1', { message: 'model orders' });
+  expect(changeset.items[0].op).toBe('create');
+  expect(changeset.message).toBe('Created orders.');
+
+  const applied = await applyCopilotChangeset('project-1', changeset.items);
+  expect(applied[0].source_type).toBe('copilot');
+
+  const inspector = await getCopilotInspector('project-1');
+  expect(inspector.tools[0].name).toBe('write_mdl_file');
+
+  fetchMock.get(`${base}/copilot/deploy-preview`, {
+    items: [{ op: 'create', path: 'models/orders.json', summary: 'Activate' }],
+    manifest_validation: { valid: true, messages: [] },
+    warnings: [],
+    steps: [],
+    message: '1 draft(s) would be activated.',
+  });
+  const preview = await getCopilotDeployPreview('project-1');
+  expect(preview.items[0].path).toBe('models/orders.json');
+
+  const [runCall] = fetchMock.callHistory.calls(`${base}/copilot`);
+  expect(JSON.parse(String(runCall.options.body))).toEqual({
+    message: 'model orders',
+  });
+  const [applyCall] = fetchMock.callHistory.calls(`${base}/copilot/apply`);
+  expect(JSON.parse(String(applyCall.options.body)).items).toHaveLength(1);
 });
 
 test('API helpers surface FastAPI detail errors', async () => {

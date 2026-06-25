@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import json  # noqa: TID251 - keep the standalone agent independent of Superset
 import logging
+import queue
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -85,6 +87,22 @@ from superset_ai_agent.semantic_layer.access import (
     SemanticAccessService,
     SemanticPermission,
 )
+from superset_ai_agent.semantic_layer.copilot.schemas import (
+    Changeset,
+    ChangesetApplyRequest,
+    CopilotInspector,
+    CopilotTurnRequest,
+    InstructionView,
+    MessageAttachment,
+    WorkspaceNode,
+)
+from superset_ai_agent.semantic_layer.copilot.service import (
+    apply_changeset_items,
+    build_deploy_preview,
+    build_inspector,
+    run_copilot,
+)
+from superset_ai_agent.semantic_layer.copilot.workspace import build_workspace_tree
 from superset_ai_agent.semantic_layer.documents import create_document
 from superset_ai_agent.semantic_layer.events import to_sse
 from superset_ai_agent.semantic_layer.extractors import (
@@ -293,13 +311,10 @@ def create_app(  # noqa: C901
             "survive a restart. Install `lancedb` or set WREN_VECTOR_INDEX=memory."
         )
 
-    app_superset_client = (
-        superset_client
-        or (
-            create_superset_client(app_config)
-            if app_config.superset_auth_mode != "user_session"
-            else None
-        )
+    app_superset_client = superset_client or (
+        create_superset_client(app_config)
+        if app_config.superset_auth_mode != "user_session"
+        else None
     )
     active_wren_client = wren_client or create_wren_client(
         app_config,
@@ -477,9 +492,7 @@ def create_app(  # noqa: C901
         permission: str = "read",
     ) -> SemanticProject:
         try:
-            return build_semantic_access_service(
-                request
-            ).require_project_permission(
+            return build_semantic_access_service(request).require_project_permission(
                 identity=AgentIdentity(owner_id=owner_id),
                 project_id=project_id,
                 permission=SemanticPermission(permission),
@@ -1260,6 +1273,262 @@ def create_app(  # noqa: C901
         except MdlFileNotFoundError as ex:
             raise HTTPException(status_code=404, detail="MDL file not found.") from ex
 
+    # -- MDL Copilot (wren_mdl_copilot.md) --------------------------------
+
+    def _require_copilot_enabled() -> None:
+        if not app_config.wren_copilot_enabled:
+            raise HTTPException(
+                status_code=404,
+                detail="MDL Copilot is disabled (set WREN_COPILOT_ENABLED=true).",
+            )
+
+    def _project_instruction_views(
+        project: SemanticProject, owner_id: str
+    ) -> list[InstructionView]:
+        if project.default_database_id is None:
+            return []
+        scope = _scope_from_project(project)
+        return [
+            InstructionView(
+                id=item.id, instruction=item.instruction, is_global=item.is_global
+            )
+            for item in active_instruction_store.list_instructions(
+                scope_hash=instruction_scope_hash(scope), owner_id=owner_id
+            )
+        ]
+
+    def _recalled_instructions(
+        project: SemanticProject, owner_id: str, query: str
+    ) -> list[str]:
+        if project.default_database_id is None:
+            return []
+        scope = _scope_from_project(project)
+        return [
+            item.instruction
+            for item in active_instruction_store.recall(
+                query,
+                scope_hash=instruction_scope_hash(scope),
+                owner_id=owner_id,
+                k=app_config.wren_instruction_recall_k,
+            )
+        ]
+
+    def _attachments_text(attachments: list[MessageAttachment]) -> str:
+        limit = app_config.wren_copilot_attachment_max_chars
+        blocks: list[str] = []
+        for attachment in attachments:
+            text = attachment.text or ""
+            if len(text) > limit:
+                text = text[:limit] + "\n…(truncated)…"
+            blocks.append(f"### {attachment.filename}\n{text}")
+        return "\n\n".join(blocks)
+
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}/workspace",
+        response_model=WorkspaceNode,
+    )
+    def get_project_workspace(
+        project_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> WorkspaceNode:
+        """Unified Wren-style workspace tree for the MDL Copilot editor."""
+
+        _require_copilot_enabled()
+        project = authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="read"
+        )
+        files = active_mdl_file_store.list(project_id, owner_id=identity.owner_id)
+        instructions = _project_instruction_views(project, identity.owner_id)
+        has_active = any(
+            file.status == "active" for file in files if file.status != "deleted"
+        )
+        return build_workspace_tree(
+            files,
+            instruction_count=len(instructions),
+            has_compiled=has_active,
+        )
+
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}/copilot/inspector",
+        response_model=CopilotInspector,
+    )
+    def get_copilot_inspector(
+        project_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> CopilotInspector:
+        """Effective agent context: prompt, skills, tools, project instructions."""
+
+        _require_copilot_enabled()
+        project = authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="read"
+        )
+        return build_inspector(
+            instructions=_project_instruction_views(project, identity.owner_id)
+        )
+
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}/copilot/deploy-preview",
+        response_model=Changeset,
+    )
+    def get_copilot_deploy_preview(
+        project_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> Changeset:
+        """Aggregate diff of all drafts vs active (Wren-style Deploy review)."""
+
+        _require_copilot_enabled()
+        project = authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="read"
+        )
+        files = active_mdl_file_store.list(project_id, owner_id=identity.owner_id)
+        return build_deploy_preview(
+            files,
+            schema_index=_schema_index_for_project(project, fastapi_request),
+            deep_validate=app_config.wren_core_validation_enabled,
+        )
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/copilot",
+        response_model=Changeset,
+    )
+    def run_project_copilot(
+        project_id: str,
+        request: CopilotTurnRequest,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> Changeset:
+        """Run one agentic MDL-editing turn; returns a reviewable changeset."""
+
+        _require_copilot_enabled()
+        project = authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
+        )
+        files = active_mdl_file_store.list(project_id, owner_id=identity.owner_id)
+        schema_index = _schema_index_for_project(project, fastapi_request)
+        try:
+            return run_copilot(
+                model_client=active_model_client,
+                files=files,
+                schema_index=schema_index,
+                user_message=request.message,
+                attachments_text=_attachments_text(request.attachments),
+                instructions=_recalled_instructions(
+                    project, identity.owner_id, request.message
+                ),
+                model=request.model,
+                max_steps=request.max_steps,
+                deep_validate=app_config.wren_modeling_deep_validation,
+            )
+        except Exception as ex:  # pylint: disable=broad-except
+            raise HTTPException(status_code=502, detail=str(ex)) from ex
+
+    @api.post("/agent/semantic-layer/projects/{project_id}/copilot/stream")
+    def stream_project_copilot(
+        project_id: str,
+        request: CopilotTurnRequest,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> StreamingResponse:
+        """Stream the agentic edit loop: ``progress`` steps then ``complete``."""
+
+        _require_copilot_enabled()
+        project = authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
+        )
+        # Resolve request-scoped context before streaming starts (no Request access
+        # from the worker thread).
+        files = active_mdl_file_store.list(project_id, owner_id=identity.owner_id)
+        schema_index = _schema_index_for_project(project, fastapi_request)
+        instructions = _recalled_instructions(
+            project, identity.owner_id, request.message
+        )
+        attachments_text = _attachments_text(request.attachments)
+
+        def event_stream() -> Any:
+            events: queue.Queue[tuple[str, Any]] = queue.Queue()
+            holder: dict[str, Any] = {}
+
+            def on_step(step: Any) -> None:
+                events.put(("progress", step))
+
+            def run() -> None:
+                try:
+                    holder["changeset"] = run_copilot(
+                        model_client=active_model_client,
+                        files=files,
+                        schema_index=schema_index,
+                        user_message=request.message,
+                        attachments_text=attachments_text,
+                        instructions=instructions,
+                        model=request.model,
+                        max_steps=request.max_steps,
+                        deep_validate=app_config.wren_modeling_deep_validation,
+                        on_step=on_step,
+                    )
+                except Exception as ex:  # pylint: disable=broad-except
+                    holder["error"] = str(ex)
+                finally:
+                    events.put(("done", None))
+
+            worker = threading.Thread(target=run, daemon=True)
+            worker.start()
+            while True:
+                kind, payload = events.get()
+                if kind == "done":
+                    break
+                if kind == "progress":
+                    yield _conversation_sse(
+                        {
+                            "type": "progress",
+                            "agent_step": payload.model_dump(mode="json"),
+                        }
+                    )
+            worker.join()
+            if "error" in holder:
+                yield _conversation_sse({"type": "error", "detail": holder["error"]})
+            else:
+                yield _conversation_sse(
+                    {
+                        "type": "complete",
+                        "changeset": holder["changeset"].model_dump(mode="json"),
+                    }
+                )
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/copilot/apply",
+        response_model=list[MdlFile],
+    )
+    def apply_project_copilot(
+        project_id: str,
+        request: ChangesetApplyRequest,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> list[MdlFile]:
+        """Persist the user-accepted changeset items as drafts."""
+
+        _require_copilot_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
+        )
+        try:
+            return apply_changeset_items(
+                active_mdl_file_store,
+                project_id=project_id,
+                items=request.items,
+                owner_id=identity.owner_id,
+            )
+        except MdlFileNotFoundError as ex:
+            raise HTTPException(status_code=404, detail="MDL file not found.") from ex
+        except MdlFileExistsError as ex:
+            raise HTTPException(status_code=409, detail=str(ex)) from ex
+        except ValueError as ex:
+            raise HTTPException(status_code=400, detail=str(ex)) from ex
+
     @api.post(
         "/agent/semantic-layer/projects/{project_id}/materialize",
         response_model=WrenMaterializationResult,
@@ -1438,9 +1707,7 @@ def create_app(  # noqa: C901
         # Fetch the schema before deleting, so an auth/connection failure leaves the
         # existing MDL intact rather than wiping it with nothing to rebuild from.
         context = _onboarding_context(project, fastapi_request)
-        for file in active_mdl_file_store.list(
-            project_id, owner_id=identity.owner_id
-        ):
+        for file in active_mdl_file_store.list(project_id, owner_id=identity.owner_id):
             active_mdl_file_store.delete(file.id, owner_id=identity.owner_id)
         return _start_onboarding_job(project, context, identity.owner_id)
 
@@ -1780,7 +2047,6 @@ def create_app(  # noqa: C901
             permission=SemanticPermission.READ,
         )
         return document
-
 
     @api.post(
         "/agent/semantic-layer/instructions",

@@ -33,13 +33,22 @@ the cut. Two seams:
 
 from __future__ import annotations
 
+import hashlib
 import re
+import uuid
+
+from pydantic import BaseModel, Field
 
 #: Default per-section character cap; sections larger than this are hard-split on
 #: whitespace so one giant block cannot dominate selection or blow the budget.
 _DEFAULT_MAX_SECTION_CHARS = 2_000
 
 _SECTION_BOUNDARY = re.compile(r"\n\s*\n")
+
+#: Stable namespace so a chunk's id is deterministic per ``(document_id, index)``.
+#: Re-indexing the same document reuses the same row ids, making the vector-store
+#: upsert a clean in-place replace (no orphan vectors) — plan R4.
+_CHUNK_ID_NAMESPACE = uuid.UUID("6f9619ff-8b86-d011-b42d-00cf4fc964ff")
 
 
 def _tokens(text: str) -> set[str]:
@@ -153,3 +162,105 @@ def _ranked_indices(sections: list[str], terms: set[str]) -> list[int]:
     # Sort by score desc, then original index asc (stable, document-order tiebreak).
     scored.sort(key=lambda pair: (-pair[1], pair[0]))
     return [index for index, _ in scored]
+
+
+# --- Persistent chunk records (RAG data layer, plan §3.1) ---------------------
+#
+# ``chunk_sections`` above produces ephemeral strings used once for enrichment
+# prompt budgeting. ``DocumentChunk`` is the *durable* record persisted per
+# document so chunks can be embedded, retrieved, viewed, and de-duplicated. The
+# row is the system-of-record; vectors live in the document vector store
+# (``document_retriever``), keyed by these chunk ids.
+
+
+class DocumentChunk(BaseModel):
+    """One persisted, retrievable slice of an extracted document."""
+
+    id: str
+    document_id: str
+    chunk_index: int
+    text: str
+    checksum: str
+    char_start: int
+    char_end: int
+    embedded: bool = False
+
+
+class DocumentChunkMatch(BaseModel):
+    """A near/exact duplicate relationship between two chunks (plan R5)."""
+
+    chunk_id: str
+    other_chunk_id: str
+    document_id: str
+    other_document_id: str
+    score: float = Field(ge=0.0, le=1.0)
+    exact: bool = False
+
+
+def chunk_id(document_id: str, index: int) -> str:
+    """Deterministic chunk id for ``(document_id, index)`` (stable across reindex)."""
+
+    return str(uuid.uuid5(_CHUNK_ID_NAMESPACE, f"{document_id}:{index}"))
+
+
+def chunk_checksum(text: str) -> str:
+    """SHA256 of chunk text — the cheap exact-duplicate key (plan R5)."""
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def build_chunk_records(
+    document_id: str,
+    text: str,
+    *,
+    max_chars: int = _DEFAULT_MAX_SECTION_CHARS,
+) -> list[DocumentChunk]:
+    """Split ``text`` into persistable :class:`DocumentChunk` records.
+
+    Character offsets point back into ``text`` so the viewer can scroll to a chunk;
+    they are best-effort (a stripped/hard-split section is located from a moving
+    cursor and falls back to the cursor position if not found verbatim).
+    """
+
+    records: list[DocumentChunk] = []
+    cursor = 0
+    for index, section in enumerate(chunk_sections(text, max_chars=max_chars)):
+        start = text.find(section, cursor)
+        if start < 0:
+            start = cursor
+        end = start + len(section)
+        cursor = end
+        records.append(
+            DocumentChunk(
+                id=chunk_id(document_id, index),
+                document_id=document_id,
+                chunk_index=index,
+                text=section,
+                checksum=chunk_checksum(section),
+                char_start=start,
+                char_end=end,
+            )
+        )
+    return records
+
+
+def keyword_rank_chunks(
+    query: str, chunks: list[DocumentChunk], k: int
+) -> list[DocumentChunk]:
+    """Rank chunks by query-token overlap (the degrade-closed retrieval fallback).
+
+    Returns up to ``k`` chunks with non-zero overlap, ordered by overlap (desc)
+    then document order. An empty/termless query returns the head ``k`` in order.
+    """
+
+    if k <= 0:
+        return []
+    terms = _tokens(query)
+    if not terms:
+        return chunks[:k]
+    scored = [
+        (len(_tokens(chunk.text) & terms), index, chunk)
+        for index, chunk in enumerate(chunks)
+    ]
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [chunk for score, _, chunk in scored if score > 0][:k]

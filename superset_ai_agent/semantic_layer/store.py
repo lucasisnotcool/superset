@@ -23,6 +23,7 @@ from typing import Protocol
 
 from superset_ai_agent.conversations.schemas import ConversationScope
 from superset_ai_agent.conversations.store import DEFAULT_OWNER_ID
+from superset_ai_agent.semantic_layer.document_chunks import DocumentChunk
 from superset_ai_agent.semantic_layer.schemas import (
     SemanticDocument,
     SemanticLayerEvent,
@@ -76,6 +77,53 @@ class SemanticLayerStore(Protocol):
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> SemanticDocument:
         """Update an existing semantic-layer document."""
+
+    def delete_document(
+        self,
+        document_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> None:
+        """Delete a document and its chunk rows (cascade-in-code).
+
+        Removes the chunk rows owned by the document in the same transaction so a
+        deleted document never leaves orphan chunks. Vector-store eviction and blob
+        removal are orchestrated by the caller (the cascade helper).
+        """
+
+    def save_chunks(
+        self,
+        document_id: str,
+        chunks: list[DocumentChunk],
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+        project_id: str | None = None,
+    ) -> list[DocumentChunk]:
+        """Replace the persisted chunk set for a document (idempotent reindex)."""
+
+    def list_chunks(
+        self,
+        document_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> list[DocumentChunk]:
+        """List a document's chunks in document order."""
+
+    def delete_chunks(
+        self,
+        document_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> None:
+        """Delete a document's chunk rows (used by reindex; never the document)."""
+
+    def list_project_chunks(
+        self,
+        project_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> list[DocumentChunk]:
+        """List every chunk in a project (cross-document duplicate scans)."""
 
     def get_state(
         self,

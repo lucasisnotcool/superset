@@ -125,6 +125,7 @@ MdlFileSourceType = Literal[
     "manual",
     "enriched_markdown",
     "onboarding",
+    "copilot",
 ]
 MdlContentType = Literal["application/json"]
 

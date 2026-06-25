@@ -20,15 +20,17 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import cast
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from superset_ai_agent.conversations.schemas import ConversationScope
 from superset_ai_agent.conversations.store import DEFAULT_OWNER_ID
 from superset_ai_agent.persistence.models import (
+    AiAgentDocumentChunk,
     AiAgentEvent,
     AiAgentSemanticDocument,
 )
+from superset_ai_agent.semantic_layer.document_chunks import DocumentChunk
 from superset_ai_agent.semantic_layer.schemas import (
     SemanticDocument,
     SemanticDocumentStatus,
@@ -153,6 +155,117 @@ class SqlAlchemySemanticLayerStore:
             session.commit()
         return self.get_document(document.id, owner_id=owner_id)
 
+    def delete_document(
+        self,
+        document_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> None:
+        with self.session_factory() as session:
+            model = self._get_document_model(
+                session,
+                document_id,
+                owner_id=owner_id,
+            )
+            # Cascade-in-code: drop the document's chunks in the same transaction
+            # so a deleted document never leaves orphan chunk rows.
+            session.execute(
+                delete(AiAgentDocumentChunk).where(
+                    AiAgentDocumentChunk.document_id == document_id,
+                    AiAgentDocumentChunk.owner_id == owner_id,
+                )
+            )
+            session.delete(model)
+            session.commit()
+
+    def save_chunks(
+        self,
+        document_id: str,
+        chunks: list[DocumentChunk],
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+        project_id: str | None = None,
+    ) -> list[DocumentChunk]:
+        with self.session_factory() as session:
+            # Replace-on-write: a reindex regenerates the full chunk set, so clear
+            # the prior rows first (idempotent per document).
+            session.execute(
+                delete(AiAgentDocumentChunk).where(
+                    AiAgentDocumentChunk.document_id == document_id,
+                    AiAgentDocumentChunk.owner_id == owner_id,
+                )
+            )
+            for chunk in chunks:
+                session.add(
+                    _chunk_to_model(
+                        chunk,
+                        owner_id=owner_id,
+                        project_id=project_id,
+                    )
+                )
+            session.commit()
+        return self.list_chunks(document_id, owner_id=owner_id)
+
+    def list_chunks(
+        self,
+        document_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> list[DocumentChunk]:
+        with self.session_factory() as session:
+            models = (
+                session.execute(
+                    select(AiAgentDocumentChunk)
+                    .where(
+                        AiAgentDocumentChunk.owner_id == owner_id,
+                        AiAgentDocumentChunk.document_id == document_id,
+                    )
+                    .order_by(AiAgentDocumentChunk.chunk_index.asc())
+                )
+                .scalars()
+                .all()
+            )
+            return [_chunk_from_model(model) for model in models]
+
+    def delete_chunks(
+        self,
+        document_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> None:
+        with self.session_factory() as session:
+            session.execute(
+                delete(AiAgentDocumentChunk).where(
+                    AiAgentDocumentChunk.document_id == document_id,
+                    AiAgentDocumentChunk.owner_id == owner_id,
+                )
+            )
+            session.commit()
+
+    def list_project_chunks(
+        self,
+        project_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> list[DocumentChunk]:
+        with self.session_factory() as session:
+            models = (
+                session.execute(
+                    select(AiAgentDocumentChunk)
+                    .where(
+                        AiAgentDocumentChunk.owner_id == owner_id,
+                        AiAgentDocumentChunk.project_id == project_id,
+                    )
+                    .order_by(
+                        AiAgentDocumentChunk.document_id.asc(),
+                        AiAgentDocumentChunk.chunk_index.asc(),
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            return [_chunk_from_model(model) for model in models]
+
     def get_state(
         self,
         scope: ConversationScope,
@@ -261,8 +374,7 @@ class SqlAlchemySemanticLayerStore:
                 .all()
             )
             return [
-                SemanticLayerEvent.model_validate(model.payload)
-                for model in models
+                SemanticLayerEvent.model_validate(model.payload) for model in models
             ]
 
     @staticmethod
@@ -332,6 +444,40 @@ def _document_from_model(
         error=model.error,
         created_at=model.created_at,
         updated_at=model.updated_at,
+    )
+
+
+def _chunk_to_model(
+    chunk: DocumentChunk,
+    *,
+    owner_id: str,
+    project_id: str | None,
+) -> AiAgentDocumentChunk:
+    return AiAgentDocumentChunk(
+        id=chunk.id,
+        document_id=chunk.document_id,
+        owner_id=owner_id,
+        project_id=project_id,
+        chunk_index=chunk.chunk_index,
+        text=chunk.text,
+        checksum=chunk.checksum,
+        char_start=chunk.char_start,
+        char_end=chunk.char_end,
+        embedded=chunk.embedded,
+        created_at=_utc_now(),
+    )
+
+
+def _chunk_from_model(model: AiAgentDocumentChunk) -> DocumentChunk:
+    return DocumentChunk(
+        id=model.id,
+        document_id=model.document_id,
+        chunk_index=model.chunk_index,
+        text=model.text,
+        checksum=model.checksum,
+        char_start=model.char_start,
+        char_end=model.char_end,
+        embedded=model.embedded,
     )
 
 

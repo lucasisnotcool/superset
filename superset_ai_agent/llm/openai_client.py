@@ -21,7 +21,15 @@ import json  # noqa: TID251 - standalone agent JSON contract
 from typing import Any
 
 from superset_ai_agent.config import AgentConfig, StructuredOutputMode
-from superset_ai_agent.llm.base import ChatMessage, ModelProviderError, ModelResult
+from superset_ai_agent.llm.base import (
+    ChatMessage,
+    message_to_openai,
+    ModelProviderError,
+    ModelResult,
+    parse_openai_tool_calls,
+    tools_to_openai,
+    ToolSpec,
+)
 from superset_ai_agent.llm.schema import to_strict_json_schema
 from superset_ai_agent.schemas import ModelInfo
 
@@ -110,13 +118,18 @@ class OpenAIModelClient:
         *,
         model: str | None = None,
         format_schema: dict[str, Any] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> ModelResult:
         last_error: Exception | None = None
         modes = FALLBACK_ORDER[self.config.openai_structured_output]
         for mode in modes:
             try:
                 return self._chat_with_mode(
-                    messages, model=model, format_schema=format_schema, mode=mode
+                    messages,
+                    model=model,
+                    format_schema=format_schema,
+                    mode=mode,
+                    tools=tools,
                 )
             except Exception as ex:  # pylint: disable=broad-except
                 last_error = ex
@@ -135,11 +148,12 @@ class OpenAIModelClient:
         model: str | None,
         format_schema: dict[str, Any] | None,
         mode: StructuredOutputMode,
+        tools: list[ToolSpec] | None = None,
     ) -> ModelResult:
         payload: dict[str, Any] = {
             "model": model or self.model,
             "messages": [
-                message.model_dump()
+                message_to_openai(message)
                 for message in _messages_for_mode(messages, format_schema, mode)
             ],
             "stream": False,
@@ -147,16 +161,34 @@ class OpenAIModelClient:
         response_format = _response_format(format_schema, mode)
         if response_format:
             payload["response_format"] = response_format
+        tool_payload = tools_to_openai(tools)
+        if tool_payload:
+            payload["tools"] = tool_payload
 
         response = self.client.chat.completions.create(**payload)
+        raw = _model_dump(response)
+
+        # Tool calls are read from the structured dump (the SDK serializes
+        # function.arguments as a JSON string there); content prefers attribute
+        # access but degrades to the dump for tool-only responses.
+        tool_calls = []
+        content = ""
         try:
             content = response.choices[0].message.content or ""
-        except (AttributeError, IndexError) as ex:
-            raise ModelProviderError(
-                "OpenAI response did not include text content."
-            ) from ex
+        except (AttributeError, IndexError):
+            content = ""
+        try:
+            message_dict = raw["choices"][0]["message"]
+            tool_calls = parse_openai_tool_calls(message_dict)
+            if not content:
+                content = message_dict.get("content") or ""
+        except (KeyError, IndexError, TypeError):
+            pass
 
-        return ModelResult(content=content, raw=_model_dump(response))
+        if not content and not tool_calls:
+            raise ModelProviderError("OpenAI response did not include text content.")
+
+        return ModelResult(content=content, raw=raw, tool_calls=tool_calls)
 
     def is_reachable(self) -> bool:
         try:

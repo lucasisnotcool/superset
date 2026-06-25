@@ -158,6 +158,26 @@ test('loads the project once per scope without re-fetch loops', async () => {
   ).toHaveLength(1);
 });
 
+test('shows the Copilot rail by default and toggles it off', async () => {
+  mockBaseRoutes([mdlFile('a', 'models/a.json')]);
+
+  render(
+    <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="main" />,
+    { useRedux: true },
+  );
+
+  await waitFor(() => {
+    expect(screen.getByText('Database 1.prod.main')).toBeInTheDocument();
+  });
+  await waitFor(() => {
+    expect(screen.getByTestId('copilot-rail')).toBeInTheDocument();
+  });
+
+  await userEvent.click(screen.getByTestId('toggle-copilot'));
+
+  expect(screen.queryByTestId('copilot-rail')).not.toBeInTheDocument();
+});
+
 test('eagerly onboards an empty schema and surfaces warnings as a toast', async () => {
   mockBaseRoutes([]);
   mockOnboard(['models/moves.json cannot be activated until fixed: bad']);
