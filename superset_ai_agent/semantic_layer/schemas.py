@@ -30,7 +30,9 @@ from superset_ai_agent.conversations.schemas import ConversationScope
 # ONLY so pre-existing persisted rows still validate on read; nothing produces them.
 SemanticDocumentStatus = Literal[
     "uploaded",
+    "extracting",
     "extracted",
+    "needs_ocr",
     "needs_review",
     "approved",
     "indexed",
@@ -249,6 +251,30 @@ class OnboardingResult(BaseModel):
     model_count: int = 0
     activated_count: int = 0
     warnings: list[str] = Field(default_factory=list)
+
+
+SemanticProjectReadinessStatus = Literal["empty", "indexing", "ready", "failed"]
+
+
+class SemanticProjectReadiness(BaseModel):
+    """Whether a project's MDL is initialized and stabilized enough for the Copilot.
+
+    The MDL Copilot must only begin editing work once the base layer has been
+    onboarded and is no longer being written. ``ready`` is the single gate the
+    frontend (spinner) and backend (409) both consult:
+
+    - ``empty``    — never onboarded; no active models and no job running.
+    - ``indexing`` — an onboarding/reset job is in flight; copilot is blocked.
+    - ``ready``    — at least one active model and nothing in flight.
+    - ``failed``   — the last onboarding failed; needs a retry.
+    """
+
+    status: SemanticProjectReadinessStatus
+    ready: bool
+    has_active_models: bool
+    active_model_count: int = 0
+    running_job_id: str | None = None
+    detail: str = ""
 
 
 class SemanticDocumentTextRequest(BaseModel):

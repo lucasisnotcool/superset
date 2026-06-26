@@ -19,8 +19,14 @@
 import fetchMock from 'fetch-mock';
 import {
   applyCopilotChangeset,
+  createCopilotConversation,
+  deleteCopilotConversation,
+  getCopilotConversation,
   getCopilotDeployPreview,
   getCopilotInspector,
+  listCopilotConversations,
+  updateCopilotConversationTitle,
+  getProjectReadiness,
   getProjectWorkspace,
   runCopilot,
   runCoverage,
@@ -578,6 +584,82 @@ test('MDL Copilot helpers call workspace, run, apply, and inspector', async () =
   });
   const [applyCall] = fetchMock.callHistory.calls(`${base}/copilot/apply`);
   expect(JSON.parse(String(applyCall.options.body)).items).toHaveLength(1);
+});
+
+test('Copilot conversation helpers use project-scoped thread endpoints', async () => {
+  const base =
+    'http://agent.local/agent/semantic-layer/projects/project-1/copilot/conversations';
+  const thread = {
+    id: 'conv-1',
+    title: 'New chat',
+    owner_id: 'local',
+    kind: 'copilot',
+    project_id: 'project-1',
+    scope: { database_id: 1, dataset_ids: [] },
+    messages: [],
+    created_at: '2026-06-19T00:00:00Z',
+    updated_at: '2026-06-19T00:00:00Z',
+  };
+  fetchMock.post(base, thread);
+  fetchMock.get(base, [
+    {
+      id: 'conv-1',
+      title: 'New chat',
+      owner_id: 'local',
+      kind: 'copilot',
+      project_id: 'project-1',
+      database_id: 1,
+      updated_at: '2026-06-19T00:00:00Z',
+      last_message: null,
+    },
+  ]);
+  fetchMock.get(`${base}/conv-1`, thread);
+  fetchMock.patch(`${base}/conv-1`, { ...thread, title: 'Orders' });
+  fetchMock.delete(`${base}/conv-1`, { deleted: true });
+
+  const created = await createCopilotConversation('project-1');
+  expect(created.kind).toBe('copilot');
+
+  const list = await listCopilotConversations('project-1');
+  expect(list[0].id).toBe('conv-1');
+
+  const got = await getCopilotConversation('project-1', 'conv-1');
+  expect(got.project_id).toBe('project-1');
+
+  const renamed = await updateCopilotConversationTitle(
+    'project-1',
+    'conv-1',
+    'Orders',
+  );
+  expect(renamed.title).toBe('Orders');
+
+  const deleted = await deleteCopilotConversation('project-1', 'conv-1');
+  expect(deleted.deleted).toBe(true);
+
+  const [patchCall] = fetchMock.callHistory.calls(`${base}/conv-1`, {
+    method: 'PATCH',
+  });
+  expect(JSON.parse(String(patchCall.options.body))).toEqual({
+    title: 'Orders',
+  });
+});
+
+test('getProjectReadiness requests the readiness endpoint', async () => {
+  const base = 'http://agent.local/agent/semantic-layer/projects/project-1';
+  fetchMock.get(`${base}/readiness`, {
+    status: 'ready',
+    ready: true,
+    has_active_models: true,
+    active_model_count: 3,
+    running_job_id: null,
+    detail: 'Semantic layer is ready.',
+  });
+
+  const readiness = await getProjectReadiness('project-1');
+  expect(readiness.status).toBe('ready');
+  expect(readiness.ready).toBe(true);
+  expect(readiness.active_model_count).toBe(3);
+  expect(fetchMock.callHistory.calls(`${base}/readiness`)).toHaveLength(1);
 });
 
 test('API helpers surface FastAPI detail errors', async () => {

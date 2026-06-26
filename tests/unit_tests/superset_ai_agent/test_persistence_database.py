@@ -78,6 +78,61 @@ def test_run_migrations_upgrades_empty_database_and_is_idempotent(tmp_path) -> N
     assert conversation.scope.schema_name == "pipeline"
 
 
+def test_conversation_kind_project_columns_present_after_migration(tmp_path) -> None:
+    config = _config(f"sqlite+pysqlite:///{tmp_path / 'agent.db'}")
+
+    run_migrations(config)
+
+    engine = create_engine_from_config(config)
+    columns = {
+        column["name"]
+        for column in inspect(engine).get_columns("ai_agent_conversations")
+    }
+    assert {"kind", "project_id"}.issubset(columns)
+
+    # A copilot thread persists its kind + project binding.
+    store = SqlAlchemyConversationStore(create_session_factory(engine))
+    conversation = store.create(
+        ConversationScope(database_id=7),
+        owner_id="user-1",
+        kind="copilot",
+        project_id="proj-1",
+    )
+    reloaded = store.get(conversation.id, owner_id="user-1")
+    assert reloaded.kind == "copilot"
+    assert reloaded.project_id == "proj-1"
+
+
+def test_migration_0008_downgrade_drops_columns(tmp_path) -> None:
+    from alembic import command
+
+    from superset_ai_agent.persistence.database import _alembic_config
+
+    config = _config(f"sqlite+pysqlite:///{tmp_path / 'agent.db'}")
+    run_migrations(config)
+
+    alembic_cfg = _alembic_config(config)
+    command.downgrade(alembic_cfg, "0007_document_chunks")
+
+    engine = create_engine_from_config(config)
+    columns = {
+        column["name"]
+        for column in inspect(engine).get_columns("ai_agent_conversations")
+    }
+    assert "kind" not in columns
+    assert "project_id" not in columns
+
+    # Upgrade back to head leaves the columns in place (round-trip is clean).
+    command.upgrade(alembic_cfg, "head")
+    columns = {
+        column["name"]
+        for column in inspect(create_engine_from_config(config)).get_columns(
+            "ai_agent_conversations"
+        )
+    }
+    assert {"kind", "project_id"}.issubset(columns)
+
+
 def test_run_migrations_rejects_unversioned_existing_agent_tables(tmp_path) -> None:
     config = _config(f"sqlite+pysqlite:///{tmp_path / 'agent.db'}")
     engine = create_engine_from_config(config)

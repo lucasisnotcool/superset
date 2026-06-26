@@ -279,11 +279,30 @@ class MdlToolset:
         content = args.get("content")
         if not isinstance(content, str) or not content.strip():
             return {"error": "write_mdl_file requires non-empty 'content'."}
+        # Full-content overwrite is the code-editor model, but an LLM that
+        # re-emits a file can silently drop the Superset-extension `properties`
+        # (displayName/alias/synonyms) that back governance + retrieval. wren-core
+        # tolerates the omission, so validation never catches it. Restore any
+        # dropped keys against the prior version of this file (additive; the agent
+        # can still *edit* a property, just not silently *delete* one).
+        prior = self._working.get(path)
+        restored = False
+        if prior is not None:
+            preserved = _preserve_superset_properties(prior, content)
+            restored = preserved != content
+            content = preserved
         self._working[path] = content
         if args.get("summary"):
             self._summaries[path] = str(args["summary"])
         validation = validate_mdl(content, schema_index=self._schema_index)
-        return {"path": path, "validation": validation.model_dump(mode="json")}
+        result = {"path": path, "validation": validation.model_dump(mode="json")}
+        if restored:
+            result["note"] = (
+                "Restored Superset `properties` (displayName/alias/synonyms) that "
+                "the new content omitted — these back governance and retrieval and "
+                "must be preserved."
+            )
+        return result
 
     def _delete_mdl_file(self, args: dict[str, Any]) -> dict[str, Any]:
         path = self._require_path(args)
@@ -456,3 +475,103 @@ def _normalize(content: str) -> str:
         return json.dumps(json.loads(content), sort_keys=True)
     except (ValueError, TypeError):
         return content.strip()
+
+
+#: Manifest sections whose named entities carry the Superset-extension
+#: ``properties`` bag (displayName / alias / synonyms and other governance
+#: metadata). The copilot must never silently drop these; this list mirrors the
+#: enrichment path's ``_MERGE_SECTIONS`` (see ``integrations/wren/llm_client.py``).
+_PROPERTIES_SECTIONS: tuple[str, ...] = (
+    "models",
+    "relationships",
+    "views",
+    "metrics",
+    "cubes",
+)
+
+
+def _restore_dropped_properties(
+    base_entity: dict[str, Any], new_entity: dict[str, Any]
+) -> bool:
+    """Additively restore base ``properties`` keys missing from ``new_entity``.
+
+    Returns True if ``new_entity`` was mutated. New values win on key collisions,
+    so the agent can still *edit* a property — it just cannot silently *drop* one.
+    """
+
+    base_props = base_entity.get("properties")
+    if not isinstance(base_props, dict) or not base_props:
+        return False
+    new_props = new_entity.get("properties")
+    new_props = new_props if isinstance(new_props, dict) else {}
+    merged = {**base_props, **new_props}
+    if merged == new_props:
+        return False
+    new_entity["properties"] = merged
+    return True
+
+
+def _restore_column_properties(
+    base_model: dict[str, Any], new_model: dict[str, Any]
+) -> bool:
+    """Restore dropped column ``properties`` within a model, matched by column name."""
+
+    base_cols = base_model.get("columns")
+    new_cols = new_model.get("columns")
+    if not isinstance(base_cols, list) or not isinstance(new_cols, list):
+        return False
+    base_by_name = {
+        col["name"]: col
+        for col in base_cols
+        if isinstance(col, dict) and isinstance(col.get("name"), str)
+    }
+    changed = False
+    for new_col in new_cols:
+        if not isinstance(new_col, dict):
+            continue
+        base_col = base_by_name.get(new_col.get("name"))
+        if base_col is not None and _restore_dropped_properties(base_col, new_col):
+            changed = True
+    return changed
+
+
+def _preserve_superset_properties(prior_content: str, new_content: str) -> str:
+    """Re-inject ``properties`` the new content dropped vs the prior file version.
+
+    Entities (and columns within models) are matched by ``name``. Formatting is
+    preserved verbatim unless a restore is actually needed, in which case the file
+    is re-serialized. Mirrors the enrichment path's structure-preserving merge so
+    both authoring streams give the same governance guarantee.
+    """
+
+    try:
+        prior = json.loads(prior_content)
+        new = json.loads(new_content)
+    except (ValueError, TypeError):
+        return new_content
+    if not isinstance(prior, dict) or not isinstance(new, dict):
+        return new_content
+
+    changed = False
+    for section in _PROPERTIES_SECTIONS:
+        base_items = prior.get(section)
+        new_items = new.get(section)
+        if not isinstance(base_items, list) or not isinstance(new_items, list):
+            continue
+        base_by_name = {
+            item["name"]: item
+            for item in base_items
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        }
+        for new_item in new_items:
+            if not isinstance(new_item, dict):
+                continue
+            base_item = base_by_name.get(new_item.get("name"))
+            if base_item is None:
+                continue
+            if _restore_dropped_properties(base_item, new_item):
+                changed = True
+            if section == "models" and _restore_column_properties(base_item, new_item):
+                changed = True
+
+    return json.dumps(new, indent=2) if changed else new_content

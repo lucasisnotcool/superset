@@ -18,19 +18,13 @@
  */
 import fetchMock from 'fetch-mock';
 import {
-  createStore,
   render,
   screen,
   userEvent,
   waitFor,
   within,
 } from 'spec/helpers/testing-library';
-import reducerIndex from 'spec/helpers/reducerIndex';
 import SemanticLayerEditor from '.';
-
-interface ToastState {
-  messageToasts: { text: string }[];
-}
 
 const originalAgentUrl = process.env.SUPERSET_AI_AGENT_URL;
 
@@ -73,7 +67,27 @@ const mdlFile = (id: string, path: string) => ({
   updated_at: '2026-06-19T00:00:00Z',
 });
 
-const mockBaseRoutes = (files: unknown[] = []) => {
+const readinessFor = (files: { status?: string }[]) => {
+  const active = files.filter(file => file.status === 'active');
+  if (active.length > 0) {
+    return {
+      status: 'ready',
+      ready: true,
+      has_active_models: true,
+      active_model_count: active.length,
+      detail: 'Semantic layer is ready.',
+    };
+  }
+  return {
+    status: 'empty',
+    ready: false,
+    has_active_models: false,
+    active_model_count: 0,
+    detail: 'Schema has not been onboarded yet.',
+  };
+};
+
+const mockBaseRoutes = (files: { status?: string }[] = []) => {
   fetchMock.post(
     'http://agent.local/agent/semantic-layer/projects/resolve',
     project,
@@ -81,6 +95,10 @@ const mockBaseRoutes = (files: unknown[] = []) => {
   fetchMock.get(
     'http://agent.local/agent/semantic-layer/projects/project-1/mdl-files',
     files,
+  );
+  fetchMock.get(
+    'http://agent.local/agent/semantic-layer/projects/project-1/readiness',
+    readinessFor(files),
   );
   fetchMock.get(
     'http://agent.local/agent/semantic-layer/projects/project-1/state',
@@ -119,10 +137,10 @@ const mockOnboard = (warnings: string[] = []) => {
   );
 };
 
-const mockReset = (warnings: string[] = []) => {
+const mockReset = (deleted = 1) => {
   fetchMock.post(
     'http://agent.local/agent/semantic-layer/projects/project-1/reset',
-    onboardingJob(warnings),
+    { deleted },
   );
 };
 
@@ -178,15 +196,76 @@ test('shows the Copilot rail by default and toggles it off', async () => {
   expect(screen.queryByTestId('copilot-rail')).not.toBeInTheDocument();
 });
 
-test('eagerly onboards an empty schema and surfaces warnings as a toast', async () => {
-  mockBaseRoutes([]);
-  mockOnboard(['models/moves.json cannot be activated until fixed: bad']);
-  const store = createStore({}, reducerIndex);
+test('blocks the Copilot with an onboarding prompt until a base model is active', async () => {
+  // A project with only draft (non-active) MDL is not "ready": the Copilot rail
+  // shows the onboarding bootstrap view rather than the chat.
+  const draftFile = { ...mdlFile('a', 'models/a.json'), status: 'draft' };
+  mockBaseRoutes([draftFile]);
 
   render(
     <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="main" />,
-    { store },
+    { useRedux: true },
   );
+
+  await waitFor(() => {
+    expect(screen.getByText('Database 1.prod.main')).toBeInTheDocument();
+  });
+  await waitFor(() => {
+    expect(screen.getByTestId('copilot-not-ready')).toBeInTheDocument();
+  });
+  // The chat surface is gated; the onboarding CTA is shown instead.
+  expect(screen.queryByTestId('copilot-input')).not.toBeInTheDocument();
+  expect(screen.getByTestId('copilot-onboard')).toBeInTheDocument();
+});
+
+test('mounts the Copilot once a base model is active (ready)', async () => {
+  mockBaseRoutes([mdlFile('a', 'models/a.json')]); // active by default
+
+  render(
+    <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="main" />,
+    { useRedux: true },
+  );
+
+  await waitFor(() => {
+    expect(screen.getByTestId('copilot-input')).toBeInTheDocument();
+  });
+  expect(screen.queryByTestId('copilot-not-ready')).not.toBeInTheDocument();
+});
+
+test('does not auto-onboard an empty schema; shows the Onboard CTA instead', async () => {
+  mockBaseRoutes([]);
+  mockOnboard();
+
+  render(
+    <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="main" />,
+    { useRedux: true },
+  );
+
+  await waitFor(() => {
+    expect(screen.getByTestId('copilot-not-ready')).toBeInTheDocument();
+  });
+  // The explicit onboarding CTA is shown and no chat composer is mounted.
+  expect(screen.getByTestId('copilot-onboard')).toBeInTheDocument();
+  expect(screen.queryByTestId('copilot-input')).not.toBeInTheDocument();
+  // Critically: onboarding is NOT fired automatically.
+  expect(
+    fetchMock.callHistory.calls(
+      'http://agent.local/agent/semantic-layer/projects/project-1/onboard',
+    ),
+  ).toHaveLength(0);
+});
+
+test('clicking Onboard from the empty state starts onboarding', async () => {
+  mockBaseRoutes([]);
+  mockOnboard();
+
+  render(
+    <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="main" />,
+    { useRedux: true },
+  );
+
+  await screen.findByTestId('copilot-onboard');
+  await userEvent.click(screen.getByTestId('copilot-onboard'));
 
   await waitFor(() => {
     expect(
@@ -194,14 +273,6 @@ test('eagerly onboards an empty schema and surfaces warnings as a toast', async 
         'http://agent.local/agent/semantic-layer/projects/project-1/onboard',
       ),
     ).toHaveLength(1);
-  });
-  await waitFor(() => {
-    const { messageToasts } = store.getState() as unknown as ToastState;
-    expect(
-      messageToasts.some(toast =>
-        toast.text.includes('Onboarding completed with warnings'),
-      ),
-    ).toBe(true);
   });
 });
 
@@ -224,9 +295,10 @@ test('opens the Add dialog with a drop zone', async () => {
   });
 });
 
-test('Reset button confirms before deleting and re-onboarding', async () => {
+test('Reset confirms, deletes all MDL, and does NOT re-onboard', async () => {
   mockBaseRoutes([mdlFile('a', 'models/a.json')]);
   mockReset();
+  mockOnboard();
 
   render(
     <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="main" />,
@@ -259,4 +331,10 @@ test('Reset button confirms before deleting and re-onboarding', async () => {
       ),
     ).toHaveLength(1);
   });
+  // Reset is delete-only: onboarding is never triggered as a side effect.
+  expect(
+    fetchMock.callHistory.calls(
+      'http://agent.local/agent/semantic-layer/projects/project-1/onboard',
+    ),
+  ).toHaveLength(0);
 });

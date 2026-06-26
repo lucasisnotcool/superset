@@ -186,3 +186,60 @@ def test_sqlalchemy_conversation_store_reports_missing_artifact() -> None:
             ConversationArtifact(sql="select 1"),
             owner_id="user-1",
         )
+
+
+def test_sqlalchemy_store_filters_by_kind_and_project() -> None:
+    store = _store()
+    sql_thread = store.create(_scope(), owner_id="user-1")
+    copilot_thread = store.create(
+        _scope(),
+        owner_id="user-1",
+        kind="copilot",
+        project_id="proj-1",
+    )
+    store.create(
+        _scope(),
+        owner_id="user-1",
+        kind="copilot",
+        project_id="proj-2",
+    )
+
+    assert len(store.list(owner_id="user-1")) == 3
+
+    sql_ids = [s.id for s in store.list(owner_id="user-1", kind="sql")]
+    assert sql_ids == [sql_thread.id]
+
+    copilot = store.list(owner_id="user-1", kind="copilot", project_id="proj-1")
+    assert [s.id for s in copilot] == [copilot_thread.id]
+    assert copilot[0].kind == "copilot"
+    assert copilot[0].project_id == "proj-1"
+
+    reloaded = store.get(copilot_thread.id, owner_id="user-1")
+    assert reloaded.kind == "copilot"
+    assert reloaded.project_id == "proj-1"
+
+
+def test_sqlalchemy_store_round_trips_changeset_artifact() -> None:
+    store = _store()
+    conversation = store.create(
+        _scope(), owner_id="user-1", kind="copilot", project_id="proj-1"
+    )
+    artifact = ConversationArtifact(
+        type="changeset",
+        payload={"items": [{"op": "update", "path": "models/orders.json"}]},
+    )
+    store.append(
+        conversation.id,
+        ConversationMessage(
+            role="assistant", content="Proposed edits.", artifacts=[artifact]
+        ),
+        owner_id="user-1",
+    )
+
+    reloaded = store.get(conversation.id, owner_id="user-1")
+    stored = reloaded.messages[-1].artifacts[0]
+    assert stored.type == "changeset"
+    assert stored.sql is None
+    assert stored.payload == {
+        "items": [{"op": "update", "path": "models/orders.json"}]
+    }

@@ -130,10 +130,32 @@ def _resolve(client: TestClient) -> dict:
     return response.json()
 
 
+def _seed_active_model(
+    client: TestClient, pid: str, *, path: str = "models/base.json"
+) -> None:
+    """Make a project 'ready' for the Copilot by activating one base model.
+
+    The Copilot editing turns are gated until the MDL base layer exists and is
+    stable; tests that exercise those turns must onboard a model first.
+    """
+
+    created = client.post(
+        f"/agent/semantic-layer/projects/{pid}/mdl-files",
+        json={"path": path, "content": MOVES},
+    )
+    assert created.status_code == 200, created.text
+    activated = client.patch(
+        f"/agent/semantic-layer/projects/{pid}/mdl-files/{created.json()['id']}",
+        json={"status": "active"},
+    )
+    assert activated.status_code == 200, activated.text
+
+
 def test_copilot_run_apply_and_workspace_round_trip(tmp_path) -> None:
     client = _client(tmp_path)
     project = _resolve(client)
     pid = project["id"]
+    _seed_active_model(client, pid)
 
     run = client.post(
         f"/agent/semantic-layer/projects/{pid}/copilot",
@@ -148,9 +170,9 @@ def test_copilot_run_apply_and_workspace_round_trip(tmp_path) -> None:
     assert item["path"] == "models/moves.json"
     assert changeset["manifest_validation"]["valid"] is True
 
-    # Nothing persisted yet (propose, don't persist).
+    # The proposed file is not persisted yet (propose, don't persist).
     listing = client.get(f"/agent/semantic-layer/projects/{pid}/mdl-files")
-    assert listing.json() == []
+    assert "models/moves.json" not in {file["path"] for file in listing.json()}
 
     apply = client.post(
         f"/agent/semantic-layer/projects/{pid}/copilot/apply",
@@ -180,13 +202,19 @@ def test_copilot_inspector_exposes_prompt_tools_skills(tmp_path) -> None:
     assert response.status_code == 200
     body = response.json()
     assert "MDL Copilot" in body["system_prompt"]
-    assert any(tool["name"] == "write_mdl_file" for tool in body["tools"])
+    tool_names = {tool["name"] for tool in body["tools"]}
+    assert "write_mdl_file" in tool_names
+    # Enrichment readiness: the document-grounding tools are exposed AND the
+    # system prompt steers the agent to use them (not just silently available).
+    assert {"list_documents", "search_documents"} <= tool_names
+    assert "search_documents" in body["system_prompt"]
     assert body["skills"]  # generate-mdl / enrich-context surfaced read-only
 
 
 def test_copilot_stream_emits_progress_then_complete(tmp_path) -> None:
     client = _client(tmp_path)
     project = _resolve(client)
+    _seed_active_model(client, project["id"])
 
     with client.stream(
         "POST",
@@ -344,3 +372,467 @@ def test_copilot_routes_404_when_disabled(tmp_path) -> None:
     assert run.status_code == 404
     workspace = client.get(f"/agent/semantic-layer/projects/{project['id']}/workspace")
     assert workspace.status_code == 404
+
+
+# -- readiness gate: Copilot only edits once the MDL base layer is stable --------
+
+
+def test_readiness_reports_empty_then_ready(tmp_path) -> None:
+    client = _client(tmp_path)
+    project = _resolve(client)
+    pid = project["id"]
+
+    empty = client.get(f"/agent/semantic-layer/projects/{pid}/readiness")
+    assert empty.status_code == 200, empty.text
+    assert empty.json() == {
+        "status": "empty",
+        "ready": False,
+        "has_active_models": False,
+        "active_model_count": 0,
+        "running_job_id": None,
+        "detail": "Schema has not been onboarded yet.",
+    }
+
+    _seed_active_model(client, pid)
+    ready = client.get(f"/agent/semantic-layer/projects/{pid}/readiness").json()
+    assert ready["status"] == "ready"
+    assert ready["ready"] is True
+    assert ready["active_model_count"] == 1
+
+
+def test_copilot_run_blocked_until_ready(tmp_path) -> None:
+    client = _client(tmp_path)
+    project = _resolve(client)
+    pid = project["id"]
+
+    # No onboarded models yet → the editing turn is gated with 409.
+    run = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot",
+        json={"message": "model the moves table"},
+    )
+    assert run.status_code == 409, run.text
+    assert run.json()["detail"]["status"] == "empty"
+
+    # Once a base model is active, the same request is accepted.
+    _seed_active_model(client, pid)
+    ok = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot",
+        json={"message": "model the moves table"},
+    )
+    assert ok.status_code == 200, ok.text
+
+
+def test_copilot_stream_blocked_until_ready(tmp_path) -> None:
+    client = _client(tmp_path)
+    project = _resolve(client)
+    pid = project["id"]
+
+    response = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot/stream",
+        json={"message": "model the moves table"},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["status"] == "empty"
+
+
+# -- reset: delete-only, never auto re-onboards ----------------------------------
+
+
+def test_reset_deletes_all_mdl_and_does_not_reonboard(tmp_path) -> None:
+    client = _client(tmp_path)
+    project = _resolve(client)
+    pid = project["id"]
+
+    # A ready project with one active model + one extra draft file.
+    _seed_active_model(client, pid)
+    extra = client.post(
+        f"/agent/semantic-layer/projects/{pid}/mdl-files",
+        json={"path": "models/extra.json", "content": MOVES},
+    )
+    assert extra.status_code == 200, extra.text
+    assert client.get(
+        f"/agent/semantic-layer/projects/{pid}/readiness"
+    ).json()["status"] == "ready"
+
+    # Reset is a plain delete: 200 with a {"deleted": count} body, no async job.
+    reset = client.post(f"/agent/semantic-layer/projects/{pid}/reset")
+    assert reset.status_code == 200, reset.text
+    assert reset.json() == {"deleted": 2}
+
+    # Every MDL file is gone...
+    files = client.get(f"/agent/semantic-layer/projects/{pid}/mdl-files").json()
+    assert files == []
+
+    # ...and the project is back to `empty` — NOT `indexing`/`ready`, which proves
+    # reset did not kick off onboarding (the inline runner would have completed it).
+    readiness = client.get(
+        f"/agent/semantic-layer/projects/{pid}/readiness"
+    ).json()
+    assert readiness["status"] == "empty"
+    assert readiness["ready"] is False
+
+    # A Copilot turn is gated again after reset (the contract still holds).
+    blocked = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot",
+        json={"message": "model the moves table"},
+    )
+    assert blocked.status_code == 409, blocked.text
+
+
+def test_reset_on_empty_project_is_a_noop(tmp_path) -> None:
+    client = _client(tmp_path)
+    project = _resolve(client)
+    pid = project["id"]
+
+    reset = client.post(f"/agent/semantic-layer/projects/{pid}/reset")
+    assert reset.status_code == 200, reset.text
+    assert reset.json() == {"deleted": 0}
+    assert client.get(
+        f"/agent/semantic-layer/projects/{pid}/readiness"
+    ).json()["status"] == "empty"
+
+
+# -- Copilot conversations: persistent, multi-turn threads (parity spec) ---------
+
+
+def test_copilot_conversation_turn_persists_messages_and_changeset(tmp_path) -> None:
+    client = _client(tmp_path)
+    project = _resolve(client)
+    pid = project["id"]
+    _seed_active_model(client, pid)
+
+    created = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot/conversations"
+    )
+    assert created.status_code == 200, created.text
+    conversation = created.json()
+    assert conversation["kind"] == "copilot"
+    assert conversation["project_id"] == pid
+    cid = conversation["id"]
+
+    run = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot",
+        json={"message": "model the moves table", "conversation_id": cid},
+    )
+    assert run.status_code == 200, run.text
+
+    # The thread now carries the user turn + the assistant turn with a changeset.
+    thread = client.get(
+        f"/agent/semantic-layer/projects/{pid}/copilot/conversations/{cid}"
+    ).json()
+    roles = [m["role"] for m in thread["messages"]]
+    assert roles == ["user", "assistant"]
+    assert thread["title"] == "model the moves table"  # auto-title from first turn
+    artifact = thread["messages"][1]["artifacts"][0]
+    assert artifact["type"] == "changeset"
+    assert artifact["sql"] is None
+    assert artifact["payload"]["items"][0]["path"] == "models/moves.json"
+
+
+def test_copilot_followup_turn_feeds_prior_history(tmp_path) -> None:
+    model = ToolCallingModel()
+    client = _client(tmp_path, model_client=model)
+    project = _resolve(client)
+    pid = project["id"]
+    _seed_active_model(client, pid)
+    cid = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot/conversations"
+    ).json()["id"]
+
+    client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot",
+        json={"message": "model the moves table", "conversation_id": cid},
+    )
+    # Reset the scripted model so the follow-up starts a fresh script.
+    model.calls = 0
+    captured: dict[str, Any] = {}
+    original_chat = model.chat
+
+    def _spy(messages: list[ChatMessage], **kwargs: Any) -> ModelResult:
+        # Snapshot: the loop mutates this list in place across tool-call rounds.
+        captured.setdefault("messages", list(messages))
+        return original_chat(messages, **kwargs)
+
+    model.chat = _spy  # type: ignore[method-assign]
+    client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot",
+        json={"message": "now also add a synonym", "conversation_id": cid},
+    )
+
+    sent = captured["messages"]
+    contents = [m.content for m in sent]
+    # System prompt, then prior user + prior assistant turns, then the new message.
+    assert sent[0].role == "system"
+    assert "model the moves table" in contents
+    assert sent[-1].content.startswith("now also add a synonym")
+
+
+def test_copilot_new_chat_is_a_distinct_thread(tmp_path) -> None:
+    client = _client(tmp_path)
+    project = _resolve(client)
+    pid = project["id"]
+
+    first = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot/conversations"
+    ).json()["id"]
+    second = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot/conversations"
+    ).json()["id"]
+    assert first != second
+
+    listing = client.get(
+        f"/agent/semantic-layer/projects/{pid}/copilot/conversations"
+    ).json()
+    assert {first, second} == {row["id"] for row in listing}
+
+
+def test_copilot_conversation_rename_and_delete(tmp_path) -> None:
+    client = _client(tmp_path)
+    project = _resolve(client)
+    pid = project["id"]
+    cid = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot/conversations"
+    ).json()["id"]
+
+    renamed = client.patch(
+        f"/agent/semantic-layer/projects/{pid}/copilot/conversations/{cid}",
+        json={"title": "Orders modeling"},
+    )
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["title"] == "Orders modeling"
+
+    deleted = client.delete(
+        f"/agent/semantic-layer/projects/{pid}/copilot/conversations/{cid}"
+    )
+    assert deleted.status_code == 200
+    assert deleted.json() == {"deleted": True}
+    gone = client.get(
+        f"/agent/semantic-layer/projects/{pid}/copilot/conversations/{cid}"
+    )
+    assert gone.status_code == 404
+
+
+def test_copilot_conversations_excluded_from_sql_history(tmp_path) -> None:
+    client = _client(tmp_path)
+    project = _resolve(client)
+    pid = project["id"]
+    client.post(f"/agent/semantic-layer/projects/{pid}/copilot/conversations")
+
+    # The AI SQL history surface must not surface Copilot threads.
+    sql_history = client.get("/agent/conversations")
+    assert sql_history.status_code == 200, sql_history.text
+    assert sql_history.json() == []
+
+
+def test_copilot_turn_without_conversation_id_is_stateless(tmp_path) -> None:
+    client = _client(tmp_path)
+    project = _resolve(client)
+    pid = project["id"]
+    _seed_active_model(client, pid)
+
+    run = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot",
+        json={"message": "model the moves table"},
+    )
+    assert run.status_code == 200, run.text
+    # No thread was created (backward-compatible one-shot).
+    listing = client.get(
+        f"/agent/semantic-layer/projects/{pid}/copilot/conversations"
+    ).json()
+    assert listing == []
+
+
+def test_copilot_turn_failure_records_paired_assistant_turn(
+    tmp_path, monkeypatch
+) -> None:
+    import superset_ai_agent.app as app_module
+
+    client = _client(tmp_path)
+    project = _resolve(client)
+    pid = project["id"]
+    _seed_active_model(client, pid)
+    cid = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot/conversations"
+    ).json()["id"]
+
+    def boom(**_kwargs: Any) -> None:
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(app_module, "run_copilot", boom)
+
+    run = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot",
+        json={"message": "model it", "conversation_id": cid},
+    )
+    assert run.status_code == 502, run.text
+
+    # The thread must not end on a dangling user turn: an assistant error turn
+    # is paired in so a resumed thread stays consistent.
+    thread = client.get(
+        f"/agent/semantic-layer/projects/{pid}/copilot/conversations/{cid}"
+    ).json()
+    roles = [m["role"] for m in thread["messages"]]
+    assert roles == ["user", "assistant"]
+    assert "failed" in thread["messages"][1]["content"].lower()
+    assert thread["messages"][1]["artifacts"] == []
+
+
+def test_copilot_stream_failure_records_paired_assistant_turn(
+    tmp_path, monkeypatch
+) -> None:
+    import superset_ai_agent.app as app_module
+
+    client = _client(tmp_path)
+    project = _resolve(client)
+    pid = project["id"]
+    _seed_active_model(client, pid)
+    cid = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot/conversations"
+    ).json()["id"]
+
+    def boom(**_kwargs: Any) -> None:
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(app_module, "run_copilot", boom)
+
+    with client.stream(
+        "POST",
+        f"/agent/semantic-layer/projects/{pid}/copilot/stream",
+        json={"message": "model it", "conversation_id": cid},
+    ) as response:
+        assert response.status_code == 200
+        body = "".join(response.iter_text())
+    assert "event: error" in body
+
+    thread = client.get(
+        f"/agent/semantic-layer/projects/{pid}/copilot/conversations/{cid}"
+    ).json()
+    roles = [m["role"] for m in thread["messages"]]
+    assert roles == ["user", "assistant"]
+    assert "failed" in thread["messages"][1]["content"].lower()
+
+
+def test_copilot_stream_cancellation_records_paired_assistant_turn(
+    tmp_path, monkeypatch
+) -> None:
+    """A client disconnect mid-stream records a cancellation as the assistant turn.
+
+    The Starlette test client consumes a streamed body to completion rather than
+    propagating ``GeneratorExit``, so we capture the route's real SSE generator and
+    ``.close()`` it directly — exactly what Starlette does on a client disconnect.
+    """
+
+    import threading
+
+    import superset_ai_agent.app as app_module
+    from superset_ai_agent.schemas import AgentStep
+    from superset_ai_agent.semantic_layer.copilot.schemas import Changeset
+
+    client = _client(tmp_path)
+    project = _resolve(client)
+    pid = project["id"]
+    _seed_active_model(client, pid)
+    cid = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot/conversations"
+    ).json()["id"]
+
+    release = threading.Event()
+
+    def slow(**kwargs: Any) -> Changeset:
+        # Emit one progress step, then block so we can "disconnect" mid-run.
+        on_step = kwargs.get("on_step")
+        if on_step:
+            on_step(AgentStep(kind="copilot_tool", summary="working", status="ok"))
+        release.wait(timeout=2)
+        return Changeset(message="late")
+
+    monkeypatch.setattr(app_module, "run_copilot", slow)
+
+    # Capture the route's SSE generator instead of letting the test client drain it.
+    real_streaming = app_module.StreamingResponse
+    captured: dict[str, Any] = {}
+
+    def capture(content: Any, **kwargs: Any) -> Any:
+        captured["gen"] = content
+        return real_streaming(iter(()), **kwargs)
+
+    monkeypatch.setattr(app_module, "StreamingResponse", capture)
+
+    started = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot/stream",
+        json={"message": "model it", "conversation_id": cid},
+    )
+    assert started.status_code == 200
+
+    gen = captured["gen"]
+    first = next(gen)  # the first progress frame
+    assert "progress" in first
+    gen.close()  # simulate the client disconnecting mid-stream
+    release.set()  # let the background worker unwind
+
+    thread = client.get(
+        f"/agent/semantic-layer/projects/{pid}/copilot/conversations/{cid}"
+    ).json()
+    # The user turn is paired with a cancellation marker (never left dangling).
+    assert thread["messages"][0]["role"] == "user"
+    assert thread["messages"][-1]["role"] == "assistant"
+    assert thread["messages"][-1]["content"] == "Generation cancelled."
+
+
+def test_copilot_apply_records_applied_turn_in_thread(tmp_path) -> None:
+    client = _client(tmp_path)
+    project = _resolve(client)
+    pid = project["id"]
+    _seed_active_model(client, pid)
+    cid = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot/conversations"
+    ).json()["id"]
+
+    run = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot",
+        json={"message": "model the moves table", "conversation_id": cid},
+    )
+    items = run.json()["items"]
+
+    apply = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot/apply",
+        json={"items": items, "conversation_id": cid},
+    )
+    assert apply.status_code == 200, apply.text
+
+    thread = client.get(
+        f"/agent/semantic-layer/projects/{pid}/copilot/conversations/{cid}"
+    ).json()
+    # user, assistant(changeset), assistant(applied note) — the apply is recorded.
+    assert [m["role"] for m in thread["messages"]] == [
+        "user",
+        "assistant",
+        "assistant",
+    ]
+    assert thread["messages"][-1]["content"] == "Applied 1 draft."
+
+
+def test_copilot_apply_without_conversation_id_does_not_touch_threads(
+    tmp_path,
+) -> None:
+    client = _client(tmp_path)
+    project = _resolve(client)
+    pid = project["id"]
+    _seed_active_model(client, pid)
+
+    run = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot",
+        json={"message": "model the moves table"},
+    )
+    apply = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot/apply",
+        json={"items": run.json()["items"]},
+    )
+    assert apply.status_code == 200, apply.text
+    # Stateless apply created no thread.
+    assert (
+        client.get(
+            f"/agent/semantic-layer/projects/{pid}/copilot/conversations"
+        ).json()
+        == []
+    )

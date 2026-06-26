@@ -72,7 +72,23 @@ class _Model:
         return ModelResult(content="A concise model-written summary.")
 
 
-def _client(tmp_path, *, indexing=True) -> TestClient:
+class _DeferredJobRunner:
+    """JobRunner that captures jobs without running them (to inspect mid-flight)."""
+
+    def __init__(self) -> None:
+        self.pending: list = []
+
+    def submit(self, fn) -> None:  # noqa: ANN001
+        self.pending.append(fn)
+
+    def run_all(self) -> None:
+        while self.pending:
+            self.pending.pop(0)()
+
+
+def _client(
+    tmp_path, *, indexing=True, async_threshold=1_000_000, job_runner=None
+) -> TestClient:
     app = create_app(
         config=AgentConfig(
             identity_provider="static",
@@ -83,6 +99,7 @@ def _client(tmp_path, *, indexing=True) -> TestClient:
             wren_core_validation_enabled=False,
             agent_storage_dir=str(tmp_path),
             wren_document_indexing_enabled=indexing,
+            wren_document_async_threshold_bytes=async_threshold,
         ),
         model_client=_Model(),
         text_to_sql_graph=object(),
@@ -91,7 +108,7 @@ def _client(tmp_path, *, indexing=True) -> TestClient:
         semantic_layer_store=InMemorySemanticLayerStore(),
         document_storage=LocalDocumentStorage(str(tmp_path)),
         context_provider=_Context(),
-        job_runner=InlineJobRunner(),
+        job_runner=job_runner or InlineJobRunner(),
     )
     return TestClient(app)
 
@@ -237,3 +254,58 @@ def test_missing_document_is_404(tmp_path) -> None:
     client = _client(tmp_path)
     assert client.get("/agent/semantic-layer/documents/nope/chunks").status_code == 404
     assert client.delete("/agent/semantic-layer/documents/nope").status_code == 404
+
+
+# --- async extraction routing (Step 9) ------------------------------------
+
+
+def test_small_upload_extracts_inline(tmp_path) -> None:
+    # _DOC is well under the (default) threshold -> inline extraction; the upload
+    # response already carries the final extracted status.
+    client = _client(tmp_path)
+    project = _project(client)
+    document = _upload(client, project["id"])
+    assert document["status"] == "extracted"
+
+
+def test_large_upload_routes_through_background_extraction(tmp_path) -> None:
+    # Threshold below the doc size -> background path. With InlineJobRunner the
+    # job still runs synchronously, so the end state must match inline extraction.
+    client = _client(tmp_path, async_threshold=10)
+    project = _project(client)
+    document = _upload(client, project["id"])
+    assert document["status"] == "extracted"
+    chunks = client.get(
+        f"/agent/semantic-layer/documents/{document['id']}/chunks"
+    ).json()
+    assert len(chunks) == 4  # same result as the inline path
+
+
+def test_background_upload_is_pollable_while_extracting(tmp_path) -> None:
+    # A deferred runner lets us observe the mid-flight state: the upload returns
+    # status="extracting" and the document is pollable until the job runs.
+    runner = _DeferredJobRunner()
+    client = _client(tmp_path, async_threshold=10, job_runner=runner)
+    project = _project(client)
+    document = _upload(client, project["id"])
+
+    assert document["status"] == "extracting"
+    polled = client.get(f"/agent/semantic-layer/documents/{document['id']}").json()
+    assert polled["status"] == "extracting"
+
+    runner.run_all()  # background extraction completes
+    done = client.get(f"/agent/semantic-layer/documents/{document['id']}").json()
+    assert done["status"] == "extracted"
+
+
+def test_oversize_upload_is_rejected(tmp_path) -> None:
+    # A doc larger than wren_max_document_bytes is rejected (400) at registration,
+    # before any background extraction is scheduled.
+    client = _client(tmp_path, async_threshold=10)
+    project = _project(client)
+    response = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/documents",
+        files={"file": ("big.md", b"x" * (10_000_000 + 1), "text/markdown")},
+    )
+    assert response.status_code == 400
+    assert "WREN_MAX_DOCUMENT_BYTES" in response.text

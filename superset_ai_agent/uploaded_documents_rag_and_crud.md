@@ -678,6 +678,23 @@ A later pass reworked the editor shell. Files: `WorkspaceTree.tsx`,
   install issue) — **run it in CI**.
 - Migration chain: single head `0007_document_chunks` (no alembic fork).
 
+### 8.7 Tier-1 format expansion (LANDED — see `document_format_tier1_plan.md`)
+A follow-on pass broadened ingestion. RAG-stage agents must know:
+- **New formats:** `.xlsx` (openpyxl) and `.pptx` (python-pptx) now extract; CSV
+  now renders **Markdown tables** (was `a | b | c`). All tabular content is GFM
+  tables, and workbook/deck provenance is encoded as blank-line-separated
+  `## Sheet: <name>` / `## Slide n` headers — the section chunker keeps these as
+  units, so **RAG provenance can be parsed from chunk headers** (no schema change).
+- **New statuses:** `SemanticDocumentStatus` gained `extracting` (background
+  extraction in flight) and `needs_ocr` (image-only PDF; OCR seam, no OCR yet —
+  `wren_document_ocr_enabled` reserved). Retrieval/indexing only runs on
+  `extracted`.
+- **Async ingestion:** uploads > `wren_document_async_threshold_bytes` (1 MB)
+  extract on a background thread (`register_document` + `extract_document` split);
+  status on the document row is the pollable surface. Size cap raised to 10 MB.
+- **RAG-stage deferred items:** table-aware chunking (a >2k-char table hard-splits
+  mid-row today) and per-chunk provenance metadata.
+
 ### 8.6 Open items / not done
 - **Phase 6** (RAG-fed enrichment behind `wren_document_selection`) — not started;
   the upload→MDL hot path stays keyword-selected by design.

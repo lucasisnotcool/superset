@@ -49,6 +49,8 @@ class JobStore(Protocol):
 
     def get(self, job_id: str) -> SemanticJob: ...
 
+    def list_for_project(self, project_id: str) -> list[SemanticJob]: ...
+
     def complete(self, job_id: str, result: OnboardingResult) -> SemanticJob: ...
 
     def fail(self, job_id: str, error: str) -> SemanticJob: ...
@@ -73,6 +75,15 @@ class InMemoryJobStore:
             if job is None:
                 raise JobNotFoundError(job_id)
             return job.model_copy(deep=True)
+
+    def list_for_project(self, project_id: str) -> list[SemanticJob]:
+        with self._lock:
+            jobs = [
+                job.model_copy(deep=True)
+                for job in self._jobs.values()
+                if job.project_id == project_id
+            ]
+        return sorted(jobs, key=lambda job: job.created_at)
 
     def complete(self, job_id: str, result: OnboardingResult) -> SemanticJob:
         return self._update(job_id, status="completed", result=result)
@@ -123,6 +134,16 @@ class SqlAlchemyJobStore:
             if model is None:
                 raise JobNotFoundError(job_id)
             return _from_model(model)
+
+    def list_for_project(self, project_id: str) -> list[SemanticJob]:
+        with self.session_factory() as session:
+            models = (
+                session.query(AiAgentJob)
+                .filter(AiAgentJob.project_id == project_id)
+                .order_by(AiAgentJob.created_at)
+                .all()
+            )
+            return [_from_model(model) for model in models]
 
     def complete(self, job_id: str, result: OnboardingResult) -> SemanticJob:
         return self._update(job_id, status="completed", result=result)

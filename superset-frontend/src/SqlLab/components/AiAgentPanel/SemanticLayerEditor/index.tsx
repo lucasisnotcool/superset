@@ -55,6 +55,7 @@ import {
   ConversationScope,
   createMdlFile,
   deleteMdlFile,
+  getProjectReadiness,
   getProjectSemanticLayerState,
   listMdlFiles,
   listSemanticDocuments,
@@ -66,6 +67,7 @@ import {
   SemanticDocument,
   SemanticLayerState,
   SemanticProject,
+  SemanticProjectReadinessStatus,
   updateMdlFile,
   validateMdlFile,
 } from '../api';
@@ -250,6 +252,12 @@ export default function SemanticLayerEditor({
   const [mdlFiles, setMdlFiles] = useState<MdlFile[]>([]);
   const [documents, setDocuments] = useState<SemanticDocument[]>([]);
   const [state, setState] = useState<SemanticLayerState | null>(null);
+  // Backend-derived readiness (empty | indexing | ready | failed). The rail uses
+  // this for the truthful `failed`/`empty` states; `failed` in particular cannot
+  // be derived client-side (it lives in the onboarding job history).
+  const [readinessStatus, setReadinessStatus] =
+    useState<SemanticProjectReadinessStatus | null>(null);
+  const [readinessDetail, setReadinessDetail] = useState<string | null>(null);
   const [activeFileId, setActiveFileId] = useState<string | null>(null);
   const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(
     null,
@@ -262,7 +270,6 @@ export default function SemanticLayerEditor({
   const [isResetting, setIsResetting] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [showCopilot, setShowCopilot] = useState(true);
-  const onboardedProjectsRef = useRef<Set<string>>(new Set());
   // Mirror the active file id in a ref so `refresh` can read the current
   // selection without depending on it (which would re-create the callback and
   // re-trigger the load effect — the cause of the autoscroll + dataset GET
@@ -324,6 +331,8 @@ export default function SemanticLayerEditor({
       setMdlFiles([]);
       setDocuments([]);
       setState(null);
+      setReadinessStatus(null);
+      setReadinessDetail(null);
       return;
     }
     const nextProject = await resolveSemanticProject({
@@ -332,16 +341,22 @@ export default function SemanticLayerEditor({
       schema_name: scope.schema_name,
       create_if_missing: true,
     });
-    const [nextFiles, nextState, nextDocuments] = await Promise.all([
-      listMdlFiles(nextProject.id),
-      getProjectSemanticLayerState(nextProject.id),
-      // Documents are scope-governed; an empty list is fine when none uploaded.
-      listSemanticDocuments(scope).catch(() => [] as SemanticDocument[]),
-    ]);
+    const [nextFiles, nextState, nextDocuments, nextReadiness] =
+      await Promise.all([
+        listMdlFiles(nextProject.id),
+        getProjectSemanticLayerState(nextProject.id),
+        // Documents are scope-governed; an empty list is fine when none uploaded.
+        listSemanticDocuments(scope).catch(() => [] as SemanticDocument[]),
+        // Readiness drives the Copilot rail's bootstrap-vs-chat split; tolerate a
+        // failure (rail falls back to the local active-models heuristic).
+        getProjectReadiness(nextProject.id).catch(() => null),
+      ]);
     setProject(nextProject);
     setMdlFiles(nextFiles);
     setDocuments(nextDocuments);
     setState(nextState);
+    setReadinessStatus(nextReadiness?.status ?? null);
+    setReadinessDetail(nextReadiness?.detail ?? null);
     // Drop a stale document selection if it no longer exists (functional update
     // so `refresh` need not depend on the selection — see the activeFileId note).
     setSelectedDocumentId(prev =>
@@ -544,8 +559,10 @@ export default function SemanticLayerEditor({
     [refresh, dispatch],
   );
 
-  // Destructive "start over": delete all MDL and re-onboard (auto-activated) from
-  // the live schema. Gated behind a confirmation dialog. Documents are kept.
+  // Destructive "start over": delete all MDL so the project returns to the empty
+  // (un-onboarded) state. Does NOT re-onboard — the rail re-gates the Copilot
+  // behind an explicit Onboard. Gated behind a confirmation dialog. Documents
+  // are kept so the user can re-enrich after re-onboarding.
   const resetProject = useCallback(async () => {
     if (!project) {
       return;
@@ -553,20 +570,12 @@ export default function SemanticLayerEditor({
     setShowResetConfirm(false);
     setIsResetting(true);
     try {
-      const job = await runReset(project.id);
-      if (job.status === 'failed') {
-        throw new Error(job.error || t('Reset failed'));
-      }
-      const warnings = job.result?.warnings ?? [];
-      if (warnings.length > 0) {
-        dispatch(
-          addWarningToast(
-            t('Reset completed with warnings: %s', warnings.join('; ')),
-          ),
-        );
-      } else {
-        dispatch(addSuccessToast(t('Semantic layer reset and re-onboarded.')));
-      }
+      await runReset(project.id);
+      dispatch(
+        addSuccessToast(
+          t('Semantic layer reset. Onboard the schema to rebuild it.'),
+        ),
+      );
       await refresh();
     } catch (ex) {
       dispatch(
@@ -596,6 +605,20 @@ export default function SemanticLayerEditor({
   const allActive =
     mdlFiles.length > 0 && mdlFiles.every(file => file.status === 'active');
 
+  // The Copilot may only edit once the MDL base layer exists and is stable. This
+  // mirrors the backend readiness gate (which 409s premature edits). The rail
+  // renders one of four states; onboarding is shown as a separate bootstrap
+  // process (never as synthetic chat), and a Copilot turn is only possible when
+  // `ready`. A foreground onboard (`isOnboarding`) is the local `indexing`
+  // signal — `runOnboard` blocks until the job is terminal, so the readiness
+  // endpoint is not polled during that window. Otherwise trust the backend
+  // status (it is the only source of truth for `failed`), with a local
+  // active-models fast-path for `ready` while readiness is still loading.
+  const hasActiveModels = mdlFiles.some(file => file.status === 'active');
+  const railStatus: SemanticProjectReadinessStatus = isOnboarding
+    ? 'indexing'
+    : (readinessStatus ?? (hasActiveModels ? 'ready' : 'empty'));
+
   // Activate (or deactivate) every MDL file in the library in one pass, then
   // refresh once so the browser reflects the new statuses.
   const setAllStatuses = (activate: boolean) =>
@@ -613,21 +636,6 @@ export default function SemanticLayerEditor({
       );
       await refresh();
     }, t('Unable to update MDL files'));
-
-  // Eagerly onboard a schema that has no MDL yet so the user lands on a
-  // populated semantic layer. Fires at most once per project.
-  useEffect(() => {
-    if (
-      project &&
-      canWrite &&
-      mdlFiles.length === 0 &&
-      !isOnboarding &&
-      !onboardedProjectsRef.current.has(project.id)
-    ) {
-      onboardedProjectsRef.current.add(project.id);
-      runOnboard(project.id);
-    }
-  }, [project, canWrite, mdlFiles.length, isOnboarding, runOnboard]);
 
   return (
     <EditorRoot data-test="semantic-layer-editor">
@@ -761,7 +769,7 @@ export default function SemanticLayerEditor({
                       </Button>
                       <Button
                         buttonStyle="tertiary"
-                        loading={isOnboarding || isResetting}
+                        loading={isResetting}
                         disabled={
                           !project ||
                           !canWrite ||
@@ -772,9 +780,7 @@ export default function SemanticLayerEditor({
                         onClick={() => setShowResetConfirm(true)}
                         icon={<Icons.ReloadOutlined iconSize="m" />}
                       >
-                        {isOnboarding || isResetting
-                          ? t('Resetting…')
-                          : t('Reset')}
+                        {isResetting ? t('Resetting…') : t('Reset')}
                       </Button>
                     </Flex>
                   </BrowserPane>
@@ -888,10 +894,18 @@ export default function SemanticLayerEditor({
                     min={280}
                   >
                     <CopilotRail data-test="copilot-rail">
+                      {/* The panel stays mounted in every state so its chat
+                          transcript survives empty↔ready transitions (e.g. after
+                          reset) within a session. When not `ready` it renders a
+                          bootstrap view (help text + Onboard/Retry) instead of the
+                          chat — onboarding is shown as a separate process. */}
                       <CopilotPanel
                         projectId={project.id}
                         canWrite={canWrite}
                         onApplied={refresh}
+                        readinessStatus={railStatus}
+                        readinessDetail={readinessDetail}
+                        onOnboard={() => runOnboard(project.id)}
                       />
                     </CopilotRail>
                   </Splitter.Panel>
@@ -938,9 +952,11 @@ export default function SemanticLayerEditor({
         title={t('Reset semantic layer?')}
         body={t(
           'This deletes every model in this project — including document ' +
-            'enrichments and any hand-edited files — and rebuilds the base models ' +
-            'from the current schema (auto-activated). Uploaded documents are kept, ' +
-            'so you can re-enrich afterward. This cannot be undone.',
+            'enrichments and any hand-edited files — returning it to the ' +
+            'un-onboarded state. Onboarding does not run automatically: you ' +
+            'choose when to rebuild the base models by clicking Onboard. ' +
+            'Uploaded documents are kept, so you can re-enrich afterward. This ' +
+            'cannot be undone.',
         )}
       />
     </EditorRoot>

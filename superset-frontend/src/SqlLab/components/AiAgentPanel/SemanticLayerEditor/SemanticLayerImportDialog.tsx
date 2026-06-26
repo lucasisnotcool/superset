@@ -429,6 +429,17 @@ export default function SemanticLayerImportDialog({
       ]}
     >
       {error && <Alert type="error" message={error} />}
+      <Alert
+        type="info"
+        showIcon
+        data-test="enrichment-deprecation-notice"
+        message={t('Enriching from a document? Use the MDL Copilot.')}
+        description={t(
+          'Markdown enrichment here is deprecated. The MDL Copilot reads your ' +
+            'uploaded documents, proposes reviewable edits, and preserves ' +
+            'governance metadata. Upload JSON here for raw MDL files.',
+        )}
+      />
       <DropZone
         type="button"
         data-test="semantic-import-dropzone"

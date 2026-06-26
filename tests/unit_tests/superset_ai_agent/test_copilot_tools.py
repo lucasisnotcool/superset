@@ -164,3 +164,115 @@ def test_write_rejects_empty_content_and_bad_path() -> None:
 
 def test_unknown_tool_returns_error() -> None:
     assert "error" in MdlToolset([]).dispatch("nope", {})
+
+
+# -- Superset `properties` preservation guard (governance metadata) ----------
+
+ORDERS_WITH_PROPS = json.dumps(
+    {
+        "models": [
+            {
+                "name": "orders",
+                "tableReference": {"schema": "public", "table": "orders"},
+                "properties": {"displayName": "Orders"},
+                "columns": [
+                    {
+                        "name": "id",
+                        "type": "BIGINT",
+                        "properties": {
+                            "displayName": "Order ID",
+                            "synonyms": "order number",
+                        },
+                    },
+                    {"name": "amount", "type": "BIGINT"},
+                ],
+            }
+        ]
+    }
+)
+
+
+def _strip_all_properties() -> str:
+    payload = json.loads(ORDERS_WITH_PROPS)
+    model = payload["models"][0]
+    model.pop("properties", None)
+    for column in model["columns"]:
+        column.pop("properties", None)
+    return json.dumps(payload)
+
+
+def test_write_restores_dropped_column_and_model_properties() -> None:
+    # The agent re-emits the file but omits every `properties` block — the guard
+    # must silently restore them so governance/retrieval metadata survives.
+    toolset = MdlToolset(
+        [_file("models/orders.json", ORDERS_WITH_PROPS)], schema_index=SCHEMA
+    )
+
+    result = toolset.dispatch(
+        "write_mdl_file",
+        {"path": "models/orders.json", "content": _strip_all_properties()},
+    )
+    assert "note" in result  # agent is told the drop was corrected
+
+    stored = json.loads(
+        toolset.dispatch("read_mdl_file", {"path": "models/orders.json"})["content"]
+    )
+    model = stored["models"][0]
+    assert model["properties"] == {"displayName": "Orders"}
+    id_col = next(c for c in model["columns"] if c["name"] == "id")
+    assert id_col["properties"] == {
+        "displayName": "Order ID",
+        "synonyms": "order number",
+    }
+
+
+def test_write_keeps_agent_edits_while_restoring_dropped_keys() -> None:
+    # New values win on collision; omitted keys are restored (additive merge).
+    toolset = MdlToolset(
+        [_file("models/orders.json", ORDERS_WITH_PROPS)], schema_index=SCHEMA
+    )
+    edited = json.loads(ORDERS_WITH_PROPS)
+    id_col = edited["models"][0]["columns"][0]
+    id_col["properties"] = {"displayName": "Identifier"}  # change one, drop synonyms
+
+    toolset.dispatch(
+        "write_mdl_file",
+        {"path": "models/orders.json", "content": json.dumps(edited)},
+    )
+
+    stored = json.loads(
+        toolset.dispatch("read_mdl_file", {"path": "models/orders.json"})["content"]
+    )
+    stored_id = stored["models"][0]["columns"][0]
+    assert stored_id["properties"] == {
+        "displayName": "Identifier",  # agent's edit preserved
+        "synonyms": "order number",  # dropped key restored
+    }
+
+
+def test_write_dropping_properties_yields_no_spurious_changeset_item() -> None:
+    # Restoring properties back to the original means the file is unchanged.
+    toolset = MdlToolset(
+        [_file("models/orders.json", ORDERS_WITH_PROPS)], schema_index=SCHEMA
+    )
+    toolset.dispatch(
+        "write_mdl_file",
+        {"path": "models/orders.json", "content": _strip_all_properties()},
+    )
+
+    assert toolset.build_changeset().items == []
+
+
+def test_write_without_prior_file_does_not_invent_properties() -> None:
+    # A brand-new file has no prior version, so nothing is restored.
+    toolset = MdlToolset([], schema_index=SCHEMA)
+
+    result = toolset.dispatch(
+        "write_mdl_file",
+        {"path": "models/orders.json", "content": _strip_all_properties()},
+    )
+    assert "note" not in result
+    stored = json.loads(
+        toolset.dispatch("read_mdl_file", {"path": "models/orders.json"})["content"]
+    )
+    assert "properties" not in stored["models"][0]

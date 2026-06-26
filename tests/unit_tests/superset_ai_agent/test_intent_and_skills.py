@@ -61,11 +61,40 @@ def test_classify_intent_bad_json_fails_closed() -> None:
 
 def test_skills_are_listed_and_loadable() -> None:
     names = list_skills()
-    assert {"onboarding", "generate-mdl", "enrich-context", "usage"} <= set(names)
-    body = get_skill("usage")
-    assert "semantic layer" in body.lower()
+    # The MDL Copilot loads exactly these three skills (COPILOT_SKILLS); the query
+    # agent is a structured-output pipeline and loads none.
+    assert {"onboarding", "generate-mdl", "enrich-context"} == set(names)
+    body = get_skill("onboarding")
+    assert "MDL" in body
 
 
 def test_unknown_skill_raises() -> None:
     with pytest.raises(FileNotFoundError):
         get_skill("does-not-exist")
+
+
+def test_skill_text_excludes_license_header() -> None:
+    # The ASF license header must stay in the source file but never reach the
+    # injected system prompt (it wastes tokens and distracts the agent).
+    for name in ("onboarding", "generate-mdl", "enrich-context"):
+        body = get_skill(name)
+        assert "Licensed to the Apache Software Foundation" not in body
+        assert not body.lstrip().startswith("<!--")
+        assert body.strip()  # real content survives
+
+
+def test_prompt_text_excludes_license_header() -> None:
+    from superset_ai_agent.prompts.registry import get_prompt
+
+    body = get_prompt("mdl_copilot")
+    assert "Licensed to the Apache Software Foundation" not in body
+    assert "MDL Copilot" in body
+
+
+def test_strip_leading_metadata_handles_comment_and_frontmatter() -> None:
+    from superset_ai_agent.prompts.registry import strip_leading_metadata
+
+    text = "<!--\nlicense\n-->\n---\nname: x\n---\n# Title\n\nBody."
+    assert strip_leading_metadata(text) == "# Title\n\nBody."
+    # No header → unchanged content.
+    assert strip_leading_metadata("# Title\n\nBody.") == "# Title\n\nBody."

@@ -21,6 +21,7 @@ import json  # noqa: TID251 - keep the standalone agent independent of Superset
 import logging
 import queue
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +63,7 @@ from superset_ai_agent.conversations.store import (
     ConversationNotFoundError,
     ConversationStore,
 )
+from superset_ai_agent.conversations.turns import ConversationTurnService
 from superset_ai_agent.graph import TextToSqlGraph
 from superset_ai_agent.integrations.superset.client import SupersetAuthError
 from superset_ai_agent.integrations.superset.factory import create_superset_client
@@ -107,6 +109,7 @@ from superset_ai_agent.semantic_layer.copilot.service import (
     apply_changeset_items,
     build_deploy_preview,
     build_inspector,
+    changeset_to_artifact,
     run_copilot,
 )
 from superset_ai_agent.semantic_layer.copilot.workspace import build_workspace_tree
@@ -122,6 +125,8 @@ from superset_ai_agent.semantic_layer.document_retriever import (
 from superset_ai_agent.semantic_layer.documents import (
     create_document,
     delete_document_cascade,
+    extract_document,
+    register_document,
     reindex_document,
 )
 from superset_ai_agent.semantic_layer.events import to_sse
@@ -194,6 +199,7 @@ from superset_ai_agent.semantic_layer.schemas import (
     SemanticLayerEventType,
     SemanticLayerState,
     SemanticProject,
+    SemanticProjectReadiness,
     SemanticProjectResolveRequest,
     WrenMaterializationResult,
 )
@@ -599,7 +605,9 @@ def create_app(  # noqa: C901
     ) -> list[ConversationSummary]:
         """List conversation summaries for the current integration identity."""
 
-        return active_conversation_store.list(owner_id=identity.owner_id)
+        # ``kind="sql"`` keeps the AI SQL history clean of Copilot threads, which
+        # live under the project-scoped ``/copilot/conversations`` surface.
+        return active_conversation_store.list(owner_id=identity.owner_id, kind="sql")
 
     @api.get("/agent/conversations/{conversation_id}", response_model=Conversation)
     def get_conversation(
@@ -1308,6 +1316,76 @@ def create_app(  # noqa: C901
                 detail="MDL Copilot is disabled (set WREN_COPILOT_ENABLED=true).",
             )
 
+    def _project_readiness(
+        project: SemanticProject, owner_id: str
+    ) -> SemanticProjectReadiness:
+        """Whether the MDL base layer is onboarded and stable (Copilot gate).
+
+        The Copilot must not edit while onboarding is still writing files. Derived
+        from existing signals — active MDL files + in-flight onboarding jobs — so no
+        new project state/migration is needed (see ``wren_mdl_copilot.md`` §AB).
+        """
+
+        files = active_mdl_file_store.list(project.id, owner_id=owner_id)
+        active = [file for file in files if file.status == "active"]
+        jobs = active_job_store.list_for_project(project.id)
+        running = next(
+            (
+                job
+                for job in reversed(jobs)
+                if job.kind == "onboarding" and job.status == "running"
+            ),
+            None,
+        )
+        if running is not None:
+            return SemanticProjectReadiness(
+                status="indexing",
+                ready=False,
+                has_active_models=bool(active),
+                active_model_count=len(active),
+                running_job_id=running.id,
+                detail="Onboarding in progress; the semantic layer is initializing.",
+            )
+        if active:
+            return SemanticProjectReadiness(
+                status="ready",
+                ready=True,
+                has_active_models=True,
+                active_model_count=len(active),
+                detail="Semantic layer is ready.",
+            )
+        last_onboarding = next(
+            (job for job in reversed(jobs) if job.kind == "onboarding"), None
+        )
+        if last_onboarding is not None and last_onboarding.status == "failed":
+            return SemanticProjectReadiness(
+                status="failed",
+                ready=False,
+                has_active_models=False,
+                detail=last_onboarding.error or "Onboarding failed; retry onboarding.",
+            )
+        return SemanticProjectReadiness(
+            status="empty",
+            ready=False,
+            has_active_models=False,
+            detail="Schema has not been onboarded yet.",
+        )
+
+    def _require_project_ready(project: SemanticProject, owner_id: str) -> None:
+        readiness = _project_readiness(project, owner_id)
+        if not readiness.ready:
+            # 409 Conflict: the request is valid but the project is not in a state
+            # that can accept Copilot edits yet. The structured detail lets the UI
+            # show a spinner (indexing) vs an onboarding prompt (empty/failed).
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "status": readiness.status,
+                    "message": readiness.detail,
+                    "running_job_id": readiness.running_job_id,
+                },
+            )
+
     def _project_instruction_views(
         project: SemanticProject, owner_id: str
     ) -> list[InstructionView]:
@@ -1378,6 +1456,27 @@ def create_app(  # noqa: C901
             documents=documents,
             has_compiled=has_active,
         )
+
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}/readiness",
+        response_model=SemanticProjectReadiness,
+    )
+    def get_project_readiness(
+        project_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> SemanticProjectReadiness:
+        """Whether the MDL base layer is onboarded and stable enough for the Copilot.
+
+        Read-only and not behind the Copilot flag — the editor polls this to show a
+        loading spinner (``indexing``) or an onboarding prompt (``empty``/``failed``)
+        before mounting the Copilot.
+        """
+
+        project = authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="read"
+        )
+        return _project_readiness(project, identity.owner_id)
 
     @api.get(
         "/agent/semantic-layer/projects/{project_id}/copilot/inspector",
@@ -1479,6 +1578,186 @@ def create_app(  # noqa: C901
         except Exception as ex:  # pylint: disable=broad-except
             raise HTTPException(status_code=502, detail=str(ex)) from ex
 
+    # -- Copilot conversations (persistent, multi-turn threads) -----------
+    # Parallel to the AI SQL ``/agent/conversations`` surface but project-scoped
+    # and tagged ``kind="copilot"`` in the shared store. See
+    # plan_copilot_parity_impl.md §6.
+
+    def _copilot_turn_service() -> ConversationTurnService:
+        return ConversationTurnService(active_conversation_store)
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/copilot/conversations",
+        response_model=Conversation,
+    )
+    def create_copilot_conversation(
+        project_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> Conversation:
+        """Start a Copilot thread bound to the project (scope from the project)."""
+
+        _require_copilot_enabled()
+        project = authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
+        )
+        return active_conversation_store.create(
+            _scope_from_project(project),
+            owner_id=identity.owner_id,
+            kind="copilot",
+            project_id=project_id,
+        )
+
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}/copilot/conversations",
+        response_model=list[ConversationSummary],
+    )
+    def list_copilot_conversations(
+        project_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> list[ConversationSummary]:
+        """List the project's Copilot threads for the current identity."""
+
+        _require_copilot_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="read"
+        )
+        return active_conversation_store.list(
+            owner_id=identity.owner_id, kind="copilot", project_id=project_id
+        )
+
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}/copilot/conversations/"
+        "{conversation_id}",
+        response_model=Conversation,
+    )
+    def get_copilot_conversation(
+        project_id: str,
+        conversation_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> Conversation:
+        """Return one Copilot thread transcript (incl. persisted changesets)."""
+
+        _require_copilot_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="read"
+        )
+        try:
+            conversation = active_conversation_store.get(
+                conversation_id, owner_id=identity.owner_id
+            )
+        except ConversationNotFoundError as ex:
+            raise HTTPException(
+                status_code=404, detail="Conversation not found."
+            ) from ex
+        if conversation.kind != "copilot" or conversation.project_id != project_id:
+            raise HTTPException(status_code=404, detail="Conversation not found.")
+        return conversation
+
+    @api.patch(
+        "/agent/semantic-layer/projects/{project_id}/copilot/conversations/"
+        "{conversation_id}",
+        response_model=Conversation,
+    )
+    def rename_copilot_conversation(
+        project_id: str,
+        conversation_id: str,
+        request: ConversationTitleUpdateRequest,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> Conversation:
+        """Rename a Copilot thread."""
+
+        _require_copilot_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
+        )
+        _require_copilot_conversation(project_id, conversation_id, identity.owner_id)
+        return active_conversation_store.update_title(
+            conversation_id, request.title, owner_id=identity.owner_id
+        )
+
+    @api.delete(
+        "/agent/semantic-layer/projects/{project_id}/copilot/conversations/"
+        "{conversation_id}",
+    )
+    def delete_copilot_conversation(
+        project_id: str,
+        conversation_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> dict[str, bool]:
+        """Delete a Copilot thread."""
+
+        _require_copilot_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
+        )
+        _require_copilot_conversation(project_id, conversation_id, identity.owner_id)
+        active_conversation_store.delete(conversation_id, owner_id=identity.owner_id)
+        return {"deleted": True}
+
+    def _require_copilot_conversation(
+        project_id: str, conversation_id: str, owner_id: str
+    ) -> Conversation:
+        """Load a thread and assert it is this project's Copilot thread (else 404)."""
+
+        try:
+            conversation = active_conversation_store.get(
+                conversation_id, owner_id=owner_id
+            )
+        except ConversationNotFoundError as ex:
+            raise HTTPException(
+                status_code=404, detail="Conversation not found."
+            ) from ex
+        if conversation.kind != "copilot" or conversation.project_id != project_id:
+            raise HTTPException(status_code=404, detail="Conversation not found.")
+        return conversation
+
+    def _copilot_thread_turn(
+        conversation_id: str | None,
+        project: SemanticProject,
+        message: str,
+        owner_id: str,
+    ) -> tuple[list[ChatMessage] | None, Callable[..., None]]:
+        """Open a persistent turn: append the user message, return (history, commit).
+
+        Returns ``(None, no-op)`` when ``conversation_id`` is absent so the turn
+        routes stay backward-compatible as stateless one-shots. The returned
+        ``commit(content, changeset=None)`` always appends a paired assistant turn
+        — the changeset summary + artifact on success, or a plain error/cancel note
+        — so the stored transcript never ends on a dangling user message (mirrors
+        the AI SQL agent's stream contract).
+        """
+
+        if not conversation_id:
+            return None, lambda *_args, **_kwargs: None
+
+        _require_copilot_conversation(project.id, conversation_id, owner_id)
+        turn_service = _copilot_turn_service()
+        conversation = turn_service.begin_turn(
+            conversation_id,
+            user_content=message,
+            scope=_scope_from_project(project),
+            owner_id=owner_id,
+        )
+        history = turn_service.history_messages(
+            conversation,
+            max_messages=app_config.wren_copilot_max_history_messages,
+        )
+
+        def commit(content: str, changeset: Changeset | None = None) -> None:
+            turn_service.commit_turn(
+                conversation_id,
+                assistant_content=content,
+                artifacts=[changeset_to_artifact(changeset)] if changeset else [],
+                owner_id=owner_id,
+            )
+
+        return history, commit
+
     @api.post(
         "/agent/semantic-layer/projects/{project_id}/copilot",
         response_model=Changeset,
@@ -1495,10 +1774,17 @@ def create_app(  # noqa: C901
         project = authorize_semantic_project(
             fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
         )
+        _require_project_ready(project, identity.owner_id)
         files = active_mdl_file_store.list(project_id, owner_id=identity.owner_id)
         schema_index = _schema_index_for_project(project, fastapi_request)
+        # Persistent thread: append the user turn, feed prior turns as history,
+        # then persist the assistant turn + changeset artifact. ``conversation_id``
+        # absent → stateless one-shot (backward compatible).
+        history, commit = _copilot_thread_turn(
+            request.conversation_id, project, request.message, identity.owner_id
+        )
         try:
-            return run_copilot(
+            changeset = run_copilot(
                 model_client=active_model_client,
                 files=files,
                 schema_index=schema_index,
@@ -1507,6 +1793,7 @@ def create_app(  # noqa: C901
                 instructions=_recalled_instructions(
                     project, identity.owner_id, request.message
                 ),
+                history=history,
                 model=request.model,
                 max_steps=request.max_steps,
                 deep_validate=app_config.wren_modeling_deep_validation,
@@ -1517,7 +1804,12 @@ def create_app(  # noqa: C901
                 retrieve_k=app_config.wren_document_retrieve_k,
             )
         except Exception as ex:  # pylint: disable=broad-except
+            # Record the failure as the assistant turn so the thread stays paired,
+            # then surface the 502 to the client.
+            commit(f"The Copilot turn failed: {ex}")
             raise HTTPException(status_code=502, detail=str(ex)) from ex
+        commit(changeset.message or "", changeset)
+        return changeset
 
     @api.post("/agent/semantic-layer/projects/{project_id}/copilot/stream")
     def stream_project_copilot(
@@ -1532,6 +1824,7 @@ def create_app(  # noqa: C901
         project = authorize_semantic_project(
             fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
         )
+        _require_project_ready(project, identity.owner_id)
         # Resolve request-scoped context before streaming starts (no Request access
         # from the worker thread).
         files = active_mdl_file_store.list(project_id, owner_id=identity.owner_id)
@@ -1540,6 +1833,11 @@ def create_app(  # noqa: C901
             project, identity.owner_id, request.message
         )
         attachments_text = _attachments_text(request.attachments)
+        # Append the user turn + assemble history in request scope (the worker
+        # thread has no Request access); ``commit`` persists the result afterwards.
+        history, commit = _copilot_thread_turn(
+            request.conversation_id, project, request.message, identity.owner_id
+        )
 
         def event_stream() -> Any:
             events: queue.Queue[tuple[str, Any]] = queue.Queue()
@@ -1557,6 +1855,7 @@ def create_app(  # noqa: C901
                         user_message=request.message,
                         attachments_text=attachments_text,
                         instructions=instructions,
+                        history=history,
                         model=request.model,
                         max_steps=request.max_steps,
                         deep_validate=app_config.wren_modeling_deep_validation,
@@ -1574,25 +1873,37 @@ def create_app(  # noqa: C901
 
             worker = threading.Thread(target=run, daemon=True)
             worker.start()
-            while True:
-                kind, payload = events.get()
-                if kind == "done":
-                    break
-                if kind == "progress":
-                    yield _conversation_sse(
-                        {
-                            "type": "progress",
-                            "agent_step": payload.model_dump(mode="json"),
-                        }
-                    )
+            try:
+                while True:
+                    kind, payload = events.get()
+                    if kind == "done":
+                        break
+                    if kind == "progress":
+                        yield _conversation_sse(
+                            {
+                                "type": "progress",
+                                "agent_step": payload.model_dump(mode="json"),
+                            }
+                        )
+            except GeneratorExit:
+                # Client disconnected (e.g. pressed Stop) before completion. Record
+                # a cancellation so the stored transcript stays paired, then let the
+                # worker finish in the background and propagate the close.
+                commit("Generation cancelled.")
+                raise
             worker.join()
             if "error" in holder:
+                # Persist the failure as the assistant turn (paired transcript),
+                # then surface the terminal error event.
+                commit(f"The Copilot turn failed: {holder['error']}")
                 yield _conversation_sse({"type": "error", "detail": holder["error"]})
             else:
+                changeset = holder["changeset"]
+                commit(changeset.message or "", changeset)
                 yield _conversation_sse(
                     {
                         "type": "complete",
-                        "changeset": holder["changeset"].model_dump(mode="json"),
+                        "changeset": changeset.model_dump(mode="json"),
                     }
                 )
 
@@ -1615,7 +1926,7 @@ def create_app(  # noqa: C901
             fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
         )
         try:
-            return apply_changeset_items(
+            applied = apply_changeset_items(
                 active_mdl_file_store,
                 project_id=project_id,
                 items=request.items,
@@ -1627,6 +1938,21 @@ def create_app(  # noqa: C901
             raise HTTPException(status_code=409, detail=str(ex)) from ex
         except ValueError as ex:
             raise HTTPException(status_code=400, detail=str(ex)) from ex
+
+        # Record the apply as an assistant turn so a resumed thread shows that the
+        # proposal was applied (parity with the SQL agent's execute-sql turn).
+        if request.conversation_id:
+            _require_copilot_conversation(
+                project_id, request.conversation_id, identity.owner_id
+            )
+            count = len(applied)
+            noun = "draft" if count == 1 else "drafts"
+            _copilot_turn_service().commit_turn(
+                request.conversation_id,
+                assistant_content=f"Applied {count} {noun}.",
+                owner_id=identity.owner_id,
+            )
+        return applied
 
     @api.post(
         "/agent/semantic-layer/projects/{project_id}/materialize",
@@ -1781,34 +2107,34 @@ def create_app(  # noqa: C901
 
     @api.post(
         "/agent/semantic-layer/projects/{project_id}/reset",
-        response_model=SemanticJob,
-        status_code=202,
     )
     def reset_semantic_project(
         project_id: str,
         fastapi_request: Request,
         identity: AgentIdentity = identity_dependency,
-    ) -> SemanticJob:
-        """Delete all MDL for a project, then re-onboard from the schema.
+    ) -> dict[str, int]:
+        """Delete all MDL for a project, returning it to the un-onboarded state.
 
         A destructive "start over": every MDL file (base models, enrichment overlays,
-        and hand-edits) is soft-deleted, then onboarding regenerates and auto-activates
-        the base models from the live catalog. Uploaded **documents are kept**, so the
-        operator can re-enrich without re-uploading. Returns the onboarding job to poll.
+        and hand-edits) is soft-deleted, so the project's readiness falls back to
+        ``empty`` and the editor re-gates the Copilot behind an explicit onboard.
+        Reset does **not** auto re-onboard — onboarding is always a deliberate user
+        action (it is the required first step on an empty layer). Uploaded
+        **documents are kept**, so the operator can re-enrich after re-onboarding.
+        Returns the number of MDL files deleted.
         """
 
-        project = authorize_semantic_project(
+        authorize_semantic_project(
             fastapi_request,
             project_id,
             owner_id=identity.owner_id,
             permission="write",
         )
-        # Fetch the schema before deleting, so an auth/connection failure leaves the
-        # existing MDL intact rather than wiping it with nothing to rebuild from.
-        context = _onboarding_context(project, fastapi_request)
+        deleted = 0
         for file in active_mdl_file_store.list(project_id, owner_id=identity.owner_id):
             active_mdl_file_store.delete(file.id, owner_id=identity.owner_id)
-        return _start_onboarding_job(project, context, identity.owner_id)
+            deleted += 1
+        return {"deleted": deleted}
 
     @api.get(
         "/agent/semantic-layer/projects/{project_id}/jobs/{job_id}",
@@ -1912,9 +2238,9 @@ def create_app(  # noqa: C901
             permission="write",
         )
         scope = _scope_from_project(project)
+        content = await file.read()
         try:
-            content = await file.read()
-            document = create_document(
+            document = register_document(
                 filename=file.filename or "document",
                 content_type=file.content_type or "application/octet-stream",
                 content=content,
@@ -1924,11 +2250,34 @@ def create_app(  # noqa: C901
                 config=app_config,
                 store=active_semantic_layer_store,
                 storage=active_document_storage,
-                extractor=active_document_extractor,
-                document_index=active_document_index,
             )
         except ValueError as ex:
             raise HTTPException(status_code=400, detail=str(ex)) from ex
+
+        def _extract() -> None:
+            extract_document(
+                document.id,
+                owner_id=identity.owner_id,
+                config=app_config,
+                store=active_semantic_layer_store,
+                storage=active_document_storage,
+                extractor=active_document_extractor,
+                document_index=active_document_index,
+            )
+
+        if document.size_bytes <= app_config.wren_document_async_threshold_bytes:
+            # Small file: extract inline so the response carries the final status.
+            _extract()
+        else:
+            # Large file: extract on a background thread; the document row tracks
+            # progress (uploaded -> extracting -> extracted/needs_ocr/error) and is
+            # pollable via GET .../documents/{id}. (InlineJobRunner in tests runs
+            # this synchronously, so the response already reflects completion.)
+            active_semantic_layer_store.update_document(
+                document.model_copy(update={"status": "extracting"}),
+                owner_id=identity.owner_id,
+            )
+            active_job_runner.submit(_extract)
         _append_semantic_event(
             store=active_semantic_layer_store,
             owner_id=identity.owner_id,

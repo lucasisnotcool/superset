@@ -72,6 +72,8 @@ def test_agent_config_reads_superset_adapter_environment(monkeypatch) -> None:
     monkeypatch.setenv("WREN_SCHEMA_CONTEXT_TOKEN_BUDGET", "2048")
     monkeypatch.setenv("WREN_REQUIRE_SCHEMA_SCOPE", "false")
     monkeypatch.setenv("WREN_MAX_DOCUMENT_BYTES", "1234")
+    monkeypatch.setenv("WREN_DOCUMENT_ASYNC_THRESHOLD_BYTES", "777")
+    monkeypatch.setenv("WREN_DOCUMENT_OCR_ENABLED", "true")
     monkeypatch.setenv("WREN_ALLOWED_DOCUMENT_TYPES", "text/plain,application/json")
     monkeypatch.setenv("AI_AGENT_SEMANTIC_ACCESS_MODE", "SUPERSET_ONLY")
     monkeypatch.setenv("AI_AGENT_SEMANTIC_FULL_ACCESS_GRANTS_WRITE", "true")
@@ -135,6 +137,8 @@ def test_agent_config_reads_superset_adapter_environment(monkeypatch) -> None:
     assert config.wren_schema_context_token_budget == 2048
     assert config.wren_require_schema_scope is False
     assert config.wren_max_document_bytes == 1234
+    assert config.wren_document_async_threshold_bytes == 777
+    assert config.wren_document_ocr_enabled is True
     assert config.wren_allowed_document_types == ("text/plain", "application/json")
     assert config.semantic_access_mode == "superset_only"
     assert config.semantic_full_access_grants_write is True

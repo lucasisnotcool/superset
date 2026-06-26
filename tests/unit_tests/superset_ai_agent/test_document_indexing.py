@@ -25,9 +25,14 @@ from superset_ai_agent.semantic_layer.document_retriever import DocumentChunkInd
 from superset_ai_agent.semantic_layer.documents import (
     create_document,
     delete_document_cascade,
+    extract_document,
+    register_document,
     reindex_document,
 )
-from superset_ai_agent.semantic_layer.extractors import CompositeDocumentExtractor
+from superset_ai_agent.semantic_layer.extractors import (
+    CompositeDocumentExtractor,
+    NeedsOcrError,
+)
 from superset_ai_agent.semantic_layer.memory import InMemorySemanticLayerStore
 from superset_ai_agent.semantic_layer.store import SemanticDocumentNotFoundError
 
@@ -212,3 +217,87 @@ def test_reindex_is_idempotent() -> None:
 
     # Deterministic ids -> reindex replaces in place, same ids, no duplication.
     assert [chunk.id for chunk in chunks] == first
+
+
+# --- register/extract split (Step 7) --------------------------------------
+
+
+def test_register_document_leaves_status_uploaded_and_skips_extraction() -> None:
+    store = InMemorySemanticLayerStore()
+    document = register_document(
+        filename="doc.md",
+        content_type="text/markdown",
+        content=_CONTENT,
+        scope=_scope(),
+        project_id="project-1",
+        owner_id="user-1",
+        config=AgentConfig(wren_document_indexing_enabled=True),
+        store=store,
+        storage=_RecordingStorage(),
+    )
+    assert document.status == "uploaded"
+    assert document.extracted_text is None
+    assert store.list_chunks(document.id, owner_id="user-1") == []
+
+
+def test_extract_document_advances_registered_document() -> None:
+    store = InMemorySemanticLayerStore()
+    storage = _RecordingStorage()
+    config = AgentConfig(wren_document_indexing_enabled=True)
+    registered = register_document(
+        filename="doc.md",
+        content_type="text/markdown",
+        content=_CONTENT,
+        scope=_scope(),
+        project_id="project-1",
+        owner_id="user-1",
+        config=config,
+        store=store,
+        storage=storage,
+    )
+
+    extracted = extract_document(
+        registered.id,
+        owner_id="user-1",
+        config=config,
+        store=store,
+        storage=storage,
+        extractor=CompositeDocumentExtractor(),
+    )
+
+    assert extracted.status == "extracted"
+    assert extracted.extracted_text
+    assert len(store.list_chunks(registered.id, owner_id="user-1")) == 3
+
+
+class _NeedsOcrExtractor:
+    """Stub extractor that always signals an image-only document."""
+
+    def extract_text(self, *, filename: str, content_type: str, content: bytes) -> str:
+        raise NeedsOcrError("PDF has no extractable text layer; OCR required.")
+
+
+def test_image_only_document_is_tagged_needs_ocr() -> None:
+    store = InMemorySemanticLayerStore()
+    storage = _RecordingStorage()
+    config = AgentConfig(wren_document_indexing_enabled=True)
+    document = create_document(
+        filename="scan.pdf",
+        content_type="application/pdf",
+        content=b"%PDF-1.4 image only",
+        scope=_scope(),
+        project_id="project-1",
+        owner_id="user-1",
+        config=config,
+        store=store,
+        storage=storage,
+        extractor=_NeedsOcrExtractor(),
+    )
+
+    assert document.status == "needs_ocr"
+    assert document.error is None
+    # No chunks indexed for a needs-OCR document...
+    assert store.list_chunks(document.id, owner_id="user-1") == []
+    # ...but the original blob is retained for a future OCR pass / download.
+    assert storage.read(document.storage_uri) == b"%PDF-1.4 image only"
+    assert any("OCR" in warning for warning in document.warnings)

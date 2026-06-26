@@ -154,6 +154,31 @@ def test_loop_degrades_when_model_emits_no_tool_calls() -> None:
     assert any("tool-calling is required" in w.lower() for w in changeset.warnings)
 
 
+def test_loop_prepends_history_after_system_before_user() -> None:
+    model = ScriptedModel([ModelResult(content="ok")])
+    toolset = MdlToolset([], schema_index=SCHEMA)
+    history = [
+        ChatMessage(role="user", content="add an orders model"),
+        ChatMessage(role="assistant", content="created models/orders.json"),
+    ]
+
+    run_copilot_loop(
+        model_client=model,
+        toolset=toolset,
+        user_message="now also add a synonym",
+        history=history,
+    )
+
+    sent = model.calls[0]["messages"]
+    roles = [m.role for m in sent]
+    # system, prior user, prior assistant, then the fresh user turn.
+    assert roles[0] == "system"
+    assert roles[1:4] == ["user", "assistant", "user"]
+    assert sent[1].content == "add an orders model"
+    assert sent[2].content == "created models/orders.json"
+    assert sent[3].content.startswith("now also add a synonym")
+
+
 def test_loop_emits_progress_via_on_step() -> None:
     model = ScriptedModel(
         [_write_call("models/orders.json", VALID), ModelResult(content="ok")]

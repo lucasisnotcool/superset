@@ -42,6 +42,17 @@ class AiAgentConversation(Base):
     id = Column(String(36), primary_key=True)
     owner_id = Column(String(255), index=True, nullable=False)
     title = Column(String(255), nullable=False)
+    #: Agent discriminator (``sql`` for the AI SQL agent, ``copilot`` for the MDL
+    #: Copilot). ``server_default`` backfills pre-existing rows to ``sql``.
+    kind = Column(
+        String(32),
+        nullable=False,
+        server_default="sql",
+        index=True,
+    )
+    #: Semantic project binding for project-scoped agents (the Copilot). Plain
+    #: column, not a FK — conversations outlive projects.
+    project_id = Column(String(36), nullable=True, index=True)
     database_id = Column(Integer, nullable=False)
     catalog_name = Column(String(255), nullable=True)
     schema_name = Column(String(255), nullable=True)

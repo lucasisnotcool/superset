@@ -46,15 +46,28 @@ class ConversationStore(Protocol):
         scope: ConversationScope,
         *,
         owner_id: str = DEFAULT_OWNER_ID,
+        kind: str = "sql",
+        project_id: str | None = None,
     ) -> Conversation:
-        """Create a conversation."""
+        """Create a conversation.
+
+        ``kind``/``project_id`` tag the owning agent (``"sql"`` vs ``"copilot"``)
+        and bind project-scoped threads; both default so existing AI SQL callers
+        are unchanged.
+        """
 
     def list(
         self,
         *,
         owner_id: str = DEFAULT_OWNER_ID,
+        kind: str | None = None,
+        project_id: str | None = None,
     ) -> list[ConversationSummary]:
-        """List conversations for an owner."""
+        """List conversations for an owner, optionally filtered by agent/project.
+
+        ``kind=None`` (the default) lists every thread the owner has; pass
+        ``kind="copilot"`` + ``project_id`` to list one agent's project threads.
+        """
 
     def get(
         self,

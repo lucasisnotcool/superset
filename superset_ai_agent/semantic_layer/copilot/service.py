@@ -27,7 +27,8 @@ from __future__ import annotations
 import logging
 from typing import Protocol
 
-from superset_ai_agent.llm.base import ModelClient
+from superset_ai_agent.conversations.schemas import ConversationArtifact
+from superset_ai_agent.llm.base import ChatMessage, ModelClient
 from superset_ai_agent.semantic_layer.copilot.loop import (
     build_system_prompt,
     run_copilot_loop,
@@ -57,8 +58,10 @@ from superset_ai_agent.skills import get_skill, list_skills
 logger = logging.getLogger(__name__)
 
 #: Skills the copilot system prompt is grounded on (Wren parity: the agent
-#: follows these procedures). Surfaced read-only in the inspector.
-COPILOT_SKILLS = ("generate-mdl", "enrich-context")
+#: follows these procedures). Surfaced read-only in the inspector. ``onboarding``
+#: gives the agent the schema → base-MDL procedure so it can assist with (or drive)
+#: onboarding, matching Wren v2's onboarding/generate-mdl/enrich-context triad.
+COPILOT_SKILLS = ("onboarding", "generate-mdl", "enrich-context")
 
 
 class _MdlFileStoreLike(Protocol):
@@ -103,6 +106,7 @@ def run_copilot(
     user_message: str,
     attachments_text: str = "",
     instructions: list[str] | None = None,
+    history: list[ChatMessage] | None = None,
     model: str | None = None,
     max_steps: int = 8,
     max_correction_retries: int = 1,
@@ -114,7 +118,12 @@ def run_copilot(
     owner_id: str | None = None,
     retrieve_k: int = 8,
 ) -> Changeset:
-    """Run one agentic MDL-editing turn against the project's files."""
+    """Run one agentic MDL-editing turn against the project's files.
+
+    ``history`` carries prior conversation turns for multi-turn memory; it is
+    passed through to the loop unchanged (assembled by the caller from the
+    persisted thread via ``ConversationTurnService``).
+    """
 
     toolset = MdlToolset(
         [f for f in files if f.status != "deleted"],
@@ -133,10 +142,29 @@ def run_copilot(
         attachments_text=attachments_text,
         instructions=instructions,
         skills=[text for _name, text in _skill_texts()],
+        history=history,
         model=model,
         max_steps=max_steps,
         max_correction_retries=max_correction_retries,
         on_step=on_step,
+    )
+
+
+#: Conversation-artifact discriminator for a persisted Copilot changeset. A resumed
+#: thread re-renders past proposals from the artifact's generic ``payload``.
+CHANGESET_ARTIFACT_TYPE = "changeset"
+
+
+def changeset_to_artifact(changeset: Changeset) -> ConversationArtifact:
+    """Wrap a reviewable changeset as a generic conversation artifact.
+
+    Keeps the conversation layer agent-agnostic: the changeset rides in the
+    artifact's opaque ``payload`` (no typed import into ``conversations/``).
+    """
+
+    return ConversationArtifact(
+        type=CHANGESET_ARTIFACT_TYPE,
+        payload=changeset.model_dump(mode="json"),
     )
 
 

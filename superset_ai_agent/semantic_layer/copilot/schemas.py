@@ -153,6 +153,10 @@ class ChangesetApplyRequest(BaseModel):
     """Apply the user-accepted subset of a changeset's items as drafts."""
 
     items: list[ChangesetItem] = Field(default_factory=list)
+    #: When set, append an "applied N draft(s)" note to this Copilot thread so the
+    #: persisted transcript records the apply action (parity with the SQL agent's
+    #: execute-sql turn). Absent → stateless apply (no thread mutation).
+    conversation_id: str | None = None
 
 
 # -- Coverage audit (markdown → MDL information-loss detection) --------------

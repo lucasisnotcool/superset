@@ -124,7 +124,11 @@ class AgentConfig:
     wren_schema_document_candidate_limit: int = 5
     wren_schema_context_token_budget: int = 6000
     wren_require_schema_scope: bool = True
-    wren_max_document_bytes: int = 2_000_000
+    wren_max_document_bytes: int = 10_000_000
+    # Uploads above this size extract on a background thread instead of inline on
+    # the request (Office files / large PDFs can be slow). Status is tracked on the
+    # document row (uploaded -> extracting -> extracted/needs_ocr/error).
+    wren_document_async_threshold_bytes: int = 1_000_000
     # C4 (wren_enrich_and_retrieve.md): document chunking + relevance selection.
     # Ingestion retains whole sections up to this many chars (was a hard 20k head
     # cut); enrichment then assembles the schema-relevant sections within the prompt
@@ -140,6 +144,8 @@ class AgentConfig:
         "text/html",
         "application/pdf",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     )
     # Document RAG + CRUD (uploaded_documents_rag_and_crud.md). Gated off by
     # default; when on, uploaded documents are chunked + embedded at ingestion and
@@ -156,6 +162,10 @@ class AgentConfig:
     # sql_pairs / instructions store.
     wren_document_vector_index: WrenVectorIndexMode = "lancedb"
     wren_document_lancedb_path: str | None = None
+    # OCR seam (reserved). Image-only PDFs are tagged status="needs_ocr" today; no
+    # OCR is performed. A future OCR backend would gate on this flag and slot into
+    # ``extract_document``'s ``needs_ocr`` branch (document_format_tier1_plan.md D).
+    wren_document_ocr_enabled: bool = False
     semantic_access_mode: SemanticAccessMode = "superset_or_uri"
     semantic_full_access_grants_write: bool = False
     semantic_activation_requires_live_schema: bool = False
@@ -194,6 +204,10 @@ class AgentConfig:
     # Coverage audit: judge votes per run (majority wins, ties break conservatively).
     # >1 trades cost for stability against LLM non-determinism. Default 1.
     wren_copilot_coverage_votes: int = 1
+    # Prior Copilot turns fed back into the edit loop as conversation history
+    # (multi-turn memory). Mirrors ``max_history_messages`` for the SQL agent;
+    # windows the most recent N messages to bound token cost.
+    wren_copilot_max_history_messages: int = 12
     # Wren full-parity seams (see wren_full.md). All default to the
     # zero-dependency binding so the service starts unchanged; turning any of
     # these on requires durable semantic persistence (semantic_layer_store=
@@ -275,9 +289,7 @@ class AgentConfig:
     )
     log_level: str = "INFO"
     suppress_superset_logs: bool = True
-    local_superset_secret_key: str = (
-        "ai-agent-local-dev-secret-key-not-for-production"  # noqa: S105
-    )
+    local_superset_secret_key: str = "ai-agent-local-dev-secret-key-not-for-production"  # noqa: S105
 
     @classmethod
     def from_env(cls) -> "AgentConfig":
@@ -533,6 +545,12 @@ class AgentConfig:
                     str(cls.wren_max_document_bytes),
                 )
             ),
+            wren_document_async_threshold_bytes=int(
+                os.getenv(
+                    "WREN_DOCUMENT_ASYNC_THRESHOLD_BYTES",
+                    str(cls.wren_document_async_threshold_bytes),
+                )
+            ),
             wren_document_extract_char_limit=int(
                 os.getenv(
                     "WREN_DOCUMENT_EXTRACT_CHAR_LIMIT",
@@ -574,6 +592,10 @@ class AgentConfig:
             wren_document_lancedb_path=(
                 os.getenv("WREN_DOCUMENT_LANCEDB_PATH")
                 or cls.wren_document_lancedb_path
+            ),
+            wren_document_ocr_enabled=_env_bool(
+                "WREN_DOCUMENT_OCR_ENABLED",
+                cls.wren_document_ocr_enabled,
             ),
             semantic_access_mode=cast(
                 SemanticAccessMode,
@@ -628,6 +650,12 @@ class AgentConfig:
                 os.getenv(
                     "WREN_COPILOT_COVERAGE_VOTES",
                     str(cls.wren_copilot_coverage_votes),
+                )
+            ),
+            wren_copilot_max_history_messages=int(
+                os.getenv(
+                    "WREN_COPILOT_MAX_HISTORY_MESSAGES",
+                    str(cls.wren_copilot_max_history_messages),
                 )
             ),
             wren_engine=cast(

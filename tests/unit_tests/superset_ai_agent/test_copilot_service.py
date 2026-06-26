@@ -224,5 +224,8 @@ def test_build_inspector_includes_prompt_skills_tools_instructions() -> None:
     assert "Prefer revenue over sales" in inspector.system_prompt
     tool_names = {t.name for t in inspector.tools}
     assert "write_mdl_file" in tool_names
-    assert {s.name for s in inspector.skills} <= {"generate-mdl", "enrich-context"}
+    skill_names = {s.name for s in inspector.skills}
+    # The copilot carries Wren's onboarding/generate/enrich triad.
+    assert skill_names <= {"onboarding", "generate-mdl", "enrich-context"}
+    assert "onboarding" in skill_names
     assert inspector.instructions[0].instruction == "Prefer revenue over sales"

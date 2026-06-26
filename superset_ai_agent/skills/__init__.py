@@ -28,6 +28,8 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
+from superset_ai_agent.prompts.registry import strip_leading_metadata
+
 _SKILLS_DIR = Path(__file__).parent
 
 
@@ -45,4 +47,5 @@ def get_skill(name: str) -> str:
     path = _SKILLS_DIR / f"{safe}.md"
     if not path.is_file():
         raise FileNotFoundError(f"Unknown skill: {name}")
-    return path.read_text(encoding="utf-8")
+    # Strip the ASF license header so it never leaks into the agent system prompt.
+    return strip_leading_metadata(path.read_text(encoding="utf-8"))

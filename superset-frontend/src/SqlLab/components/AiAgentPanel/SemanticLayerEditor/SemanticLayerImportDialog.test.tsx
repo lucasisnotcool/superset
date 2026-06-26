@@ -80,6 +80,17 @@ const renderDialog = (
   return { onApplied, fileInput };
 };
 
+test('shows a deprecation notice steering enrichment to the MDL Copilot', () => {
+  renderDialog();
+
+  expect(
+    screen.getByTestId('enrichment-deprecation-notice'),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText('Enriching from a document? Use the MDL Copilot.'),
+  ).toBeInTheDocument();
+});
+
 test('stages a dropped JSON file as a new MDL draft with a diff', async () => {
   const { fileInput } = renderDialog();
   fetchMock.post(

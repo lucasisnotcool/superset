@@ -76,12 +76,18 @@ def run_copilot_loop(  # noqa: C901 - a tool-call+correction loop is irreducibly
     attachments_text: str = "",
     instructions: list[str] | None = None,
     skills: list[str] | None = None,
+    history: list[ChatMessage] | None = None,
     model: str | None = None,
     max_steps: int = 8,
     max_correction_retries: int = 1,
     on_step: StepSink | None = None,
 ) -> Changeset:
-    """Run the bounded agentic edit loop and return a reviewable changeset."""
+    """Run the bounded agentic edit loop and return a reviewable changeset.
+
+    ``history`` carries prior conversation turns (multi-turn memory). It is
+    prepended after the system prompt and before the new user turn, so the model
+    sees the running thread without changing the base prompt contract.
+    """
 
     steps: list[AgentStep] = []
 
@@ -102,6 +108,7 @@ def run_copilot_loop(  # noqa: C901 - a tool-call+correction loop is irreducibly
 
     messages: list[ChatMessage] = [
         ChatMessage(role="system", content=system_prompt),
+        *(history or []),
         ChatMessage(role="user", content=user_content),
     ]
 

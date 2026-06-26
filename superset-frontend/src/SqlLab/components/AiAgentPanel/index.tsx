@@ -1282,7 +1282,7 @@ const AiAgentPanel = () => {
                     <Button
                       aria-label={t('Insert')}
                       buttonStyle="tertiary"
-                      onClick={() => onInsertSql(artifact.sql)}
+                      onClick={() => onInsertSql(artifact.sql ?? '')}
                       disabled={!artifact.sql || !queryEditor?.id}
                       icon={<Icons.EditOutlined iconSize="m" />}
                     >
@@ -1291,7 +1291,7 @@ const AiAgentPanel = () => {
                     <Button
                       aria-label={t('Copy')}
                       buttonStyle="tertiary"
-                      onClick={() => onCopySql(artifact.sql)}
+                      onClick={() => onCopySql(artifact.sql ?? '')}
                       disabled={!artifact.sql}
                       icon={<Icons.CopyOutlined iconSize="m" />}
                     >

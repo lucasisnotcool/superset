@@ -100,31 +100,86 @@ const inspector = {
   instructions: [],
 };
 
-const installFetch = () => {
-  const fetchMockFn = jest.fn((input: RequestInfo | URL) => {
-    const url = String(input);
-    if (url.endsWith('/copilot/stream')) {
-      return Promise.resolve(streamResponse(SSE));
-    }
-    if (url.endsWith('/copilot/apply')) {
-      return Promise.resolve(jsonResponse(appliedFiles));
-    }
-    if (url.endsWith('/copilot/inspector')) {
-      return Promise.resolve(jsonResponse(inspector));
-    }
-    return Promise.resolve(jsonResponse({}));
-  });
+const conversation = (messages: unknown[] = []) => ({
+  id: 'conv-1',
+  title: messages.length ? 'model the orders table' : 'New chat',
+  owner_id: 'local',
+  kind: 'copilot',
+  project_id: 'project-1',
+  scope: { database_id: 1, dataset_ids: [] },
+  messages,
+  created_at: '2026-06-19T00:00:00Z',
+  updated_at: '2026-06-19T00:00:00Z',
+});
+
+// The thread the backend returns after a turn: user + assistant carrying the
+// changeset as a generic artifact (so a resumed thread re-renders the proposal).
+const threadAfterTurn = conversation([
+  {
+    id: 'm-user',
+    role: 'user',
+    content: 'model the orders table',
+    created_at: '2026-06-19T00:00:00Z',
+    artifacts: [],
+  },
+  {
+    id: 'm-assistant',
+    role: 'assistant',
+    content: 'Created the orders model.',
+    created_at: '2026-06-19T00:00:01Z',
+    artifacts: [
+      { id: 'a-1', type: 'changeset', sql: null, payload: changeset },
+    ],
+  },
+]);
+
+const installFetch = (opts: { history?: unknown[]; thread?: unknown } = {}) => {
+  const fetchMockFn = jest.fn(
+    (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.includes('/copilot/stream')) {
+        return Promise.resolve(streamResponse(SSE));
+      }
+      if (url.includes('/copilot/apply')) {
+        return Promise.resolve(jsonResponse(appliedFiles));
+      }
+      if (url.includes('/copilot/inspector')) {
+        return Promise.resolve(jsonResponse(inspector));
+      }
+      // A single conversation: GET resume, PATCH rename, DELETE.
+      if (/\/copilot\/conversations\/[^/]+$/.test(url)) {
+        return Promise.resolve(
+          jsonResponse(
+            method === 'DELETE'
+              ? { deleted: true }
+              : (opts.thread ?? threadAfterTurn),
+          ),
+        );
+      }
+      if (url.endsWith('/copilot/conversations')) {
+        return Promise.resolve(
+          jsonResponse(
+            method === 'POST' ? conversation() : (opts.history ?? []),
+          ),
+        );
+      }
+      return Promise.resolve(jsonResponse({}));
+    },
+  );
   global.fetch = fetchMockFn as unknown as typeof fetch;
   return fetchMockFn;
 };
 
 beforeEach(() => {
   process.env.SUPERSET_AI_AGENT_URL = 'http://agent.local/';
+  localStorage.clear();
 });
 
 afterEach(() => {
   process.env.SUPERSET_AI_AGENT_URL = originalAgentUrl;
   global.fetch = originalFetch;
+  localStorage.clear();
   jest.restoreAllMocks();
 });
 
@@ -132,7 +187,15 @@ test('streams the copilot, shows a diff, and applies accepted changes', async ()
   const fetchFn = installFetch();
   const onApplied = jest.fn();
 
-  render(<CopilotPanel projectId="project-1" canWrite onApplied={onApplied} />);
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      onApplied={onApplied}
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+    />,
+  );
 
   await userEvent.type(
     screen.getByTestId('copilot-input'),
@@ -153,11 +216,23 @@ test('streams the copilot, shows a diff, and applies accepted changes', async ()
     String(url).endsWith('/copilot/apply'),
   );
   expect(applyCall).toBeDefined();
+  // The apply carries the active thread id so the backend records an apply turn.
+  expect(JSON.parse(String((applyCall![1] as RequestInit).body))).toEqual({
+    items: expect.any(Array),
+    conversation_id: 'conv-1',
+  });
 });
 
 test('rejecting a file excludes it from apply', async () => {
   installFetch();
-  render(<CopilotPanel projectId="project-1" canWrite />);
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+    />,
+  );
 
   await userEvent.type(screen.getByTestId('copilot-input'), 'do it');
   await userEvent.click(screen.getByTestId('copilot-send'));
@@ -168,19 +243,253 @@ test('rejecting a file excludes it from apply', async () => {
   expect(screen.getByTestId('copilot-apply')).toBeDisabled();
 });
 
-test('disables the composer without write permission', () => {
+test('disables the composer without write permission', async () => {
   installFetch();
-  render(<CopilotPanel projectId="project-1" canWrite={false} />);
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite={false}
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+    />,
+  );
 
-  expect(screen.getByTestId('copilot-input')).toBeDisabled();
+  // Await the mount-time history fetch so its state update is wrapped in act().
+  expect(await screen.findByTestId('copilot-input')).toBeDisabled();
   expect(screen.getByTestId('copilot-send')).toBeDisabled();
 });
 
 test('opens the inspector drawer and loads agent context', async () => {
   installFetch();
-  render(<CopilotPanel projectId="project-1" canWrite />);
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+    />,
+  );
 
   await userEvent.click(screen.getByTestId('copilot-inspector-toggle'));
 
   expect(await screen.findByText('You are MDL Copilot.')).toBeInTheDocument();
+});
+
+test('empty layer shows an Onboard call-to-action instead of the chat', async () => {
+  installFetch();
+  const onOnboard = jest.fn();
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="empty"
+      onOnboard={onOnboard}
+    />,
+  );
+
+  // Bootstrap view, not chat: no composer, no coverage/inspector affordances.
+  expect(screen.getByTestId('copilot-not-ready')).toBeInTheDocument();
+  expect(screen.queryByTestId('copilot-input')).not.toBeInTheDocument();
+  expect(
+    screen.queryByTestId('copilot-coverage-toggle'),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.queryByTestId('copilot-inspector-toggle'),
+  ).not.toBeInTheDocument();
+
+  await userEvent.click(screen.getByTestId('copilot-onboard'));
+  expect(onOnboard).toHaveBeenCalledTimes(1);
+});
+
+test('indexing shows a progress view and no Onboard button', () => {
+  installFetch();
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="indexing"
+      onOnboard={jest.fn()}
+    />,
+  );
+
+  expect(screen.getByTestId('copilot-not-ready')).toBeInTheDocument();
+  expect(screen.queryByTestId('copilot-onboard')).not.toBeInTheDocument();
+  expect(screen.queryByTestId('copilot-input')).not.toBeInTheDocument();
+});
+
+test('failed onboarding shows the error and a Retry button', async () => {
+  installFetch();
+  const onOnboard = jest.fn();
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="failed"
+      readinessDetail="Access denied to schema sales."
+      onOnboard={onOnboard}
+    />,
+  );
+
+  expect(
+    screen.getByText(/Access denied to schema sales\./),
+  ).toBeInTheDocument();
+  await userEvent.click(screen.getByTestId('copilot-onboard'));
+  expect(onOnboard).toHaveBeenCalledTimes(1);
+});
+
+test('persists the turn to a thread and survives reload via the API', async () => {
+  // First mount: send a turn (creates a thread, persisted server-side).
+  const fetchFn = installFetch();
+  const { unmount } = render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+    />,
+  );
+  await userEvent.type(
+    screen.getByTestId('copilot-input'),
+    'model the orders table',
+  );
+  await userEvent.click(screen.getByTestId('copilot-send'));
+  expect(
+    await screen.findByText('Created the orders model.'),
+  ).toBeInTheDocument();
+  // The active thread id was stored so it can be resumed after a reload.
+  expect(
+    localStorage.getItem('sqllab:mdl-copilot:conversation:project-1'),
+  ).toBe('conv-1');
+  // A thread was created on the backend.
+  expect(
+    fetchFn.mock.calls.some(
+      ([url, init]) =>
+        String(url).endsWith('/copilot/conversations') &&
+        (init as RequestInit | undefined)?.method === 'POST',
+    ),
+  ).toBe(true);
+  unmount();
+
+  // Simulated reload: a fresh mount resumes the stored thread from the API.
+  installFetch();
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+    />,
+  );
+  // The transcript is restored from the backend (not from local state).
+  expect(
+    await screen.findByText('Created the orders model.'),
+  ).toBeInTheDocument();
+});
+
+test('"New chat" clears the transcript and forgets the active thread', async () => {
+  installFetch();
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+    />,
+  );
+  await userEvent.type(screen.getByTestId('copilot-input'), 'model orders');
+  await userEvent.click(screen.getByTestId('copilot-send'));
+  await screen.findByText('Created the orders model.');
+
+  await userEvent.click(screen.getByTestId('copilot-new-chat'));
+
+  expect(
+    screen.queryByText('Created the orders model.'),
+  ).not.toBeInTheDocument();
+  expect(
+    localStorage.getItem('sqllab:mdl-copilot:conversation:project-1'),
+  ).toBeNull();
+});
+
+test('resumes a past thread and renders its changeset read-only', async () => {
+  // History lists one prior thread; resuming it returns the persisted turn.
+  installFetch({
+    history: [
+      {
+        id: 'conv-1',
+        title: 'model the orders table',
+        owner_id: 'local',
+        kind: 'copilot',
+        project_id: 'project-1',
+        database_id: 1,
+        updated_at: '2026-06-19T00:00:00Z',
+        last_message: 'Created the orders model.',
+      },
+    ],
+  });
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+    />,
+  );
+
+  await userEvent.click(screen.getByTestId('copilot-history-toggle'));
+  await userEvent.click(await screen.findByTestId('copilot-history-item'));
+
+  // The prior proposal re-renders, but read-only: no Apply/Accept affordances.
+  expect(
+    await screen.findByText('Created the orders model.'),
+  ).toBeInTheDocument();
+  expect(screen.getByTestId('copilot-changeset')).toBeInTheDocument();
+  expect(screen.queryByTestId('copilot-apply')).not.toBeInTheDocument();
+  expect(screen.queryByTestId('copilot-accept')).not.toBeInTheDocument();
+});
+
+test('a stale stored thread that 404s is forgotten, not surfaced as an error', async () => {
+  // The active thread was deleted elsewhere: resume returns 404.
+  const fetchMockFn = jest.fn(
+    (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (/\/copilot\/conversations\/[^/]+$/.test(url)) {
+        return Promise.resolve({
+          ok: false,
+          status: 404,
+          text: () => Promise.resolve(JSON.stringify({ detail: 'not found' })),
+        } as unknown as Response);
+      }
+      if (url.endsWith('/copilot/conversations')) {
+        return Promise.resolve(
+          jsonResponse(method === 'POST' ? conversation() : []),
+        );
+      }
+      return Promise.resolve(jsonResponse({}));
+    },
+  );
+  global.fetch = fetchMockFn as unknown as typeof fetch;
+  localStorage.setItem('sqllab:mdl-copilot:conversation:project-1', 'gone-1');
+
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+    />,
+  );
+
+  // The empty-state prompt shows (fresh chat), and no error banner is rendered.
+  expect(
+    await screen.findByText(
+      /Ask the agent to model a table, add a metric, or fix validation\./,
+    ),
+  ).toBeInTheDocument();
+  await waitFor(() =>
+    expect(
+      localStorage.getItem('sqllab:mdl-copilot:conversation:project-1'),
+    ).toBeNull(),
+  );
+  expect(screen.getByTestId('copilot-input')).toBeInTheDocument();
 });

@@ -17,8 +17,33 @@
 
 from __future__ import annotations
 
+import re
 from functools import lru_cache
 from pathlib import Path
+
+_LEADING_HTML_COMMENT = re.compile(r"^\s*<!--.*?-->\s*", re.DOTALL)
+_LEADING_FRONTMATTER = re.compile(r"^\s*---\s*\n.*?\n---\s*\n", re.DOTALL)
+
+
+def strip_leading_metadata(text: str) -> str:
+    """Strip a leading license/HTML-comment block and/or YAML frontmatter.
+
+    Prompt and skill files carry an ASF license header (an HTML comment), and may
+    carry YAML frontmatter. That boilerplate is required in the *source file* but
+    must never reach the model's system prompt — there it only wastes tokens and
+    distracts the agent. Headers are removed at load time so the files stay
+    license-compliant while the injected text starts at the real content. Repeats
+    until stable so either ordering (comment-then-frontmatter or the reverse) is
+    handled.
+    """
+
+    previous = None
+    stripped = text
+    while previous != stripped:
+        previous = stripped
+        stripped = _LEADING_HTML_COMMENT.sub("", stripped, count=1)
+        stripped = _LEADING_FRONTMATTER.sub("", stripped, count=1)
+    return stripped.lstrip()
 
 
 @lru_cache(maxsize=32)
@@ -30,4 +55,4 @@ def get_prompt(name: str) -> str:
     """
 
     prompt_path = Path(__file__).parent / f"{name}.md"
-    return prompt_path.read_text(encoding="utf-8")
+    return strip_leading_metadata(prompt_path.read_text(encoding="utf-8"))

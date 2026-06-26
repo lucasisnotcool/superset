@@ -28,10 +28,11 @@ limitations under the License.
 
 **Status:** MDL Copilot (agentic CRUD + validation/correction loop) **and** the
 Coverage Audit (md→MDL information-loss detection) are **implemented, wired UI→API,
-and tested**. Verified green: **backend 547 unit tests** (`ruff`/`black`/`mypy`
-clean on new code), **frontend 144 `AiAgentPanel` jest tests / 22 suites**
+and tested**. Verified green: **backend 557 unit tests** (`ruff`/`black`/`mypy`
+clean on new code), **frontend 148 `AiAgentPanel` jest tests / 22 suites**
 (`prettier` clean). Everything is gated behind `WREN_COPILOT_ENABLED` (404 when
-off).
+off). The **unified onboarding/enrichment lifecycle** (readiness gate, `properties`
+preservation, enrichment-via-Copilot, onboarding-skill parity) is **§AB.10**.
 
 ## AB.1 How to run / verify
 
@@ -133,6 +134,11 @@ npx prettier --write <files>     # eslint v9 CLI can't load the legacy config st
 | POST | `/copilot/apply` | Persist accepted `ChangesetItem`s as drafts. |
 | POST | `/copilot/coverage` | Coverage audit (`CoverageRequest{document_id, model?, include_overreach}`) → `CoverageReport`. |
 | GET | `/documents` | List project source documents (added for the coverage picker). |
+| GET | `/readiness` | Project readiness (`SemanticProjectReadiness{status,ready,…}`); **not** copilot-gated (read-only, drives the spinner). §AB.10. |
+
+**Gate:** `POST /copilot` and `/copilot/stream` now also call `_require_project_ready`
+→ **409** (`detail.status` ∈ `empty`/`indexing`/`failed`) until the base MDL layer is
+onboarded and stable. §AB.10.
 
 Reused existing: `mdl-files` CRUD+validate, `documents`/`documents/text`+`enrich`,
 `onboard`/`reset`/`materialize`, `jobs/{id}`, `instructions`, `projects/resolve`,
@@ -168,6 +174,12 @@ conversations + `messages[/stream]`.
 - **Attachments**: inline long-context on the **copilot** request only; bypass the
   document/RAG pipeline by design. The legacy SqlLab chat does NOT take attachments
   (out of scope — separate agent).
+- **`properties` is never silently dropped** by the Copilot write path (§AB.10.1):
+  additive restore against the prior file version; the agent may add/change keys
+  but not delete an existing block.
+- **Readiness gate** (§AB.10.2): copilot edits are 409'd until the base MDL layer is
+  onboarded and stable; readiness is *derived* (active files + running jobs), no new
+  project column/migration.
 
 ## AB.7 Codebase facts / gotchas discovered (load-bearing for future work)
 
@@ -200,10 +212,23 @@ conversations + `messages[/stream]`.
 coverage + 404-gating + extracted-text fallback) · `test_copilot_coverage.py`
 (A/B/C/D, embedder, caching, multi-vote, over-reach, eval). FE: `api.test.ts`,
 `CopilotPanel.test.tsx`, `WorkspaceTree.test.tsx`, `CoverageReportModal.test.tsx`,
-`CoverageDialog.test.tsx`, `SemanticLayerEditor/index.test.tsx`.
+`CoverageDialog.test.tsx`, `SemanticLayerEditor/index.test.tsx`,
+`SemanticLayerEditor/SemanticLayerImportDialog.test.tsx`. §AB.10 adds: properties
+guard (`test_copilot_tools.py`), readiness gate (`test_copilot_api.py` +
+`SemanticLayerEditor/index.test.tsx` + `api.test.ts`), onboarding skill
+(`test_copilot_service.py`), enrichment deprecation notice
+(`SemanticLayerImportDialog.test.tsx`).
 
 ## AB.9 Remaining / deferred (with rationale)
 
+- **Onboarding UI gating & user flow** — planned in
+  [`plan_onboarding_gating_user_flow.md`](plan_onboarding_gating_user_flow.md):
+  remove auto-onboard, reset→delete-only, readiness-driven rail with a
+  separate-process bootstrap view vs chat. Not yet implemented.
+- **Copilot ↔ AI SQL agent parity** (conversation persistence + multi-turn) —
+  spec in [`plan_copilot_parity_spec.md`](plan_copilot_parity_spec.md). The Copilot
+  is currently stateless per request (no thread, no history); the SQL agent has a
+  full conversation stack. Not yet implemented; build on the gating plan.
 - **Snapshot/revert versioning** (`current_version_id`) — needs a new table +
   Alembic migration not verifiable here. Deploy-**preview** delivers the
   review-before-Deploy half.
@@ -221,6 +246,160 @@ coverage + 404-gating + extracted-text fallback) · `test_copilot_coverage.py`
 - Minor UI polish: deploy-preview has no editor button yet; coverage picker lists
   all documents regardless of extraction status; toggling the Copilot rail remounts
   (chat transcript not persisted — conversations store integration is the fix).
+
+## AB.10 Unified onboarding/enrichment lifecycle (this pass)
+
+Four changes that unify the schema-open → onboard → enrich → query flow and close
+the highest-severity gaps found in the end-to-end UX investigation. All read-only
+to existing contracts except where noted; no migration added.
+
+**1. `properties` preservation guard (data-loss fix — was the top risk).**
+The Copilot `write_mdl_file` path was a verbatim overwrite, so an LLM that
+re-emitted a file could silently drop the Superset-extension `properties`
+(`displayName`/`alias`/`synonyms`) that back governance + retrieval — and neither
+structural nor wren-core validation catches it. Now `tools.py:_write_mdl_file`
+runs `_preserve_superset_properties(prior, new)`: entities/columns matched by name,
+**additively** restore any dropped `properties` key (new values still win on
+collision), re-serialize only if a restore happened, and return a `note` so the
+agent learns it. Mirrors the enrichment path's `_merge_column_preserving_structure`.
+`prompts/mdl_copilot.md` gained a hard rule: never remove/empty an existing
+`properties` block. Tests: `test_copilot_tools.py` (restore, additive-edit,
+no-spurious-diff, no-invent-on-new-file).
+
+**2. Readiness gate (Copilot only edits a stable layer).**
+New `SemanticProjectReadiness` schema + `GET …/readiness` (read-only, not behind
+the copilot flag) derive status from existing signals — active MDL files +
+in-flight onboarding jobs — via `JobStore.list_for_project` (added to the protocol,
+`InMemoryJobStore`, `SqlAlchemyJobStore`). States: `empty`/`indexing`/`ready`/
+`failed`. `POST /copilot` and `/copilot/stream` call `_require_project_ready` →
+**409** until `ready`. **No migration**: readiness is derived, not a new column
+(`current_version_id` is still the dangling one). Frontend `SemanticLayerEditor`
+gates the Copilot rail on a locally-derived `copilotReady = hasActiveModels &&
+!isOnboarding` (single source of truth = `mdlFiles`, already reactive), showing a
+spinner (`indexing`) or an **Onboard** prompt (`empty`) via `data-test=
+copilot-not-ready`. Tests: `test_copilot_api.py` (readiness states, 409-until-ready,
+seed-active helper), `SemanticLayerEditor/index.test.tsx` (blocked vs mounted),
+`api.test.ts` (`getProjectReadiness`).
+
+**3. Enrichment via Copilot as the primary stream.**
+`prompts/mdl_copilot.md` now lists the document tools (`list_documents`/
+`search_documents`/`find_duplicate_documents`) and adds an "Enriching from
+documents" workflow (search → fold into descriptions/synonyms/metrics → reconcile
+conflicts) — previously the tools were callable but undocumented, so the agent
+rarely used them. The legacy `SemanticLayerImportDialog` shows a **deprecation
+notice** steering document-enrichment to the Copilot (legacy markdown-enrich path
+kept functional, not deleted). Tests: `test_copilot_api.py` (inspector advertises
+document tools + prompt steers them), `SemanticLayerImportDialog.test.tsx` (notice).
+
+**4. Onboarding-skill parity.**
+`COPILOT_SKILLS` now loads `("onboarding", "generate-mdl", "enrich-context")` —
+Wren v2's triad (the `onboarding` skill existed but was inert). `skills/onboarding.md`
+gained the Wren workspace layout (`models/`, `relationships.json`, `views/`) and the
+note that there is **no `mkdir`** — `write_mdl_file` creates folders implicitly from
+the path. Test: `test_copilot_service.py` (inspector includes the `onboarding` skill).
+
+**Wren-v2 reference (sources):** Wren authors a YAML directory (`models/<name>/
+metadata.yml`, `relationships.yml`, `views/`, `cubes/`, `instructions.md`) compiled
+to a single `target/mdl.json`; onboarding is introspection-driven (FKs → relationships)
+with LLM enrichment on top; `properties` is the documented metadata/extension bag;
+deploy passes an INDEXING gate before query. We mirror the *behavior* (JSON files,
+introspection seed, properties bag, readiness gate) with our storage.
+
+**Known gaps / risks after this pass:**
+- Binary (PDF/DOCX) **attachments** to the Copilot are still read client-side as
+  text (`file.text()`); for binaries, upload first then `search_documents`. Markdown/
+  text attachments are fine.
+- Readiness on the FE is **derived locally**, not polled from `/readiness`; the
+  endpoint exists for the backend gate + external consumers. Multi-worker/stale
+  cases are caught by the backend 409 (authority), not the FE derivation.
+- The `properties` guard cannot *delete* a property by design (governance fields
+  shouldn't be silently droppable); intentional removal needs a manual edit.
+- Onboarding itself is still the deterministic introspection path (Copilot is gated
+  *after* it); "Copilot drives onboarding" (item 1's stretch) remains the
+  deterministic-fallback design, now correctly gated.
+- Coverage/`deploy-preview`/`inspector` are **not** readiness-gated (read-only views
+  the editor needs while loading); only the editing turns are.
+
+## AB.11 Prompt network (authoritative map)
+
+Every prompt that drives an agent, plus the meta-prompts that drive agents to
+maintain those prompts. "Loaded by" = the exact runtime call site. All runtime
+prompt/skill files are loaded through `get_prompt`/`get_skill`, which **strip the
+leading ASF license header / frontmatter at load** (`prompts/registry.py`
+`strip_leading_metadata`) so no boilerplate reaches the model.
+
+### 1. MDL Copilot — the authoring agent (`semantic_layer/copilot/`)
+The effective system prompt is assembled per run by `loop.py:build_system_prompt`
+= **base + `## Skills` (all three, always-on) + `## Operator instructions`**.
+
+| Role | File | Loaded by |
+|---|---|---|
+| Base system prompt | `prompts/mdl_copilot.md` | `loop.py` `build_system_prompt` → `get_prompt("mdl_copilot")` |
+| Skill (always-on) | `skills/onboarding.md` | `service.py` `COPILOT_SKILLS` → `_skill_texts` → `get_skill` |
+| Skill (always-on) | `skills/generate-mdl.md` | same |
+| Skill (always-on) | `skills/enrich-context.md` | same |
+
+Skills are **injected context, not tool-called and not on-demand**. The Copilot's
+actions are tools (`tools.py`), not skills.
+
+### 2. Coverage Audit — Copilot sub-feature (`semantic_layer/copilot/coverage.py`)
+| File | Loaded by |
+|---|---|
+| `prompts/coverage_extract.md` | `coverage.py` `extract_claims` |
+| `prompts/coverage_judge.md` | `coverage.py` `judge_coverage` |
+| `prompts/coverage_overreach.md` | `coverage.py` `judge_overreach` |
+
+### 3. Deterministic onboarding / enrichment — non-Copilot (`integrations/wren/llm_client.py`)
+The base-model generation + document-enrichment path (structure from the catalog,
+semantics from the model). Distinct from the Copilot.
+
+| File | Loaded by |
+|---|---|
+| `prompts/wren_onboarding.md` | `llm_client.py` `_call_model("wren_onboarding")` (`generate_base_model`) |
+| `prompts/wren_enrichment.md` | `llm_client.py` `_call_model("wren_enrichment")` (`propose_mdl_from_document`) |
+
+### 4. AI SQL agent — the query/consume agents (`graph.py`, `conversation_graph.py`)
+Two LangGraph **structured-output** pipelines (no tools, no skills).
+
+| File | Loaded by | Node |
+|---|---|---|
+| `prompts/table_selection.md` | `graph.py` `get_prompt("table_selection")` | model selection |
+| `prompts/text_to_sql.md` | `graph.py` `get_prompt("text_to_sql")` | one-shot SQL draft (`SqlDraft`) |
+| `prompts/conversation.md` | `conversation_graph.py` (`get_prompt("conversation")`, 2 sites) | chat draft |
+| `prompts/sql_reflection.md` | `conversation_graph.py` `get_prompt("sql_reflection")` | reflect / review |
+
+### 5. Loaders & assembly (plumbing)
+- `prompts/registry.py` — `get_prompt`, `strip_leading_metadata` (header strip), lru-cached.
+- `skills/__init__.py` — `get_skill`, `list_skills` (same header strip).
+- `semantic_layer/copilot/loop.py` — `build_system_prompt` (base + skills + instructions).
+- `semantic_layer/copilot/service.py` — `COPILOT_SKILLS`, `_skill_texts`, `build_inspector`.
+
+### 6. Maintenance prompts (meta — agents that maintain the prompts above)
+Located at `superset_ai_agent/`. These are run by a human handing each to an agent
+instance; they are **not** loaded at runtime.
+
+| Meta-prompt | Drives | Targets |
+|---|---|---|
+| `codebase_prompt_for_agents_skill_maintenance.md` | 3 skill agents (onboarding / generate-mdl / enrich-context) | `skills/*.md` (+ `prompts/wren_onboarding.md`, `prompts/wren_enrichment.md`); copy-first from upstream baseline, tailor in place |
+| `codebase_prompt_for_agent_mdl_prompt_integration.md` | 1 integrator agent | sole editor of `prompts/mdl_copilot.md`; reconciles base↔skill layering |
+| `codebase_prompt_for_agent_query_maintenance.md` | 1 query agent | `prompts/{text_to_sql,conversation,sql_reflection,table_selection}.md`; evolve in place |
+
+Agent reports: `codebase_response_for_agents_skill_maintenance/{onboarding,generate-mdl,enrich-context,mdl_copilot_integration,query_agent}.md`.
+
+### 7. Upstream baselines (reference-only — NEVER loaded at runtime)
+`wren_upstream_skills/` holds verbatim Canner/WrenAI sources used by the
+maintenance agents as tailoring baselines (provenance headers; third-party — see
+its `README.md`). Files: `onboarding.SKILL.md`, `generate-mdl.SKILL.md`,
+`enrich-context.SKILL.md`, `enrich-context.references.{gap_catalog,cube_proposals}.md`,
+`AGENTS.md` (base-prompt structural baseline), `usage.SKILL.md` +
+`wren_langchain_prompt.py` (query baselines). Not removed during cleanup.
+
+### Cleanup performed this pass
+`skills/usage.md` was **removed** — it was inert (no skill-loading exists in the
+query graphs; the Copilot loads only the three `COPILOT_SKILLS`), an untailored
+paraphrase, and its genuine content is preserved in
+`wren_upstream_skills/usage.SKILL.md`. All other prompts have a live consumer
+(verified by grepping every `get_prompt(...)` / `get_skill(...)` call site).
 
 
 ## 0. Summary & intent
@@ -684,3 +863,64 @@ New:
 - `POST .../projects/{pid}/copilot/stream` (SSE)
 - `GET  .../projects/{pid}/copilot/inspector`
 - (extend) `POST .../conversations/{id}/messages[/stream]` with `attachments[]`
+
+## AB. As-built — Copilot conversation persistence & multi-turn (parity)
+
+Implements `plan_copilot_parity_impl.md` (companion `plan_copilot_parity_spec.md`,
+File 2; builds on File 1's always-mounted readiness rail). Brings the MDL Copilot
+to AI SQL parity on **durable persistence** and **multi-turn memory**, reusing the
+shared conversation stack rather than forking it.
+
+**Shared conversation stack (reused, made agent-agnostic).**
+- `ConversationArtifact` (`conversations/schemas.py`) is now generic: `type: str`
+  (was `Literal["sql"]`), `sql` optional, plus an opaque `payload: dict`. The
+  Copilot persists its `Changeset` as `type="changeset"` + `payload=changeset
+  .model_dump()` — no typed import into `conversations/`.
+- `Conversation`/`ConversationSummary` gained `kind` (`"sql"` default | `"copilot"`)
+  and `project_id`. Migration `0008_conversation_kind_project` adds the columns
+  (`server_default="sql"` backfills existing SQL threads; `project_id` is a plain
+  indexed column, not a FK).
+- `ConversationStore.create/list` take `kind`/`project_id`; `list(kind=…)` filters
+  so the AI SQL history (`GET /agent/conversations`, now `kind="sql"`) and the
+  project-scoped Copilot history stay separate. Both `InMemory` and `SqlAlchemy`
+  stores implement it.
+
+**The reusable seam (goal 2).** `conversations/turns.py::ConversationTurnService`
+owns the agent-agnostic turn choreography — `begin_turn` (append user + scope),
+`history_messages` (window prior turns → `ChatMessage[]`), `commit_turn` (append
+assistant + artifacts). A future agent reuses persistence + the turn lifecycle by
+supplying its own loop and artifact shape; it customizes only its graph/RAG.
+
+**Multi-turn into the loop.** `run_copilot_loop`/`run_copilot` take
+`history: list[ChatMessage]`, prepended after the system prompt and before the new
+user turn (no prompt-network change, per spec §7). Windowed by
+`WREN_COPILOT_MAX_HISTORY_MESSAGES` (default 12; mirrors `AI_AGENT_MAX_HISTORY_MESSAGES`).
+
+**Routes (project-scoped, parallel surface).**
+- `POST/GET .../projects/{pid}/copilot/conversations` (create / list)
+- `GET/PATCH/DELETE .../projects/{pid}/copilot/conversations/{cid}` (get / rename / delete)
+- `.../copilot` and `.../copilot/stream` now honor `conversation_id`: append the
+  user turn, feed history, persist the assistant turn + `changeset` artifact. Absent
+  `conversation_id` → stateless one-shot (backward compatible). Readiness 409 +
+  write-authz gates unchanged.
+
+**Frontend.** `CopilotPanel` is thread-backed: it creates/loads threads via the
+client, persists each turn server-side, and resumes the active thread across page
+reload (localStorage `sqllab:mdl-copilot:conversation:{projectId}`). Header gains
+New chat / History / Rename / Delete (AI SQL parity). Past changesets re-render
+**read-only** on resume; only the live turn's changeset is actionable (no stale
+Apply). Justified deviations from the SQL panel: keeps file attachments + changeset
+review (authoring-specific); omits the execution-mode dropdown (Copilot proposes
+drafts; Apply is the human gate).
+
+**Transcript-consistency hardening (gap closure).** The stored transcript never
+ends on a dangling user turn: the turn helper's `commit(content, changeset=None)`
+always pairs an assistant turn — the changeset summary + artifact on success, a
+failure note on error (non-streaming 502 and streaming `error` event), and
+`"Generation cancelled."` on client disconnect (`GeneratorExit`), mirroring the AI
+SQL stream contract. Apply is recorded too: `ChangesetApplyRequest.conversation_id`
+makes the apply route append an `"Applied N draft(s)."` assistant turn, so a resumed
+thread shows the proposal *was* applied (parity with the SQL agent's execute-sql
+turn). The FE client raises a typed `AgentApiError` carrying the HTTP status; a
+resumed thread that 404s (deleted elsewhere) is silently forgotten — stale
+localStorage cleared, fresh chat — instead of surfacing an error banner.

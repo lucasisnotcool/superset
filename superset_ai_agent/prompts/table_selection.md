@@ -11,7 +11,8 @@ Return a structured JSON object matching the provided schema: an object with a
 Rules:
 - Choose ONLY names that appear in `candidate_models` — never invent a name.
 - Pick the smallest coherent set that can answer the question, including models
-  needed for joins implied by the question. Prefer precision over breadth.
+  reached through the semantic layer's defined relationships when the question
+  implies a join. Prefer precision over breadth.
 - Return at most `max_models` names. If many seem equally relevant, prefer the
   higher-ranked (earlier) candidates.
 - If you cannot tell which are relevant, return the first `max_models` candidates

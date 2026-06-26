@@ -35,6 +35,7 @@ from superset_ai_agent.semantic_layer.document_retriever import (
 )
 from superset_ai_agent.semantic_layer.extractors import (
     DocumentExtractor,
+    NeedsOcrError,
     normalize_content_type,
 )
 from superset_ai_agent.semantic_layer.file_storage import DocumentStorage
@@ -44,7 +45,7 @@ from superset_ai_agent.semantic_layer.store import SemanticLayerStore
 logger = logging.getLogger(__name__)
 
 
-def create_document(
+def register_document(
     *,
     filename: str,
     content_type: str,
@@ -55,14 +56,14 @@ def create_document(
     config: AgentConfig,
     store: SemanticLayerStore,
     storage: DocumentStorage,
-    extractor: DocumentExtractor,
-    document_index: DocumentChunkIndex | None = None,
 ) -> SemanticDocument:
-    """Validate, store, and extract text from a semantic source document.
+    """Validate and persist a document's bytes + metadata row, without extracting.
 
-    When document indexing is enabled, a successfully-extracted document is split
-    into persisted chunks and (if a vector cache is available) embedded for
-    retrieval. Chunking is best-effort: a failure never fails the upload.
+    Fast path: validates, writes the original blob, and saves the row with
+    ``status="uploaded"``. Extraction (which may be slow for large PDFs / Office
+    files) is performed separately by :func:`extract_document`, inline for small
+    files or on a background thread for large ones. Raises ``ValueError`` on a
+    rejected (type/size) upload before any blob is written.
     """
 
     normalized_type = normalize_content_type(content_type)
@@ -87,12 +88,35 @@ def create_document(
         content=content,
     )
     document = document.model_copy(update={"storage_uri": storage_uri})
-    document = store.save_document(document, owner_id=owner_id)
+    return store.save_document(document, owner_id=owner_id)
 
+
+def extract_document(
+    document_id: str,
+    *,
+    owner_id: str = DEFAULT_OWNER_ID,
+    config: AgentConfig,
+    store: SemanticLayerStore,
+    storage: DocumentStorage,
+    extractor: DocumentExtractor,
+    document_index: DocumentChunkIndex | None = None,
+) -> SemanticDocument:
+    """Extract text for an already-registered document and update its status.
+
+    Reads the original bytes back from blob storage, so it is safe to run on a
+    background thread without holding the content in memory. Maps
+    ``NeedsOcrError`` to ``status="needs_ocr"`` (the OCR seam; no OCR is performed)
+    and any other failure to ``status="error"``. On success, when document indexing
+    is enabled, chunks are persisted and best-effort embedded. Never raises: a
+    failure is recorded on the document row.
+    """
+
+    document = store.get_document(document_id, owner_id=owner_id)
+    content = storage.read(document.storage_uri)
     try:
         extracted_text = extractor.extract_text(
-            filename=filename,
-            content_type=normalized_type,
+            filename=document.filename,
+            content_type=document.content_type,
             content=content,
         )
         warnings: list[str] = []
@@ -114,6 +138,16 @@ def create_document(
                 "updated_at": _utc_now(),
             }
         )
+    except NeedsOcrError as ex:
+        # Image-only / no text layer: tag for a future OCR backend rather than
+        # storing an empty document. The original bytes remain available.
+        document = document.model_copy(
+            update={
+                "status": "needs_ocr",
+                "warnings": [*document.warnings, str(ex)],
+                "updated_at": _utc_now(),
+            }
+        )
     except Exception as ex:  # pylint: disable=broad-except
         document = document.model_copy(
             update={
@@ -131,6 +165,50 @@ def create_document(
             owner_id=owner_id,
         )
     return saved
+
+
+def create_document(
+    *,
+    filename: str,
+    content_type: str,
+    content: bytes,
+    scope: ConversationScope,
+    project_id: str | None = None,
+    owner_id: str = DEFAULT_OWNER_ID,
+    config: AgentConfig,
+    store: SemanticLayerStore,
+    storage: DocumentStorage,
+    extractor: DocumentExtractor,
+    document_index: DocumentChunkIndex | None = None,
+) -> SemanticDocument:
+    """Validate, store, and extract text from a semantic source document (inline).
+
+    Convenience composition of :func:`register_document` + :func:`extract_document`
+    used by callers that want synchronous extraction (the text endpoint, small
+    uploads, tests). Large uploads route the two phases separately so extraction
+    can run in the background; see ``app.py``.
+    """
+
+    document = register_document(
+        filename=filename,
+        content_type=content_type,
+        content=content,
+        scope=scope,
+        project_id=project_id,
+        owner_id=owner_id,
+        config=config,
+        store=store,
+        storage=storage,
+    )
+    return extract_document(
+        document.id,
+        owner_id=owner_id,
+        config=config,
+        store=store,
+        storage=storage,
+        extractor=extractor,
+        document_index=document_index,
+    )
 
 
 def _index_document_chunks(

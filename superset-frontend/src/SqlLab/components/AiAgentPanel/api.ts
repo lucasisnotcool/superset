@@ -289,8 +289,12 @@ export interface ConversationScope {
 
 export interface ConversationArtifact {
   id: string;
-  type: 'sql';
-  sql: string;
+  // Free-form agent discriminator: 'sql' for the AI SQL agent, 'changeset' for
+  // the MDL Copilot. Non-SQL agents carry their data in `payload`.
+  type: string;
+  sql?: string | null;
+  // Opaque per-agent payload (e.g. a serialized Copilot Changeset).
+  payload?: Record<string, unknown> | null;
   explanation?: string | null;
   validation?: SqlValidationResult | null;
   execution_result?: ExecutionResult | null;
@@ -375,6 +379,8 @@ export interface Conversation {
   id: string;
   title: string;
   owner_id: string;
+  kind: string;
+  project_id?: string | null;
   scope: ConversationScope;
   messages: ConversationMessage[];
   created_at: string;
@@ -385,6 +391,8 @@ export interface ConversationSummary {
   id: string;
   title: string;
   owner_id: string;
+  kind: string;
+  project_id?: string | null;
   database_id: number;
   catalog_name?: string | null;
   schema_name?: string | null;
@@ -566,10 +574,36 @@ export interface Instruction {
   created_at: string;
 }
 
+export type SemanticProjectReadinessStatus =
+  | 'empty'
+  | 'indexing'
+  | 'ready'
+  | 'failed';
+
+export interface SemanticProjectReadiness {
+  status: SemanticProjectReadinessStatus;
+  ready: boolean;
+  has_active_models: boolean;
+  active_model_count: number;
+  running_job_id?: string | null;
+  detail: string;
+}
+
 const trimTrailingSlash = (url: string) => url.replace(/\/+$/, '');
 
 export const getAgentBaseUrl = () =>
   trimTrailingSlash(process.env.SUPERSET_AI_AGENT_URL || '/ai-agent');
+
+/** Error carrying the HTTP status so callers can branch (e.g. handle 404). */
+export class AgentApiError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'AgentApiError';
+    this.status = status;
+  }
+}
 
 const requestJson = async <T>(path: string, init?: RequestInit): Promise<T> => {
   const response = await fetch(`${getAgentBaseUrl()}${path}`, {
@@ -582,7 +616,10 @@ const requestJson = async <T>(path: string, init?: RequestInit): Promise<T> => {
   });
 
   if (!response.ok) {
-    throw new Error(await getAgentErrorMessage(response));
+    throw new AgentApiError(
+      await getAgentErrorMessage(response),
+      response.status,
+    );
   }
 
   return response.json() as Promise<T>;
@@ -596,7 +633,10 @@ const requestForm = async <T>(path: string, body: FormData): Promise<T> => {
   });
 
   if (!response.ok) {
-    throw new Error(await getAgentErrorMessage(response));
+    throw new AgentApiError(
+      await getAgentErrorMessage(response),
+      response.status,
+    );
   }
 
   return response.json() as Promise<T>;
@@ -1099,6 +1139,51 @@ export const getCopilotDeployPreview = (projectId: string) =>
     { method: 'GET' },
   );
 
+// -- Copilot conversations (persistent, multi-turn threads) -----------------
+// Parallel to the AI SQL conversation client but project-scoped. The shared
+// backend store tags these threads `kind="copilot"`.
+
+const copilotConversationsPath = (projectId: string) =>
+  `/agent/semantic-layer/projects/${projectId}/copilot/conversations`;
+
+export const createCopilotConversation = (projectId: string) =>
+  requestJson<Conversation>(copilotConversationsPath(projectId), {
+    method: 'POST',
+  });
+
+export const listCopilotConversations = (projectId: string) =>
+  requestJson<ConversationSummary[]>(copilotConversationsPath(projectId), {
+    method: 'GET',
+  });
+
+export const getCopilotConversation = (
+  projectId: string,
+  conversationId: string,
+) =>
+  requestJson<Conversation>(
+    `${copilotConversationsPath(projectId)}/${conversationId}`,
+    { method: 'GET' },
+  );
+
+export const updateCopilotConversationTitle = (
+  projectId: string,
+  conversationId: string,
+  title: string,
+) =>
+  requestJson<Conversation>(
+    `${copilotConversationsPath(projectId)}/${conversationId}`,
+    { method: 'PATCH', body: JSON.stringify({ title }) },
+  );
+
+export const deleteCopilotConversation = (
+  projectId: string,
+  conversationId: string,
+) =>
+  requestJson<{ deleted: boolean }>(
+    `${copilotConversationsPath(projectId)}/${conversationId}`,
+    { method: 'DELETE' },
+  );
+
 export type CoverageClaimKind =
   | 'definition'
   | 'metric'
@@ -1172,10 +1257,14 @@ export const runCopilot = (projectId: string, payload: CopilotTurnRequest) =>
 export const applyCopilotChangeset = (
   projectId: string,
   items: ChangesetItem[],
+  conversationId?: string | null,
 ) =>
   requestJson<MdlFile[]>(
     `/agent/semantic-layer/projects/${projectId}/copilot/apply`,
-    { method: 'POST', body: JSON.stringify({ items }) },
+    {
+      method: 'POST',
+      body: JSON.stringify({ items, conversation_id: conversationId ?? null }),
+    },
   );
 
 /**
@@ -1304,14 +1393,30 @@ export const onboardSemanticProject = (projectId: string) =>
     { method: 'POST' },
   );
 
+/**
+ * Whether the project's MDL base layer is onboarded and stable enough for the
+ * Copilot. The editor polls this to show a spinner (indexing) or an onboarding
+ * prompt (empty/failed) before mounting the Copilot.
+ */
+export const getProjectReadiness = (projectId: string) =>
+  requestJson<SemanticProjectReadiness>(
+    `/agent/semantic-layer/projects/${projectId}/readiness`,
+    { method: 'GET' },
+  );
+
 export const getSemanticJob = (projectId: string, jobId: string) =>
   requestJson<SemanticJob>(
     `/agent/semantic-layer/projects/${projectId}/jobs/${jobId}`,
     { method: 'GET' },
   );
 
+/**
+ * Reset a project: delete all MDL so it returns to the un-onboarded (`empty`)
+ * state. Does NOT re-onboard — onboarding is always an explicit user action.
+ * Resolves with the number of MDL files deleted.
+ */
 export const resetSemanticProject = (projectId: string) =>
-  requestJson<SemanticJob>(
+  requestJson<{ deleted: number }>(
     `/agent/semantic-layer/projects/${projectId}/reset`,
     { method: 'POST' },
   );
@@ -1352,14 +1457,12 @@ export const runOnboarding = async (
   pollSemanticJob(projectId, await onboardSemanticProject(projectId), opts);
 
 /**
- * Reset a project (delete all MDL, then re-onboard + auto-activate) and resolve
- * once the resulting onboarding job reaches a terminal state.
+ * Reset a project (delete all MDL). No onboarding job is created — the project
+ * returns to the `empty` state and the user re-onboards explicitly. Resolves
+ * with the number of MDL files deleted.
  */
-export const runReset = async (
-  projectId: string,
-  opts: { intervalMs?: number; attempts?: number } = {},
-): Promise<SemanticJob> =>
-  pollSemanticJob(projectId, await resetSemanticProject(projectId), opts);
+export const runReset = (projectId: string): Promise<{ deleted: number }> =>
+  resetSemanticProject(projectId);
 
 export const materializeSemanticProject = (projectId: string) =>
   requestJson<WrenMaterializationResult>(

@@ -20,3 +20,22 @@ Rules:
   next SQL should differ.
 - Respect execution_mode. In manual mode, a retry means proposing a new SQL
   artifact for user approval, not automatic execution.
+
+Diagnosing a failed observation (write layer-specific `retry_feedback`):
+- Classify the latest observation's failure before writing feedback, and address
+  one root cause at a time so the next attempt is verifiable:
+  - Semantic-layer (MDL) failure — the error names an unknown/wrong model or
+    column, an ambiguous column, or an undefined join/relationship. Tell the
+    drafter the exact correct name from `wren_context`, to qualify the ambiguous
+    column with its model, or to join only on a defined relationship. Do not let
+    it invent a name.
+  - Database/dialect failure — type mismatch, unsupported function, permission,
+    or timeout. Tell the drafter to add an explicit CAST, use a dialect-neutral
+    function, or simplify (fewer joins, tighter filters, a LIMIT).
+  - Empty result (no rows, no error) — the SQL ran but matched nothing. Tell the
+    drafter to relax an over-tight filter, widen a date range, or check a join
+    that dropped all rows, rather than re-issuing the same shape.
+  - Duplicate attempt — require a materially different query, not a cosmetic edit
+    of an attempted_sql entry.
+- If the observations already answer the question, prefer `answer` over a
+  speculative `retry` — do not burn retry budget polishing a sufficient result.

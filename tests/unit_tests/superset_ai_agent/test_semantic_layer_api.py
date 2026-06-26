@@ -404,9 +404,11 @@ def test_onboard_auto_activates_models_deterministic_fallback(tmp_path) -> None:
     assert poll.json()["status"] == "completed"
 
 
-def test_reset_deletes_all_mdl_then_reonboards(tmp_path) -> None:
-    # Reset is a clean slate: it soft-deletes every existing MDL file (base models,
-    # enrichment overlays, hand-edits) and re-onboards (auto-activating the base).
+def test_reset_deletes_all_mdl_and_does_not_reonboard(tmp_path) -> None:
+    # Reset is delete-only: it soft-deletes every existing MDL file (base models,
+    # enrichment overlays, hand-edits) and returns the project to the un-onboarded
+    # state. Onboarding is always an explicit, separate user action — reset never
+    # rebuilds automatically.
     client, _ = _client(tmp_path)
     project = _resolve_project(client)
     # A hand-authored extra file + an enrichment-style file that reset must remove.
@@ -421,19 +423,20 @@ def test_reset_deletes_all_mdl_then_reonboards(tmp_path) -> None:
 
     reset = client.post(f"/agent/semantic-layer/projects/{project['id']}/reset")
 
-    assert reset.status_code == 202
-    job = reset.json()
-    assert job["kind"] == "onboarding"
-    assert job["status"] == "completed"
-    # The library now holds only the re-onboarded base model(s); the legacy and
-    # enrichment files are gone, and the fresh base is active.
+    # 200 with a {"deleted": count} body — a plain delete, not an async job.
+    assert reset.status_code == 200, reset.text
+    assert reset.json() == {"deleted": 2}
+    # The library is now empty; nothing was re-onboarded.
     files = client.get(
         f"/agent/semantic-layer/projects/{project['id']}/mdl-files"
     ).json()
-    paths = {f["path"] for f in files}
-    assert "models/legacy.json" not in paths
-    assert enrich_file["path"] not in paths
-    assert any(f["status"] == "active" for f in files)
+    assert files == []
+    # Readiness falls back to `empty` (an inline runner would have produced active
+    # models had reset re-onboarded), confirming delete-only behavior.
+    readiness = client.get(
+        f"/agent/semantic-layer/projects/{project['id']}/readiness"
+    ).json()
+    assert readiness["status"] == "empty"
 
 
 def test_onboard_uses_llm_when_available(tmp_path) -> None:

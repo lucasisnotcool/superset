@@ -44,8 +44,15 @@ class InMemoryConversationStore:
         scope: ConversationScope,
         *,
         owner_id: str = DEFAULT_OWNER_ID,
+        kind: str = "sql",
+        project_id: str | None = None,
     ) -> Conversation:
-        conversation = Conversation(owner_id=owner_id, scope=scope)
+        conversation = Conversation(
+            owner_id=owner_id,
+            scope=scope,
+            kind=kind,
+            project_id=project_id,
+        )
         self._conversations[conversation.id] = conversation
         return conversation.model_copy(deep=True)
 
@@ -53,11 +60,15 @@ class InMemoryConversationStore:
         self,
         *,
         owner_id: str = DEFAULT_OWNER_ID,
+        kind: str | None = None,
+        project_id: str | None = None,
     ) -> list[ConversationSummary]:
         conversations = [
             conversation
             for conversation in self._conversations.values()
             if conversation.owner_id == owner_id
+            and (kind is None or conversation.kind == kind)
+            and (project_id is None or conversation.project_id == project_id)
         ]
         return [
             _summarize(conversation)
@@ -170,6 +181,8 @@ def _summarize(conversation: Conversation) -> ConversationSummary:
         id=conversation.id,
         title=conversation.title,
         owner_id=conversation.owner_id,
+        kind=conversation.kind,
+        project_id=conversation.project_id,
         database_id=conversation.scope.database_id,
         catalog_name=conversation.scope.catalog_name,
         schema_name=conversation.scope.schema_name,

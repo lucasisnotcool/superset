@@ -17,8 +17,26 @@ with a `files` array and an optional `warnings` array. Each file has a `path` an
 `manifest`. The `manifest` holds `models` (and optionally `relationships` and
 `metrics`). **All field names are camelCase, matching the engine's native shape.**
 
+## Add, never strip — emit the full preserved object
+When you re-emit a model or column, copy **every** existing `properties` key
+(`displayName`, `alias`, `synonyms`, `description`) and **every** physical field
+(`tableReference`, column `name`, `type`, `expression`, `relationship`,
+`isCalculated`, `notNull`) **forward verbatim**, then add your new semantics. Emit
+the full object, never a partial overlay. These keys are read by retrieval
+(`schema_retriever._semantic_terms`) and coverage scoring
+(`copilot/coverage._column_fact`); dropping one silently degrades both with no
+error. A server-side `*_preserving_structure` merge will restore what you drop, but
+treat that as defense-in-depth — be correct from the first token.
+
 ## What you MAY author (the semantic + derived layer)
-- **Descriptions:** model and column `description`s.
+- **Descriptions:** model and column `description`s. For column-local semantics,
+  append a greppable `[tag]` line per category to the `description` after the prose
+  (one tag per category, never duplicate an existing tag):
+  - `[enum] A=active, B=banned` — low-cardinality code columns (status/type/*_code).
+  - `[unit] cents (×0.01 = USD)` — `*_amount/_price/_qty/_rate/_bytes/_duration`.
+  - `[null] NULL = never logged in` — nullable columns where NULL carries meaning.
+  - `[magic] -1 = unknown; 0 = system` — numeric sentinel outliers.
+  - `[time] UTC; event time; month-end snapshot` — DATE/TIMESTAMP TZ/grain/event-vs-record.
 - **Display names & a single alias:** under a column's `properties`, set
   `displayName` (human label) and/or `alias` (one canonical short name).
 - **Calculated fields:** a *new* column with `"isCalculated": true` and an
@@ -48,14 +66,17 @@ with a `files` array and an optional `warnings` array. Each file has a `path` an
 - Keep every existing `tableReference`, column `name`, and column `type` intact. `type`
   is REQUIRED on every column (including calculated fields).
 
-## Synonyms — important
-The MDL has **no synonyms array**. For a single canonical label use `properties.alias`/
-`properties.displayName`. For *multiple* colloquial terms for one thing (e.g. "patty",
-"DU", "drive can" all meaning one drive unit), do **not** invent a field — instead list
-them in the column/model `description` in plain language ("Also called …"), and add a
-`warnings` entry suggesting an operator Instruction (e.g. *"Add instruction: when users
-say 'patty' they mean drive_unit"*). Operator Instructions are the durable home for
-colloquial vocabulary.
+## Synonyms — use `properties.synonyms`
+Colloquial vocabulary has a **native home in the MDL**: `properties.synonyms`, which
+`schema_retriever._semantic_terms` reads directly (and `_preserve_superset_properties`
+protects) so a question that says "patty" retrieves `drive_unit`. For a single canonical
+label use `properties.alias`/`properties.displayName`; for *multiple* colloquial terms
+for one thing (e.g. "patty", "DU", "drive can" all meaning one drive unit), set
+`properties.synonyms` to the list of terms (and you may also mention them in the
+`description` for human readers). Reserve a `warnings` "add an operator Instruction"
+suggestion for *rule-shaped* facts that have no MDL field — default filters
+(`exclude deleted_at IS NOT NULL`), external-ID maps, currency conventions, canonical-
+table preferences — since you cannot write the instruction store yourself.
 
 ## Output discipline
 - Return a single improved file in `files[0]`, unless the document clearly warrants
@@ -68,9 +89,9 @@ colloquial vocabulary.
   preferred semantics, unless it conflicts with the structure rules above.
 
 ## Exemplars
-- **Alias / displayName:** a column `{"name":"drive_unit","type":"VARCHAR","properties":
-  {"displayName":"Drive Unit","alias":"drive_unit","description":"One finished drive
-  unit; floor term 'patty'."}}`.
+- **Alias / displayName / synonyms:** a column `{"name":"drive_unit","type":"VARCHAR",
+  "properties":{"displayName":"Drive Unit","alias":"drive_unit","synonyms":["patty","DU",
+  "drive can"],"description":"One finished drive unit; floor term 'patty'."}}`.
 - **Filtered ratio as an aggregate calculated field:** `{"name":"golden_yield",
   "type":"DOUBLE","isCalculated":true,"expression":"SUM(CASE WHEN ticket_type='STANDARD'
   THEN units_completed - units_scrapped - units_reworked ELSE 0 END) / NULLIF(SUM(CASE

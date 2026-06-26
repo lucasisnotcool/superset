@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -60,11 +60,22 @@ class ConversationScope(BaseModel):
 
 
 class ConversationArtifact(BaseModel):
-    """Structured artifact emitted by the assistant."""
+    """Structured artifact emitted by an assistant turn.
+
+    Generic across agents: ``type`` is a free-form discriminator (``"sql"`` for the
+    AI SQL agent, ``"changeset"`` for the MDL Copilot). SQL-specific fields stay for
+    the SQL agent; agents whose output has a different shape carry it in the generic
+    ``payload`` dict (e.g. the Copilot stores ``Changeset.model_dump()`` there).
+    """
 
     id: str = Field(default_factory=_new_id)
-    type: Literal["sql"] = "sql"
-    sql: str
+    type: str = "sql"
+    #: SQL text for ``type="sql"`` artifacts; ``None`` for non-SQL agent artifacts.
+    sql: str | None = None
+    #: Opaque per-agent payload for artifacts whose shape is not SQL (e.g. a
+    #: Copilot ``Changeset`` serialized to JSON). Keeps the conversation layer
+    #: agent-agnostic — it never imports an agent's payload type.
+    payload: dict[str, Any] | None = None
     explanation: str | None = None
     validation: SqlValidation | None = None
     execution_result: ExecutionResult | None = None
@@ -97,6 +108,12 @@ class Conversation(BaseModel):
     id: str = Field(default_factory=_new_id)
     title: str = "New chat"
     owner_id: str = "local"
+    #: Agent discriminator: which agent owns this thread. Defaults to ``"sql"`` so
+    #: pre-existing AI SQL threads remain valid; the MDL Copilot uses ``"copilot"``.
+    kind: str = "sql"
+    #: Semantic project binding for project-scoped agents (the Copilot). ``None`` for
+    #: database-scoped SQL threads.
+    project_id: str | None = None
     scope: ConversationScope
     messages: list[ConversationMessage] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=_utc_now)
@@ -109,6 +126,8 @@ class ConversationSummary(BaseModel):
     id: str
     title: str
     owner_id: str
+    kind: str = "sql"
+    project_id: str | None = None
     database_id: int
     catalog_name: str | None = None
     schema_name: str | None = None

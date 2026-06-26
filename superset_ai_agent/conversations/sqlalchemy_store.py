@@ -54,14 +54,23 @@ class SqlAlchemyConversationStore:
         scope: ConversationScope,
         *,
         owner_id: str = DEFAULT_OWNER_ID,
+        kind: str = "sql",
+        project_id: str | None = None,
     ) -> Conversation:
-        conversation = Conversation(owner_id=owner_id, scope=scope)
+        conversation = Conversation(
+            owner_id=owner_id,
+            scope=scope,
+            kind=kind,
+            project_id=project_id,
+        )
         now = _utc_now()
         with self.session_factory() as session:
             model = AiAgentConversation(
                 id=conversation.id,
                 owner_id=owner_id,
                 title=conversation.title,
+                kind=kind,
+                project_id=project_id,
                 database_id=scope.database_id,
                 catalog_name=scope.catalog_name,
                 schema_name=scope.schema_name,
@@ -78,21 +87,29 @@ class SqlAlchemyConversationStore:
         self,
         *,
         owner_id: str = DEFAULT_OWNER_ID,
+        kind: str | None = None,
+        project_id: str | None = None,
     ) -> list[ConversationSummary]:
         with self.session_factory() as session:
+            query = (
+                select(AiAgentConversation)
+                .options(
+                    selectinload(AiAgentConversation.messages).selectinload(
+                        AiAgentMessage.artifacts
+                    )
+                )
+                .where(
+                    AiAgentConversation.owner_id == owner_id,
+                    AiAgentConversation.deleted_at.is_(None),
+                )
+            )
+            if kind is not None:
+                query = query.where(AiAgentConversation.kind == kind)
+            if project_id is not None:
+                query = query.where(AiAgentConversation.project_id == project_id)
             conversations = (
                 session.execute(
-                    select(AiAgentConversation)
-                    .options(
-                        selectinload(AiAgentConversation.messages).selectinload(
-                            AiAgentMessage.artifacts
-                        )
-                    )
-                    .where(
-                        AiAgentConversation.owner_id == owner_id,
-                        AiAgentConversation.deleted_at.is_(None),
-                    )
-                    .order_by(AiAgentConversation.updated_at.desc())
+                    query.order_by(AiAgentConversation.updated_at.desc())
                 )
                 .scalars()
                 .all()
@@ -299,6 +316,8 @@ def _conversation_from_model(model: AiAgentConversation) -> Conversation:
         id=model.id,
         title=model.title,
         owner_id=model.owner_id,
+        kind=model.kind,
+        project_id=model.project_id,
         scope=ConversationScope.model_validate(model.scope),
         messages=messages,
         created_at=model.created_at,
@@ -313,6 +332,8 @@ def _summarize_model(model: AiAgentConversation) -> ConversationSummary:
         id=model.id,
         title=model.title,
         owner_id=model.owner_id,
+        kind=model.kind,
+        project_id=model.project_id,
         database_id=model.database_id,
         catalog_name=model.catalog_name,
         schema_name=model.schema_name,
