@@ -35,16 +35,26 @@ logger = logging.getLogger()
 # without the deprecated driver. See apache/superset discussion #37428.
 try:
     import oracledb
+    from sqlalchemy.dialects import registry
 
-    # SQLAlchemy's cx_oracle dialect rejects drivers reporting a version below
-    # 5.2. python-oracledb's real version (2.x/3.x) fails that gate, so report the
-    # final cx_Oracle release to satisfy the legacy oracle:// and
-    # oracle+cx_oracle:// dialects. The native oracle+oracledb:// dialect ignores
-    # this. See python-oracledb's "Using in SQLAlchemy" compatibility note.
+    # python-oracledb is API-compatible with cx_Oracle. SQLAlchemy's cx_oracle
+    # dialect rejects drivers reporting a version below 5.2, so report the final
+    # cx_Oracle release, then alias the module so the dialect imports oracledb.
     oracledb.version = "8.3.0"
     sys.modules.setdefault("cx_Oracle", oracledb)
+
+    # SQLAlchemy 1.4 ships no native oracledb dialect (added in 2.0), so the
+    # oracle+oracledb:// URL that OracleEngineSpec advertises fails to load with
+    # NoSuchModuleError. Map that dialect name onto cx_oracle, which now drives
+    # python-oracledb via the alias above. This makes oracle://,
+    # oracle+cx_oracle:// and oracle+oracledb:// all resolve to the modern driver.
+    registry.register(
+        "oracle.oracledb",
+        "sqlalchemy.dialects.oracle.cx_oracle",
+        "OracleDialect_cx_oracle",
+    )
 except ModuleNotFoundError:
-    logger.info("oracledb not installed; skipping cx_Oracle compatibility shim")
+    logger.info("oracledb not installed; skipping Oracle driver compatibility shim")
 
 DATABASE_DIALECT = os.getenv("DATABASE_DIALECT")
 DATABASE_USER = os.getenv("DATABASE_USER")
