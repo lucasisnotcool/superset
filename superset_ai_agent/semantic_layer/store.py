@@ -62,6 +62,21 @@ class SemanticLayerStore(Protocol):
     ) -> list[SemanticDocument]:
         """List documents for a semantic project."""
 
+    def find_document_by_checksum(
+        self,
+        project_id: str,
+        checksum: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> SemanticDocument | None:
+        """Return the newest byte-identical document in a project, if any.
+
+        Backs content-hash dedup at upload time: a match means the same bytes were
+        already ingested into this project, so re-ingestion can be skipped. Scoped
+        to ``project_id`` + ``owner_id`` (same bytes in another project are a
+        distinct artifact). Returns ``None`` when no match exists.
+        """
+
     def get_document(
         self,
         document_id: str,

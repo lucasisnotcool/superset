@@ -109,6 +109,30 @@ class SqlAlchemySemanticLayerStore:
             )
             return [_document_from_model(model) for model in models]
 
+    def find_document_by_checksum(
+        self,
+        project_id: str,
+        checksum: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> SemanticDocument | None:
+        with self.session_factory() as session:
+            model = (
+                session.execute(
+                    select(AiAgentSemanticDocument)
+                    .where(
+                        AiAgentSemanticDocument.owner_id == owner_id,
+                        AiAgentSemanticDocument.project_id == project_id,
+                        AiAgentSemanticDocument.checksum == checksum,
+                    )
+                    .order_by(AiAgentSemanticDocument.created_at.desc())
+                    .limit(1)
+                )
+                .scalars()
+                .first()
+            )
+            return _document_from_model(model) if model is not None else None
+
     def get_document(
         self,
         document_id: str,

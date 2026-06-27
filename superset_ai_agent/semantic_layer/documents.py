@@ -73,6 +73,19 @@ def register_document(
         config=config,
     )
     checksum = hashlib.sha256(content).hexdigest()
+    # Content-hash dedup (best-practice idempotent ingestion): if these exact bytes
+    # were already ingested into this project, reuse the existing document instead
+    # of writing a second blob/row/chunk-set/vector-set. ``deduplicated`` signals
+    # the caller to skip (re-)extraction. Only project-scoped uploads dedup; the
+    # same bytes in a different project are a distinct artifact.
+    if project_id is not None:
+        existing = store.find_document_by_checksum(
+            project_id,
+            checksum,
+            owner_id=owner_id,
+        )
+        if existing is not None:
+            return existing.model_copy(update={"deduplicated": True})
     document = SemanticDocument(
         project_id=project_id,
         filename=filename,
@@ -200,6 +213,10 @@ def create_document(
         store=store,
         storage=storage,
     )
+    if document.deduplicated:
+        # Byte-identical to an existing project document: it is already extracted
+        # and indexed, so skip re-extraction and return the existing row as-is.
+        return document
     return extract_document(
         document.id,
         owner_id=owner_id,

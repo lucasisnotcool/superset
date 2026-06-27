@@ -75,7 +75,7 @@ import {
   validateMdlFile,
 } from '../api';
 import SemanticLayerStateBadge from '../SemanticLayerStateBadge';
-import SemanticLayerImportDialog from './SemanticLayerImportDialog';
+import useDocumentIngestion from '../useDocumentIngestion';
 import InstructionsPanel from './InstructionsPanel';
 import CopilotPanel from './CopilotPanel';
 import OnboardingTablePicker from './OnboardingTablePicker';
@@ -281,7 +281,6 @@ export default function SemanticLayerEditor({
   );
   const [editorPath, setEditorPath] = useState('models/new_model.json');
   const [editorValue, setEditorValue] = useState(defaultMdl);
-  const [showImportDialog, setShowImportDialog] = useState(false);
   const [showOnboardPicker, setShowOnboardPicker] = useState(false);
   const [showProvenance, setShowProvenance] = useState(false);
   const [isOnboarding, setIsOnboarding] = useState(false);
@@ -299,6 +298,11 @@ export default function SemanticLayerEditor({
   // storm). Synced on every render so it always holds the latest value.
   const activeFileIdRef = useRef<string | null>(null);
   activeFileIdRef.current = activeFileId;
+  // Hidden file input backing the "Upload document" button. Upload runs the SAME
+  // shared ingestion pipeline as the Copilot "Attach" (persist + dedup + vectorize
+  // + show in the tree); the only difference is it does not attach to a chat.
+  const uploadInputRef = useRef<HTMLInputElement>(null);
+  const { ingest, isIngesting } = useDocumentIngestion(project?.id ?? null);
 
   const activeFile = mdlFiles.find(file => file.id === activeFileId) || null;
   const selectedDocument =
@@ -414,6 +418,22 @@ export default function SemanticLayerEditor({
       );
     });
   }, [refresh, dispatch]);
+
+  // Upload document(s) through the shared ingestion pipeline, then refresh so the
+  // new files appear in the workspace tree. No chat involvement — this is the
+  // "Attach minus the conversation" ingress.
+  const handleUpload = useCallback(
+    async (event: ChangeEvent<HTMLInputElement>) => {
+      const files = Array.from(event.target.files ?? []);
+      event.target.value = '';
+      if (!files.length) return;
+      const results = await ingest(files);
+      if (results.length) {
+        await refresh();
+      }
+    },
+    [ingest, refresh],
+  );
 
   const withLoading = async (action: () => Promise<void>, fallback: string) => {
     setIsLoading(true);
@@ -890,18 +910,33 @@ export default function SemanticLayerEditor({
                       {allActive ? t('Deactivate all') : t('Activate all')}
                     </Button>
                     <Flex gap="small" wrap="wrap">
+                      <input
+                        ref={uploadInputRef}
+                        type="file"
+                        multiple
+                        accept=".json,.md,.markdown,.txt,.csv,.html,.pdf,.docx,.xlsx,.pptx"
+                        css={css`
+                          display: none;
+                        `}
+                        onChange={handleUpload}
+                        data-test="semantic-upload-input"
+                      />
                       <Tooltip
                         title={t(
                           'Upload a document (PDF, Word, Excel, PowerPoint, CSV, ' +
-                            'HTML) for the Copilot and viewer — or add MDL JSON / ' +
-                            'Markdown.',
+                            'HTML, Markdown, JSON). It is added to the workspace ' +
+                            'and vectorized for the Copilot and viewer.',
                         )}
                       >
                         <Button
                           buttonStyle="tertiary"
-                          disabled={!project || !canWrite || isLoading}
-                          onClick={() => setShowImportDialog(true)}
+                          disabled={
+                            !project || !canWrite || isLoading || isIngesting
+                          }
+                          loading={isIngesting}
+                          onClick={() => uploadInputRef.current?.click()}
                           icon={<Icons.UploadOutlined iconSize="m" />}
+                          data-test="semantic-upload-document"
                         >
                           {t('Upload document')}
                         </Button>
@@ -1045,7 +1080,7 @@ export default function SemanticLayerEditor({
                         readinessStatus={railStatus}
                         readinessDetail={readinessDetail}
                         onOnboard={() => setShowOnboardPicker(true)}
-                        onUpload={() => setShowImportDialog(true)}
+                        onDocumentsChanged={refresh}
                       />
                     </CopilotRail>
                   </Splitter.Panel>
@@ -1073,14 +1108,6 @@ export default function SemanticLayerEditor({
             ),
           },
         ]}
-      />
-      <SemanticLayerImportDialog
-        show={showImportDialog}
-        onHide={() => setShowImportDialog(false)}
-        projectId={project?.id ?? null}
-        existingFiles={mdlFiles}
-        canWrite={canWrite}
-        onApplied={refresh}
       />
       <OnboardingTablePicker
         open={showOnboardPicker}

@@ -58,6 +58,9 @@ import {
   streamCopilot,
   updateCopilotConversationTitle,
 } from '../api';
+import { SemanticDocument } from '../api';
+import useDocumentIngestion from '../useDocumentIngestion';
+import { getDocumentStatusMeta } from './documentStatus';
 import CopilotInspectorDialog from './CopilotInspectorDialog';
 import CoverageDialog from './CoverageDialog';
 
@@ -89,10 +92,10 @@ export interface CopilotPanelProps {
   /** Start onboarding the schema (the required first step on an empty layer). */
   onOnboard: () => void;
   /**
-   * Open the shared upload dialog so the user can add source documents for the
-   * Copilot to read. Optional: the panel renders without it (e.g. in isolation).
+   * Called after attaching persists one or more documents, so the editor can
+   * refresh its document list and the new files appear in the workspace tree.
    */
-  onUpload?: () => void;
+  onDocumentsChanged?: () => void;
 }
 
 type Decision = 'accepted' | 'rejected';
@@ -112,9 +115,10 @@ const CopilotPanel = ({
   readinessStatus,
   readinessDetail,
   onOnboard,
-  onUpload,
+  onDocumentsChanged,
 }: CopilotPanelProps) => {
   const theme = useTheme();
+  const { ingest, isIngesting } = useDocumentIngestion(projectId);
   const isReady = readinessStatus === 'ready';
   const [input, setInput] = useState('');
   // Persisted thread state: the transcript lives on the backend (survives
@@ -124,7 +128,12 @@ const CopilotPanel = ({
   const [pendingUser, setPendingUser] = useState<string | null>(null);
   const [summaries, setSummaries] = useState<ConversationSummary[]>([]);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
-  const [attachments, setAttachments] = useState<MessageAttachment[]>([]);
+  // Attaching now PERSISTS each file as a workspace document (upload + dedup +
+  // vectorize) — the same pipeline as the "Upload document" button — and then
+  // grounds the current turn by inlining the server-extracted text. We hold the
+  // persisted documents (not raw text) so a chip can show live status and the
+  // send payload is derived from the authoritative extraction.
+  const [attachedDocs, setAttachedDocs] = useState<SemanticDocument[]>([]);
   // The LIVE, actionable changeset for the just-completed turn. Past changesets
   // re-render read-only from message artifacts on resume (no stale Apply).
   const [changeset, setChangeset] = useState<Changeset | null>(null);
@@ -203,7 +212,7 @@ const CopilotPanel = ({
     setMessages([]);
     setPendingUser(null);
     setInput('');
-    setAttachments([]);
+    setAttachedDocs([]);
     setError(null);
     resetProposal();
     setIsHistoryOpen(false);
@@ -235,20 +244,40 @@ const CopilotPanel = ({
     async (event: ChangeEvent<HTMLInputElement>) => {
       const files = Array.from(event.target.files ?? []);
       event.target.value = '';
-      const next: MessageAttachment[] = [];
-      for (const file of files) {
-        // eslint-disable-next-line no-await-in-loop
-        const raw = await file.text();
-        next.push({
-          filename: file.name,
-          content_type: file.type || 'text/plain',
-          text: raw.slice(0, MAX_ATTACHMENT_CHARS),
-          truncated: raw.length > MAX_ATTACHMENT_CHARS,
-        });
-      }
-      setAttachments(prev => [...prev, ...next]);
+      if (!files.length) return;
+      // Persist through the shared ingestion pipeline (upload + dedup + vectorize).
+      const results = await ingest(files);
+      if (!results.length) return;
+      // Ground the current turn on what was persisted; de-dupe by id so a
+      // re-attached (deduplicated) document is not staged twice.
+      setAttachedDocs(prev => {
+        const seen = new Set(prev.map(doc => doc.id));
+        const additions = results
+          .map(result => result.document)
+          .filter(doc => !seen.has(doc.id));
+        return [...prev, ...additions];
+      });
+      // The new documents now live in the workspace; let the editor refresh so
+      // they appear in the file browser tree.
+      onDocumentsChanged?.();
     },
-    [],
+    [ingest, onDocumentsChanged],
+  );
+
+  // Build the inline grounding payload from the persisted documents' extracted
+  // text (server-side extraction handles PDF/DOCX/etc.), bounded per attachment.
+  const attachmentsForSend = useCallback(
+    (): MessageAttachment[] =>
+      attachedDocs.map(doc => {
+        const text = doc.extracted_text ?? '';
+        return {
+          filename: doc.filename,
+          content_type: doc.content_type,
+          text: text.slice(0, MAX_ATTACHMENT_CHARS),
+          truncated: text.length > MAX_ATTACHMENT_CHARS,
+        };
+      }),
+    [attachedDocs],
   );
 
   const handleSend = useCallback(async () => {
@@ -262,6 +291,7 @@ const CopilotPanel = ({
     setLiveSteps([]);
     try {
       const id = await ensureConversation();
+      const attachments = attachmentsForSend();
       const result = await streamCopilot(
         projectId,
         {
@@ -271,7 +301,7 @@ const CopilotPanel = ({
         },
         step => setLiveSteps(prev => [...prev, step]),
       );
-      setAttachments([]);
+      setAttachedDocs([]);
       // The turn (user + assistant + changeset artifact) is now persisted; reload
       // the thread so the transcript matches the durable record exactly.
       const conversation = await getCopilotConversation(projectId, id);
@@ -296,7 +326,7 @@ const CopilotPanel = ({
       setIsRunning(false);
     }
   }, [
-    attachments,
+    attachmentsForSend,
     ensureConversation,
     input,
     isRunning,
@@ -537,25 +567,6 @@ const CopilotPanel = ({
             chat for cross-agent parity. */}
         {isReady ? (
           <Flex gap={theme.sizeUnit}>
-            {onUpload ? (
-              <Tooltip
-                title={t(
-                  'Upload a document (PDF, Word, Excel, PowerPoint, CSV, HTML) ' +
-                    'for the Copilot to read.',
-                )}
-              >
-                <Button
-                  buttonStyle="link"
-                  buttonSize="small"
-                  icon={<Icons.UploadOutlined />}
-                  disabled={!canWrite}
-                  onClick={onUpload}
-                  data-test="copilot-upload"
-                >
-                  {t('Upload')}
-                </Button>
-              </Tooltip>
-            ) : null}
             <Button
               buttonStyle="link"
               buttonSize="small"
@@ -878,21 +889,33 @@ const CopilotPanel = ({
               padding: ${theme.sizeUnit * 2}px;
             `}
           >
-            {attachments.length > 0 ? (
-              <Flex wrap="wrap" gap={theme.sizeUnit}>
-                {attachments.map((attachment, index) => (
-                  <Tag
-                    // eslint-disable-next-line react/no-array-index-key
-                    key={`${attachment.filename}-${index}`}
-                    closable
-                    onClose={() =>
-                      setAttachments(prev => prev.filter((_, i) => i !== index))
-                    }
-                  >
-                    {attachment.filename}
-                    {attachment.truncated ? ` (${t('truncated')})` : ''}
-                  </Tag>
-                ))}
+            {attachedDocs.length > 0 ? (
+              <Flex
+                wrap="wrap"
+                gap={theme.sizeUnit}
+                data-test="copilot-attachments"
+              >
+                {attachedDocs.map(doc => {
+                  const meta = getDocumentStatusMeta(doc.status);
+                  return (
+                    <Tag
+                      key={doc.id}
+                      closable
+                      onClose={() =>
+                        setAttachedDocs(prev =>
+                          prev.filter(item => item.id !== doc.id),
+                        )
+                      }
+                    >
+                      {doc.filename}
+                      {/* Surface a status hint only when it needs attention
+                          (e.g. still extracting, needs OCR, or errored); a ready
+                          document shows just its name. The workspace tree is the
+                          live status surface — this is a snapshot at attach time. */}
+                      {meta.attention ? ` · ${meta.label}` : ''}
+                    </Tag>
+                  );
+                })}
               </Flex>
             ) : null}
             <Input.TextArea
@@ -918,23 +941,32 @@ const CopilotPanel = ({
                 ref={fileInputRef}
                 type="file"
                 multiple
-                accept=".json,.md,.txt,.yml,.yaml,.csv,text/*"
+                accept=".json,.md,.markdown,.txt,.csv,.html,.pdf,.docx,.xlsx,.pptx"
                 css={css`
                   display: none;
                 `}
                 onChange={handleAttach}
                 data-test="copilot-attach-input"
               />
-              <Button
-                buttonStyle="link"
-                buttonSize="small"
-                icon={<Icons.UploadOutlined />}
-                disabled={!canWrite || isRunning}
-                onClick={() => fileInputRef.current?.click()}
-                data-test="copilot-attach"
+              <Tooltip
+                title={t(
+                  'Attach a document (PDF, Word, Excel, PowerPoint, CSV, HTML, ' +
+                    'Markdown, JSON). It is added to the workspace, vectorized, ' +
+                    'and used to ground this chat.',
+                )}
               >
-                {t('Attach')}
-              </Button>
+                <Button
+                  buttonStyle="link"
+                  buttonSize="small"
+                  icon={<Icons.UploadOutlined />}
+                  disabled={!canWrite || isRunning || isIngesting}
+                  loading={isIngesting}
+                  onClick={() => fileInputRef.current?.click()}
+                  data-test="copilot-attach"
+                >
+                  {t('Attach')}
+                </Button>
+              </Tooltip>
               <Button
                 buttonStyle="primary"
                 buttonSize="small"

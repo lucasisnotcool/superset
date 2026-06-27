@@ -188,13 +188,23 @@ so **Phase 2–4 are unblocked**.
   so document features can ship independent of the copilot loop. Existing upload/list/get
   routes stay ungated (unchanged).
 
-## 0.7 Two document lanes — keep them distinct
-- **Ephemeral (Copilot FR7):** message attachments, inlined into the prompt,
-  no RAG, no persistence. Owned by Copilot.
-- **Persistent (this plan):** uploaded `raw/` documents, chunked + embedded +
-  indexed, viewable and agent-mutable. Owned here.
-- *Future convergence (out of scope):* an attachment could be "promoted" to a
-  persistent document; note as a seam, do not build.
+## 0.7 Document lanes — NOW UNIFIED (see `plan_unified_attach_ingestion_spec.md`)
+> ⚠️ **Updated:** the two lanes below were merged. The "future convergence" seam
+> was built. Copilot **Attach** and the **Upload document** button now both run
+> the single persistent pipeline via `useDocumentIngestion` (FE) →
+> `uploadProjectSourceDocument` → `register_document` (content-hash dedup) →
+> extract + vectorize. The only difference: Attach also inlines the
+> server-extracted text into the current turn; Upload does not. There is no longer
+> an ephemeral, non-persisted attachment lane, and the staging/classification
+> dialog (`SemanticLayerImportDialog`) was deleted. Historical description kept
+> below for intent.
+- **Ephemeral (Copilot FR7) — RETIRED:** message attachments used to be inlined
+  with no RAG/persistence. Attach now persists + vectorizes like any upload.
+- **Persistent:** uploaded `raw/` documents, chunked + embedded + indexed,
+  viewable and agent-mutable — now the *only* lane.
+- **Dedup:** `register_document`/`create_document` short-circuit on a byte-identical
+  existing document (per-project, owner-isolated), returning it with a transient
+  `deduplicated=True` and skipping re-extract/re-index.
 
 ---
 

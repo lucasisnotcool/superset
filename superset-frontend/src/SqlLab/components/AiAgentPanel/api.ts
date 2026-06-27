@@ -352,6 +352,13 @@ export interface SemanticDocument {
   error?: string | null;
   created_at: string;
   updated_at: string;
+  /**
+   * Transient, response-only flag set by the upload endpoint when the bytes were
+   * byte-identical to an existing document in the project (content-hash dedup), so
+   * no new document/chunks/vectors were created. Never present on a reloaded
+   * document — only on the immediate upload response.
+   */
+  deduplicated?: boolean;
 }
 
 export interface DocumentChunk {

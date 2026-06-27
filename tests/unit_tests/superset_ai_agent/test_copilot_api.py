@@ -231,6 +231,42 @@ def test_copilot_stream_emits_progress_then_complete(tmp_path) -> None:
     assert "models/moves.json" in complete
 
 
+def test_copilot_stream_preflight_failure_returns_diagnosable_502(
+    tmp_path, monkeypatch
+) -> None:
+    # Request-scoped inputs (conversation store, schema, instructions) resolve
+    # *before* streaming starts; a StreamingResponse has no way to change its
+    # status once the body iterator is entered. A failure there must surface as a
+    # 502 carrying the cause, not a bare 500 with an empty body and no log.
+    from superset_ai_agent.conversations.turns import ConversationTurnService
+
+    client = _client(tmp_path)
+    project = _resolve(client)
+    pid = project["id"]
+    _seed_active_model(client, pid)
+
+    conversation = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot/conversations"
+    )
+    assert conversation.status_code == 200, conversation.text
+    conversation_id = conversation.json()["id"]
+
+    def _boom(self, *args, **kwargs):
+        raise RuntimeError("conversation store unavailable")
+
+    monkeypatch.setattr(ConversationTurnService, "begin_turn", _boom)
+
+    response = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot/stream",
+        json={"message": "model the moves table", "conversation_id": conversation_id},
+    )
+
+    assert response.status_code == 502, response.text
+    detail = response.json()["detail"]
+    assert "Copilot preflight failed" in detail
+    assert "conversation store unavailable" in detail
+
+
 def test_copilot_deploy_preview_lists_pending_drafts(tmp_path) -> None:
     client = _client(tmp_path)
     project = _resolve(client)
@@ -450,9 +486,10 @@ def test_reset_deletes_all_mdl_and_does_not_reonboard(tmp_path) -> None:
         json={"path": "models/extra.json", "content": MOVES},
     )
     assert extra.status_code == 200, extra.text
-    assert client.get(
-        f"/agent/semantic-layer/projects/{pid}/readiness"
-    ).json()["status"] == "ready"
+    assert (
+        client.get(f"/agent/semantic-layer/projects/{pid}/readiness").json()["status"]
+        == "ready"
+    )
 
     # Reset is a plain delete: 200 with a {"deleted": count} body, no async job.
     reset = client.post(f"/agent/semantic-layer/projects/{pid}/reset")
@@ -465,9 +502,7 @@ def test_reset_deletes_all_mdl_and_does_not_reonboard(tmp_path) -> None:
 
     # ...and the project is back to `empty` — NOT `indexing`/`ready`, which proves
     # reset did not kick off onboarding (the inline runner would have completed it).
-    readiness = client.get(
-        f"/agent/semantic-layer/projects/{pid}/readiness"
-    ).json()
+    readiness = client.get(f"/agent/semantic-layer/projects/{pid}/readiness").json()
     assert readiness["status"] == "empty"
     assert readiness["ready"] is False
 
@@ -487,9 +522,10 @@ def test_reset_on_empty_project_is_a_noop(tmp_path) -> None:
     reset = client.post(f"/agent/semantic-layer/projects/{pid}/reset")
     assert reset.status_code == 200, reset.text
     assert reset.json() == {"deleted": 0}
-    assert client.get(
-        f"/agent/semantic-layer/projects/{pid}/readiness"
-    ).json()["status"] == "empty"
+    assert (
+        client.get(f"/agent/semantic-layer/projects/{pid}/readiness").json()["status"]
+        == "empty"
+    )
 
 
 # -- Copilot conversations: persistent, multi-turn threads (parity spec) ---------
@@ -501,9 +537,7 @@ def test_copilot_conversation_turn_persists_messages_and_changeset(tmp_path) -> 
     pid = project["id"]
     _seed_active_model(client, pid)
 
-    created = client.post(
-        f"/agent/semantic-layer/projects/{pid}/copilot/conversations"
-    )
+    created = client.post(f"/agent/semantic-layer/projects/{pid}/copilot/conversations")
     assert created.status_code == 200, created.text
     conversation = created.json()
     assert conversation["kind"] == "copilot"
@@ -831,8 +865,6 @@ def test_copilot_apply_without_conversation_id_does_not_touch_threads(
     assert apply.status_code == 200, apply.text
     # Stateless apply created no thread.
     assert (
-        client.get(
-            f"/agent/semantic-layer/projects/{pid}/copilot/conversations"
-        ).json()
+        client.get(f"/agent/semantic-layer/projects/{pid}/copilot/conversations").json()
         == []
     )

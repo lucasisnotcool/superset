@@ -26,10 +26,19 @@ import {
 } from 'spec/helpers/testing-library';
 import SemanticLayerEditor from '.';
 
+// Stub the shared ingestion hook so the Upload-document wiring can be asserted
+// without real uploads; its own behavior is covered in useDocumentIngestion.test.
+const mockIngest = jest.fn();
+jest.mock('../useDocumentIngestion', () => ({
+  __esModule: true,
+  default: () => ({ ingest: mockIngest, isIngesting: false }),
+}));
+
 const originalAgentUrl = process.env.SUPERSET_AI_AGENT_URL;
 
 beforeEach(() => {
   process.env.SUPERSET_AI_AGENT_URL = 'http://agent.local/';
+  mockIngest.mockReset();
 });
 
 afterEach(() => {
@@ -383,8 +392,26 @@ test('registers an unregistered physical table from the picker, then onboards it
   });
 });
 
-test('opens the upload-document dialog with a drop zone', async () => {
+test('Upload document ingests files through the shared pipeline (no dialog)', async () => {
   mockBaseRoutes([mdlFile('a', 'models/a.json')]);
+  mockIngest.mockResolvedValue([
+    {
+      document: {
+        id: 'doc-1',
+        filename: 'glossary.csv',
+        content_type: 'text/csv',
+        size_bytes: 10,
+        status: 'extracted',
+        scope: { database_id: 1, dataset_ids: [] },
+        checksum: 'abc',
+        storage_uri: 'mem://x',
+        warnings: [],
+        created_at: '',
+        updated_at: '',
+      },
+      deduplicated: false,
+    },
+  ]);
 
   render(
     <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="main" />,
@@ -395,14 +422,22 @@ test('opens the upload-document dialog with a drop zone', async () => {
     expect(screen.getByText('Database 1.prod.main')).toBeInTheDocument();
   });
 
-  // The discoverable "Upload document" entry opens the shared upload dialog (G1b).
-  await userEvent.click(
+  // The button stays, but the legacy staging dialog is gone — Upload now runs the
+  // same persist+vectorize pipeline as Copilot Attach, just without a chat.
+  expect(
     screen.getByRole('button', { name: /Upload document/i }),
-  );
+  ).toBeInTheDocument();
+  expect(
+    screen.queryByTestId('semantic-import-dropzone'),
+  ).not.toBeInTheDocument();
 
-  await waitFor(() => {
-    expect(screen.getByTestId('semantic-import-dropzone')).toBeInTheDocument();
-  });
+  // Choosing a file routes it through the shared ingestion hook.
+  await userEvent.upload(
+    screen.getByTestId('semantic-upload-input'),
+    new File(['revenue'], 'glossary.csv', { type: 'text/csv' }),
+  );
+  await waitFor(() => expect(mockIngest).toHaveBeenCalledTimes(1));
+  expect(mockIngest).toHaveBeenCalledWith([expect.any(File)]);
 });
 
 test('Reset confirms, deletes all MDL, and does NOT re-onboard', async () => {

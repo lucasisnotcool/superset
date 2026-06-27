@@ -143,6 +143,32 @@ def test_upload_indexes_chunks(tmp_path) -> None:
     assert chunks[0]["chunk_index"] == 0
 
 
+def test_upload_dedups_identical_bytes(tmp_path) -> None:
+    client = _client(tmp_path)
+    project = _project(client)
+
+    first = _upload(client, project["id"])
+    assert first["deduplicated"] is False
+
+    # Re-uploading byte-identical content reuses the existing document (R4).
+    second_response = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/documents",
+        files={"file": ("glossary-renamed.md", _DOC, "text/markdown")},
+    )
+    assert second_response.status_code == 200, second_response.text
+    second = second_response.json()
+    assert second["deduplicated"] is True
+    assert second["id"] == first["id"]
+
+    # No duplicate chunk set was produced — still one document's worth of chunks.
+    chunks = client.get(f"/agent/semantic-layer/documents/{first['id']}/chunks").json()
+    assert len(chunks) == 4
+
+    # A reload of the canonical document does not carry the transient flag.
+    reloaded = client.get(f"/agent/semantic-layer/documents/{first['id']}").json()
+    assert reloaded["deduplicated"] is False
+
+
 def test_download_returns_raw_bytes(tmp_path) -> None:
     client = _client(tmp_path)
     project = _project(client)

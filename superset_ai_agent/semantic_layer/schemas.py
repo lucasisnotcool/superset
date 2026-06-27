@@ -109,6 +109,11 @@ class SemanticDocument(BaseModel):
     error: str | None = None
     created_at: datetime = Field(default_factory=_utc_now)
     updated_at: datetime = Field(default_factory=_utc_now)
+    # Transient, response-only flag: set True when an upload was short-circuited to
+    # an existing byte-identical document (content-hash dedup). It is never
+    # persisted — the storage mapper does not read it, so a reloaded document is
+    # always ``deduplicated=False``.
+    deduplicated: bool = False
 
 
 class SemanticLayerState(BaseModel):

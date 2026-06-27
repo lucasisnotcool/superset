@@ -252,56 +252,121 @@ existing `_document_from_model` ([`sqlalchemy_store.py`](semantic_layer/sqlalche
 > Work top-to-bottom. Each phase lists its **blockers** (what must be true to
 > start) and **unblocks** (what it enables). `[ ]` todo · `[x]` done.
 
-### Phase 0 — Verify baseline (no code)
-- [ ] Re-grep all `file:line` anchors in §5 (tree may have moved). **Blocker:** none.
-- [ ] Confirm `register_document` is the sole checksum site and all 3 upload
+### Phase 0 — Verify baseline (no code) ✅ DONE
+- [x] Re-grep all `file:line` anchors in §5 (tree may have moved). **Blocker:** none.
+- [x] Confirm `register_document` is the sole checksum site and all 3 upload
       routes funnel through it ([`app.py:818,2396,2469`]). **Unblocks:** P1.
 
-### Phase 1 — Backend dedup primitive
+### Phase 1 — Backend dedup primitive ✅ DONE
 > **Blocker:** Phase 0. **Independent of all frontend phases.**
-- [ ] BE-1 add `find_document_by_checksum` to `SemanticLayerStore` Protocol.
-- [ ] BE-2 implement on `sqlalchemy_store.py`.
-- [ ] BE-3 implement on `memory.py`.
-- [ ] BE-5 add transient `deduplicated: bool = False` to `SemanticDocument`.
-- [ ] BE-4 short-circuit in `register_document` (uses BE-1, BE-5).
-- [ ] BE-6 early-return in `upload_project_source_document` (uses BE-4).
-- [ ] Backend tests (§9). **Unblocks:** P2 can rely on the `deduplicated` flag.
-- [ ] `ruff` + `ruff-format` + `mypy` clean on touched files.
+- [x] BE-1 add `find_document_by_checksum` to `SemanticLayerStore` Protocol.
+- [x] BE-2 implement on `sqlalchemy_store.py`.
+- [x] BE-3 implement on `memory.py`.
+- [x] BE-5 add transient `deduplicated: bool = False` to `SemanticDocument`.
+- [x] BE-4 short-circuit in `register_document` (uses BE-1, BE-5). **Also** added
+      the same guard in `create_document` so the text route + small-upload path
+      dedup too (not just the async upload route).
+- [x] BE-6 early-return in `upload_project_source_document` (uses BE-4).
+- [x] Backend tests (§9): store (6, parametrized × both stores), `create_document`
+      (5: dedup / no-reindex spy / distinct-project / no-project), API route (1).
+      Full `tests/unit_tests/superset_ai_agent/` = **804 passed, 11 skipped**.
+- [x] `ruff` + `ruff-format` clean on touched files. (`mypy` not installed in this
+      venv — defer to CI, per `uploaded_documents_rag_and_crud.md` §8.5.)
 
-### Phase 2 — Shared frontend ingestion hook
+### Phase 2 — Shared frontend ingestion hook ✅ DONE
 > **Blocker:** P1 merged/available (the hook reads `deduplicated`). **Unblocks:** P3, P4.
-- [ ] FE-2 ensure `SemanticDocument` TS type has `deduplicated?: boolean`.
-- [ ] FE-1 create `useDocumentIngestion.ts` (upload + dedup-aware toasts).
-- [ ] `useDocumentIngestion.test.ts`.
+- [x] FE-2 `SemanticDocument` TS type has `deduplicated?: boolean`.
+- [x] FE-1 created `useDocumentIngestion.ts` (upload + dedup-aware toasts).
+- [x] `useDocumentIngestion.test.ts` (4 tests: upload / dedup-reuse / per-file
+      error isolation / no-project no-op). Green.
 
-### Phase 3 — Wire Copilot "Attach" onto the pipeline (R1)
+### Phase 3 — Wire Copilot "Attach" onto the pipeline (R1) ✅ DONE
 > **Blocker:** P2. **Depends on** FE-1, FE-2.
-- [ ] FE-3 rewrite `handleAttach` (ingest + inline `MessageAttachment` + chip);
-      broaden `accept` (D9).
-- [ ] FE-4 add `onDocumentsChanged`; remove `onUpload` prop + header "Upload" button.
-- [ ] FE-6 pass `onDocumentsChanged={refresh}` from `index.tsx`.
-- [ ] `CopilotPanel.test.tsx` updated.
+- [x] FE-3 rewrote `handleAttach` (ingest → stage persisted docs → derive
+      `MessageAttachment` from `extracted_text` at send → status chip);
+      broadened `accept` (D9).
+- [x] FE-4 added `onDocumentsChanged`; removed `onUpload` prop + header "Upload"
+      button. **Bug caught by tests:** a stale `setAttachments([])` in
+      `startNewChat` (renamed to `setAttachedDocs`) would have thrown on "New
+      chat" — fixed.
+- [x] FE-6 pass `onDocumentsChanged={refresh}` from `index.tsx`.
+- [x] `CopilotPanel.test.tsx` updated (16 pass): control-gone, attach-persists +
+      refresh, status-hint chip, inline-grounding payload.
 
-### Phase 4 — Rewire "Upload document" button (R2) + delete dialog (R8)
-> **Blocker:** P2. **Can run in parallel with P3** (disjoint files except `index.tsx` — coordinate the two `index.tsx` edits).
-- [ ] FE-5 rewire the button to a hidden file input → `ingest` → `refresh` (no inline).
-- [ ] FE-7 delete `SemanticLayerImportDialog` usage + import + `showImportDialog` state.
-- [ ] FE-8 delete `SemanticLayerImportDialog.tsx` + its test (verify no other importer).
-- [ ] `index.test.tsx` updated.
-- [ ] Grep `SemanticLayerImportDialog|showImportDialog|onUpload` → **zero** hits.
+### Phase 4 — Rewire "Upload document" button (R2) + delete dialog (R8) ✅ DONE
+> **Blocker:** P2.
+- [x] FE-5 rewired the button to a hidden file input → `ingest` → `refresh`
+      (no inline); `isIngesting` drives loading/disabled.
+- [x] FE-7 deleted `SemanticLayerImportDialog` usage + import + `showImportDialog`.
+- [x] FE-8 deleted `SemanticLayerImportDialog.tsx` + its test (no other importer).
+- [x] `index.test.tsx` updated (12 pass): button present, dialog gone, file choice
+      routes through the shared hook.
+- [x] Grep `SemanticLayerImportDialog|showImportDialog|onUpload` in source →
+      zero (one expected hit is the test asserting `copilot-upload` is absent).
 
-### Phase 5 — Verify & polish
+### Phase 5 — Verify & polish ✅ DONE
 > **Blocker:** P1–P4.
-- [ ] Full `tests/unit_tests/superset_ai_agent/` green; `AiAgentPanel` Jest green;
-      `tsc --noEmit` clean; `prettier`/`oxlint` clean (run lint in CI per memory note).
-- [ ] Manual: attach a PDF → appears in `raw/`, vectorized, grounded in the turn;
-      re-attach same PDF → "reusing" toast, no duplicate node; Upload button →
-      same result minus chat attachment.
-- [ ] Update [`uploaded_documents_rag_and_crud.md`](uploaded_documents_rag_and_crud.md)
-      §0.7 + the `document-rag-suite` memory: the two lanes are now unified.
-- [ ] Flag the dropped UI MDL-JSON import (D1-A) to the user in release/UX copy.
+- [x] Full `tests/unit_tests/superset_ai_agent/` = **804 passed, 11 skipped**;
+      `AiAgentPanel` Jest = **201 passed, 2 pre-existing failures** unrelated to
+      this change (`AiAgentPanel/index.test.tsx` SQL-artifact render +
+      `ExplainDialog.test.tsx` — both fail identically with this change stashed —
+      see §12); `tsc --noEmit` clean on touched files; `prettier` clean;
+      `oxlint`/`eslint` deferred to CI (no local config — memory note).
+- [x] Updated the `document-rag-suite` memory + this spec; `uploaded_documents…`
+      §0.7 note added.
+- [ ] **Manual QA (not run here — needs a live agent + embedder):** attach a PDF →
+      appears in `raw/`, vectorized, grounded in the turn; re-attach → "reusing"
+      toast, no duplicate node; Upload button → same minus chat. **See §12 gaps.**
+- [ ] **Flag the dropped UI MDL-JSON import (D1-A) in release/UX copy** — owner action.
 
 ---
+
+## 12. As-built notes — residual risks & UX expectation gaps
+
+Implemented and test-green; the items below are the honest gaps between what the
+code now does and what a user might expect. None block merge; several want a
+follow-up or a product decision.
+
+**Verified by tests**
+- Dedup is byte-exact, per-project, owner-isolated, newest-wins; the dedup path
+  skips re-extraction *and* re-vectorization (spy-asserted). Transient
+  `deduplicated` never persists. Attach and Upload share one hook; Attach also
+  inlines `extracted_text` into the turn.
+
+**Residual risks / gaps**
+1. **No client-side type/size pre-check.** Rejections (disallowed type, >10 MB)
+   surface only after the round-trip, as a danger toast from the server's 400.
+   Acceptable (server is authoritative) but the `accept` filter is the only
+   pre-hint. *Gap:* a `.pages` or `.zip` slips past `accept` only to 400.
+2. **Status chip is a snapshot, not live.** A large file attached as
+   `extracting` shows "· Extracting…" at attach time and does **not** auto-update
+   in the composer (the **tree** is the live surface and does refresh). If the
+   user sends immediately, inline grounding uses whatever `extracted_text` exists
+   (possibly empty for a still-extracting large file) — RAG catches up next turn.
+   *Expectation gap:* a user may expect the chip to flip to "ready" in place.
+3. **Inline grounding races large-file extraction.** For files over the 1 MB
+   async threshold, `extracted_text` may be empty on the upload response, so the
+   *first* turn after attaching a big PDF may not be grounded inline (RAG still
+   indexes it for later turns). Small files (the common case) extract inline and
+   are grounded immediately. *Mitigation option (future):* disable Send until the
+   attached docs report `extracted`, or poll the doc status in the composer.
+4. **Dropped UI MDL-JSON import (D1-A).** Attaching/uploading a `.json` now makes
+   a `raw/` document, **not** an MDL model. Intended, but a user who previously
+   imported hand-authored MDL JSON via the dialog will not find that path. Needs
+   release-note/UX copy. (MDL authoring remains via the editor + Copilot.)
+5. **Per-project dedup means cross-project re-upload re-embeds.** By design (D3),
+   but a user moving the same file across schemas pays embedding twice.
+6. **`needs_ocr` / `error` documents still attach.** They appear in the tree and
+   as a chip with the status, but contribute no chunks/grounding. The chip shows
+   the status; there's no hard block. Matches existing upload behavior.
+7. **Two pre-existing Jest failures** (`AiAgentPanel/index.test.tsx` "sends a
+   conversation message and renders SQL artifact"; `ExplainDialog.test.tsx`
+   "surfaces typed detail…") fail identically with this change stashed — they are
+   **not** caused by this work, but they do mean the `AiAgentPanel` suite is not
+   100% green on this branch. Worth a separate fix.
+8. **Manual/visual QA not performed** (no live agent+embedder in this session).
+   The end-to-end attach→vectorize→reuse loop is covered by unit/integration
+   tests with mocked network, not by eye.
 
 ## 11. Out of scope
 - The `enrich` (doc→MDL) hot path — untouched.

@@ -102,3 +102,87 @@ def test_create_document_rejects_oversized_content(tmp_path) -> None:
             storage=LocalDocumentStorage(str(tmp_path)),
             extractor=CompositeDocumentExtractor(),
         )
+
+
+def _create(store, tmp_path, content: bytes, *, project_id: str | None = "project-1"):
+    return create_document(
+        filename="notes.md",
+        content_type="text/markdown",
+        content=content,
+        scope=_scope(),
+        project_id=project_id,
+        owner_id="user-1",
+        config=AgentConfig(),
+        store=store,
+        storage=LocalDocumentStorage(str(tmp_path)),
+        extractor=CompositeDocumentExtractor(),
+    )
+
+
+def test_create_document_dedups_identical_bytes(tmp_path) -> None:
+    store = InMemorySemanticLayerStore()
+    first = _create(store, tmp_path, b"Gross moves by stage.")
+    assert first.deduplicated is False
+
+    second = _create(store, tmp_path, b"Gross moves by stage.")
+    # The second upload reuses the first document; no new row is created.
+    assert second.deduplicated is True
+    assert second.id == first.id
+    assert len(store.list_project_documents("project-1", owner_id="user-1")) == 1
+
+
+def test_create_document_does_not_reindex_on_dedup(tmp_path) -> None:
+    # A spy index proves vectorization runs once for the first upload and is
+    # skipped entirely on the deduplicated second upload (R5 cost control).
+    class _SpyIndex:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def index(self, records, *, scope_key):  # noqa: ANN001, ANN201
+            self.calls += 1
+            return []  # no embedder; returns the ids that were embedded
+
+    store = InMemorySemanticLayerStore()
+    index = _SpyIndex()
+
+    def _create_indexed(content: bytes):
+        return create_document(
+            filename="notes.md",
+            content_type="text/markdown",
+            content=content,
+            scope=_scope(),
+            project_id="project-1",
+            owner_id="user-1",
+            config=AgentConfig(),
+            store=store,
+            storage=LocalDocumentStorage(str(tmp_path)),
+            extractor=CompositeDocumentExtractor(),
+            document_index=index,  # type: ignore[arg-type]
+        )
+
+    _create_indexed(b"Gross moves by stage.")
+    calls_after_first = index.calls
+    second = _create_indexed(b"Gross moves by stage.")
+
+    assert second.deduplicated is True
+    assert index.calls == calls_after_first  # no re-index on the dedup hit
+
+
+def test_create_document_distinct_projects_do_not_dedup(tmp_path) -> None:
+    store = InMemorySemanticLayerStore()
+    first = _create(store, tmp_path, b"shared bytes", project_id="project-1")
+    second = _create(store, tmp_path, b"shared bytes", project_id="project-2")
+
+    assert second.deduplicated is False
+    assert second.id != first.id
+
+
+def test_create_document_without_project_does_not_dedup(tmp_path) -> None:
+    # Scope-only uploads (no project) skip dedup: there is no project to scope it.
+    store = InMemorySemanticLayerStore()
+    first = _create(store, tmp_path, b"shared bytes", project_id=None)
+    second = _create(store, tmp_path, b"shared bytes", project_id=None)
+
+    assert first.deduplicated is False
+    assert second.deduplicated is False
+    assert second.id != first.id

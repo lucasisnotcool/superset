@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.pool import StaticPool
@@ -169,3 +171,76 @@ def test_list_project_chunks_spans_documents(store) -> None:
     assert len(project_chunks) == 3
     assert {chunk.document_id for chunk in project_chunks} == {first.id, second.id}
     assert store.list_project_chunks("other-project", owner_id="user-1") == []
+
+
+def _save_document_with(
+    store,
+    *,
+    checksum: str,
+    project_id: str = "project-1",
+    owner_id: str = "user-1",
+    created_at: datetime | None = None,
+) -> SemanticDocument:
+    fields: dict = {
+        "project_id": project_id,
+        "filename": "notes.md",
+        "content_type": "text/markdown",
+        "size_bytes": 10,
+        "scope": _SCOPE,
+        "checksum": checksum,
+        "storage_uri": "file:///tmp/notes.md",
+        "status": "extracted",
+    }
+    if created_at is not None:
+        fields["created_at"] = created_at
+    return store.save_document(SemanticDocument(**fields), owner_id=owner_id)
+
+
+@pytest.mark.parametrize("store", _stores())
+def test_find_document_by_checksum_returns_match(store) -> None:
+    saved = _save_document_with(store, checksum="hash-1")
+
+    found = store.find_document_by_checksum("project-1", "hash-1", owner_id="user-1")
+    assert found is not None
+    assert found.id == saved.id
+    # The persisted/reloaded document never carries the transient dedup flag.
+    assert found.deduplicated is False
+
+
+@pytest.mark.parametrize("store", _stores())
+def test_find_document_by_checksum_misses(store) -> None:
+    _save_document_with(store, checksum="hash-1")
+
+    assert (
+        store.find_document_by_checksum("project-1", "other-hash", owner_id="user-1")
+        is None
+    )
+    # Owner isolation: the same bytes under a different owner do not match.
+    assert (
+        store.find_document_by_checksum("project-1", "hash-1", owner_id="intruder")
+        is None
+    )
+    # Project isolation: the same bytes in another project are a distinct artifact.
+    assert (
+        store.find_document_by_checksum("other-project", "hash-1", owner_id="user-1")
+        is None
+    )
+
+
+@pytest.mark.parametrize("store", _stores())
+def test_find_document_by_checksum_returns_newest(store) -> None:
+    older = _save_document_with(
+        store,
+        checksum="dup",
+        created_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+    )
+    newer = _save_document_with(
+        store,
+        checksum="dup",
+        created_at=datetime(2024, 6, 1, tzinfo=timezone.utc),
+    )
+
+    found = store.find_document_by_checksum("project-1", "dup", owner_id="user-1")
+    assert found is not None
+    assert found.id == newer.id
+    assert found.id != older.id

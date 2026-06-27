@@ -22,7 +22,40 @@ import {
   userEvent,
   waitFor,
 } from 'spec/helpers/testing-library';
+import type { SemanticDocument } from '../api';
 import CopilotPanel from './CopilotPanel';
+
+// The shared ingestion hook is exercised in its own suite; here we stub it so the
+// attach wiring (inline grounding + tree refresh) can be asserted without redux or
+// real network. `mockIngest` resolves with the persisted documents.
+const mockIngest = jest.fn();
+jest.mock('../useDocumentIngestion', () => ({
+  __esModule: true,
+  default: () => ({ ingest: mockIngest, isIngesting: false }),
+}));
+
+const ingestedDoc = (
+  overrides: Partial<SemanticDocument> = {},
+): SemanticDocument => ({
+  id: 'doc-1',
+  filename: 'spec.pdf',
+  content_type: 'application/pdf',
+  size_bytes: 10,
+  status: 'extracted',
+  scope: { database_id: 1, dataset_ids: [] },
+  checksum: 'abc',
+  storage_uri: 'mem://x',
+  extracted_text: 'Quarterly revenue by region.',
+  warnings: [],
+  created_at: '',
+  updated_at: '',
+  ...overrides,
+});
+
+const attachFile = async (name = 'spec.pdf', type = 'application/pdf') => {
+  const input = screen.getByTestId('copilot-attach-input') as HTMLInputElement;
+  await userEvent.upload(input, new File(['bytes'], name, { type }));
+};
 
 const originalAgentUrl = process.env.SUPERSET_AI_AGENT_URL;
 const originalFetch = global.fetch;
@@ -174,6 +207,7 @@ const installFetch = (opts: { history?: unknown[]; thread?: unknown } = {}) => {
 beforeEach(() => {
   process.env.SUPERSET_AI_AGENT_URL = 'http://agent.local/';
   localStorage.clear();
+  mockIngest.mockReset();
 });
 
 afterEach(() => {
@@ -418,24 +452,7 @@ test('invalid changeset items are excluded from the default accepted set (P3)', 
   expect(await screen.findByText('Apply 1 accepted')).toBeInTheDocument();
 });
 
-test('ready view shows an Upload control that calls onUpload (RG2)', async () => {
-  installFetch();
-  const onUpload = jest.fn();
-  render(
-    <CopilotPanel
-      projectId="project-1"
-      canWrite
-      readinessStatus="ready"
-      onOnboard={jest.fn()}
-      onUpload={onUpload}
-    />,
-  );
-
-  await userEvent.click(screen.getByTestId('copilot-upload'));
-  expect(onUpload).toHaveBeenCalledTimes(1);
-});
-
-test('no Upload control when onUpload is not provided', () => {
+test('the standalone Upload control is gone (attach is the single ingress)', () => {
   installFetch();
   render(
     <CopilotPanel
@@ -447,6 +464,88 @@ test('no Upload control when onUpload is not provided', () => {
   );
 
   expect(screen.queryByTestId('copilot-upload')).not.toBeInTheDocument();
+  // Attach remains, and is now the persist+ground entry point.
+  expect(screen.getByTestId('copilot-attach')).toBeInTheDocument();
+});
+
+test('attaching persists via the pipeline and refreshes the workspace', async () => {
+  installFetch();
+  mockIngest.mockResolvedValue([
+    { document: ingestedDoc(), deduplicated: false },
+  ]);
+  const onDocumentsChanged = jest.fn();
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+      onDocumentsChanged={onDocumentsChanged}
+    />,
+  );
+
+  await attachFile();
+
+  // Ingestion ran with the chosen file, the editor was asked to refresh, and a
+  // chip for the persisted document is staged for the next turn.
+  await waitFor(() => expect(mockIngest).toHaveBeenCalledTimes(1));
+  expect(onDocumentsChanged).toHaveBeenCalledTimes(1);
+  expect(await screen.findByText('spec.pdf')).toBeInTheDocument();
+});
+
+test('a still-extracting attachment shows a status hint on its chip', async () => {
+  installFetch();
+  mockIngest.mockResolvedValue([
+    { document: ingestedDoc({ status: 'extracting' }), deduplicated: false },
+  ]);
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+    />,
+  );
+
+  await attachFile();
+
+  expect(await screen.findByText(/spec\.pdf · Extracting/)).toBeInTheDocument();
+});
+
+test('attaching inlines the extracted text into the next turn', async () => {
+  const fetchFn = installFetch();
+  mockIngest.mockResolvedValue([
+    { document: ingestedDoc(), deduplicated: false },
+  ]);
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+    />,
+  );
+
+  await attachFile();
+  await screen.findByText('spec.pdf');
+  await userEvent.type(screen.getByTestId('copilot-input'), 'summarize it');
+  await userEvent.click(screen.getByTestId('copilot-send'));
+
+  await waitFor(() => {
+    const streamCall = fetchFn.mock.calls.find(([url]) =>
+      String(url).includes('/copilot/stream'),
+    );
+    expect(streamCall).toBeDefined();
+    const body = JSON.parse(String((streamCall![1] as RequestInit).body));
+    expect(body.attachments).toEqual([
+      expect.objectContaining({
+        filename: 'spec.pdf',
+        content_type: 'application/pdf',
+        text: 'Quarterly revenue by region.',
+        truncated: false,
+      }),
+    ]);
+  });
 });
 
 test('persists the turn to a thread and survives reload via the API', async () => {

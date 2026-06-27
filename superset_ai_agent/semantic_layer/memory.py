@@ -75,6 +75,25 @@ class InMemorySemanticLayerStore:
             if stored_owner_id == owner_id and document.project_id == project_id
         ]
 
+    def find_document_by_checksum(
+        self,
+        project_id: str,
+        checksum: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> SemanticDocument | None:
+        matches = [
+            document
+            for stored_owner_id, document in self._documents.values()
+            if stored_owner_id == owner_id
+            and document.project_id == project_id
+            and document.checksum == checksum
+        ]
+        if not matches:
+            return None
+        newest = max(matches, key=lambda document: document.created_at)
+        return newest.model_copy(deep=True)
+
     def get_document(
         self,
         document_id: str,

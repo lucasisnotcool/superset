@@ -1854,14 +1854,25 @@ def create_app(  # noqa: C901
             fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
         )
         _require_project_ready(project, identity.owner_id)
-        files = active_mdl_file_store.list(project_id, owner_id=identity.owner_id)
-        schema_index = _schema_index_for_project(project, fastapi_request)
         # Persistent thread: append the user turn, feed prior turns as history,
         # then persist the assistant turn + changeset artifact. ``conversation_id``
-        # absent → stateless one-shot (backward compatible).
-        history, commit = _copilot_thread_turn(
-            request.conversation_id, project, request.message, identity.owner_id
-        )
+        # absent → stateless one-shot (backward compatible). Guard the preflight
+        # (store/schema/thread reads) so a setup failure surfaces as a 502 with a
+        # diagnosable message instead of a bare 500 (mirrors the stream route).
+        try:
+            files = active_mdl_file_store.list(project_id, owner_id=identity.owner_id)
+            schema_index = _schema_index_for_project(project, fastapi_request)
+            history, commit = _copilot_thread_turn(
+                request.conversation_id, project, request.message, identity.owner_id
+            )
+        except HTTPException:
+            raise
+        except Exception as ex:  # pylint: disable=broad-except
+            logger.exception("Copilot preflight failed for project %s", project_id)
+            raise HTTPException(
+                status_code=502,
+                detail=f"Copilot preflight failed: {type(ex).__name__}: {ex}",
+            ) from ex
         try:
             changeset = run_copilot(
                 model_client=active_model_client,
@@ -1892,7 +1903,7 @@ def create_app(  # noqa: C901
         return changeset
 
     @api.post("/agent/semantic-layer/projects/{project_id}/copilot/stream")
-    def stream_project_copilot(
+    def stream_project_copilot(  # noqa: C901
         project_id: str,
         request: CopilotTurnRequest,
         fastapi_request: Request,
@@ -1906,18 +1917,35 @@ def create_app(  # noqa: C901
         )
         _require_project_ready(project, identity.owner_id)
         # Resolve request-scoped context before streaming starts (no Request access
-        # from the worker thread).
-        files = active_mdl_file_store.list(project_id, owner_id=identity.owner_id)
-        schema_index = _schema_index_for_project(project, fastapi_request)
-        instructions = _recalled_instructions(
-            project, identity.owner_id, request.message
-        )
-        attachments_text = _attachments_text(request.attachments)
-        # Append the user turn + assemble history in request scope (the worker
-        # thread has no Request access); ``commit`` persists the result afterwards.
-        history, commit = _copilot_thread_turn(
-            request.conversation_id, project, request.message, identity.owner_id
-        )
+        # from the worker thread). A StreamingResponse commits a 200 status the
+        # moment its body iterator is entered, so any failure here must surface as a
+        # normal HTTP error *before* streaming begins. Without this guard an
+        # unhandled preflight error collapses into a bare 500 ("Internal Server
+        # Error", 21 bytes) with no logged traceback -- unlike worker-loop errors,
+        # which are streamed back as ``error`` events. Mirror the non-stream
+        # sibling's 502 contract and log the cause so it is diagnosable.
+        try:
+            files = active_mdl_file_store.list(project_id, owner_id=identity.owner_id)
+            schema_index = _schema_index_for_project(project, fastapi_request)
+            instructions = _recalled_instructions(
+                project, identity.owner_id, request.message
+            )
+            attachments_text = _attachments_text(request.attachments)
+            # Append the user turn + assemble history in request scope (the worker
+            # thread has no Request access); ``commit`` persists the result after.
+            history, commit = _copilot_thread_turn(
+                request.conversation_id, project, request.message, identity.owner_id
+            )
+        except HTTPException:
+            raise
+        except Exception as ex:  # pylint: disable=broad-except
+            logger.exception(
+                "Copilot stream preflight failed for project %s", project_id
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"Copilot preflight failed: {type(ex).__name__}: {ex}",
+            ) from ex
 
         def event_stream() -> Any:
             events: queue.Queue[tuple[str, Any]] = queue.Queue()
@@ -2094,9 +2122,7 @@ def create_app(  # noqa: C901
             schema_name=project.schema_name,
             limit=app_config.wren_schema_table_scan_limit,
         )
-        resolved = [
-            dataset.id for dataset in candidates if dataset.id not in excluded
-        ]
+        resolved = [dataset.id for dataset in candidates if dataset.id not in excluded]
         if not resolved:
             raise HTTPException(
                 status_code=400,
@@ -2423,6 +2449,12 @@ def create_app(  # noqa: C901
             )
         except ValueError as ex:
             raise HTTPException(status_code=400, detail=str(ex)) from ex
+
+        if document.deduplicated:
+            # Byte-identical to an existing document in this project: it is already
+            # extracted + indexed, so skip re-extraction and return it as-is (the
+            # ``deduplicated`` flag lets the client surface a "reusing" notice).
+            return document
 
         def _extract() -> None:
             extract_document(
