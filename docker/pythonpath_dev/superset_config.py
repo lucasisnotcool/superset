@@ -67,7 +67,19 @@ try:
     _oracle_client_lib_dir = os.getenv(
         "ORACLE_CLIENT_LIB_DIR", "/opt/oracle/instantclient"
     )
-    if _oracle_thick_mode and os.path.isdir(_oracle_client_lib_dir):
+
+    def init_oracle_thick_mode() -> None:
+        """
+        Initialize python-oracledb Thick mode in the current process.
+
+        Safe to call once per process; a redundant call (or missing client libs)
+        is logged rather than raised so it can never crash startup. The OCI client
+        must be created *after* a fork — calling it in a prefork parent and then
+        forking is unsafe — so Celery workers invoke this via worker_process_init
+        (below) instead of at import time.
+        """
+        if not (_oracle_thick_mode and os.path.isdir(_oracle_client_lib_dir)):
+            return
         try:
             oracledb.init_oracle_client(lib_dir=_oracle_client_lib_dir)
             logger.info(
@@ -75,9 +87,29 @@ try:
                 _oracle_client_lib_dir,
             )
         except Exception as ex:  # pylint: disable=broad-except
-            # Already-initialized or missing libs shouldn't crash startup; the
-            # connection simply falls back to Thin mode behavior.
             logger.warning("Could not enable Oracle Thick mode: %s", ex)
+
+    # The Flask web server (and one-off CLI commands) don't fork a worker pool, so
+    # initialize at import. A Celery prefork master must NOT initialize the OCI
+    # client before forking; defer to worker_process_init so each child sets up
+    # Thick mode after the fork.
+    _running_under_celery = any("celery" in arg for arg in sys.argv)
+    if not _running_under_celery:
+        init_oracle_thick_mode()
+    else:
+        try:
+            from celery.signals import worker_process_init
+
+            def _init_oracle_thick_mode_in_worker(**_kwargs: object) -> None:
+                init_oracle_thick_mode()
+
+            # weak=False keeps the handler alive; Celery signals otherwise hold
+            # only a weak reference and the local function would be collected.
+            worker_process_init.connect(_init_oracle_thick_mode_in_worker, weak=False)
+        except ImportError:
+            logger.warning(
+                "celery not importable; Oracle Thick mode not wired for workers"
+            )
 except ModuleNotFoundError:
     logger.info("oracledb not installed; skipping Oracle driver compatibility shim")
 
