@@ -64,5 +64,14 @@ CDN / Thin-mode warning.
 4. Rebuild. Look for `Using bundled Linux Instant Client from ...` in the build
    log, then `python-oracledb Thick mode enabled` in the Superset/worker logs.
 
+## Multiple clients
+
+If more than one client folder is present (e.g. `instantclient_19_12` and
+`instantclient_23_26`), the build deterministically selects the **highest
+version** (`sort -V` on the discovered `libclntsh.so*`). Newer Instant Clients
+are backward-compatible, so a 23.x client connects fine to a 19c database.
+Prefer keeping just one folder here to avoid surprises; the build log prints
+`Using bundled Linux Instant Client from ...` so you can confirm which was used.
+
 The binaries here are git-ignored (see `.gitignore`) — they stay local to each
 machine and are never committed.

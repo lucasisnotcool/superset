@@ -279,7 +279,10 @@ COPY docker/oracle-instantclient/ /tmp/oracle-instantclient/
 #   3. else warn and continue in Thin mode
 RUN set -eux; \
     mkdir -p /opt/oracle; \
-    bundled_lib="$(find /tmp/oracle-instantclient -name 'libclntsh.so*' 2>/dev/null | head -n1 || true)"; \
+    # If several clients are bundled, pick the highest version deterministically
+    # (sort -V); newer clients are backward-compatible with older databases. Keep
+    # only one directory here to avoid ambiguity.
+    bundled_lib="$(find /tmp/oracle-instantclient -name 'libclntsh.so*' 2>/dev/null | sort -V | tail -n1 || true)"; \
     if [ -n "${bundled_lib}" ]; then \
       src_dir="$(dirname "${bundled_lib}")"; \
       echo "Using bundled Linux Instant Client from ${src_dir}"; \
