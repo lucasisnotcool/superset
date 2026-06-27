@@ -282,6 +282,15 @@ COPY docker/oracle-instantclient/ /tmp/oracle-instantclient/
 #   4. else warn and continue in Thin mode
 RUN set -eux; \
     mkdir -p /opt/oracle; \
+    # Debian trixie ships libaio as libaio.so.1t64 (a spurious t64 rename), but \
+    # the Oracle client links against libaio.so.1. Provide the expected soname so \
+    # Thick mode doesn't fail with "libaio.so.1: cannot open shared object". \
+    for d in /usr/lib/*-linux-gnu /usr/lib64 /usr/lib; do \
+      if [ -e "${d}/libaio.so.1t64" ] && [ ! -e "${d}/libaio.so.1" ]; then \
+        ln -s libaio.so.1t64 "${d}/libaio.so.1"; \
+      fi; \
+    done; \
+    ldconfig || true; \
     bundled_zip="$(ls /tmp/oracle-instantclient/*.zip 2>/dev/null | sort -V | tail -n1 || true)"; \
     bundled_lib="$(find /tmp/oracle-instantclient -name 'libclntsh.so.*' 2>/dev/null | sort -V | tail -n1 || true)"; \
     if [ -n "${bundled_zip}" ]; then \
@@ -327,7 +336,7 @@ RUN set -eux; \
     # Verify the client actually loads (catches flattened symlinks / missing deps \
     # / truncated binaries) so the failure is loud at build time, not runtime. \
     if [ -e "${ORACLE_CLIENT_LIB_DIR}/libclntsh.so" ]; then \
-      if ldd "${ORACLE_CLIENT_LIB_DIR}/libclntsh.so" 2>&1 | grep -i 'not found'; then \
+      if LD_LIBRARY_PATH="${ORACLE_CLIENT_LIB_DIR}" ldd "${ORACLE_CLIENT_LIB_DIR}/libclntsh.so" 2>&1 | grep -i 'not found'; then \
         echo "WARNING: bundled Oracle client has unresolved libraries above;" \
              "Thick mode will fail. Prefer bundling the original Linux .zip." >&2; \
       else \
