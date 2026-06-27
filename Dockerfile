@@ -264,40 +264,35 @@ RUN /app/docker/apt-install.sh \
 # legacy 10G password verifiers that Thin mode rejects with DPY-3015.
 #
 # Local fallback for CDN-blocked / air-gapped builds: anything placed under
-# docker/oracle-instantclient/ is copied into the build. Drop an unzipped LINUX
-# Instant Client (Basic or Basic Light — the .so libraries, NOT the Windows
-# .dll/.exe package) there to bundle it. The directory ships empty (.gitkeep),
-# so this COPY is a no-op by default.
+# docker/oracle-instantclient/ is copied into the build. STRONGLY PREFER dropping
+# the original Oracle LINUX .zip there — it is unzipped inside Linux so symlinks
+# and binaries stay intact. An already-extracted folder also works, but if it was
+# unzipped/copied on Windows its symlinks were flattened into stubs (DPI-1047),
+# which we then best-effort repair. The directory ships empty (.gitkeep), so this
+# COPY is a no-op by default.
 ARG TARGETARCH
 ENV ORACLE_CLIENT_LIB_DIR=/opt/oracle/instantclient
 COPY docker/oracle-instantclient/ /tmp/oracle-instantclient/
 
 # Resolve the client in priority order, and NEVER fail the build — a missing
 # client only disables Thick mode (Oracle still works in Thin mode):
-#   1. a bundled LINUX client under docker/oracle-instantclient/ (detected by .so)
-#   2. else Oracle's CDN, arch-matched to TARGETARCH (supplied by BuildKit)
-#   3. else warn and continue in Thin mode
+#   1. a bundled LINUX .zip  -> unzipped inside Linux (symlinks/binaries intact)
+#   2. an already-extracted LINUX client dir (.so) -> copied + symlinks repaired
+#   3. else Oracle's CDN, arch-matched to TARGETARCH (supplied by BuildKit)
+#   4. else warn and continue in Thin mode
 RUN set -eux; \
     mkdir -p /opt/oracle; \
-    # If several clients are bundled, pick the highest version deterministically
-    # (sort -V); newer clients are backward-compatible with older databases. Keep
-    # only one directory here to avoid ambiguity.
-    bundled_lib="$(find /tmp/oracle-instantclient -name 'libclntsh.so*' 2>/dev/null | sort -V | tail -n1 || true)"; \
-    if [ -n "${bundled_lib}" ]; then \
+    bundled_zip="$(ls /tmp/oracle-instantclient/*.zip 2>/dev/null | sort -V | tail -n1 || true)"; \
+    bundled_lib="$(find /tmp/oracle-instantclient -name 'libclntsh.so.*' 2>/dev/null | sort -V | tail -n1 || true)"; \
+    if [ -n "${bundled_zip}" ]; then \
+      echo "Unzipping bundled Instant Client ${bundled_zip} inside Linux"; \
+      unzip -q "${bundled_zip}" -d /opt/oracle; \
+      ln -s "$(ls -d /opt/oracle/instantclient_* | sort -V | tail -n1)" "${ORACLE_CLIENT_LIB_DIR}"; \
+    elif [ -n "${bundled_lib}" ]; then \
       src_dir="$(dirname "${bundled_lib}")"; \
-      echo "Using bundled Linux Instant Client from ${src_dir}"; \
+      echo "Using bundled (extracted) Instant Client from ${src_dir}"; \
       mkdir -p "${ORACLE_CLIENT_LIB_DIR}"; \
       cp -a "${src_dir}/." "${ORACLE_CLIENT_LIB_DIR}/"; \
-      # Loader symlinks (e.g. libclntsh.so -> libclntsh.so.NN.M) are lost when the \
-      # client is unzipped/copied on Windows, leaving truncated stub files that \
-      # trigger DPI-1047 "file too short". Recreate them from the versioned .so. \
-      for base in libclntsh libclntshcore libocci; do \
-        versioned="$(ls "${ORACLE_CLIENT_LIB_DIR}/${base}".so.* 2>/dev/null | sort -V | tail -n1 || true)"; \
-        if [ -n "${versioned}" ]; then \
-          ln -sf "$(basename "${versioned}")" "${ORACLE_CLIENT_LIB_DIR}/${base}.so"; \
-          echo "Recreated symlink ${base}.so -> $(basename "${versioned}")"; \
-        fi; \
-      done; \
     else \
       case "${TARGETARCH:-amd64}" in \
         amd64) ic_url="https://download.oracle.com/otn_software/linux/instantclient/instantclient-basiclite-linuxx64.zip" ;; \
@@ -307,11 +302,36 @@ RUN set -eux; \
       if [ -n "${ic_url}" ] && curl -fsSL --max-time 120 "${ic_url}" -o /tmp/instantclient.zip; then \
         unzip -q /tmp/instantclient.zip -d /opt/oracle; \
         rm -f /tmp/instantclient.zip; \
-        ln -s /opt/oracle/instantclient_* "${ORACLE_CLIENT_LIB_DIR}"; \
+        ln -s "$(ls -d /opt/oracle/instantclient_* | sort -V | tail -n1)" "${ORACLE_CLIENT_LIB_DIR}"; \
         echo "Installed Oracle Instant Client from Oracle CDN"; \
       else \
         echo "WARNING: no bundled Linux Instant Client and Oracle CDN unreachable;" \
              "Oracle limited to Thin mode (DPY-3015 for legacy 10G verifiers)." >&2; \
+      fi; \
+    fi; \
+    # Universal loader-symlink repair for every path above. For each versioned \
+    # library (libX.so.N[.M]) ensure the loader symlink libX.so resolves. Only \
+    # missing / dangling / truncated-stub links are recreated; valid symlinks are \
+    # left untouched. Fixes Windows-flattened symlinks (DPI-1047 "file too short" \
+    # / libnnz.so "cannot open shared object"). \
+    if [ -d "${ORACLE_CLIENT_LIB_DIR}" ]; then \
+      for v in "${ORACLE_CLIENT_LIB_DIR}"/lib*.so.*; do \
+        [ -e "${v}" ] || continue; \
+        link="${v%.so.*}.so"; \
+        if [ ! -e "${link}" ] || [ "$(wc -c <"${link}" 2>/dev/null || echo 0)" -lt 1024 ]; then \
+          ln -sf "$(basename "${v}")" "${link}"; \
+          echo "Repaired symlink $(basename "${link}") -> $(basename "${v}")"; \
+        fi; \
+      done; \
+    fi; \
+    # Verify the client actually loads (catches flattened symlinks / missing deps \
+    # / truncated binaries) so the failure is loud at build time, not runtime. \
+    if [ -e "${ORACLE_CLIENT_LIB_DIR}/libclntsh.so" ]; then \
+      if ldd "${ORACLE_CLIENT_LIB_DIR}/libclntsh.so" 2>&1 | grep -i 'not found'; then \
+        echo "WARNING: bundled Oracle client has unresolved libraries above;" \
+             "Thick mode will fail. Prefer bundling the original Linux .zip." >&2; \
+      else \
+        echo "Oracle Instant Client OK: $(readlink -f "${ORACLE_CLIENT_LIB_DIR}/libclntsh.so")"; \
       fi; \
     fi; \
     rm -rf /tmp/oracle-instantclient
