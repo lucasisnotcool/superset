@@ -154,6 +154,59 @@ test('select-all-matching sends mode=all with exclusions', async () => {
   });
 });
 
+test('select-all also checks the listed unregistered tables', async () => {
+  jest.restoreAllMocks();
+  // Schema has an extra physical table that isn't a registered dataset.
+  mockSupersetGet({
+    physicalNames: ['orders', 'customers', 'products', 'events'],
+  });
+  const onConfirm = renderPicker();
+  await screen.findByText('orders');
+  // The unregistered row is listed.
+  expect(await screen.findByText('events')).toBeInTheDocument();
+
+  await userEvent.click(screen.getByText('Select all'));
+  // Count covers the 3 registered datasets + the 1 unregistered table.
+  expect(screen.getByTestId('picker-count')).toHaveTextContent(
+    'All 4 matching selected',
+  );
+  // The unregistered checkbox is now checked, like the registered rows.
+  expect(screen.getByTestId('picker-unregistered-checkbox')).toBeChecked();
+
+  // Confirm registers & onboards: the unregistered table is created first, then
+  // the all-minus-excludes registered selection is sent.
+  jest
+    .spyOn(SupersetClient, 'post')
+    .mockResolvedValue({ json: { id: 99 } } as any);
+  await userEvent.click(screen.getByTestId('picker-confirm'));
+  await waitFor(() =>
+    expect(onConfirm).toHaveBeenCalledWith({
+      mode: 'all',
+      excludeDatasetIds: [],
+      search: null,
+    }),
+  );
+});
+
+test('select-all leaves unregistered tables alone without register permission', async () => {
+  jest.restoreAllMocks();
+  mockSupersetGet({
+    physicalNames: ['orders', 'customers', 'products', 'events'],
+    permissions: ['can_read'], // no can_write → cannot register
+  });
+  renderPicker();
+  await screen.findByText('orders');
+  await screen.findByText('events');
+
+  await userEvent.click(screen.getByText('Select all'));
+  // Only the 3 registered datasets are selected; the unregistered row stays off
+  // (its checkbox is disabled) so no bulk registration is implied.
+  expect(screen.getByTestId('picker-count')).toHaveTextContent(
+    'All 3 matching selected',
+  );
+  expect(screen.getByTestId('picker-unregistered-checkbox')).not.toBeChecked();
+});
+
 test('confirm is disabled with nothing selected', async () => {
   renderPicker();
   await screen.findByText('orders');

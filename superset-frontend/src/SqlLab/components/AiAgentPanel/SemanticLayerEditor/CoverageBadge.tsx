@@ -19,11 +19,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { t } from '@apache-superset/core/translation';
 import { Tag, Tooltip } from '@superset-ui/core/components';
-import {
-  CoverageStatusInfo,
-  getCoverageStatus,
-  refreshCoverage,
-} from '../api';
+import { CoverageStatusInfo, getCoverageStatus, refreshCoverage } from '../api';
 
 const POLL_MS = 4000;
 

@@ -24,8 +24,8 @@ from superset_ai_agent.semantic_layer.schemas import (
     actor_type_for,
     coalesce_user_runs,
     OnboardingRequest,
-    ProvenanceEntry,
     provenance_from_event,
+    ProvenanceEntry,
     SemanticLayerEvent,
 )
 

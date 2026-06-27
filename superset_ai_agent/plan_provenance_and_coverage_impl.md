@@ -251,3 +251,86 @@ under the License.
 - Read-time grouping of consecutive same-author edits — Google Docs version history grouping: https://support.google.com/docs/answer/190843
 - Debounce + cancel-stale-work in queueing/background systems — Inngest: https://www.inngest.com/blog/debouncing-in-queuing-systems-optimizing-efficiency-in-async-workflows
 - Stale-request supersession (AbortController model) — pattern reference: https://medium.com/@velja/delaying-debouncing-and-cancelling-request-using-abortcontoller-in-react-d8e089bfce14
+
+---
+
+## Implementation status (delivered 2026-06-28)
+
+All Phase 1 + Phase 2 items are implemented, unit-tested, and green
+(backend: `tests/unit_tests/superset_ai_agent/` 833 passed / 11 skipped;
+frontend: `MdlProvenanceDialog` + `CoverageBadge` suites 9 passed). Migration
+`0009_coverage_runs` upgrade/downgrade round-trips on a single linear head.
+
+### What shipped, by area
+
+- **Provenance completeness (A).** `actor_type` + `copilot_edit`/`coverage` kinds
+  + `mdl_agent_edit`/`coverage_completed` events (`schemas.py`); apply path now
+  emits one server-authoritative provenance entry per changeset, classified as
+  `enrichment` (documents pulled via `search_documents`) vs `copilot_edit`
+  (`app.py::_emit_agent_apply_provenance`, `service.py::apply_provenance_payload`,
+  `changeset_from_conversation`; toolset records `referenced_document_ids`).
+  Read-time coalescing of consecutive user `mdl_updated` runs
+  (`schemas.py::coalesce_user_runs`). UI: actor tags, "Edited N times" range,
+  document chips, conversation deep-link.
+- **Background coverage (B).** `ai_agent_coverage_runs` table + `CoverageRunStore`
+  (claim-CAS lease + supersede + idempotency); `run_coverage_audit(should_cancel=)`
+  + `run_directory_coverage` (union of docs); centralized `_schedule_coverage`
+  hook on activation / active-file edit / active-file delete / onboarding-complete,
+  with reset cancelling in-flight runs; debounced claim-on-start job; read
+  endpoints `coverage/latest|runs/{id}|status|refresh`; provenance drill-in +
+  header `CoverageBadge`. Sync per-document `/copilot/coverage` deprecated.
+
+### Decisions confirmed during build (deltas from the plan)
+
+- **Coalescing predicate narrowed to `mdl_updated` only** (not all user actions).
+  `create`/`activate`/`delete` are distinct lifecycle events a user expects to see
+  individually; only repeated content saves are the "noise" the user described
+  ("edit at 2pm then 5pm = one change"). This also kept existing provenance API
+  tests meaningful. (`schemas.py::_is_user_edit`)
+- **`CoverageCancelled` → `CoverageCancelledError`** to satisfy the repo's N818.
+- **Debounce default 0s** (`wren_coverage_debounce_seconds`): correctness is
+  carried by claim-on-start supersession, so the wait is a pure cost optimization;
+  0 keeps inline/test runs deterministic. Production sets a 3–5s window.
+
+## Remaining risks & expectation/UI gaps (for the next session)
+
+These are deliberate MVP boundaries, not defects — each has a clear follow-up.
+
+1. **Enrichment document attribution is by retrieval, not "use" (R6).** We record
+   document ids the agent pulled via `search_documents`. If the agent reasons from
+   an inline message *attachment* (which has no `document_id`) or from a document it
+   `list_documents`-ed but never searched, that apply is classified `copilot_edit`,
+   not `enrichment`, and shows no document chips. *Gap vs. "capture the doc used
+   for enrichment":* covered for the RAG/search path; not for inline attachments.
+   Follow-up: thread attachment filenames + `list_documents` hits into the signal.
+2. **Coverage findings are not tagged per source document.** The directory report
+   aggregates the union of claims; the UI shows totals/score and a flat finding
+   list, but a finding does not say which document it came from. *Gap vs. a user
+   who expects per-document drill-down in the directory report.* Follow-up
+   (Phase 3.x): carry `document_id` on each `CoverageFinding`.
+3. **Overreach is union-level only.** `include_overreach` (off by default) flags MDL
+   facts unsupported by *any* document; it cannot say "unsupported except by doc X".
+   Acceptable for an advisory signal.
+4. **Cooperative cancellation is stage-granular.** A superseded run still finishes
+   its current in-flight LLM call (extract or judge) before yielding at the next
+   `should_cancel` check. Worst case: one extra model call per superseded run. No
+   way around this without killable workers.
+5. **Single in-process scheduler, multi-worker correctness via DB lease.** Two
+   workers can both schedule, but `claim()` (CAS `pending→running`) ensures one
+   runs; the debounce is per-process. Cross-worker debounce coalescing is best-effort
+   — acceptable because supersession already de-dupes on checksum.
+6. **Badge polling, not push.** `CoverageBadge` polls `coverage/status` every 4s
+   while `analysing`; a completed run can take up to one poll interval to surface.
+   The provenance dialog does not live-update while open (re-open to refresh).
+   *Minor gap vs. an expectation of instant update.* Follow-up: SSE on the existing
+   project events stream (Phase 3.4).
+7. **`refreshSignal={mdlFiles}` re-fetches the badge on any file-list change**,
+   including draft edits that do not change the active set. Harmless (status is
+   cheap + idempotent) but slightly chattier than necessary.
+8. **ESLint could not be run in this checkout** (repo ships a legacy `.eslintrc`
+   but the installed ESLint is v10, which requires flat config) — an environment
+   issue, not these changes. Prettier + Jest + the enforced pre-commit ruff hook
+   are clean; TypeScript types were authored to match existing `api.ts` patterns.
+9. **`persistence/models.py` mypy noise** — the new `AiAgentCoverageRun` produces
+   the same 2 `Column`-typing errors that all 13 pre-existing models already emit;
+   the file is not mypy-clean at baseline. No new logic-file type errors.

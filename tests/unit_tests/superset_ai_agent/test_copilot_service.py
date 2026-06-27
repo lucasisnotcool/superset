@@ -23,7 +23,6 @@ import json  # noqa: TID251 - standalone agent JSON contract
 
 from superset_ai_agent.conversations.schemas import (
     Conversation,
-    ConversationArtifact,
     ConversationMessage,
     ConversationScope,
 )

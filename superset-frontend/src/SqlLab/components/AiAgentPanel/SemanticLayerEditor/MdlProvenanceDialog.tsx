@@ -19,7 +19,14 @@
 import { useCallback, useEffect, useState } from 'react';
 import { t } from '@apache-superset/core/translation';
 import { css, styled } from '@apache-superset/core/theme';
-import { Button, Empty, Flex, Modal, Tag, Typography } from '@superset-ui/core/components';
+import {
+  Button,
+  Empty,
+  Flex,
+  Modal,
+  Tag,
+  Typography,
+} from '@superset-ui/core/components';
 import { Icons } from '@superset-ui/core/components/Icons';
 import {
   CoverageReport,
@@ -222,7 +229,8 @@ const MdlProvenanceDialog = ({
     }
   }, [open, load]);
 
-  const showingReport = report !== null || reportLoading || reportError !== null;
+  const showingReport =
+    report !== null || reportLoading || reportError !== null;
 
   if (showingReport) {
     return (
@@ -317,7 +325,10 @@ const MdlProvenanceDialog = ({
                   {documents.length > 0 ? (
                     <Flex wrap gap="small" data-test="provenance-documents">
                       {documents.map(doc => (
-                        <Tag key={doc.id ?? doc.filename} icon={<Icons.FileTextOutlined />}>
+                        <Tag
+                          key={doc.id ?? doc.filename}
+                          icon={<Icons.FileTextOutlined />}
+                        >
                           {doc.filename ?? doc.id}
                         </Tag>
                       ))}

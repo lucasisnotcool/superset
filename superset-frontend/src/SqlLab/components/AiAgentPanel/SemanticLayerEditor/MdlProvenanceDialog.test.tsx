@@ -185,7 +185,9 @@ test('opens a stored coverage report from a coverage entry', async () => {
 
   await userEvent.click(await screen.findByTestId('provenance-open-coverage'));
   // The report body replaces the timeline; a back link returns to history.
-  expect(await screen.findByTestId('provenance-coverage-back')).toBeInTheDocument();
+  expect(
+    await screen.findByTestId('provenance-coverage-back'),
+  ).toBeInTheDocument();
   await userEvent.click(screen.getByTestId('provenance-coverage-back'));
   expect(await screen.findByTestId('provenance-entry')).toBeInTheDocument();
 });

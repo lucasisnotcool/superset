@@ -367,7 +367,7 @@ def _from_model(model: AiAgentCoverageRun) -> CoverageRun:
         owner_id=model.owner_id,
         mdl_checksum=model.mdl_checksum,
         docs_checksum=model.docs_checksum,
-        status=model.status,  # type: ignore[arg-type]
+        status=model.status,
         score=model.score,
         report=(
             CoverageReport.model_validate(model.report)

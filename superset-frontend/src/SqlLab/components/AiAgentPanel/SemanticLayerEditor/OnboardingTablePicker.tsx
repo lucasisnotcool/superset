@@ -306,8 +306,10 @@ const OnboardingTablePicker = ({
   const lastIndexRef = useRef<number | null>(null);
 
   // Selection of UNREGISTERED physical tables (keyed on table name — they have no
-  // dataset id yet). Always explicit: "select all" never pulls these in, so a
-  // bulk action can't silently create datasets. Registered at confirm time.
+  // dataset id yet). "Select all" includes the listed unregistered tables when the
+  // user may register them (so it matches the visible list and Clear's scope), but
+  // nothing is created until confirm — registration is always an explicit step
+  // behind the "Register & onboard" button, never a silent side effect.
   const [includedNew, setIncludedNew] = useState<Set<string>>(new Set());
   const [registering, setRegistering] = useState(false);
   const [registerProgress, setRegisterProgress] = useState<string | null>(null);
@@ -570,7 +572,15 @@ const OnboardingTablePicker = ({
   const selectAllMatching = useCallback(() => {
     setMode('all');
     setExcluded(new Set());
-  }, []);
+    // Match the visible list (and Clear's scope): also check the listed
+    // unregistered tables when the user may register them. Nothing is created
+    // here — they're registered only at confirm time, behind the explicit
+    // "Register & onboard" button — so this stays a no-surprise bulk action.
+    // Without register permission those checkboxes are disabled, so leave them.
+    if (allowRegister) {
+      setIncludedNew(new Set(unregistered));
+    }
+  }, [allowRegister, unregistered]);
 
   const deselectAll = useCallback(() => {
     setMode('include');

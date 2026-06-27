@@ -22,9 +22,9 @@ from __future__ import annotations
 import json  # noqa: TID251 - standalone agent JSON contract
 from typing import Any
 
-from superset_ai_agent.llm.base import ChatMessage, ModelResult, ToolSpec
 import pytest
 
+from superset_ai_agent.llm.base import ChatMessage, ModelResult, ToolSpec
 from superset_ai_agent.semantic_layer.copilot.coverage import (
     aggregate_report,
     build_mdl_facts,
