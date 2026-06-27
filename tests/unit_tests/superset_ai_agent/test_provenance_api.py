@@ -98,6 +98,33 @@ def test_edit_emits_mdl_updated_entry(tmp_path) -> None:
     assert [e["kind"] for e in entries] == ["mdl_updated", "mdl_created"]
 
 
+def test_consecutive_user_edits_coalesce_into_one_entry(tmp_path) -> None:
+    client, _ = _client(tmp_path)
+    project = _resolve_project(client)
+    pid = project["id"]
+    created = _seed_base_model(client, pid, model="orders", table="orders")
+
+    for col in ("stage", "amount", "region"):
+        edit = client.patch(
+            f"/agent/semantic-layer/projects/{pid}/mdl-files/{created['id']}",
+            json={
+                "content": (
+                    '{"models":[{"name":"orders","tableReference":{"table":"orders"},'
+                    f'"columns":[{{"name":"{col}","type":"varchar"}}]}}]}}'
+                )
+            },
+        )
+        assert edit.status_code == 200, edit.text
+
+    entries = _provenance(client, pid)
+    # Three saves collapse to a single "Edited 3 times" entry; create stands alone.
+    assert [e["kind"] for e in entries] == ["mdl_updated", "mdl_created"]
+    coalesced = entries[0]
+    assert coalesced["edit_count"] == 3
+    assert coalesced["summary"] == "Edited 3 times"
+    assert coalesced["first_at"] is not None
+
+
 def test_onboarding_entry_carries_selection_detail(tmp_path) -> None:
     client, _ = _client(tmp_path)
     project = _resolve_project(client)

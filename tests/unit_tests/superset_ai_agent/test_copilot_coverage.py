@@ -23,14 +23,19 @@ import json  # noqa: TID251 - standalone agent JSON contract
 from typing import Any
 
 from superset_ai_agent.llm.base import ChatMessage, ModelResult, ToolSpec
+import pytest
+
 from superset_ai_agent.semantic_layer.copilot.coverage import (
     aggregate_report,
     build_mdl_facts,
+    CoverageCancelledError,
+    CoverageDocument,
     extract_claims,
     InMemoryCoverageCache,
     judge_coverage,
     judge_overreach,
     run_coverage_audit,
+    run_directory_coverage,
 )
 from superset_ai_agent.semantic_layer.copilot.coverage_eval import (
     GoldLabel,
@@ -392,3 +397,71 @@ def test_aggregate_report_weights_partial_half() -> None:
     report = aggregate_report(findings)
 
     assert report.score == round((1 + 0.5) / 3, 3)
+
+
+# -- Feature B: directory-level aggregate + cancellation -------------------
+
+
+def test_run_directory_coverage_unions_claims_across_documents() -> None:
+    # Two documents each yield one claim; both are judged together (union).
+    model = ScriptedModel(
+        [
+            json.dumps(
+                {"claims": [{"kind": "definition", "subject": "a", "statement": "x"}]}
+            ),
+            json.dumps(
+                {"claims": [{"kind": "synonym", "subject": "b", "statement": "y"}]}
+            ),
+            json.dumps(
+                {
+                    "findings": [
+                        {"claim_id": "c0", "status": "covered", "matched": "m"},
+                        {"claim_id": "c1", "status": "missing"},
+                    ]
+                }
+            ),
+        ]
+    )
+    report = run_directory_coverage(
+        model,
+        documents=[
+            CoverageDocument("d1", "a.md", "doc a"),
+            CoverageDocument("d2", "b.md", "doc b"),
+        ],
+        files=[_file()],
+    )
+
+    assert report.total == 2
+    assert report.covered == 1
+    assert report.missing == 1
+    assert report.score == 0.5
+
+
+def test_run_directory_coverage_no_documents_is_a_noop() -> None:
+    model = ScriptedModel([])  # never called
+    report = run_directory_coverage(model, documents=[], files=[_file()])
+
+    assert report.total == 0
+    assert report.score == 1.0
+    assert model.calls == 0
+    assert any("No documents" in w for w in report.warnings)
+
+
+def test_run_directory_coverage_cancels_before_judging() -> None:
+    # should_cancel trips after the first claim extraction → no judge call.
+    model = ScriptedModel(
+        [json.dumps({"claims": [{"kind": "definition", "statement": "x"}]})]
+    )
+    state = {"calls": 0}
+
+    def should_cancel() -> bool:
+        state["calls"] += 1
+        return state["calls"] > 1  # allow the first stage, cancel before judging
+
+    with pytest.raises(CoverageCancelledError):
+        run_directory_coverage(
+            model,
+            documents=[CoverageDocument("d1", "a.md", "doc a")],
+            files=[_file()],
+            should_cancel=should_cancel,
+        )

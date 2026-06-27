@@ -27,7 +27,10 @@ from __future__ import annotations
 import logging
 from typing import Protocol
 
-from superset_ai_agent.conversations.schemas import ConversationArtifact
+from superset_ai_agent.conversations.schemas import (
+    Conversation,
+    ConversationArtifact,
+)
 from superset_ai_agent.llm.base import ChatMessage, ModelClient
 from superset_ai_agent.semantic_layer.copilot.loop import (
     build_system_prompt,
@@ -216,6 +219,65 @@ def apply_changeset_items(
                 continue
             store.delete(item.file_id, owner_id=owner_id)
     return applied
+
+
+def changeset_from_conversation(conversation: Conversation) -> Changeset | None:
+    """Return the most recent persisted changeset artifact, if any.
+
+    The apply request carries only the accepted items (not the agent's summary or
+    the documents it consulted), so provenance reads the server-authoritative
+    changeset back from the conversation transcript (it cannot be spoofed by the
+    client). Returns ``None`` when the thread has no changeset artifact.
+    """
+
+    for message in reversed(conversation.messages):
+        for artifact in reversed(message.artifacts):
+            if artifact.type == CHANGESET_ARTIFACT_TYPE:
+                try:
+                    return Changeset.model_validate(artifact.payload)
+                except (ValueError, TypeError):
+                    return None
+    return None
+
+
+def apply_provenance_payload(
+    *,
+    items: list[ChangesetItem],
+    owner_id: str,
+    conversation_id: str | None,
+    summary: str | None,
+    documents: list[dict[str, str | None]],
+) -> tuple[str, str, dict[str, object]]:
+    """Build the (event_type, message, detail) for an agent-apply provenance event.
+
+    Classifies the apply as an ``enrichment`` pass when the agent retrieved
+    document passages (``documents`` non-empty), else a generic ``copilot_edit``.
+    ``ops``/``paths`` derive from the accepted items; ``documents`` are resolved
+    id+filename pairs the caller looked up from the document store.
+    """
+
+    ops = {"create": 0, "update": 0, "delete": 0}
+    paths: list[str] = []
+    for item in items:
+        ops[item.op] = ops.get(item.op, 0) + 1
+        paths.append(item.path)
+    is_enrichment = bool(documents)
+    event_type = "document_enriched" if is_enrichment else "mdl_agent_edit"
+    label = (summary or "").strip()
+    if not label:
+        total = len(items)
+        noun = "change" if total == 1 else "changes"
+        label = f"{'Enriched' if is_enrichment else 'Applied'} {total} {noun}"
+    detail: dict[str, object] = {
+        "actor": owner_id,
+        "source_type": "copilot",
+        "conversation_id": conversation_id,
+        "summary": label,
+        "ops": ops,
+        "paths": paths,
+        "documents": documents,
+    }
+    return event_type, label, detail
 
 
 def build_deploy_preview(

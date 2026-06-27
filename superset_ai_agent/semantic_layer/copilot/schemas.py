@@ -25,12 +25,22 @@ apply it as a draft.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Literal
+from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
 from superset_ai_agent.schemas import AgentStep
 from superset_ai_agent.semantic_layer.schemas import MdlValidationResult
+
+
+def _new_id() -> str:
+    return str(uuid4())
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 #: Default attachment ceiling (chars). The route enforces the configured value.
 ATTACHMENT_MAX_CHARS = 200_000
@@ -77,6 +87,10 @@ class Changeset(BaseModel):
     steps: list[AgentStep] = Field(default_factory=list)
     #: Free-text assistant summary of what was proposed (for the chat bubble).
     message: str = ""
+    #: Document ids whose passages the agent retrieved via ``search_documents``
+    #: while producing this changeset — the enrichment-provenance signal (a
+    #: non-empty list means this apply is recorded as an enrichment pass).
+    referenced_document_ids: list[str] = Field(default_factory=list)
 
 
 class WorkspaceNode(BaseModel):
@@ -236,6 +250,37 @@ class CoverageRequest(BaseModel):
     model: str | None = None
     #: Also flag MDL facts unsupported by the document (reverse direction).
     include_overreach: bool = False
+
+
+CoverageRunStatus = Literal[
+    "pending",
+    "running",
+    "complete",
+    "failed",
+    "superseded",
+]
+
+
+class CoverageRun(BaseModel):
+    """A background coverage run over the active MDL directory (Feature B).
+
+    Tracks the run lifecycle and carries the aggregated ``CoverageReport`` once
+    complete. ``mdl_checksum`` is the active-set version this run targets — it is
+    both the supersession key (a newer change starts a fresh run) and the
+    idempotency key (an identical version reuses the stored report).
+    """
+
+    id: str = Field(default_factory=_new_id)
+    project_id: str
+    owner_id: str
+    mdl_checksum: str
+    docs_checksum: str = ""
+    status: CoverageRunStatus = "pending"
+    score: float | None = None
+    report: CoverageReport | None = None
+    error: str | None = None
+    created_at: datetime = Field(default_factory=_utc_now)
+    updated_at: datetime = Field(default_factory=_utc_now)
 
 
 WorkspaceNode.model_rebuild()

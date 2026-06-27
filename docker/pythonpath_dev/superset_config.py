@@ -29,6 +29,23 @@ from flask_caching.backends.filesystemcache import FileSystemCache
 
 logger = logging.getLogger()
 
+# Oracle is driven by the modern python-oracledb client, but some SQLAlchemy and
+# Superset code paths still probe for the legacy cx_Oracle module. python-oracledb
+# is API-compatible with cx_Oracle, so alias it to keep Oracle connections working
+# without the deprecated driver. See apache/superset discussion #37428.
+try:
+    import oracledb
+
+    # SQLAlchemy's cx_oracle dialect rejects drivers reporting a version below
+    # 5.2. python-oracledb's real version (2.x/3.x) fails that gate, so report the
+    # final cx_Oracle release to satisfy the legacy oracle:// and
+    # oracle+cx_oracle:// dialects. The native oracle+oracledb:// dialect ignores
+    # this. See python-oracledb's "Using in SQLAlchemy" compatibility note.
+    oracledb.version = "8.3.0"
+    sys.modules.setdefault("cx_Oracle", oracledb)
+except ModuleNotFoundError:
+    logger.info("oracledb not installed; skipping cx_Oracle compatibility shim")
+
 DATABASE_DIALECT = os.getenv("DATABASE_DIALECT")
 DATABASE_USER = os.getenv("DATABASE_USER")
 DATABASE_PASSWORD = os.getenv("DATABASE_PASSWORD")
@@ -119,6 +136,16 @@ WEBDRIVER_BASEURL_USER_FRIENDLY = (
     f"http://localhost:8888/{os.environ.get('SUPERSET_APP_ROOT', '/')}/"
 )
 SQLLAB_CTAS_NO_LIMIT = True
+
+# Surface Oracle as a featured tile in the "Connect a database" modal (in addition
+# to the built-in defaults). The OracleEngineSpec only renders here once the
+# oracledb driver is installed in the image (see Dockerfile dev target).
+from superset.config import PREFERRED_DATABASES as _PREFERRED_DATABASES  # noqa: E402
+
+PREFERRED_DATABASES = [
+    *(db for db in _PREFERRED_DATABASES if db != "Oracle"),
+    "Oracle",
+]
 
 if os.getenv("SUPERSET_ENV") == "development" and os.getenv(
     "SUPERSET_DOCKER_RELAX_CSP",

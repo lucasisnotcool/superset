@@ -17,10 +17,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json  # noqa: TID251 - keep the standalone agent independent of Superset
 import logging
 import queue
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -91,28 +93,41 @@ from superset_ai_agent.semantic_layer.access import (
     SemanticPermission,
 )
 from superset_ai_agent.semantic_layer.copilot.coverage import (
+    CoverageCancelledError,
+    CoverageDocument,
     InMemoryCoverageCache,
     run_coverage_audit,
+    run_directory_coverage,
 )
 from superset_ai_agent.semantic_layer.copilot.schemas import (
     Changeset,
     ChangesetApplyRequest,
+    ChangesetItem,
     CopilotInspector,
     CopilotTurnRequest,
     CoverageReport,
     CoverageRequest,
+    CoverageRun,
     InstructionView,
     MessageAttachment,
     WorkspaceNode,
 )
 from superset_ai_agent.semantic_layer.copilot.service import (
     apply_changeset_items,
+    apply_provenance_payload,
     build_deploy_preview,
     build_inspector,
+    changeset_from_conversation,
     changeset_to_artifact,
     run_copilot,
 )
 from superset_ai_agent.semantic_layer.copilot.workspace import build_workspace_tree
+from superset_ai_agent.semantic_layer.coverage_store import (
+    CoverageRunNotFoundError,
+    CoverageRunStore,
+    InMemoryCoverageRunStore,
+    SqlAlchemyCoverageRunStore,
+)
 from superset_ai_agent.semantic_layer.document_chunks import (
     DocumentChunk,
     DocumentChunkMatch,
@@ -186,6 +201,7 @@ from superset_ai_agent.semantic_layer.schema_snapshot import (
     SqlAlchemySchemaSnapshotStore,
 )
 from superset_ai_agent.semantic_layer.schemas import (
+    coalesce_user_runs,
     InstructionCreateRequest,
     MdlEnrichmentProposal,
     MdlFile,
@@ -255,6 +271,7 @@ def create_app(  # noqa: C901
     identity_provider: Any | None = None,
     job_store: JobStore | None = None,
     job_runner: JobRunner | None = None,
+    coverage_run_store: CoverageRunStore | None = None,
     schema_snapshot_store: SchemaSnapshotStore | None = None,
     retriever: Any | None = None,
 ) -> FastAPI:
@@ -339,6 +356,12 @@ def create_app(  # noqa: C901
     active_document_index = create_document_index(app_config, active_embedder)
     # Per-worker coverage-report cache (determinism on repeat audits).
     active_coverage_cache = InMemoryCoverageCache()
+    # Durable background coverage runs (Feature B) — score/report history plus the
+    # supersession lease so a new MDL change cancels a stale in-flight run.
+    active_coverage_run_store = coverage_run_store or _create_coverage_run_store(
+        app_config,
+        session_factory=session_factory,
+    )
     active_vector_index = effective_vector_index(app_config, active_retriever)
     if active_vector_index == "memory_fallback":
         logger.warning(
@@ -1034,6 +1057,226 @@ def create_app(  # noqa: C901
         except Exception:  # pylint: disable=broad-except
             logger.warning("Failed to record MDL provenance event.", exc_info=True)
 
+    def _emit_agent_apply_provenance(
+        *,
+        project: SemanticProject,
+        owner_id: str,
+        items: list[ChangesetItem],
+        conversation_id: str | None,
+    ) -> None:
+        """Record a Copilot apply as one provenance entry (best-effort).
+
+        Reads the server-authoritative changeset back from the conversation for
+        the agent's summary and the documents it consulted, classifies the apply
+        as an enrichment pass (documents referenced) or a generic agent edit, and
+        appends a single timeline entry. Never blocks the apply.
+        """
+
+        try:
+            summary: str | None = None
+            documents: list[dict[str, str | None]] = []
+            if conversation_id:
+                conversation = active_conversation_store.get(
+                    conversation_id, owner_id=owner_id
+                )
+                changeset = changeset_from_conversation(conversation)
+                if changeset is not None:
+                    summary = changeset.message
+                    for document_id in changeset.referenced_document_ids:
+                        filename: str | None = None
+                        try:
+                            document = active_semantic_layer_store.get_document(
+                                document_id, owner_id=owner_id
+                            )
+                            filename = document.filename
+                        except Exception:  # pylint: disable=broad-except
+                            filename = None
+                        documents.append({"id": document_id, "filename": filename})
+            event_type, message, detail = apply_provenance_payload(
+                items=items,
+                owner_id=owner_id,
+                conversation_id=conversation_id,
+                summary=summary,
+                documents=documents,
+            )
+            _append_semantic_event(
+                store=active_semantic_layer_store,
+                owner_id=owner_id,
+                event_type=event_type,  # type: ignore[arg-type]
+                scope=_scope_from_project(project),
+                document_id=None,
+                message=message,
+                project_id=project.id,
+                detail=detail,
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.warning(
+                "Failed to record Copilot apply provenance event.", exc_info=True
+            )
+
+    # -- Background directory coverage (Feature B) ------------------------
+
+    def _active_mdl_checksum(project_id: str, owner_id: str) -> str:
+        """A deterministic version key for the active MDL directory.
+
+        Hashes the sorted (path, per-file checksum) of active files — cheaper than
+        materializing to disk and stable across reorderings. Drives both
+        supersession (a change → a new key) and idempotency (same key → reuse).
+        """
+
+        active = sorted(
+            (f.path, f.checksum)
+            for f in active_mdl_file_store.list(project_id, owner_id=owner_id)
+            if f.status == "active"
+        )
+        digest = hashlib.sha256(
+            json.dumps(active, separators=(",", ":")).encode("utf-8")
+        )
+        return digest.hexdigest()
+
+    def _coverage_documents(
+        project_id: str, owner_id: str
+    ) -> list[CoverageDocument]:
+        """Gather each project document's text (chunks, else extracted text)."""
+
+        chunks_by_doc: dict[str, list[Any]] = {}
+        for chunk in active_semantic_layer_store.list_project_chunks(
+            project_id, owner_id=owner_id
+        ):
+            chunks_by_doc.setdefault(chunk.document_id, []).append(chunk)
+        documents: list[CoverageDocument] = []
+        for document in active_semantic_layer_store.list_project_documents(
+            project_id, owner_id=owner_id
+        ):
+            doc_chunks = sorted(
+                chunks_by_doc.get(document.id, []), key=lambda c: c.chunk_index
+            )
+            text = "\n\n".join(c.text for c in doc_chunks)
+            if not text:
+                text = document.extracted_text or ""
+            if text.strip():
+                documents.append(
+                    CoverageDocument(
+                        document_id=document.id,
+                        filename=document.filename,
+                        text=text,
+                    )
+                )
+        return documents
+
+    def _docs_checksum(documents: list[CoverageDocument]) -> str:
+        payload = sorted(f"{d.document_id}:{len(d.text)}" for d in documents)
+        return hashlib.sha256(
+            json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def _schedule_coverage(project: SemanticProject, owner_id: str) -> None:
+        """Schedule a debounced directory coverage run on the active MDL set.
+
+        Idempotent (skips an identical version already audited), superseding (a new
+        change cancels any in-flight run), and a no-op when there is nothing to
+        audit (no active MDL or no documents). Best-effort — never blocks the
+        triggering write.
+        """
+
+        if not (
+            app_config.wren_copilot_enabled
+            and app_config.wren_coverage_auto_enabled
+        ):
+            return
+        try:
+            mdl_checksum = _active_mdl_checksum(project.id, owner_id)
+            documents = _coverage_documents(project.id, owner_id)
+            if not documents or not mdl_checksum:
+                return
+            docs_checksum = _docs_checksum(documents)
+            existing = active_coverage_run_store.find_complete(
+                project.id, mdl_checksum, docs_checksum
+            )
+            if existing is not None:
+                return
+            active_coverage_run_store.supersede(project.id)
+            run = active_coverage_run_store.create(
+                project_id=project.id,
+                owner_id=owner_id,
+                mdl_checksum=mdl_checksum,
+                docs_checksum=docs_checksum,
+            )
+            active_job_runner.submit(
+                lambda: _run_coverage_job(run.id, project, owner_id)
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.warning("Failed to schedule coverage run.", exc_info=True)
+
+    def _run_coverage_job(
+        run_id: str, project: SemanticProject, owner_id: str
+    ) -> None:
+        """Background body: debounce → claim → audit → persist + emit event."""
+
+        debounce = app_config.wren_coverage_debounce_seconds
+        if debounce > 0:
+            time.sleep(debounce)
+        # Claim-on-start lease: a newer trigger that superseded this run wins, so
+        # only the latest pending run proceeds (cross-worker safe).
+        if not active_coverage_run_store.claim(run_id):
+            return
+
+        def _superseded() -> bool:
+            try:
+                return active_coverage_run_store.get(run_id).status == "superseded"
+            except CoverageRunNotFoundError:
+                return True
+
+        try:
+            files = active_mdl_file_store.list(project.id, owner_id=owner_id)
+            documents = _coverage_documents(project.id, owner_id)
+            instructions = [
+                view.instruction
+                for view in _project_instruction_views(project, owner_id)
+            ]
+            report = run_directory_coverage(
+                active_model_client,
+                documents=documents,
+                files=files,
+                instructions=instructions,
+                embedder=active_embedder,
+                votes=app_config.wren_copilot_coverage_votes,
+                include_overreach=app_config.wren_coverage_include_overreach,
+                should_cancel=_superseded,
+            )
+        except CoverageCancelledError:
+            return  # superseded mid-run; the newer run will report
+        except Exception as ex:  # pylint: disable=broad-except
+            logger.warning("Coverage run failed.", exc_info=True)
+            try:
+                active_coverage_run_store.fail(run_id, str(ex))
+            except CoverageRunNotFoundError:
+                pass
+            return
+
+        active_coverage_run_store.complete(run_id, report, score=report.score)
+        try:
+            _append_semantic_event(
+                store=active_semantic_layer_store,
+                owner_id=owner_id,
+                event_type="coverage_completed",
+                scope=_scope_from_project(project),
+                document_id=None,
+                message=f"Coverage {round(report.score * 100)}%",
+                project_id=project.id,
+                detail={
+                    "run_id": run_id,
+                    "score": report.score,
+                    "total": report.total,
+                    "covered": report.covered,
+                    "partial": report.partial,
+                    "missing": report.missing,
+                    "unsupported": report.unsupported,
+                },
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.warning("Failed to record coverage provenance.", exc_info=True)
+
     @api.post(
         "/agent/semantic-layer/projects/{project_id}/mdl-files",
         response_model=MdlFile,
@@ -1309,6 +1552,10 @@ def create_app(  # noqa: C901
                     file=updated,
                     message=f"Edited {updated.path}",
                 )
+            # The active MDL directory changed (activation, or an edit to a live
+            # file) → (re)run directory coverage on the latest version.
+            if updated.status == "active":
+                _schedule_coverage(project, identity.owner_id)
             return updated
         except MdlFileNotFoundError as ex:
             raise HTTPException(status_code=404, detail="MDL file not found.") from ex
@@ -1349,6 +1596,9 @@ def create_app(  # noqa: C901
                 file=existing,
                 message=f"Deleted {existing.path}",
             )
+            # Deleting a live file changes the active directory → re-audit coverage.
+            if existing.status == "active":
+                _schedule_coverage(project, identity.owner_id)
         except MdlFileNotFoundError as ex:
             raise HTTPException(status_code=404, detail="MDL file not found.") from ex
         return {"deleted": True}
@@ -1608,7 +1858,13 @@ def create_app(  # noqa: C901
         fastapi_request: Request,
         identity: AgentIdentity = identity_dependency,
     ) -> CoverageReport:
-        """Audit a document for information lost in markdown → MDL conversion."""
+        """Audit a single document for information lost in markdown → MDL.
+
+        DEPRECATED (Feature B): directory-level coverage now runs automatically in
+        the background and is surfaced in the provenance dialog. This synchronous,
+        per-document route is retained one release for an on-demand drill-down and
+        will be removed once the badge + provenance surface fully replaces it.
+        """
 
         _require_copilot_enabled()
         project = authorize_semantic_project(
@@ -1656,6 +1912,103 @@ def create_app(  # noqa: C901
             )
         except Exception as ex:  # pylint: disable=broad-except
             raise HTTPException(status_code=502, detail=str(ex)) from ex
+
+    # -- Background directory coverage: read + manual refresh (Feature B) ---
+
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}/coverage/latest",
+        response_model=CoverageRun | None,
+    )
+    def get_latest_coverage(
+        project_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> CoverageRun | None:
+        """The most recent completed directory coverage run (score + report)."""
+
+        _require_copilot_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="read"
+        )
+        return active_coverage_run_store.latest_complete(project_id)
+
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}/coverage/runs/{run_id}",
+        response_model=CoverageRun,
+    )
+    def get_coverage_run(
+        project_id: str,
+        run_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> CoverageRun:
+        """Fetch one stored coverage run (the provenance dialog's drill-in)."""
+
+        _require_copilot_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="read"
+        )
+        try:
+            run = active_coverage_run_store.get(run_id)
+        except CoverageRunNotFoundError as ex:
+            raise HTTPException(
+                status_code=404, detail="Coverage run not found."
+            ) from ex
+        if run.project_id != project_id:
+            raise HTTPException(status_code=404, detail="Coverage run not found.")
+        return run
+
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}/coverage/status",
+    )
+    def get_coverage_status(
+        project_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> dict[str, Any]:
+        """Live coverage state for the editor badge (analysing / stale / ready)."""
+
+        _require_copilot_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="read"
+        )
+        latest = active_coverage_run_store.latest_complete(project_id)
+        active = active_coverage_run_store.active_run(project_id)
+        current_checksum = _active_mdl_checksum(project_id, identity.owner_id)
+        running = active is not None
+        stale = latest is not None and latest.mdl_checksum != current_checksum
+        if running:
+            status = "analysing"
+        elif latest is None:
+            status = "none"
+        elif stale:
+            status = "stale"
+        else:
+            status = "ready"
+        return {
+            "status": status,
+            "running": running,
+            "stale": stale,
+            "score": latest.score if latest is not None else None,
+            "run_id": latest.id if latest is not None else None,
+        }
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/coverage/refresh",
+    )
+    def refresh_coverage(
+        project_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> dict[str, bool]:
+        """Manually (re)schedule a directory coverage run on the current MDL."""
+
+        _require_copilot_enabled()
+        project = authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
+        )
+        _schedule_coverage(project, identity.owner_id)
+        return {"scheduled": True}
 
     # -- Copilot conversations (persistent, multi-turn threads) -----------
     # Parallel to the AI SQL ``/agent/conversations`` surface but project-scoped
@@ -2040,7 +2393,7 @@ def create_app(  # noqa: C901
         """Persist the user-accepted changeset items as drafts."""
 
         _require_copilot_enabled()
-        authorize_semantic_project(
+        project = authorize_semantic_project(
             fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
         )
         try:
@@ -2056,6 +2409,14 @@ def create_app(  # noqa: C901
             raise HTTPException(status_code=409, detail=str(ex)) from ex
         except ValueError as ex:
             raise HTTPException(status_code=400, detail=str(ex)) from ex
+
+        # Record the agent's edit in the MDL provenance timeline (best-effort).
+        _emit_agent_apply_provenance(
+            project=project,
+            owner_id=identity.owner_id,
+            items=request.items,
+            conversation_id=request.conversation_id,
+        )
 
         # Record the apply as an assistant turn so a resumed thread shows that the
         # proposal was applied (parity with the SQL agent's execute-sql turn).
@@ -2264,6 +2625,8 @@ def create_app(  # noqa: C901
                     "warnings": result.warnings,
                 },
             )
+            # Onboarding activated the base layer → audit coverage on it.
+            _schedule_coverage(project, owner_id)
 
         active_job_runner.submit(_run_onboarding)
         # Re-fetch so an inline runner reflects completion immediately while a
@@ -2339,6 +2702,9 @@ def create_app(  # noqa: C901
             owner_id=identity.owner_id,
             types=PROVENANCE_EVENT_TYPES,
         )
+        # Cancel any in-flight coverage run so it cannot complete against MDL that
+        # no longer exists (the active set is now empty).
+        active_coverage_run_store.supersede(project_id)
         return {"deleted": deleted}
 
     @api.get(
@@ -3136,6 +3502,9 @@ def create_app(  # noqa: C901
             if entry is not None
         ]
         entries.sort(key=lambda entry: entry.created_at, reverse=True)
+        # Collapse contiguous user-edit runs *before* capping so the cap bounds
+        # displayed rows, not raw events.
+        entries = coalesce_user_runs(entries)
         return entries[:PROVENANCE_HISTORY_CAP]
 
     @api.post("/agent/validate-sql")
@@ -3248,6 +3617,23 @@ def _create_job_store(
         if session_factory is None:
             raise ValueError("SQLAlchemy job store requires a database.")
         return SqlAlchemyJobStore(session_factory)
+    raise ValueError(
+        "Unsupported AI_AGENT_SEMANTIC_LAYER_STORE value "
+        f"{config.semantic_layer_store!r}. Expected one of: memory, sqlalchemy."
+    )
+
+
+def _create_coverage_run_store(
+    config: AgentConfig,
+    *,
+    session_factory: Any | None = None,
+) -> CoverageRunStore:
+    if config.semantic_layer_store == "memory":
+        return InMemoryCoverageRunStore()
+    if config.semantic_layer_store == "sqlalchemy":
+        if session_factory is None:
+            raise ValueError("SQLAlchemy coverage-run store requires a database.")
+        return SqlAlchemyCoverageRunStore(session_factory)
     raise ValueError(
         "Unsupported AI_AGENT_SEMANTIC_LAYER_STORE value "
         f"{config.semantic_layer_store!r}. Expected one of: memory, sqlalchemy."

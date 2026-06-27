@@ -113,6 +113,9 @@ class MdlToolset:
         self._project_id = project_id
         self._owner_id = owner_id or DEFAULT_OWNER_ID
         self._retrieve_k = retrieve_k
+        #: Document ids the agent pulled passages from (search_documents) — the
+        #: enrichment-provenance signal, stamped onto the built changeset.
+        self._referenced_document_ids: list[str] = []
 
     @property
     def _documents_available(self) -> bool:
@@ -378,6 +381,9 @@ class MdlToolset:
             )
         else:
             ranked = keyword_rank_chunks(query, chunks, limit)
+        for chunk in ranked:
+            if chunk.document_id not in self._referenced_document_ids:
+                self._referenced_document_ids.append(chunk.document_id)
         return {
             "passages": [
                 {
@@ -475,6 +481,7 @@ class MdlToolset:
             items=items,
             manifest_validation=self.validate_working(),
             message=message,
+            referenced_document_ids=list(self._referenced_document_ids),
         )
 
     # -- helpers ----------------------------------------------------------

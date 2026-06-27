@@ -17,6 +17,7 @@
  * under the License.
  */
 import fetchMock from 'fetch-mock';
+import userEvent from '@testing-library/user-event';
 import { render, screen } from 'spec/helpers/testing-library';
 import MdlProvenanceDialog from './MdlProvenanceDialog';
 
@@ -75,6 +76,118 @@ test('shows an empty state when there is no history', async () => {
   );
 
   expect(await screen.findByText(/No history yet/)).toBeInTheDocument();
+});
+
+test('renders agent enrichment with document chips, actor tag and a conversation link', async () => {
+  fetchMock.get(PROVENANCE, [
+    {
+      id: 'a1',
+      kind: 'enrichment',
+      status: 'ok',
+      summary: 'Add synonyms from glossary',
+      created_at: '2026-06-26T05:00:00Z',
+      actor_type: 'agent',
+      detail: {
+        source_type: 'copilot',
+        conversation_id: 'conv-9',
+        documents: [{ id: 'd1', filename: 'glossary.md' }],
+      },
+    },
+  ]);
+  const onOpenConversation = jest.fn();
+
+  render(
+    <MdlProvenanceDialog
+      open
+      projectId="project-1"
+      onClose={jest.fn()}
+      onOpenConversation={onOpenConversation}
+    />,
+  );
+
+  const entry = await screen.findByTestId('provenance-entry');
+  expect(entry).toHaveTextContent('Enrichment');
+  expect(screen.getByTestId('provenance-actor')).toHaveTextContent('Agent');
+  expect(screen.getByTestId('provenance-documents')).toHaveTextContent(
+    'glossary.md',
+  );
+  await userEvent.click(screen.getByTestId('provenance-open-conversation'));
+  expect(onOpenConversation).toHaveBeenCalledWith('conv-9');
+});
+
+test('renders a coalesced user run as an edited-N-times range', async () => {
+  fetchMock.get(PROVENANCE, [
+    {
+      id: 'u1',
+      kind: 'mdl_updated',
+      status: 'ok',
+      summary: 'Edited 3 times',
+      created_at: '2026-06-26T17:00:00Z',
+      first_at: '2026-06-25T14:00:00Z',
+      edit_count: 3,
+      actor_type: 'user',
+      detail: { paths: ['models/orders.json'] },
+    },
+  ]);
+
+  render(
+    <MdlProvenanceDialog open projectId="project-1" onClose={jest.fn()} />,
+  );
+
+  const entry = await screen.findByTestId('provenance-entry');
+  expect(entry).toHaveTextContent('Edited 3 times');
+  expect(entry).toHaveTextContent('3 edits');
+  expect(screen.getByTestId('provenance-actor')).toHaveTextContent('You');
+});
+
+test('opens a stored coverage report from a coverage entry', async () => {
+  fetchMock.get(PROVENANCE, [
+    {
+      id: 'cov1',
+      kind: 'coverage',
+      status: 'ok',
+      summary: 'Coverage 80%',
+      created_at: '2026-06-26T06:00:00Z',
+      actor_type: 'system',
+      detail: { run_id: 'run-7', score: 0.8 },
+    },
+  ]);
+  fetchMock.get(
+    'http://agent.local/agent/semantic-layer/projects/project-1/coverage/runs/run-7',
+    {
+      id: 'run-7',
+      project_id: 'project-1',
+      owner_id: 'u1',
+      mdl_checksum: 'c1',
+      docs_checksum: 'd1',
+      status: 'complete',
+      score: 0.8,
+      report: {
+        document_filename: '',
+        findings: [],
+        total: 5,
+        covered: 4,
+        partial: 0,
+        missing: 1,
+        score: 0.8,
+        overreach: [],
+        unsupported: 0,
+        warnings: [],
+      },
+      created_at: '2026-06-26T06:00:00Z',
+      updated_at: '2026-06-26T06:00:00Z',
+    },
+  );
+
+  render(
+    <MdlProvenanceDialog open projectId="project-1" onClose={jest.fn()} />,
+  );
+
+  await userEvent.click(await screen.findByTestId('provenance-open-coverage'));
+  // The report body replaces the timeline; a back link returns to history.
+  expect(await screen.findByTestId('provenance-coverage-back')).toBeInTheDocument();
+  await userEvent.click(screen.getByTestId('provenance-coverage-back'));
+  expect(await screen.findByTestId('provenance-entry')).toBeInTheDocument();
 });
 
 test('does not fetch when closed', () => {

@@ -206,6 +206,13 @@ class AgentConfig:
     # Coverage audit: judge votes per run (majority wins, ties break conservatively).
     # >1 trades cost for stability against LLM non-determinism. Default 1.
     wren_copilot_coverage_votes: int = 1
+    # Background directory coverage (Feature B): auto-run on MDL-directory change.
+    wren_coverage_auto_enabled: bool = True
+    # Debounce window (seconds) before a scheduled coverage run claims itself, so a
+    # burst of activations coalesces into one run. 0 disables the wait (tests/inline).
+    wren_coverage_debounce_seconds: float = 0.0
+    # Also flag MDL facts unsupported by any document (overreach) in auto runs.
+    wren_coverage_include_overreach: bool = False
     # Prior Copilot turns fed back into the edit loop as conversation history
     # (multi-turn memory). Mirrors ``max_history_messages`` for the SQL agent;
     # windows the most recent N messages to bound token cost.
@@ -693,6 +700,20 @@ class AgentConfig:
                     "WREN_COPILOT_COVERAGE_VOTES",
                     str(cls.wren_copilot_coverage_votes),
                 )
+            ),
+            wren_coverage_auto_enabled=_env_bool(
+                "WREN_COVERAGE_AUTO_ENABLED",
+                cls.wren_coverage_auto_enabled,
+            ),
+            wren_coverage_debounce_seconds=float(
+                os.getenv(
+                    "WREN_COVERAGE_DEBOUNCE_SECONDS",
+                    str(cls.wren_coverage_debounce_seconds),
+                )
+            ),
+            wren_coverage_include_overreach=_env_bool(
+                "WREN_COVERAGE_INCLUDE_OVERREACH",
+                cls.wren_coverage_include_overreach,
             ),
             wren_copilot_max_history_messages=int(
                 os.getenv(

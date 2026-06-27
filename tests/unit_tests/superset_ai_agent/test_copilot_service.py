@@ -21,7 +21,12 @@ from __future__ import annotations
 
 import json  # noqa: TID251 - standalone agent JSON contract
 
-from superset_ai_agent.conversations.schemas import ConversationScope
+from superset_ai_agent.conversations.schemas import (
+    Conversation,
+    ConversationArtifact,
+    ConversationMessage,
+    ConversationScope,
+)
 from superset_ai_agent.semantic_layer.copilot.schemas import (
     Changeset,
     ChangesetItem,
@@ -29,8 +34,11 @@ from superset_ai_agent.semantic_layer.copilot.schemas import (
 )
 from superset_ai_agent.semantic_layer.copilot.service import (
     apply_changeset_items,
+    apply_provenance_payload,
     build_deploy_preview,
     build_inspector,
+    changeset_from_conversation,
+    changeset_to_artifact,
 )
 from superset_ai_agent.semantic_layer.copilot.workspace import build_workspace_tree
 from superset_ai_agent.semantic_layer.mdl_files import InMemoryMdlFileStore
@@ -229,6 +237,87 @@ def test_build_inspector_includes_prompt_skills_tools_instructions() -> None:
     assert skill_names <= {"onboarding", "generate-mdl", "enrich-context"}
     assert "onboarding" in skill_names
     assert inspector.instructions[0].instruction == "Prefer revenue over sales"
+
+
+def _conversation_with(changeset: Changeset | None) -> Conversation:
+    messages = []
+    if changeset is not None:
+        messages.append(
+            ConversationMessage(
+                role="assistant",
+                content="proposed",
+                artifacts=[changeset_to_artifact(changeset)],
+            )
+        )
+    return Conversation(
+        kind="copilot",
+        project_id="p1",
+        scope=ConversationScope(database_id=1),
+        messages=messages,
+    )
+
+
+def test_changeset_from_conversation_returns_latest_changeset() -> None:
+    older = Changeset(message="first", referenced_document_ids=["d-old"])
+    newer = Changeset(message="second", referenced_document_ids=["d1", "d2"])
+    conversation = Conversation(
+        kind="copilot",
+        project_id="p1",
+        scope=ConversationScope(database_id=1),
+        messages=[
+            ConversationMessage(
+                role="assistant", content="a", artifacts=[changeset_to_artifact(older)]
+            ),
+            ConversationMessage(
+                role="assistant", content="b", artifacts=[changeset_to_artifact(newer)]
+            ),
+        ],
+    )
+
+    found = changeset_from_conversation(conversation)
+    assert found is not None
+    assert found.message == "second"
+    assert found.referenced_document_ids == ["d1", "d2"]
+
+
+def test_changeset_from_conversation_none_when_absent() -> None:
+    assert changeset_from_conversation(_conversation_with(None)) is None
+
+
+def test_apply_provenance_payload_classifies_enrichment() -> None:
+    items = [
+        ChangesetItem(op="update", path="models/orders.json", file_id="f1"),
+        ChangesetItem(op="create", path="models/customers.json"),
+    ]
+    event_type, message, detail = apply_provenance_payload(
+        items=items,
+        owner_id="u1",
+        conversation_id="c1",
+        summary="Add synonyms from glossary",
+        documents=[{"id": "d1", "filename": "glossary.md"}],
+    )
+
+    assert event_type == "document_enriched"
+    assert message == "Add synonyms from glossary"
+    assert detail["ops"] == {"create": 1, "update": 1, "delete": 0}
+    assert detail["paths"] == ["models/orders.json", "models/customers.json"]
+    assert detail["documents"] == [{"id": "d1", "filename": "glossary.md"}]
+    assert detail["source_type"] == "copilot"
+    assert detail["conversation_id"] == "c1"
+
+
+def test_apply_provenance_payload_generic_edit_without_docs() -> None:
+    event_type, message, detail = apply_provenance_payload(
+        items=[ChangesetItem(op="update", path="models/orders.json", file_id="f1")],
+        owner_id="u1",
+        conversation_id=None,
+        summary=None,
+        documents=[],
+    )
+
+    assert event_type == "mdl_agent_edit"
+    assert message == "Applied 1 change"
+    assert detail["documents"] == []
 
 
 def test_build_inspector_reflects_active_mode() -> None:

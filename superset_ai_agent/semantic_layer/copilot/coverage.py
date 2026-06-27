@@ -29,7 +29,8 @@ from __future__ import annotations
 import hashlib
 import json  # noqa: TID251 - standalone agent JSON contract
 import logging
-from typing import Any, Protocol
+from collections.abc import Callable
+from typing import Any, NamedTuple, Protocol
 
 from pydantic import BaseModel, Field
 
@@ -574,6 +575,19 @@ def aggregate_report(
     )
 
 
+class CoverageCancelledError(Exception):
+    """Raised when a ``should_cancel`` check trips between coverage stages.
+
+    The audit cannot kill an in-flight LLM call, so supersession takes effect at
+    the next stage boundary. Callers must not persist a partial result.
+    """
+
+
+def _raise_if_cancelled(should_cancel: Callable[[], bool] | None) -> None:
+    if should_cancel is not None and should_cancel():
+        raise CoverageCancelledError()
+
+
 def run_coverage_audit(
     model_client: ModelClient,
     *,
@@ -587,6 +601,7 @@ def run_coverage_audit(
     votes: int = 1,
     cache: CoverageCache | None = None,
     include_overreach: bool = False,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> CoverageReport:
     """Full coverage audit: extract → flatten → judge → aggregate.
 
@@ -594,6 +609,8 @@ def run_coverage_audit(
     unchanged inputs is identical and free. ``votes`` > 1 runs the judge multiple
     times and takes the majority status per claim (ties break conservatively).
     ``include_overreach`` additionally flags MDL facts unsupported by the document.
+    ``should_cancel`` is polled at each stage boundary; a True result raises
+    ``CoverageCancelledError`` so a superseded background run stops without persisting.
     """
 
     facts = build_mdl_facts(files, instructions=instructions)
@@ -609,6 +626,7 @@ def run_coverage_audit(
         if cached is not None:
             return cached
 
+    _raise_if_cancelled(should_cancel)
     claims = extract_claims(model_client, document_text=document_text, model=model)
     if claims is None:
         # A provider failure is transient — do not cache it.
@@ -626,6 +644,7 @@ def run_coverage_audit(
             warnings=["No modelable claims were found in the document."],
         )
     else:
+        _raise_if_cancelled(should_cancel)
         findings = judge_coverage(
             model_client,
             claims,
@@ -646,9 +665,84 @@ def run_coverage_audit(
             warnings=warnings,
         )
         if include_overreach:
+            _raise_if_cancelled(should_cancel)
             overreach = judge_overreach(model_client, claims, facts, model=model)
             report.overreach = overreach
             report.unsupported = len(overreach)
     if cache is not None:
         cache.set(key, report)
+    return report
+
+
+class CoverageDocument(NamedTuple):
+    """One project document fed into a directory-level coverage run."""
+
+    document_id: str
+    filename: str
+    text: str
+
+
+def run_directory_coverage(
+    model_client: ModelClient,
+    *,
+    documents: list[CoverageDocument],
+    files: list[Any],
+    instructions: list[str] | None = None,
+    model: str | None = None,
+    embedder: Embedder | None = None,
+    votes: int = 1,
+    include_overreach: bool = False,
+    should_cancel: Callable[[], bool] | None = None,
+) -> CoverageReport:
+    """Audit the whole MDL directory against the union of project documents.
+
+    The forward direction asks "did the active MDL capture everything the
+    documents say?" by extracting claims from every document and judging them
+    together against the active MDL facts (Feature B, decision D2 = union). With
+    no documents the run is a no-op (score 1.0, a warning). ``should_cancel`` is
+    polled per document and per stage so a superseded run stops promptly.
+    """
+
+    facts = build_mdl_facts(files, instructions=instructions)
+    if not documents:
+        return aggregate_report(
+            [],
+            warnings=["No documents to audit; coverage is vacuously complete."],
+        )
+
+    all_claims: list[CoverageClaim] = []
+    warnings: list[str] = []
+    for document in documents:
+        _raise_if_cancelled(should_cancel)
+        claims = extract_claims(
+            model_client, document_text=document.text, model=model
+        )
+        if claims is None:
+            warnings.append(f"Claim extraction failed for {document.filename}.")
+            continue
+        all_claims.extend(claims)
+
+    if not all_claims:
+        warnings.append("No modelable claims were found across the documents.")
+        return aggregate_report([], warnings=warnings)
+
+    _raise_if_cancelled(should_cancel)
+    findings = judge_coverage(
+        model_client,
+        all_claims,
+        facts,
+        model=model,
+        embedder=embedder,
+        votes=votes,
+    )
+    if not facts:
+        warnings.append(
+            "The project has no MDL semantics yet; everything is missing."
+        )
+    report = aggregate_report(findings, warnings=warnings)
+    if include_overreach:
+        _raise_if_cancelled(should_cancel)
+        overreach = judge_overreach(model_client, all_claims, facts, model=model)
+        report.overreach = overreach
+        report.unsupported = len(overreach)
     return report

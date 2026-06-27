@@ -21,6 +21,7 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -376,3 +377,27 @@ class AiAgentInstruction(Base):
     instruction = Column(Text, nullable=False)
     is_global = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class AiAgentCoverageRun(Base):
+    """A background MDL-directory coverage run and its stored report (Feature B).
+
+    Doubles as the supersession state row: ``status`` + ``mdl_checksum`` let a
+    new active-set change cancel a stale in-flight run and start one on the
+    latest version. ``report`` holds the full ``CoverageReport`` JSON; ``score``
+    is denormalized for a cheap latest-score badge.
+    """
+
+    __tablename__ = "ai_agent_coverage_runs"
+
+    id = Column(String(36), primary_key=True)
+    project_id = Column(String(36), index=True, nullable=False)
+    owner_id = Column(String(255), index=True, nullable=False)
+    mdl_checksum = Column(String(128), index=True, nullable=False)
+    docs_checksum = Column(String(128), nullable=False, default="")
+    status = Column(String(32), index=True, nullable=False)
+    score = Column(Float, nullable=True)
+    report = Column(JSON, nullable=True)
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), index=True, nullable=False)
+    updated_at = Column(DateTime(timezone=True), index=True, nullable=False)

@@ -397,6 +397,64 @@ def test_copilot_coverage_falls_back_to_extracted_text_without_indexing(
     assert report.json()["total"] == 2
 
 
+def test_directory_coverage_auto_runs_and_surfaces_in_provenance(tmp_path) -> None:
+    # Activating MDL while a document exists auto-runs directory coverage (inline
+    # job runner) and records a coverage entry in provenance + a latest report.
+    client = _client(tmp_path, model_client=CoverageModel())
+    project = _resolve(client)
+    pid = project["id"]
+
+    client.post(
+        f"/agent/semantic-layer/projects/{pid}/documents/text",
+        json={
+            "filename": "glossary.md",
+            "text": "id = order id. A drive unit is a patty.",
+            "content_type": "text/markdown",
+        },
+    )
+    # Activating a base model is an active-set change → schedules coverage.
+    _seed_active_model(client, pid)
+
+    latest = client.get(f"/agent/semantic-layer/projects/{pid}/coverage/latest")
+    assert latest.status_code == 200, latest.text
+    body = latest.json()
+    assert body is not None
+    assert body["status"] == "complete"
+    assert body["report"]["total"] == 2
+
+    status = client.get(
+        f"/agent/semantic-layer/projects/{pid}/coverage/status"
+    ).json()
+    assert status["status"] == "ready"
+    assert status["running"] is False
+
+    provenance = client.get(
+        f"/agent/semantic-layer/projects/{pid}/provenance"
+    ).json()
+    coverage_entries = [e for e in provenance if e["kind"] == "coverage"]
+    assert len(coverage_entries) == 1
+    assert coverage_entries[0]["actor_type"] == "system"
+    assert coverage_entries[0]["detail"]["run_id"] == body["id"]
+
+
+def test_directory_coverage_is_idempotent_for_same_version(tmp_path) -> None:
+    client = _client(tmp_path, model_client=CoverageModel())
+    project = _resolve(client)
+    pid = project["id"]
+    client.post(
+        f"/agent/semantic-layer/projects/{pid}/documents/text",
+        json={"filename": "g.md", "text": "id = order id.", "content_type": "text/markdown"},
+    )
+    _seed_active_model(client, pid)
+
+    # A manual refresh on the unchanged version reuses the stored run (no new one).
+    before = client.get(f"/agent/semantic-layer/projects/{pid}/coverage/latest").json()
+    refresh = client.post(f"/agent/semantic-layer/projects/{pid}/coverage/refresh")
+    assert refresh.status_code == 200, refresh.text
+    after = client.get(f"/agent/semantic-layer/projects/{pid}/coverage/latest").json()
+    assert before["id"] == after["id"]
+
+
 def test_copilot_routes_404_when_disabled(tmp_path) -> None:
     client = _client(tmp_path, enabled=False)
     project = _resolve(client)
@@ -844,6 +902,40 @@ def test_copilot_apply_records_applied_turn_in_thread(tmp_path) -> None:
         "assistant",
     ]
     assert thread["messages"][-1]["content"] == "Applied 1 draft."
+
+
+def test_copilot_apply_emits_agent_provenance(tmp_path) -> None:
+    # The core gap fix: applying a Copilot changeset must appear in the MDL
+    # provenance timeline as an agent edit (it previously bypassed provenance).
+    client = _client(tmp_path)
+    project = _resolve(client)
+    pid = project["id"]
+    _seed_active_model(client, pid)
+    cid = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot/conversations"
+    ).json()["id"]
+
+    run = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot",
+        json={"message": "model the moves table", "conversation_id": cid},
+    )
+    items = run.json()["items"]
+    apply = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot/apply",
+        json={"items": items, "conversation_id": cid},
+    )
+    assert apply.status_code == 200, apply.text
+
+    provenance = client.get(
+        f"/agent/semantic-layer/projects/{pid}/provenance"
+    ).json()
+    agent_edits = [e for e in provenance if e["kind"] == "copilot_edit"]
+    assert len(agent_edits) == 1
+    entry = agent_edits[0]
+    assert entry["actor_type"] == "agent"
+    assert entry["detail"]["source_type"] == "copilot"
+    assert entry["detail"]["ops"]["create"] == 1
+    assert entry["detail"]["conversation_id"] == cid
 
 
 def test_copilot_apply_without_conversation_id_does_not_touch_threads(

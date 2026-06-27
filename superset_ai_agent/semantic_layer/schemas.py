@@ -59,6 +59,10 @@ SemanticLayerEventType = Literal[
     "mdl_activated",
     "mdl_deleted",
     "document_enriched",
+    # Copilot/agent edits applied via the changeset path, and background coverage
+    # runs (plan_provenance_and_coverage_impl.md, Features A & B).
+    "mdl_agent_edit",
+    "coverage_completed",
 ]
 SemanticJobStatus = Literal["running", "completed", "failed"]
 
@@ -75,6 +79,8 @@ PROVENANCE_EVENT_TYPES: frozenset[str] = frozenset(
         "mdl_activated",
         "mdl_deleted",
         "document_enriched",
+        "mdl_agent_edit",
+        "coverage_completed",
     }
 )
 #: Max provenance entries returned by the read route (newest-first). History is
@@ -313,11 +319,19 @@ class OnboardingResult(BaseModel):
 ProvenanceKind = Literal[
     "onboarding",
     "enrichment",
+    "copilot_edit",
+    "coverage",
     "mdl_created",
     "mdl_updated",
     "mdl_activated",
     "mdl_deleted",
 ]
+
+#: Who is responsible for a timeline entry. Drives the dialog's icon/label and,
+#: crucially, coalescing: only contiguous ``user`` runs collapse into one entry.
+#: ``actor`` is always the owner id (the human owns the project even when driving
+#: the Copilot), so origin must be derived from the file ``source_type``/``kind``.
+ActorType = Literal["user", "agent", "system"]
 
 
 class ProvenanceEntry(BaseModel):
@@ -333,22 +347,52 @@ class ProvenanceEntry(BaseModel):
     summary: str
     created_at: datetime
     actor: str | None = None
+    actor_type: ActorType = "system"
+    #: Number of raw events merged into this entry (>1 only for coalesced user runs).
+    edit_count: int = 1
+    #: Earliest timestamp in a coalesced user run (``None`` when ``edit_count == 1``).
+    first_at: datetime | None = None
     detail: dict[str, Any] = Field(default_factory=dict)
 
 
 #: Maps provenance ``SemanticLayerEventType`` values to the dialog's ``ProvenanceKind``.
 #: Onboarding start/fail collapse onto the ``onboarding`` kind (status conveys outcome);
-#: ``document_enriched`` maps to ``enrichment``.
+#: ``document_enriched`` maps to ``enrichment``; ``mdl_agent_edit`` to ``copilot_edit``.
 _PROVENANCE_KIND_BY_EVENT: dict[str, ProvenanceKind] = {
     "onboarding_started": "onboarding",
     "onboarding_completed": "onboarding",
     "onboarding_failed": "onboarding",
     "document_enriched": "enrichment",
+    "mdl_agent_edit": "copilot_edit",
+    "coverage_completed": "coverage",
     "mdl_created": "mdl_created",
     "mdl_updated": "mdl_updated",
     "mdl_activated": "mdl_activated",
     "mdl_deleted": "mdl_deleted",
 }
+
+
+def actor_type_for(kind: ProvenanceKind, source_type: str | None) -> ActorType:
+    """Classify a provenance entry's origin for display and coalescing.
+
+    ``user`` is reserved for hand edits (manual / uploaded MDL) so that only
+    those collapse into a single timeline entry; agent (Copilot/enrichment) and
+    system (onboarding/coverage) entries always stand alone.
+    """
+
+    if kind in ("onboarding", "coverage"):
+        return "system"
+    if kind in ("enrichment", "copilot_edit"):
+        return "agent"
+    # ``mdl_*`` CRUD events: classify by the file's recorded ``source_type``.
+    if source_type in ("manual", "uploaded_mdl"):
+        return "user"
+    if source_type in ("copilot", "enriched_markdown"):
+        return "agent"
+    if source_type == "onboarding":
+        return "system"
+    # Manual-CRUD REST routes always stamp ``source_type``; default to user.
+    return "user"
 
 
 def provenance_from_event(event: SemanticLayerEvent) -> ProvenanceEntry | None:
@@ -374,8 +418,84 @@ def provenance_from_event(event: SemanticLayerEvent) -> ProvenanceEntry | None:
         summary=event.message,
         created_at=event.created_at,
         actor=detail.get("actor"),
+        actor_type=actor_type_for(kind, detail.get("source_type")),
         detail=detail,
     )
+
+
+def _coalesced_paths(run: list[ProvenanceEntry]) -> list[str]:
+    """Union the file paths touched across a coalesced user run (order-preserving)."""
+
+    paths: list[str] = []
+    for entry in run:
+        candidates = list(entry.detail.get("paths") or [])
+        single = entry.detail.get("path")
+        if isinstance(single, str):
+            candidates.append(single)
+        for path in candidates:
+            if isinstance(path, str) and path not in paths:
+                paths.append(path)
+    return paths
+
+
+def _is_user_edit(entry: ProvenanceEntry) -> bool:
+    """A hand ``mdl_updated`` save — the only entry that coalesces.
+
+    Lifecycle actions (create / activate / delete) are distinct events a user
+    expects to see individually; only repeated content saves are noise worth
+    collapsing, matching the "edit MDL at 2pm then 5pm = one change" intent.
+    """
+
+    return entry.actor_type == "user" and entry.kind == "mdl_updated"
+
+
+def coalesce_user_runs(entries: list[ProvenanceEntry]) -> list[ProvenanceEntry]:
+    """Collapse contiguous runs of user edits into a single timeline entry.
+
+    ``entries`` must be sorted newest-first. A maximal run of adjacent user
+    ``mdl_updated`` entries becomes one entry stamped at the run's latest
+    timestamp (``first_at`` = earliest, ``edit_count`` = run size, ``summary`` =
+    "Edited N times"). Anything else (agent/enrichment/coverage/onboarding, or a
+    user create/activate/delete) breaks the run and passes through unchanged — so
+    an agent edit between two user edits keeps them in separate runs. Mirrors how
+    editors group an editing session (e.g. Google Docs version history) and keeps
+    the raw event log append-only.
+    """
+
+    result: list[ProvenanceEntry] = []
+    run: list[ProvenanceEntry] = []
+
+    def flush() -> None:
+        if not run:
+            return
+        if len(run) == 1:
+            result.append(run[0])
+        else:
+            newest, oldest = run[0], run[-1]  # newest-first ordering
+            detail = dict(newest.detail)
+            paths = _coalesced_paths(run)
+            if paths:
+                detail["paths"] = paths
+            result.append(
+                newest.model_copy(
+                    update={
+                        "edit_count": len(run),
+                        "first_at": oldest.created_at,
+                        "summary": f"Edited {len(run)} times",
+                        "detail": detail,
+                    }
+                )
+            )
+        run.clear()
+
+    for entry in entries:
+        if _is_user_edit(entry):
+            run.append(entry)
+            continue
+        flush()
+        result.append(entry)
+    flush()
+    return result
 
 
 SemanticProjectReadinessStatus = Literal["empty", "indexing", "ready", "failed"]

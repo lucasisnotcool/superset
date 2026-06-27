@@ -80,6 +80,7 @@ import InstructionsPanel from './InstructionsPanel';
 import CopilotPanel from './CopilotPanel';
 import OnboardingTablePicker from './OnboardingTablePicker';
 import MdlProvenanceDialog from './MdlProvenanceDialog';
+import CoverageBadge from './CoverageBadge';
 import DocumentDetailPane from './DocumentDetailPane';
 import WorkspaceTree, { treeFromFiles } from './WorkspaceTree';
 
@@ -793,6 +794,7 @@ export default function SemanticLayerEditor({
                   data-test="open-provenance"
                 />
               </Tooltip>
+              <CoverageBadge projectId={project?.id} refreshSignal={mdlFiles} />
             </Flex>
             <SemanticLayerStateBadge state={state} />
           </Flex>

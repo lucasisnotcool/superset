@@ -1319,6 +1319,65 @@ export const runCoverage = (
     },
   );
 
+// -- Background directory coverage (Feature B) ------------------------------
+
+export type CoverageRunStatus =
+  | 'pending'
+  | 'running'
+  | 'complete'
+  | 'failed'
+  | 'superseded';
+
+export interface CoverageRun {
+  id: string;
+  project_id: string;
+  owner_id: string;
+  mdl_checksum: string;
+  docs_checksum: string;
+  status: CoverageRunStatus;
+  score?: number | null;
+  report?: CoverageReport | null;
+  error?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CoverageStatusInfo {
+  status: 'analysing' | 'stale' | 'ready' | 'none';
+  running: boolean;
+  stale: boolean;
+  score?: number | null;
+  run_id?: string | null;
+}
+
+/** The latest completed directory coverage run (score + report), or null. */
+export const getLatestCoverage = (projectId: string) =>
+  requestJson<CoverageRun | null>(
+    `/agent/semantic-layer/projects/${projectId}/coverage/latest`,
+    { method: 'GET' },
+  );
+
+/** Fetch one stored coverage run by id (provenance drill-in). */
+export const getCoverageRun = (projectId: string, runId: string) =>
+  requestJson<CoverageRun>(
+    `/agent/semantic-layer/projects/${projectId}/coverage/runs/${runId}`,
+    { method: 'GET' },
+  );
+
+/** Live coverage state for the editor badge (analysing / stale / ready). */
+export const getCoverageStatus = (projectId: string) =>
+  requestJson<CoverageStatusInfo>(
+    `/agent/semantic-layer/projects/${projectId}/coverage/status`,
+    { method: 'GET' },
+  );
+
+/** Manually (re)schedule a directory coverage run on the current MDL. */
+export const refreshCoverage = (projectId: string) =>
+  requestJson<{ scheduled: boolean }>(
+    `/agent/semantic-layer/projects/${projectId}/coverage/refresh`,
+    { method: 'POST' },
+  );
+
 export const runCopilot = (projectId: string, payload: CopilotTurnRequest) =>
   requestJson<Changeset>(
     `/agent/semantic-layer/projects/${projectId}/copilot`,
@@ -1683,10 +1742,14 @@ export const getProjectSemanticLayerState = (projectId: string) =>
 export type ProvenanceKind =
   | 'onboarding'
   | 'enrichment'
+  | 'copilot_edit'
+  | 'coverage'
   | 'mdl_created'
   | 'mdl_updated'
   | 'mdl_activated'
   | 'mdl_deleted';
+
+export type ProvenanceActorType = 'user' | 'agent' | 'system';
 
 export interface ProvenanceEntry {
   id: string;
@@ -1695,6 +1758,11 @@ export interface ProvenanceEntry {
   summary: string;
   created_at: string;
   actor?: string | null;
+  actor_type?: ProvenanceActorType;
+  /** Number of raw events merged into this entry (>1 for coalesced user runs). */
+  edit_count?: number;
+  /** Earliest timestamp in a coalesced user run (null when edit_count === 1). */
+  first_at?: string | null;
   detail: Record<string, unknown>;
 }
 
