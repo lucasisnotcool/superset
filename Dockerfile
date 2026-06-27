@@ -288,6 +288,16 @@ RUN set -eux; \
       echo "Using bundled Linux Instant Client from ${src_dir}"; \
       mkdir -p "${ORACLE_CLIENT_LIB_DIR}"; \
       cp -a "${src_dir}/." "${ORACLE_CLIENT_LIB_DIR}/"; \
+      # Loader symlinks (e.g. libclntsh.so -> libclntsh.so.NN.M) are lost when the \
+      # client is unzipped/copied on Windows, leaving truncated stub files that \
+      # trigger DPI-1047 "file too short". Recreate them from the versioned .so. \
+      for base in libclntsh libclntshcore libocci; do \
+        versioned="$(ls "${ORACLE_CLIENT_LIB_DIR}/${base}".so.* 2>/dev/null | sort -V | tail -n1 || true)"; \
+        if [ -n "${versioned}" ]; then \
+          ln -sf "$(basename "${versioned}")" "${ORACLE_CLIENT_LIB_DIR}/${base}.so"; \
+          echo "Recreated symlink ${base}.so -> $(basename "${versioned}")"; \
+        fi; \
+      done; \
     else \
       case "${TARGETARCH:-amd64}" in \
         amd64) ic_url="https://download.oracle.com/otn_software/linux/instantclient/instantclient-basiclite-linuxx64.zip" ;; \
