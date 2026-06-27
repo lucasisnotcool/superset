@@ -28,14 +28,18 @@ should back this with the agent database or a task queue (Celery); see the
 
 from __future__ import annotations
 
+import logging
 import threading
 from datetime import datetime, timezone
 from typing import Callable, Protocol
 
+from pydantic import ValidationError
 from sqlalchemy.orm import Session, sessionmaker
 
 from superset_ai_agent.persistence.models import AiAgentJob
 from superset_ai_agent.semantic_layer.schemas import OnboardingResult, SemanticJob
+
+logger = logging.getLogger(__name__)
 
 
 class JobNotFoundError(KeyError):
@@ -186,17 +190,36 @@ def _to_model(job: SemanticJob) -> AiAgentJob:
     )
 
 
+def _result_from_model(model: AiAgentJob) -> OnboardingResult | None:
+    """Deserialize a job's stored result, tolerating legacy/unparseable payloads.
+
+    A persisted result written by an older revision (e.g. a pre-native-JSON
+    onboarding result whose files carry ``content_type='application/x-yaml'``)
+    no longer validates against the current schema. Such a row must not take
+    down callers that only need the job's status/kind (e.g. the Copilot
+    readiness gate) -- degrade the result to ``None`` and log instead of raising.
+    """
+
+    if model.result is None:
+        return None
+    try:
+        return OnboardingResult.model_validate(model.result)
+    except ValidationError:
+        logger.warning(
+            "Job %s has an unparseable legacy result; treating it as absent. "
+            "Purge legacy rows to clear this.",
+            model.id,
+        )
+        return None
+
+
 def _from_model(model: AiAgentJob) -> SemanticJob:
     return SemanticJob(
         id=model.id,
         kind=model.kind,
         status=model.status,  # type: ignore[arg-type]
         project_id=model.project_id,
-        result=(
-            OnboardingResult.model_validate(model.result)
-            if model.result is not None
-            else None
-        ),
+        result=_result_from_model(model),
         error=model.error,
         created_at=model.created_at,
         updated_at=model.updated_at,

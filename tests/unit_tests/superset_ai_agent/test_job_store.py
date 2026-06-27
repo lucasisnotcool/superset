@@ -49,9 +49,7 @@ def test_inmemory_job_store_lifecycle() -> None:
     job = store.create(kind="onboarding", project_id="p1")
     assert job.status == "running"
 
-    completed = store.complete(
-        job.id, OnboardingResult(project_id="p1", model_count=2)
-    )
+    completed = store.complete(job.id, OnboardingResult(project_id="p1", model_count=2))
     assert completed.status == "completed"
     assert store.get(job.id).result.model_count == 2
 
@@ -84,3 +82,53 @@ def test_sqlalchemy_job_store_records_failure() -> None:
     fetched = store.get(job.id)
     assert fetched.status == "failed"
     assert fetched.error == "boom"
+
+
+def test_sqlalchemy_job_store_tolerates_legacy_unparseable_result() -> None:
+    # A job persisted by an older revision can hold a result whose files carry
+    # the pre-native-JSON ``content_type='application/x-yaml'``, which no longer
+    # validates against the current schema. Listing such a row must degrade the
+    # result to None instead of crashing the whole readiness gate.
+    from datetime import datetime, timezone
+
+    from superset_ai_agent.persistence.models import AiAgentJob
+
+    session_factory = create_session_factory(_engine())
+    store = SqlAlchemyJobStore(session_factory)
+
+    legacy_result = {
+        "project_id": "p1",
+        "model_count": 1,
+        "files": [
+            {
+                "id": "f1",
+                "project_id": "p1",
+                "path": "models/x.yaml",
+                "filename": "x.yaml",
+                "content": "models: []",
+                "content_type": "application/x-yaml",
+                "checksum": "abc",
+            }
+        ],
+    }
+    now = datetime.now(timezone.utc)
+    with session_factory() as session:
+        session.add(
+            AiAgentJob(
+                id="legacy-1",
+                kind="onboarding",
+                status="completed",
+                project_id="p1",
+                result=legacy_result,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        session.commit()
+
+    # Neither listing nor fetching raises; the unparseable result is dropped.
+    jobs = store.list_for_project("p1")
+    assert len(jobs) == 1
+    assert jobs[0].status == "completed"
+    assert jobs[0].result is None
+    assert store.get("legacy-1").result is None
