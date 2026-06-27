@@ -1,0 +1,7 @@
+# Keep this directory in git but never commit the (large, license-restricted)
+# Oracle Instant Client binaries. Each machine drops its own LINUX client here
+# for CDN-blocked / air-gapped builds; the Dockerfile copies whatever is present.
+*
+!.gitkeep
+!.gitignore
+!README.md

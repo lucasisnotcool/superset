@@ -260,24 +260,48 @@ RUN /app/docker/apt-install.sh \
     curl \
     unzip
 
-# Oracle Instant Client (Basic Light) for python-oracledb Thick mode. Thick mode
-# supports legacy 10G password verifiers that Thin mode rejects with DPY-3015.
-# Arch-matched to the build platform (TARGETARCH is supplied automatically by
-# BuildKit). Thick mode is activated by oracledb.init_oracle_client() in
-# docker/pythonpath_dev/superset_config.py against ORACLE_CLIENT_LIB_DIR below.
+# Oracle Instant Client for python-oracledb Thick mode. Thick mode supports
+# legacy 10G password verifiers that Thin mode rejects with DPY-3015.
+#
+# Local fallback for CDN-blocked / air-gapped builds: anything placed under
+# docker/oracle-instantclient/ is copied into the build. Drop an unzipped LINUX
+# Instant Client (Basic or Basic Light — the .so libraries, NOT the Windows
+# .dll/.exe package) there to bundle it. The directory ships empty (.gitkeep),
+# so this COPY is a no-op by default.
 ARG TARGETARCH
 ENV ORACLE_CLIENT_LIB_DIR=/opt/oracle/instantclient
+COPY docker/oracle-instantclient/ /tmp/oracle-instantclient/
+
+# Resolve the client in priority order, and NEVER fail the build — a missing
+# client only disables Thick mode (Oracle still works in Thin mode):
+#   1. a bundled LINUX client under docker/oracle-instantclient/ (detected by .so)
+#   2. else Oracle's CDN, arch-matched to TARGETARCH (supplied by BuildKit)
+#   3. else warn and continue in Thin mode
 RUN set -eux; \
-    case "${TARGETARCH:-amd64}" in \
-      amd64) IC_URL="https://download.oracle.com/otn_software/linux/instantclient/instantclient-basiclite-linuxx64.zip" ;; \
-      arm64) IC_URL="https://download.oracle.com/otn_software/linux/instantclient/instantclient-basiclite-linux-arm64.zip" ;; \
-      *) echo "Unsupported TARGETARCH for Oracle Instant Client: ${TARGETARCH}" >&2; exit 1 ;; \
-    esac; \
     mkdir -p /opt/oracle; \
-    curl -fsSL "$IC_URL" -o /tmp/instantclient.zip; \
-    unzip -q /tmp/instantclient.zip -d /opt/oracle; \
-    rm /tmp/instantclient.zip; \
-    ln -s /opt/oracle/instantclient_* "${ORACLE_CLIENT_LIB_DIR}"
+    bundled_lib="$(find /tmp/oracle-instantclient -name 'libclntsh.so*' 2>/dev/null | head -n1 || true)"; \
+    if [ -n "${bundled_lib}" ]; then \
+      src_dir="$(dirname "${bundled_lib}")"; \
+      echo "Using bundled Linux Instant Client from ${src_dir}"; \
+      mkdir -p "${ORACLE_CLIENT_LIB_DIR}"; \
+      cp -a "${src_dir}/." "${ORACLE_CLIENT_LIB_DIR}/"; \
+    else \
+      case "${TARGETARCH:-amd64}" in \
+        amd64) ic_url="https://download.oracle.com/otn_software/linux/instantclient/instantclient-basiclite-linuxx64.zip" ;; \
+        arm64) ic_url="https://download.oracle.com/otn_software/linux/instantclient/instantclient-basiclite-linux-arm64.zip" ;; \
+        *) ic_url="" ;; \
+      esac; \
+      if [ -n "${ic_url}" ] && curl -fsSL --max-time 120 "${ic_url}" -o /tmp/instantclient.zip; then \
+        unzip -q /tmp/instantclient.zip -d /opt/oracle; \
+        rm -f /tmp/instantclient.zip; \
+        ln -s /opt/oracle/instantclient_* "${ORACLE_CLIENT_LIB_DIR}"; \
+        echo "Installed Oracle Instant Client from Oracle CDN"; \
+      else \
+        echo "WARNING: no bundled Linux Instant Client and Oracle CDN unreachable;" \
+             "Oracle limited to Thin mode (DPY-3015 for legacy 10G verifiers)." >&2; \
+      fi; \
+    fi; \
+    rm -rf /tmp/oracle-instantclient
 
 # Copy development requirements and install them
 COPY requirements/*.txt requirements/
