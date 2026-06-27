@@ -146,7 +146,9 @@ class CopilotTurnRequest(BaseModel):
     attachments: list[MessageAttachment] = Field(default_factory=list)
     conversation_id: str | None = None
     model: str | None = None
-    max_steps: int = Field(default=8, ge=2, le=24)
+    # When omitted, the server falls back to AgentConfig.wren_copilot_max_steps
+    # (env WREN_COPILOT_MAX_STEPS). An explicit value still overrides per-request.
+    max_steps: int | None = Field(default=None, ge=2, le=24)
 
 
 class ChangesetApplyRequest(BaseModel):

@@ -151,6 +151,8 @@ def run_copilot_loop(  # noqa: C901 - a tool-call+correction loop is irreducibly
     corrections = 0
     steps_taken = 0
     tools_unsupported = False
+    finalized = False
+    model_failed = False
 
     while steps_taken < max_steps:
         steps_taken += 1
@@ -165,6 +167,7 @@ def run_copilot_loop(  # noqa: C901 - a tool-call+correction loop is irreducibly
                     status="error",
                 )
             )
+            model_failed = True
             break
 
         if result.tool_calls:
@@ -219,6 +222,7 @@ def run_copilot_loop(  # noqa: C901 - a tool-call+correction loop is irreducibly
                     status="ok" if validation.valid else "warning",
                 )
             )
+            finalized = True
             break
 
         corrections += 1
@@ -241,12 +245,37 @@ def run_copilot_loop(  # noqa: C901 - a tool-call+correction loop is irreducibly
             )
         )
 
+    if not finalized and not tools_unsupported and not model_failed:
+        # Step budget exhausted while the model was still mid-edit. Force one
+        # tool-free turn so it writes a closing summary instead of leaving an
+        # empty message, then validate the partial working set and flag it so the
+        # (possibly incomplete) changeset is clearly reviewable and re-runnable.
+        if not final_text.strip():
+            try:
+                closing = model_client.chat(messages, tools=None, model=model)
+                final_text = closing.content or final_text
+            except Exception as ex:  # pylint: disable=broad-except
+                logger.warning("Copilot finalize call failed: %s", ex)
+        emit(
+            AgentStep(
+                kind="copilot_validate",
+                summary=f"Stopped at the {max_steps}-step limit",
+                status="warning",
+            )
+        )
+
     changeset = toolset.build_changeset(message=final_text)
     changeset.steps = steps
     if tools_unsupported:
         changeset.warnings.append(
             "The configured model did not return tool calls; no edits were "
             "proposed. Tool-calling is required for agentic MDL editing."
+        )
+    elif not finalized and not model_failed:
+        changeset.warnings.append(
+            f"Reached the {max_steps}-step tool budget before finishing. The "
+            "proposals may be incomplete — accept what is correct, then re-run "
+            "to continue (or raise WREN_COPILOT_MAX_STEPS)."
         )
     return changeset
 

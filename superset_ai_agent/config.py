@@ -210,6 +210,12 @@ class AgentConfig:
     # (multi-turn memory). Mirrors ``max_history_messages`` for the SQL agent;
     # windows the most recent N messages to bound token cost.
     wren_copilot_max_history_messages: int = 12
+    # Upper bound on tool-calling turns in the agentic MDL-edit loop before it
+    # finalizes. A capable model enriching many files (schema → list → read each →
+    # write each → validate) can need well over the legacy default of 8; raise this
+    # for large projects. Operator-tunable at runtime (no rebuild) via
+    # WREN_COPILOT_MAX_STEPS. Recommended range 8–24.
+    wren_copilot_max_steps: int = 16
     # Wren full-parity seams (see wren_full.md). All default to the
     # zero-dependency binding so the service starts unchanged; turning any of
     # these on requires durable semantic persistence (semantic_layer_store=
@@ -692,6 +698,12 @@ class AgentConfig:
                 os.getenv(
                     "WREN_COPILOT_MAX_HISTORY_MESSAGES",
                     str(cls.wren_copilot_max_history_messages),
+                )
+            ),
+            wren_copilot_max_steps=int(
+                os.getenv(
+                    "WREN_COPILOT_MAX_STEPS",
+                    str(cls.wren_copilot_max_steps),
                 )
             ),
             wren_engine=cast(
