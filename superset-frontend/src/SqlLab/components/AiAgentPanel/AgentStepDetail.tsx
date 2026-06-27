@@ -23,7 +23,6 @@ import {
   Button,
   Collapse,
   Icons,
-  Radio,
   Tag,
 } from '@superset-ui/core/components';
 import type {
@@ -392,51 +391,6 @@ const RecalledExamples = ({
   );
 };
 
-const ToggleRow = styled.div`
-  ${({ theme }) => css`
-    margin-top: ${theme.sizeUnit}px;
-  `}
-`;
-
-// Toggle between the SQL the model authored (semantic) and what the engine
-// rewrote and Superset executed (native), so the rewrite is legible without two
-// stacked blocks competing for space (B4). Defaults to the executed (native) form.
-const SqlToggle = ({
-  semanticSql,
-  nativeSql,
-}: {
-  semanticSql?: string | null;
-  nativeSql?: string | null;
-}) => {
-  const [view, setView] = useState<'native' | 'semantic'>(
-    nativeSql ? 'native' : 'semantic',
-  );
-  if (!semanticSql && !nativeSql) {
-    return null;
-  }
-  if (!semanticSql || !nativeSql) {
-    // Only one side exists — no toggle needed.
-    return <CodeBlock code={(nativeSql || semanticSql) as string} />;
-  }
-  return (
-    <>
-      <ToggleRow>
-        <Radio.GroupWrapper
-          size="small"
-          value={view}
-          onChange={event => setView(event.target.value)}
-          options={[
-            { label: t('Native (executed)'), value: 'native' },
-            { label: t('Semantic (authored)'), value: 'semantic' },
-          ]}
-          optionType="button"
-        />
-      </ToggleRow>
-      <CodeBlock code={view === 'native' ? nativeSql : semanticSql} />
-    </>
-  );
-};
-
 // Each branch renders only the fields the corresponding backend step produces
 // (api.ts AgentStepDetail union). Falls through to `null` for an unknown shape,
 // so a future detail kind never throws — the step still shows its summary.
@@ -565,29 +519,22 @@ function DetailBody({ detail }: { detail: Detail }) {
       );
     case 'plan_semantic_sql':
       return (
-        <>
-          <List>
-            <Row label={t('Engine')} value={detail.engine} />
-            <Row
-              label={t('Rewritten')}
-              value={detail.rewritten ? t('yes') : t('no')}
-            />
-            <Row
-              label={t('Referenced tables')}
-              value={detail.referenced_tables.join(', ')}
-            />
-            <Row
-              label={t('Warnings')}
-              value={detail.warnings.join('; ') || null}
-            />
-          </List>
-          {detail.rewritten ? (
-            <SqlToggle
-              semanticSql={detail.semantic_sql}
-              nativeSql={detail.native_sql}
-            />
-          ) : null}
-        </>
+        <List>
+          <Row label={t('Engine')} value={detail.engine} />
+          <Row
+            label={t('Rewritten')}
+            value={detail.rewritten ? t('yes') : t('no')}
+          />
+          <Row
+            label={t('Referenced tables')}
+            value={detail.referenced_tables.join(', ')}
+          />
+          <Row
+            label={t('Warnings')}
+            value={detail.warnings.join('; ') || null}
+          />
+          <Sql label={t('Semantic SQL')} sql={detail.semantic_sql} />
+        </List>
       );
     case 'validate_sql':
       return (

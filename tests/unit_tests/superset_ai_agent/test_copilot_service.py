@@ -229,3 +229,13 @@ def test_build_inspector_includes_prompt_skills_tools_instructions() -> None:
     assert skill_names <= {"onboarding", "generate-mdl", "enrich-context"}
     assert "onboarding" in skill_names
     assert inspector.instructions[0].instruction == "Prefer revenue over sales"
+
+
+def test_build_inspector_reflects_active_mode() -> None:
+    # The inspector preview must show the same mode banner the loop will send, so
+    # operators can see whether auto-pilot is live (P1).
+    grill = build_inspector()
+    autopilot = build_inspector(autopilot=True)
+
+    assert "MODE = grill" in grill.system_prompt
+    assert "MODE = autopilot" in autopilot.system_prompt

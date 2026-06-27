@@ -111,6 +111,7 @@ def run_copilot(
     max_steps: int = 8,
     max_correction_retries: int = 1,
     deep_validate: bool = False,
+    autopilot: bool = False,
     on_step: StepSink | None = None,
     document_store: DocumentReader | None = None,
     document_index: DocumentChunkIndex | None = None,
@@ -146,6 +147,7 @@ def run_copilot(
         model=model,
         max_steps=max_steps,
         max_correction_retries=max_correction_retries,
+        autopilot=autopilot,
         on_step=on_step,
     )
 
@@ -277,13 +279,19 @@ def build_deploy_preview(
 def build_inspector(
     *,
     instructions: list[InstructionView] | None = None,
+    autopilot: bool = False,
 ) -> CopilotInspector:
-    """Assemble the inspector view: prompt, skills, tools, instructions."""
+    """Assemble the inspector view: prompt, skills, tools, instructions.
+
+    ``autopilot`` mirrors the live runtime flag so the previewed system prompt
+    shows the same ``## Active mode`` banner the loop will actually send.
+    """
 
     skills = [SkillDescriptor(name=name, text=text) for name, text in _skill_texts()]
     system_prompt = build_system_prompt(
         instructions=[i.instruction for i in (instructions or [])],
         skills=[s.text for s in skills],
+        mode="autopilot" if autopilot else "grill",
     )
     tools = [
         ToolDescriptor(name=spec.name, description=spec.description)

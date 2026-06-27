@@ -73,6 +73,19 @@ def test_unknown_skill_raises() -> None:
         get_skill("does-not-exist")
 
 
+def test_enrich_skill_lets_autopilot_propose_relationships_and_metrics() -> None:
+    # P2: relationships/metrics are no longer grilled/suppressed in auto-pilot —
+    # they are proposed into the (human-reviewed) changeset. Guard the contract so a
+    # future edit can't silently restore the old "high-blast-radius → grill" gating.
+    body = get_skill("enrich-context")
+
+    assert "propose them into the" in body or "proposed directly into the" in body
+    assert "review gate" in body or "review-gated" in body
+    # The old gating that suppressed relationships/metrics must be gone.
+    assert "high-blast-radius" not in body
+    assert "three escalations" not in body
+
+
 def test_skill_text_excludes_license_header() -> None:
     # The ASF license header must stay in the source file but never reach the
     # injected system prompt (it wastes tokens and distracts the agent).

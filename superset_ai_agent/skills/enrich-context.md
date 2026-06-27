@@ -66,15 +66,20 @@ folder, no `wren` CLI, no `queries.yml`, no cube authoring.
 
 ### Auto-pilot mode only
 
-8. **Drop into grill for three cases.** Interrupt auto-pilot and ask when:
+8. **Drop into grill for two cases only.** Interrupt auto-pilot and ask when:
    - (a) **Conflict** — a document and the current MDL disagree.
-   - (b) **High-blast-radius proposal** — a new `relationship`, a new `metric`,
-     or a new aggregate calculated field. These become public artifacts visible
-     to every future agent session.
-   - (c) **Routing ambiguity** — you cannot confidently pick a sink (MDL field
+   - (b) **Routing ambiguity** — you cannot confidently pick a sink (MDL field
      vs recommend-an-Instruction).
 
-   Everything else: apply directly and log to the audit list.
+   Everything else: propose it directly into the changeset and log to the audit
+   list. **This includes new relationships, metrics, and aggregate calculated
+   fields** — do *not* suppress or grill them. They are proposals, not deployments:
+   every changeset item is reviewed and accepted (or rejected) by a human before
+   anything is persisted or activated, so the accept step *is* the review gate.
+   Propose the relationships and metrics the schema and documents imply, each
+   tagged with confidence (high / med / low) and its source. A semantic layer
+   without relationships and metrics is under-enriched; surfacing them as
+   review-gated drafts is the job, not a risk to escalate.
 
 ## Step 0 — Mode is set by configuration
 
@@ -151,11 +156,12 @@ skip drop it. Search the documents instead of asking whenever you can. One
 question at a time.
 
 ### Auto-pilot mode
-Process every Lane 1–3 finding directly except the three escalations (conflict;
-new relationship / metric / aggregate calculated field; routing ambiguity → grill
-those). For everything else: synthesize the proposal, pick the sink, write back,
-`validate_project` immediately after any MDL edit (revert the single change on
-failure), append to the audit with confidence + source.
+Process every Lane 1–3 finding directly except the two escalations (conflict;
+routing ambiguity → grill those). New relationships, metrics, and aggregate
+calculated fields are **proposed directly into the changeset**, not escalated — the
+human accept step reviews them. For every finding: synthesize the proposal, pick
+the sink, write back, `validate_project` immediately after any MDL edit (revert the
+single change on failure), append to the audit with confidence + source.
 
 ## Step 5 — Gap catalog (the ten business-semantic categories)
 
@@ -236,8 +242,9 @@ Document defines a named metric / aggregation (ARR, WAU, churn, a ratio)
 Use a document's explicit formula verbatim and cite the source passage in the
 field's `description`. Filtered ratios belong inside the measure expression
 (`SUM(CASE WHEN … )` or `FILTER (WHERE …)`) — there is no separate filter field.
-Every new relationship / metric / aggregate calculated field is high-blast-radius
-(Rule 8b): grill it in auto-pilot.
+In **auto-pilot**, propose new relationships / metrics / aggregate calculated
+fields directly into the changeset (review-gated; tag confidence + source) — do not
+grill them. In **grill** mode, propose each and wait, one at a time.
 
 ## Step 7 — Routing & writeback
 
@@ -292,8 +299,9 @@ Print a tight report:
 - Do not author cubes or write `queries.yml` / NL→SQL pairs — neither is a sink
   in this path (see parity notes).
 - Do not skip `validate_project` after a write; never leave the project invalid.
-- In auto-pilot, do not auto-apply conflicts or new relationship / metric /
-  aggregate calculated fields — grill those.
+- In auto-pilot, do not grill or suppress new relationships / metrics / aggregate
+  calculated fields — propose them into the (review-gated) changeset. Only conflicts
+  and routing ambiguity (Rule 8a/8b) interrupt for a question.
 
 ## Parity notes (Wren → ours)
 - **instructions.md → instruction store, but agent-read-only.** The agent has no

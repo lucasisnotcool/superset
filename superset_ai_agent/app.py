@@ -1572,7 +1572,8 @@ def create_app(  # noqa: C901
             fastapi_request, project_id, owner_id=identity.owner_id, permission="read"
         )
         return build_inspector(
-            instructions=_project_instruction_views(project, identity.owner_id)
+            instructions=_project_instruction_views(project, identity.owner_id),
+            autopilot=app_config.wren_copilot_autopilot_enabled,
         )
 
     @api.get(
@@ -1875,6 +1876,7 @@ def create_app(  # noqa: C901
                 model=request.model,
                 max_steps=request.max_steps,
                 deep_validate=app_config.wren_modeling_deep_validation,
+                autopilot=app_config.wren_copilot_autopilot_enabled,
                 document_store=active_semantic_layer_store,
                 document_index=active_document_index,
                 project_id=project_id,
@@ -1937,6 +1939,7 @@ def create_app(  # noqa: C901
                         model=request.model,
                         max_steps=request.max_steps,
                         deep_validate=app_config.wren_modeling_deep_validation,
+                        autopilot=app_config.wren_copilot_autopilot_enabled,
                         on_step=on_step,
                         document_store=active_semantic_layer_store,
                         document_index=active_document_index,

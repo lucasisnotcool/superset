@@ -47,15 +47,43 @@ def _truncate(text: str, limit: int = 4000) -> str:
     return text if len(text) <= limit else text[:limit] + "\n…(truncated)…"
 
 
+#: Active-mode banner injected into the system prompt so the agent knows which
+#: posture the enrich-context skill's Step 0 selects. Without this the resolved
+#: ``wren_copilot_autopilot_enabled`` flag never reaches the model and it defaults
+#: to the cautious (grill) reading — see plan_copilot_enrichment_assertiveness.md RC1.
+_MODE_BLOCK = {
+    "grill": (
+        "## Active mode\n"
+        "MODE = grill. Propose each change and wait for the human to accept, edit, "
+        "or skip — one decision at a time. Do not batch-apply inferences."
+    ),
+    "autopilot": (
+        "## Active mode\n"
+        "MODE = autopilot. Make your best-effort inferences and **propose them "
+        "directly in the changeset** — including new relationships and metrics. The "
+        "human accept/reject step on the changeset is the review gate, so you do not "
+        "ask first for those. Still escalate only genuine conflicts (a document "
+        "disagreeing with current MDL) and routing ambiguity; tag every inference "
+        "with confidence and source."
+    ),
+}
+
+
 def build_system_prompt(
     *,
     instructions: list[str] | None = None,
     skills: list[str] | None = None,
+    mode: str = "grill",
 ) -> str:
-    """Assemble the effective system prompt: base + skills + project instructions."""
+    """Assemble the effective system prompt: base + mode + skills + instructions.
+
+    ``mode`` is ``"grill"`` or ``"autopilot"`` (resolved from
+    ``wren_copilot_autopilot_enabled``); it renders an ``## Active mode`` banner so
+    the enrich-context skill's mode branch is actually selectable by the model.
+    """
 
     base = get_prompt("mdl_copilot")
-    blocks = [base]
+    blocks = [base, _MODE_BLOCK.get(mode, _MODE_BLOCK["grill"])]
     if skills:
         blocks.append("## Skills\n" + "\n\n".join(skills))
     if instructions:
@@ -80,6 +108,7 @@ def run_copilot_loop(  # noqa: C901 - a tool-call+correction loop is irreducibly
     model: str | None = None,
     max_steps: int = 8,
     max_correction_retries: int = 1,
+    autopilot: bool = False,
     on_step: StepSink | None = None,
 ) -> Changeset:
     """Run the bounded agentic edit loop and return a reviewable changeset.
@@ -100,7 +129,11 @@ def run_copilot_loop(  # noqa: C901 - a tool-call+correction loop is irreducibly
                 logger.debug("Copilot step sink raised; continuing.", exc_info=True)
 
     specs = toolset.specs()
-    system_prompt = build_system_prompt(instructions=instructions, skills=skills)
+    system_prompt = build_system_prompt(
+        instructions=instructions,
+        skills=skills,
+        mode="autopilot" if autopilot else "grill",
+    )
 
     user_content = user_message
     if attachments_text:

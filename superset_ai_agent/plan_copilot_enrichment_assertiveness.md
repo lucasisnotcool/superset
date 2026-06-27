@@ -176,9 +176,26 @@ assertive mode the enrichment skill was written for.** Fix RC1 first; the rest r
 
 ---
 
-## 8. Verification summary (fill in on completion)
-- [ ] P1 keystone landed + tested
-- [ ] P2 / P3 copy changes landed + tested
-- [ ] P4 / P5 evaluated (done or consciously deferred — record which)
-- [ ] Suite green; pre-commit clean
-- [ ] Manual check with a live model: relationships + metrics now proposed in auto-pilot
+## 8. Verification summary
+
+- [x] **P1 keystone landed + tested.** `wren_copilot_autopilot_enabled` now threads
+      `run_copilot → run_copilot_loop → build_system_prompt`, rendering an
+      `## Active mode` banner (grill | autopilot); `build_inspector` mirrors it; both
+      `app.py` call sites + the inspector route pass the flag. Tests: 5 (grill/autopilot
+      banner in prompt, loop sends banner, inspector reflects mode).
+- [x] **P2 / P3 copy changes landed + tested.** enrich-context auto-pilot now *proposes*
+      relationships/metrics into the review-gated changeset (Rule 8 trimmed to 2
+      escalations; Step 4/6 + things-to-avoid reconciled). Base prompt scopes
+      "smallest edits" to targeted requests; enrichment sweeps the catalog incl.
+      relationships+metrics. Tests: 2 (skill contract guard; base-prompt scope).
+- [x] **P4 / P5 evaluated → DEFERRED (recorded).** Both are gated on live-model
+      evidence (DP3/DP4 say "observe-then-tune; don't do blindly"). No live model in
+      this environment, so deferred rather than implemented speculatively. Re-open if
+      manual testing shows assertiveness still lacking (P4) or step exhaustion (P5).
+- [x] **Suite green; lint clean.** 793 passed / 11 skipped (786 baseline + 7 new);
+      ruff clean on changed `.py`; no new mypy errors (only pre-existing
+      `persistence/models.py` `Base` + `MdlFileStore` protocol conflicts remain).
+- [ ] **Manual check with a live model** (REQUIRED before claiming UX fixed): set
+      `wren_copilot_autopilot_enabled=true`, run an enrichment turn, confirm
+      relationships + metrics are proposed in the changeset. Wiring + prompt contract
+      are unit-proven; end behavior depends on the model honoring the prompt.

@@ -23,7 +23,10 @@ import json  # noqa: TID251 - standalone agent JSON contract
 from typing import Any
 
 from superset_ai_agent.llm.base import ChatMessage, ModelResult, ToolCall, ToolSpec
-from superset_ai_agent.semantic_layer.copilot.loop import run_copilot_loop
+from superset_ai_agent.semantic_layer.copilot.loop import (
+    build_system_prompt,
+    run_copilot_loop,
+)
 from superset_ai_agent.semantic_layer.copilot.tools import MdlToolset
 from superset_ai_agent.semantic_layer.mdl_validator import SchemaIndex
 
@@ -190,6 +193,60 @@ def test_loop_self_corrects_relationship_emitted_as_model() -> None:
         if "relationships[]" in (m.content or "")
     ]
     assert correction_msgs
+
+
+# -- Active-mode banner (P1: wren_copilot_autopilot_enabled reaches the prompt) ----
+
+
+def test_system_prompt_defaults_to_grill_mode() -> None:
+    prompt = build_system_prompt()
+
+    assert "## Active mode" in prompt
+    assert "MODE = grill" in prompt
+    assert "MODE = autopilot" not in prompt
+
+
+def test_system_prompt_renders_autopilot_mode() -> None:
+    prompt = build_system_prompt(mode="autopilot")
+
+    assert "MODE = autopilot" in prompt
+    # Auto-pilot explicitly authorizes proposing relationships/metrics directly.
+    assert "relationships and metrics" in prompt
+    assert "MODE = grill" not in prompt
+
+
+def test_system_prompt_scopes_edit_breadth_to_request() -> None:
+    # P3: the "smallest set of edits" invariant must not suppress an enrichment
+    # sweep — the base prompt now scopes breadth to the request and names
+    # relationships + metrics as in-scope for enrichment.
+    prompt = build_system_prompt()
+
+    assert "smallest set of edits" in prompt  # targeted requests stay minimal
+    assert "enrichment" in prompt.lower()
+    assert "relationships, and metrics" in prompt or "relationships and metrics" in prompt
+
+
+def test_loop_sends_grill_banner_by_default() -> None:
+    model = ScriptedModel([ModelResult(content="ok")])
+    toolset = MdlToolset([], schema_index=SCHEMA)
+
+    run_copilot_loop(model_client=model, toolset=toolset, user_message="hi")
+
+    system = model.calls[0]["messages"][0]
+    assert system.role == "system"
+    assert "MODE = grill" in (system.content or "")
+
+
+def test_loop_sends_autopilot_banner_when_enabled() -> None:
+    model = ScriptedModel([ModelResult(content="ok")])
+    toolset = MdlToolset([], schema_index=SCHEMA)
+
+    run_copilot_loop(
+        model_client=model, toolset=toolset, user_message="hi", autopilot=True
+    )
+
+    system = model.calls[0]["messages"][0]
+    assert "MODE = autopilot" in (system.content or "")
 
 
 def test_loop_degrades_when_model_emits_no_tool_calls() -> None:
