@@ -255,7 +255,29 @@ FROM python-common AS dev
 RUN /app/docker/apt-install.sh \
     git \
     pkg-config \
-    default-libmysqlclient-dev
+    default-libmysqlclient-dev \
+    libaio1t64 \
+    curl \
+    unzip
+
+# Oracle Instant Client (Basic Light) for python-oracledb Thick mode. Thick mode
+# supports legacy 10G password verifiers that Thin mode rejects with DPY-3015.
+# Arch-matched to the build platform (TARGETARCH is supplied automatically by
+# BuildKit). Thick mode is activated by oracledb.init_oracle_client() in
+# docker/pythonpath_dev/superset_config.py against ORACLE_CLIENT_LIB_DIR below.
+ARG TARGETARCH
+ENV ORACLE_CLIENT_LIB_DIR=/opt/oracle/instantclient
+RUN set -eux; \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) IC_URL="https://download.oracle.com/otn_software/linux/instantclient/instantclient-basiclite-linuxx64.zip" ;; \
+      arm64) IC_URL="https://download.oracle.com/otn_software/linux/instantclient/instantclient-basiclite-linux-arm64.zip" ;; \
+      *) echo "Unsupported TARGETARCH for Oracle Instant Client: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    mkdir -p /opt/oracle; \
+    curl -fsSL "$IC_URL" -o /tmp/instantclient.zip; \
+    unzip -q /tmp/instantclient.zip -d /opt/oracle; \
+    rm /tmp/instantclient.zip; \
+    ln -s /opt/oracle/instantclient_* "${ORACLE_CLIENT_LIB_DIR}"
 
 # Copy development requirements and install them
 COPY requirements/*.txt requirements/

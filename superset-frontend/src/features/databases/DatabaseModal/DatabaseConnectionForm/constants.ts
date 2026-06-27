@@ -42,6 +42,8 @@ import SSHTunnelSwitch from '../SSHTunnelSwitch';
 export const FormFieldOrder = [
   'host',
   'port',
+  'service_name',
+  'sid',
   'database',
   'default_catalog',
   'default_schema',
@@ -74,6 +76,8 @@ export const FORM_FIELD_MAP = {
   http_path: httpPath,
   http_path_field: httpPathField,
   port: portField,
+  service_name: validatedInputField,
+  sid: validatedInputField,
   database: databaseField,
   default_catalog: defaultCatalogField,
   default_schema: defaultSchemaField,

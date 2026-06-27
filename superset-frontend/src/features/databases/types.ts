@@ -46,6 +46,8 @@ export type DatabaseParameters = {
   host?: string;
   port?: number;
   database?: string;
+  service_name?: string;
+  sid?: string;
   default_catalog?: string;
   default_schema?: string;
   http_path_field?: string;

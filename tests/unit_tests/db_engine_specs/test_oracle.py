@@ -128,3 +128,176 @@ def test_denormalize_name(name: str, expected_result: str):
     from superset.db_engine_specs.oracle import OracleEngineSpec as spec  # noqa: N813
 
     assert spec.denormalize_name(oracle.dialect(), name) == expected_result
+
+
+def test_build_sqlalchemy_uri_service_name() -> None:
+    from superset.db_engine_specs.oracle import OracleEngineSpec
+
+    uri = OracleEngineSpec.build_sqlalchemy_uri(
+        {
+            "username": "scott",
+            "password": "tiger",
+            "host": "dbhost",
+            "port": 1521,
+            "service_name": "ORCLPDB1",
+        }
+    )
+    assert uri == "oracle+cx_oracle://scott:tiger@dbhost:1521?service_name=ORCLPDB1"
+
+
+def test_build_sqlalchemy_uri_sid() -> None:
+    from superset.db_engine_specs.oracle import OracleEngineSpec
+
+    uri = OracleEngineSpec.build_sqlalchemy_uri(
+        {
+            "username": "scott",
+            "password": "tiger",
+            "host": "dbhost",
+            "port": 1521,
+            "sid": "ORCL",
+        }
+    )
+    assert uri == "oracle+cx_oracle://scott:tiger@dbhost:1521/ORCL"
+
+
+def test_build_sqlalchemy_uri_service_name_preferred_over_sid() -> None:
+    from superset.db_engine_specs.oracle import OracleEngineSpec
+
+    uri = OracleEngineSpec.build_sqlalchemy_uri(
+        {
+            "username": "scott",
+            "password": "tiger",
+            "host": "dbhost",
+            "port": 1521,
+            "service_name": "ORCLPDB1",
+            "sid": "ORCL",
+        }
+    )
+    # service name wins; cx_oracle rejects a URL that sets both
+    assert uri == "oracle+cx_oracle://scott:tiger@dbhost:1521?service_name=ORCLPDB1"
+
+
+def test_build_sqlalchemy_uri_merges_extra_query() -> None:
+    from superset.db_engine_specs.oracle import OracleEngineSpec
+
+    uri = OracleEngineSpec.build_sqlalchemy_uri(
+        {
+            "username": "scott",
+            "password": "tiger",
+            "host": "dbhost",
+            "port": 1521,
+            "service_name": "ORCLPDB1",
+            "query": {"encoding": "UTF-8"},
+        }
+    )
+    assert uri == (
+        "oracle+cx_oracle://scott:tiger@dbhost:1521"
+        "?encoding=UTF-8&service_name=ORCLPDB1"
+    )
+
+
+def test_get_parameters_from_uri_service_name() -> None:
+    from superset.db_engine_specs.oracle import OracleEngineSpec
+
+    parameters = OracleEngineSpec.get_parameters_from_uri(
+        "oracle+oracledb://scott:tiger@dbhost:1521/?service_name=ORCLPDB1"
+    )
+    assert parameters == {
+        "username": "scott",
+        "password": "tiger",
+        "host": "dbhost",
+        "port": 1521,
+        "service_name": "ORCLPDB1",
+        "sid": None,
+        "query": {},
+    }
+
+
+def test_get_parameters_from_uri_sid() -> None:
+    from superset.db_engine_specs.oracle import OracleEngineSpec
+
+    parameters = OracleEngineSpec.get_parameters_from_uri(
+        "oracle+cx_oracle://scott:tiger@dbhost:1521/ORCL"
+    )
+    assert parameters == {
+        "username": "scott",
+        "password": "tiger",
+        "host": "dbhost",
+        "port": 1521,
+        "service_name": None,
+        "sid": "ORCL",
+        "query": {},
+    }
+
+
+def test_parameters_round_trip_service_name() -> None:
+    from superset.db_engine_specs.oracle import OracleEngineSpec
+
+    parameters = {
+        "username": "scott",
+        "password": "tiger",
+        "host": "dbhost",
+        "port": 1521,
+        "service_name": "ORCLPDB1",
+        "sid": None,
+        "query": {},
+    }
+    uri = OracleEngineSpec.build_sqlalchemy_uri(parameters)
+    assert OracleEngineSpec.get_parameters_from_uri(uri) == parameters
+
+
+def test_validate_parameters_missing_identifier() -> None:
+    from superset.db_engine_specs.oracle import OracleEngineSpec
+
+    errors = OracleEngineSpec.validate_parameters(
+        {
+            "parameters": {
+                "username": "scott",
+                "host": "dbhost",
+                "port": 1521,
+            }
+        }
+    )
+    messages = {error.message for error in errors}
+    assert "Either a service name or a SID must be provided." in messages
+
+
+def test_validate_parameters_both_identifiers() -> None:
+    from superset.db_engine_specs.oracle import OracleEngineSpec
+
+    errors = OracleEngineSpec.validate_parameters(
+        {
+            "parameters": {
+                "username": "scott",
+                "host": "dbhost",
+                "port": 1521,
+                "service_name": "ORCLPDB1",
+                "sid": "ORCL",
+            }
+        }
+    )
+    messages = {error.message for error in errors}
+    assert "Provide either a service name or a SID, not both." in messages
+
+
+def test_validate_parameters_missing_required() -> None:
+    from superset.db_engine_specs.oracle import OracleEngineSpec
+
+    errors = OracleEngineSpec.validate_parameters({"parameters": {}})
+    missing_errors = [
+        error
+        for error in errors
+        if "One or more parameters are missing" in error.message
+    ]
+    assert missing_errors
+    assert set(missing_errors[0].extra["missing"]) == {"host", "port", "username"}
+
+
+def test_parameters_json_schema_exposes_oracle_fields() -> None:
+    from superset.db_engine_specs.oracle import OracleEngineSpec
+
+    schema = OracleEngineSpec.parameters_json_schema()
+    properties = set(schema["properties"])
+    assert {"host", "port", "username", "service_name", "sid"} <= properties
+    # Oracle has no plain "database" field; it uses service_name / sid instead
+    assert "database" not in properties

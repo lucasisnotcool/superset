@@ -16,12 +16,15 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+import { fireEvent, render, screen } from 'spec/helpers/testing-library';
 import {
   ConfigurationMethod,
+  DatabaseConnectionFormProps,
+  DatabaseForm,
   DatabaseObject,
   Engines,
 } from 'src/features/databases/types';
-import { computeInitialIsPublic } from './index';
+import DatabaseConnectionForm, { computeInitialIsPublic } from './index';
 
 const baseDb: Partial<DatabaseObject> = {
   configuration_method: ConfigurationMethod.DynamicForm,
@@ -82,4 +85,67 @@ test('computeInitialIsPublic: returns false when parameters.oauth2_client_info i
       } as DatabaseObject['parameters'],
     }),
   ).toBe(false);
+});
+
+// Mirrors the JSON schema OracleEngineSpec.parameters_json_schema() returns:
+// no plain `database` field, but explicit `service_name` and `sid`.
+const oracleDbModel = {
+  parameters: {
+    properties: {
+      host: { description: 'Hostname or IP address' },
+      port: { description: 'Database port' },
+      service_name: { description: 'Oracle service name' },
+      sid: { description: 'Oracle SID' },
+      username: { description: 'Username' },
+      password: { description: 'Password' },
+    },
+    required: ['host', 'port', 'username'],
+  },
+} as unknown as DatabaseForm;
+
+const noop = () => {};
+
+const renderOracleForm = (
+  overrides: Partial<DatabaseConnectionFormProps> = {},
+) =>
+  render(
+    <DatabaseConnectionForm
+      dbModel={oracleDbModel}
+      db={{ parameters: {} } as Partial<DatabaseObject>}
+      sslForced={false}
+      isValidating={false}
+      onParametersChange={noop}
+      onChange={noop}
+      onQueryChange={noop}
+      onExtraInputChange={noop}
+      onEncryptedExtraInputChange={noop}
+      onClearEncryptedExtraKey={noop}
+      onAddTableCatalog={noop}
+      onRemoveTableCatalog={noop}
+      validationErrors={null}
+      getValidation={noop}
+      clearValidationErrors={noop}
+      {...overrides}
+    />,
+  );
+
+test('Oracle form renders Service name and SID fields and no Database name field', () => {
+  renderOracleForm();
+  expect(screen.getByText('Service name')).toBeInTheDocument();
+  expect(screen.getByText('SID')).toBeInTheDocument();
+  expect(screen.getByText('Host')).toBeInTheDocument();
+  expect(screen.getByText('Port')).toBeInTheDocument();
+  // Oracle has no plain "Database name" field; it uses service_name / sid
+  expect(screen.queryByText('Database name')).not.toBeInTheDocument();
+});
+
+test('Oracle service_name input writes back through onParametersChange', () => {
+  const onParametersChange = jest.fn();
+  renderOracleForm({ onParametersChange });
+  const input = document.querySelector(
+    'input[name="service_name"]',
+  ) as HTMLInputElement;
+  expect(input).toBeInTheDocument();
+  fireEvent.change(input, { target: { value: 'ORCLPDB1' } });
+  expect(onParametersChange).toHaveBeenCalled();
 });

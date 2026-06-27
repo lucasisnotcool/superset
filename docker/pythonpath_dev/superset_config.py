@@ -53,6 +53,31 @@ try:
         "sqlalchemy.dialects.oracle.cx_oracle",
         "OracleDialect_cx_oracle",
     )
+
+    # Enable python-oracledb Thick mode when the Oracle Instant Client is bundled
+    # in the image. Thick mode supports legacy 10G password verifiers that Thin
+    # mode rejects with DPY-3015. Opt out with ORACLE_THICK_MODE=false to stay in
+    # Thin mode (no Instant Client required).
+    _oracle_thick_mode = os.getenv("ORACLE_THICK_MODE", "true").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    _oracle_client_lib_dir = os.getenv(
+        "ORACLE_CLIENT_LIB_DIR", "/opt/oracle/instantclient"
+    )
+    if _oracle_thick_mode and os.path.isdir(_oracle_client_lib_dir):
+        try:
+            oracledb.init_oracle_client(lib_dir=_oracle_client_lib_dir)
+            logger.info(
+                "python-oracledb Thick mode enabled (lib_dir=%s)",
+                _oracle_client_lib_dir,
+            )
+        except Exception as ex:  # pylint: disable=broad-except
+            # Already-initialized or missing libs shouldn't crash startup; the
+            # connection simply falls back to Thin mode behavior.
+            logger.warning("Could not enable Oracle Thick mode: %s", ex)
 except ModuleNotFoundError:
     logger.info("oracledb not installed; skipping Oracle driver compatibility shim")
 

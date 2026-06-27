@@ -38,6 +38,22 @@ const FIELD_TEXT_MAP = {
     placeholder: t('e.g. AccountAdmin'),
     className: 'form-group-w-50',
   },
+  service_name: {
+    label: t('Service name'),
+    placeholder: t('e.g. ORCLPDB1'),
+    helpText: t(
+      'Oracle service name (recommended for Oracle 12c+ and pluggable databases). Provide either a service name or a SID.',
+    ),
+    className: 'form-group-w-50',
+  },
+  sid: {
+    label: t('SID'),
+    placeholder: t('e.g. ORCL'),
+    helpText: t(
+      'Oracle System ID (SID) for older databases. Provide either a service name or a SID.',
+    ),
+    className: 'form-group-w-50',
+  },
 };
 
 type FieldTextMapKey = keyof typeof FIELD_TEXT_MAP;
