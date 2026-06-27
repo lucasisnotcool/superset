@@ -333,10 +333,21 @@ RUN set -eux; \
         fi; \
       done; \
     fi; \
-    # Verify the client actually loads (catches flattened symlinks / missing deps \
-    # / truncated binaries) so the failure is loud at build time, not runtime. \
+    # Register the client on the system loader path via ldconfig. Oracle's libs \
+    # have no RPATH, so at runtime libclntsh.so cannot find its siblings \
+    # (libnnz.so, libclntshcore.so) unless the directory is in the loader cache. \
+    # Without this, init_oracle_client() fails with DPI-1047 "libnnz.so: cannot \
+    # open shared object" even though the files are present. \
+    if [ -d "${ORACLE_CLIENT_LIB_DIR}" ]; then \
+      real_dir="$(readlink -f "${ORACLE_CLIENT_LIB_DIR}")"; \
+      echo "${real_dir}" > /etc/ld.so.conf.d/oracle-instantclient.conf; \
+      ldconfig; \
+    fi; \
+    # Verify the client resolves the way it will at runtime (plain ldd, no \
+    # LD_LIBRARY_PATH) so a flattened symlink / missing dep / truncated binary \
+    # fails loudly at build time instead of silently falling back to Thin mode. \
     if [ -e "${ORACLE_CLIENT_LIB_DIR}/libclntsh.so" ]; then \
-      if LD_LIBRARY_PATH="${ORACLE_CLIENT_LIB_DIR}" ldd "${ORACLE_CLIENT_LIB_DIR}/libclntsh.so" 2>&1 | grep -i 'not found'; then \
+      if ldd "${ORACLE_CLIENT_LIB_DIR}/libclntsh.so" 2>&1 | grep -i 'not found'; then \
         echo "WARNING: bundled Oracle client has unresolved libraries above;" \
              "Thick mode will fail. Prefer bundling the original Linux .zip." >&2; \
       else \
