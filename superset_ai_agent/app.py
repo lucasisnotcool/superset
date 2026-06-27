@@ -1849,17 +1849,21 @@ def create_app(  # noqa: C901
     ) -> Changeset:
         """Run one agentic MDL-editing turn; returns a reviewable changeset."""
 
-        _require_copilot_enabled()
-        project = authorize_semantic_project(
-            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
-        )
-        _require_project_ready(project, identity.owner_id)
-        # Persistent thread: append the user turn, feed prior turns as history,
-        # then persist the assistant turn + changeset artifact. ``conversation_id``
-        # absent → stateless one-shot (backward compatible). Guard the preflight
-        # (store/schema/thread reads) so a setup failure surfaces as a 502 with a
-        # diagnosable message instead of a bare 500 (mirrors the stream route).
+        # Guard the whole preflight (authorization, readiness, and the
+        # store/schema/thread reads) so any setup failure -- including one from the
+        # write-permission check the SQL agent never exercises -- surfaces as a 502
+        # with a diagnosable message instead of a bare 500. Expected typed failures
+        # (403/404/409) pass through unchanged. ``conversation_id`` absent → the
+        # thread turn is a stateless one-shot (backward compatible).
         try:
+            _require_copilot_enabled()
+            project = authorize_semantic_project(
+                fastapi_request,
+                project_id,
+                owner_id=identity.owner_id,
+                permission="write",
+            )
+            _require_project_ready(project, identity.owner_id)
             files = active_mdl_file_store.list(project_id, owner_id=identity.owner_id)
             schema_index = _schema_index_for_project(project, fastapi_request)
             history, commit = _copilot_thread_turn(
@@ -1911,20 +1915,25 @@ def create_app(  # noqa: C901
     ) -> StreamingResponse:
         """Stream the agentic edit loop: ``progress`` steps then ``complete``."""
 
-        _require_copilot_enabled()
-        project = authorize_semantic_project(
-            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
-        )
-        _require_project_ready(project, identity.owner_id)
-        # Resolve request-scoped context before streaming starts (no Request access
-        # from the worker thread). A StreamingResponse commits a 200 status the
-        # moment its body iterator is entered, so any failure here must surface as a
-        # normal HTTP error *before* streaming begins. Without this guard an
-        # unhandled preflight error collapses into a bare 500 ("Internal Server
-        # Error", 21 bytes) with no logged traceback -- unlike worker-loop errors,
-        # which are streamed back as ``error`` events. Mirror the non-stream
-        # sibling's 502 contract and log the cause so it is diagnosable.
+        # Resolve the whole preflight (authorization, readiness, and the
+        # request-scoped context the worker thread cannot fetch) before streaming
+        # starts. A StreamingResponse commits a 200 status the moment its body
+        # iterator is entered, so any failure here must surface as a normal HTTP
+        # error *before* streaming begins. Without this guard an unhandled preflight
+        # error -- including one from the write-permission check, which the SQL
+        # agent never exercises -- collapses into a bare 500 ("Internal Server
+        # Error", 21 bytes) with no logged traceback, unlike worker-loop errors
+        # (streamed back as ``error`` events). Expected typed failures (403/404/409)
+        # pass through unchanged; anything else becomes a diagnosable 502.
         try:
+            _require_copilot_enabled()
+            project = authorize_semantic_project(
+                fastapi_request,
+                project_id,
+                owner_id=identity.owner_id,
+                permission="write",
+            )
+            _require_project_ready(project, identity.owner_id)
             files = active_mdl_file_store.list(project_id, owner_id=identity.owner_id)
             schema_index = _schema_index_for_project(project, fastapi_request)
             instructions = _recalled_instructions(

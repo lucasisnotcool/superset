@@ -153,11 +153,14 @@ foreach ($name in $envVars.Keys) {
 
 # --- Report ---------------------------------------------------------------
 Write-Host ""
-Write-Host "=== In BOTH (unchanged; kept .env value) ===" -ForegroundColor Cyan
-if ($unchanged.Count -eq 0) {
-    Write-Host "  (none)"
+# Only echo variables present in BOTH whose values differ (case-sensitive).
+# All in-both vars still keep their .env value in the output; this is report-only.
+$differing = @($unchanged | Where-Object { $_.EnvValue -cne $_.ExampleValue })
+Write-Host ("=== In BOTH with DIFFERENT values ({0} of {1}; kept .env value) ===" -f $differing.Count, $unchanged.Count) -ForegroundColor Cyan
+if ($differing.Count -eq 0) {
+    Write-Host "  (none differ)"
 } else {
-    foreach ($v in $unchanged) {
+    foreach ($v in $differing) {
         Write-Host ("  {0}  (.env line {1}, example line {2})" -f $v.Name, $v.EnvLine, $v.ExampleLine)
         Write-Host ("      .env    = {0}" -f (Format-Val $v.EnvValue))
         Write-Host ("      example = {0}" -f (Format-Val $v.ExampleValue))
