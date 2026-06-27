@@ -115,3 +115,39 @@ test('actions are disabled without write access', () => {
     container.querySelector('a[href="/ai-agent/download/doc-1"]'),
   ).toBeInTheDocument();
 });
+
+// The backend tags image-only PDFs needs_ocr and large uploads extracting; the
+// shared api type does not list these yet, so cast at the test boundary.
+const withStatus = (status: string): SemanticDocument => ({
+  ...document,
+  status: status as SemanticDocument['status'],
+});
+
+test('needs_ocr shows a Needs OCR badge and an explanatory note', () => {
+  render(
+    <DocumentDetailPane
+      document={withStatus('needs_ocr')}
+      canWrite
+      onDeleted={jest.fn()}
+      onChanged={jest.fn()}
+    />,
+  );
+
+  expect(screen.getByText('Needs OCR')).toBeInTheDocument();
+  expect(screen.getByText(/looks scanned or image-only/i)).toBeInTheDocument();
+});
+
+test('extracting shows a progress badge', () => {
+  render(
+    <DocumentDetailPane
+      document={withStatus('extracting')}
+      canWrite
+      onDeleted={jest.fn()}
+      onChanged={jest.fn()}
+    />,
+  );
+
+  expect(screen.getByText('Extracting…')).toBeInTheDocument();
+  // The needs_ocr note must not appear for other statuses.
+  expect(screen.queryByText(/looks scanned/i)).not.toBeInTheDocument();
+});

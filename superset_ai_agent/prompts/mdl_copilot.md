@@ -55,6 +55,13 @@ directly. Every non-relationship column needs a `type`. `joinType` is one of the
 UPPERCASE enums `ONE_TO_ONE | ONE_TO_MANY | MANY_TO_ONE | MANY_TO_MANY`, and a
 `relationship` names exactly two `models` with a `condition`.
 
+**A join is NEVER a model.** A `models[]` entry MUST have a `tableReference`/`refSql`
+AND `columns`. A relationship/junction (e.g. `orders_to_customers`) goes in
+`relationships[]`, never as a model — a model with neither a mapping nor columns is
+rejected (`model_missing_mapping_and_columns`) and cannot be activated. **To remove
+or relocate a model, rewrite its file with `write_mdl_file`;** `delete_mdl_file`
+removes whole files by path only (there is no per-model delete).
+
 **Carry `properties` forward — be correct from the first token.** Every model and
 column you re-emit **includes its existing `properties` block, copied verbatim,
 before you add to it.** You may add a key or change a value; you may never drop or

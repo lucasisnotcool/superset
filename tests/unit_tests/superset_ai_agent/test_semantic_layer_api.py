@@ -404,6 +404,56 @@ def test_onboard_auto_activates_models_deterministic_fallback(tmp_path) -> None:
     assert poll.json()["status"] == "completed"
 
 
+def test_onboard_include_forwards_selected_dataset_ids(tmp_path) -> None:
+    # Feature A: an "include" onboard forwards the selected dataset ids to the
+    # context fetch (which filters introspection to just those tables).
+    client, context_provider = _client(tmp_path)
+    project = _resolve_project(client)
+
+    response = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/onboard",
+        json={"mode": "include", "dataset_ids": [42]},
+    )
+    assert response.status_code == 202, response.text
+    # The onboarding schema fetch carried the selection.
+    onboarding_requests = [
+        r
+        for r in context_provider.requests
+        if r.question == "semantic layer onboarding"
+    ]
+    assert onboarding_requests[-1].dataset_ids == [42]
+
+
+def test_onboard_include_empty_is_rejected(tmp_path) -> None:
+    client, _ = _client(tmp_path)
+    project = _resolve_project(client)
+
+    response = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/onboard",
+        json={"mode": "include", "dataset_ids": []},
+    )
+    assert response.status_code == 400, response.text
+    assert "at least one table" in response.json()["detail"].lower()
+
+
+def test_onboard_all_mode_introspects_whole_schema(tmp_path) -> None:
+    # Empty/all body preserves the legacy whole-schema path: no dataset_ids filter.
+    client, context_provider = _client(tmp_path)
+    project = _resolve_project(client)
+
+    response = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/onboard",
+        json={},
+    )
+    assert response.status_code == 202, response.text
+    onboarding_requests = [
+        r
+        for r in context_provider.requests
+        if r.question == "semantic layer onboarding"
+    ]
+    assert onboarding_requests[-1].dataset_ids == []
+
+
 def test_reset_deletes_all_mdl_and_does_not_reonboard(tmp_path) -> None:
     # Reset is delete-only: it soft-deletes every existing MDL file (base models,
     # enrichment overlays, hand-edits) and returns the project to the un-onboarded

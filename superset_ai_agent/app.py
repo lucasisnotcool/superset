@@ -192,6 +192,11 @@ from superset_ai_agent.semantic_layer.schemas import (
     MdlFileCreateRequest,
     MdlFileUpdateRequest,
     MdlValidationResult,
+    OnboardingRequest,
+    PROVENANCE_EVENT_TYPES,
+    provenance_from_event,
+    PROVENANCE_HISTORY_CAP,
+    ProvenanceEntry,
     SemanticDocument,
     SemanticDocumentTextRequest,
     SemanticJob,
@@ -558,6 +563,7 @@ def create_app(  # noqa: C901
             ),
             semantic_layer_persistent=app_config.semantic_layer_store != "memory",
             vector_index=active_vector_index,
+            max_document_bytes=app_config.wren_max_document_bytes,
         )
 
     @api.get("/models", response_model=list[ModelInfo])
@@ -988,6 +994,46 @@ def create_app(  # noqa: C901
         )
         return active_mdl_file_store.list(project_id, owner_id=identity.owner_id)
 
+    def _emit_mdl_provenance(
+        *,
+        project: SemanticProject,
+        owner_id: str,
+        event_type: SemanticLayerEventType,
+        file: MdlFile,
+        message: str,
+        status_from: str | None = None,
+    ) -> None:
+        """Append an MDL-CRUD provenance event (best-effort; never blocks the write).
+
+        Provenance is an audit aid, not part of the write contract — a failure to
+        record must not fail the file operation (mirrors the Copilot step-sink).
+        """
+
+        try:
+            detail: dict[str, Any] = {
+                "actor": owner_id,
+                "path": file.path,
+                "file_id": file.id,
+                "source_type": file.source_type,
+            }
+            if file.source_document_id:
+                detail["document_id"] = file.source_document_id
+            if status_from is not None:
+                detail["status_from"] = status_from
+                detail["status_to"] = file.status
+            _append_semantic_event(
+                store=active_semantic_layer_store,
+                owner_id=owner_id,
+                event_type=event_type,
+                scope=_scope_from_project(project),
+                document_id=file.source_document_id,
+                message=message,
+                project_id=project.id,
+                detail=detail,
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.warning("Failed to record MDL provenance event.", exc_info=True)
+
     @api.post(
         "/agent/semantic-layer/projects/{project_id}/mdl-files",
         response_model=MdlFile,
@@ -1007,7 +1053,7 @@ def create_app(  # noqa: C901
             permission="write",
         )
         try:
-            return active_mdl_file_store.create(
+            created = active_mdl_file_store.create(
                 project_id,
                 request,
                 owner_id=identity.owner_id,
@@ -1016,6 +1062,14 @@ def create_app(  # noqa: C901
                     schema_index=_schema_index_for_project(project, fastapi_request),
                 ),
             )
+            _emit_mdl_provenance(
+                project=project,
+                owner_id=identity.owner_id,
+                event_type="mdl_created",
+                file=created,
+                message=f"Created {created.path}",
+            )
+            return created
         except MdlFileExistsError as ex:
             # A path conflict is distinct from a malformed request — 409 lets the
             # client recover (rename/auto-suffix) rather than treating it as a 400.
@@ -1238,6 +1292,23 @@ def create_app(  # noqa: C901
                     owner_id=identity.owner_id,
                     mdl_file_store=active_mdl_file_store,
                 )
+            if request.status == "active" and existing.status != "active":
+                _emit_mdl_provenance(
+                    project=project,
+                    owner_id=identity.owner_id,
+                    event_type="mdl_activated",
+                    file=updated,
+                    message=f"Activated {updated.path}",
+                    status_from=existing.status,
+                )
+            else:
+                _emit_mdl_provenance(
+                    project=project,
+                    owner_id=identity.owner_id,
+                    event_type="mdl_updated",
+                    file=updated,
+                    message=f"Edited {updated.path}",
+                )
             return updated
         except MdlFileNotFoundError as ex:
             raise HTTPException(status_code=404, detail="MDL file not found.") from ex
@@ -1257,7 +1328,7 @@ def create_app(  # noqa: C901
     ) -> dict[str, bool]:
         """Delete one MDL JSON file from a governed semantic project."""
 
-        authorize_semantic_project(
+        project = authorize_semantic_project(
             fastapi_request,
             project_id,
             owner_id=identity.owner_id,
@@ -1271,6 +1342,13 @@ def create_app(  # noqa: C901
             if existing.project_id != project_id:
                 raise MdlFileNotFoundError(file_id)
             active_mdl_file_store.delete(file_id, owner_id=identity.owner_id)
+            _emit_mdl_provenance(
+                project=project,
+                owner_id=identity.owner_id,
+                event_type="mdl_deleted",
+                file=existing,
+                message=f"Deleted {existing.path}",
+            )
         except MdlFileNotFoundError as ex:
             raise HTTPException(status_code=404, detail="MDL file not found.") from ex
         return {"deleted": True}
@@ -1981,31 +2059,87 @@ def create_app(  # noqa: C901
             base_path=_wren_materialization_base(app_config),
         )
 
+    def _resolve_onboarding_dataset_ids(
+        superset_client_for_request: Any,
+        project: SemanticProject,
+        request: OnboardingRequest,
+    ) -> list[int] | None:
+        """Turn an ``OnboardingRequest`` into concrete dataset ids (or ``None``).
+
+        ``None`` means "the whole schema" — the legacy full-introspection path.
+        ``include`` selects exactly the chosen datasets; ``all`` means the schema,
+        optionally minus excludes (resolved server-side, bounded by the table-scan
+        limit — the same bound onboarding already applies).
+        """
+
+        if request.mode == "include":
+            if not request.dataset_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Select at least one table to onboard.",
+                )
+            return list(dict.fromkeys(request.dataset_ids))
+
+        # mode == "all"
+        if not request.exclude_dataset_ids:
+            return None  # whole schema — unchanged behavior
+
+        excluded = set(request.exclude_dataset_ids)
+        candidates = superset_client_for_request.list_datasets(
+            database_id=project.default_database_id,
+            catalog_name=project.catalog_name,
+            schema_name=project.schema_name,
+            limit=app_config.wren_schema_table_scan_limit,
+        )
+        resolved = [
+            dataset.id for dataset in candidates if dataset.id not in excluded
+        ]
+        if not resolved:
+            raise HTTPException(
+                status_code=400,
+                detail="No tables remain after exclusions.",
+            )
+        return resolved
+
     def _onboarding_context(
         project: SemanticProject,
         fastapi_request: Request,
-    ) -> Any:
-        """Fetch the full-scope schema for onboarding (CR3), mapping auth errors."""
+        request: OnboardingRequest | None = None,
+    ) -> tuple[Any, list[int] | None]:
+        """Fetch the onboarding schema context for the requested table selection.
+
+        Returns ``(context, resolved_dataset_ids)``. ``resolved_dataset_ids`` is
+        recorded on the onboarding provenance entry (Feature B). Maps auth errors.
+        """
 
         if project.default_database_id is None:
             raise HTTPException(
                 status_code=400,
                 detail="Project has no associated database for onboarding.",
             )
-        request_context_provider, _ = build_superset_runtime(fastapi_request)
+        request = request or OnboardingRequest()
+        request_context_provider, request_superset_client = build_superset_runtime(
+            fastapi_request
+        )
         try:
-            # CR3: onboard the whole scope (full introspection), not a question-ranked
-            # subset — onboarding must seed every table as base structure.
+            dataset_ids = _resolve_onboarding_dataset_ids(
+                request_superset_client, project, request
+            )
+            # CR3: onboard the whole scope (full introspection) unless a subset was
+            # selected. ``get_full_schema`` forwards ``dataset_ids`` to the id-filtered
+            # fetch (context/superset_metadata.py), so a selection seeds only those.
             fetch_full = getattr(request_context_provider, "get_full_schema", None)
             fetch = fetch_full or request_context_provider.get_context
-            return fetch(
+            context = fetch(
                 AgentQueryRequest(
                     question="semantic layer onboarding",
                     database_id=project.default_database_id,
                     catalog_name=project.catalog_name,
                     schema_name=project.schema_name,
+                    dataset_ids=dataset_ids or [],
                 )
             )
+            return context, dataset_ids
         except SupersetAuthError as ex:
             raise HTTPException(status_code=ex.status_code, detail=str(ex)) from ex
 
@@ -2013,13 +2147,17 @@ def create_app(  # noqa: C901
         project: SemanticProject,
         context: Any,
         owner_id: str,
+        dataset_ids: list[int] | None = None,
     ) -> SemanticJob:
-        """Create + submit the onboarding job, shared by onboard and reset.
+        """Create + submit the onboarding job.
 
         Onboarding auto-activates valid base models; this also re-indexes retrieval
         so the freshly active layer is searchable immediately (E6 deploy→reindex).
+        ``dataset_ids`` (the selected subset, or ``None`` for the whole schema) is
+        recorded on the provenance entry (Feature B).
         """
 
+        mode = "selected" if dataset_ids is not None else "all"
         job = active_job_store.create(kind="onboarding", project_id=project.id)
         scope = _scope_from_project(project)
         _append_semantic_event(
@@ -2030,6 +2168,11 @@ def create_app(  # noqa: C901
             document_id=None,
             message="Onboarding started.",
             project_id=project.id,
+            detail={
+                "actor": owner_id,
+                "mode": mode,
+                "dataset_ids": dataset_ids or [],
+            },
         )
 
         def _run_onboarding() -> None:
@@ -2073,6 +2216,15 @@ def create_app(  # noqa: C901
                     f"{result.activated_count} activated."
                 ),
                 project_id=project.id,
+                detail={
+                    "actor": owner_id,
+                    "mode": mode,
+                    "dataset_ids": dataset_ids or [],
+                    "model_count": result.model_count,
+                    "activated_count": result.activated_count,
+                    "paths": [f.path for f in result.files],
+                    "warnings": result.warnings,
+                },
             )
 
         active_job_runner.submit(_run_onboarding)
@@ -2088,12 +2240,15 @@ def create_app(  # noqa: C901
     def onboard_semantic_project(
         project_id: str,
         fastapi_request: Request,
+        request: OnboardingRequest | None = None,
         identity: AgentIdentity = identity_dependency,
     ) -> SemanticJob:
         """Start async schema onboarding; poll the returned job for the result.
 
         The schema context is fetched synchronously (request-scoped auth); only
-        the slower LLM generation and MDL writes run in the background.
+        the slower LLM generation and MDL writes run in the background. The body
+        selects which tables to onboard (Feature A); an absent/empty body onboards
+        the whole schema (backward compatible).
         """
 
         project = authorize_semantic_project(
@@ -2102,8 +2257,12 @@ def create_app(  # noqa: C901
             owner_id=identity.owner_id,
             permission="write",
         )
-        context = _onboarding_context(project, fastapi_request)
-        return _start_onboarding_job(project, context, identity.owner_id)
+        context, dataset_ids = _onboarding_context(
+            project, fastapi_request, request or OnboardingRequest()
+        )
+        return _start_onboarding_job(
+            project, context, identity.owner_id, dataset_ids=dataset_ids
+        )
 
     @api.post(
         "/agent/semantic-layer/projects/{project_id}/reset",
@@ -2134,6 +2293,14 @@ def create_app(  # noqa: C901
         for file in active_mdl_file_store.list(project_id, owner_id=identity.owner_id):
             active_mdl_file_store.delete(file.id, owner_id=identity.owner_id)
             deleted += 1
+        # Provenance is the editing history of the MDL directory, so it resets with
+        # it (delete-on-reset). Document events are NOT in PROVENANCE_EVENT_TYPES —
+        # uploaded documents survive a reset, so their history must too.
+        active_semantic_layer_store.delete_project_events(
+            project_id,
+            owner_id=identity.owner_id,
+            types=PROVENANCE_EVENT_TYPES,
+        )
         return {"deleted": deleted}
 
     @api.get(
@@ -2894,6 +3061,39 @@ def create_app(  # noqa: C901
             media_type="text/event-stream",
         )
 
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}/provenance",
+        response_model=list[ProvenanceEntry],
+    )
+    def get_project_provenance(
+        project_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> list[ProvenanceEntry]:
+        """Return the MDL directory's provenance timeline (newest-first, capped).
+
+        Onboarding / enrichment / MDL-CRUD entries only — document events are
+        excluded (they outlive a reset). Reset clears this log (delete-on-reset).
+        """
+
+        authorize_semantic_project(
+            fastapi_request,
+            project_id,
+            owner_id=identity.owner_id,
+            permission="read",
+        )
+        events = active_semantic_layer_store.list_project_events(
+            project_id,
+            owner_id=identity.owner_id,
+        )
+        entries = [
+            entry
+            for entry in (provenance_from_event(event) for event in events)
+            if entry is not None
+        ]
+        entries.sort(key=lambda entry: entry.created_at, reverse=True)
+        return entries[:PROVENANCE_HISTORY_CAP]
+
     @api.post("/agent/validate-sql")
     def validate_sql(request: ValidateSqlRequest) -> SqlValidation:
         """Validate SQL without invoking the model."""
@@ -2902,6 +3102,7 @@ def create_app(  # noqa: C901
             request.sql,
             dialect=request.dialect,
             default_limit=request.default_limit or app_config.default_sql_limit,
+            policy_mode=app_config.sql_policy_mode,
         )
 
     return api
@@ -3091,6 +3292,7 @@ def _append_semantic_event(
     document_id: str | None,
     message: str,
     project_id: str | None = None,
+    detail: dict[str, Any] | None = None,
 ) -> None:
     state = store.get_state(scope, owner_id=owner_id)
     store.append_event(
@@ -3101,6 +3303,7 @@ def _append_semantic_event(
             document_id=document_id,
             state=state,
             message=message,
+            detail=detail,
         ),
         owner_id=owner_id,
     )

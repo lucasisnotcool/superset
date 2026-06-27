@@ -90,3 +90,33 @@ def test_sqlalchemy_semantic_layer_store_round_trips_state() -> None:
         "document_extracted"
     )
     assert store.list_documents(scope, owner_id="user-2") == []
+
+
+def test_delete_project_events_by_type_preserves_document_events() -> None:
+    scope = ConversationScope(database_id=1, schema_name="pipeline")
+    store = _store()
+    for event_type, message in [
+        ("document_uploaded", "Uploaded notes.txt."),
+        ("mdl_created", "Created models/orders.json"),
+        ("mdl_activated", "Activated models/orders.json"),
+    ]:
+        store.append_event(
+            SemanticLayerEvent(
+                project_id="project-1",
+                type=event_type,
+                scope=scope,
+                message=message,
+            ),
+            owner_id="user-1",
+        )
+
+    deleted = store.delete_project_events(
+        "project-1",
+        owner_id="user-1",
+        types=frozenset({"mdl_created", "mdl_activated"}),
+    )
+
+    assert deleted == 2
+    remaining = store.list_project_events("project-1", owner_id="user-1")
+    # The document event survives a provenance-only purge.
+    assert [event.type for event in remaining] == ["document_uploaded"]

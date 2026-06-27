@@ -550,8 +550,11 @@ syntax, or comments, improve this with AST-aware limit detection.
    behavior.
 3. Keep new graph nodes small and deterministic. Expensive or transport-specific
    work belongs behind `ContextProvider`, `SupersetClient`, or `ModelClient`.
-4. Do not allow generated SQL to bypass `validate_read_only_sql()` before
-   execution.
+4. Do not allow generated SQL to bypass the SQL safety policy
+   (`tools/sql_policy.py`, surfaced via `validate_read_only_sql()`) before
+   execution. Classification is delegated to Superset core's `SQLScript`; the
+   execution tier decision lives in `sql_policy.decide()`. Only read-only SQL
+   auto-runs, and human approval never promotes a non-read-only statement.
 5. When adding Superset data to prompts, keep payloads compact and capped.
    Large schemas should be selected or retrieved, not blindly dumped.
 6. Prefer MCP/REST adapters for permission-sensitive behavior. The local adapter

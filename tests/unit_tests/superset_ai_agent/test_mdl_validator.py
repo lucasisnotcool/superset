@@ -136,6 +136,54 @@ def test_calculated_column_requires_expression() -> None:
     assert any(m.code == "calculated_requires_expression" for m in result.messages)
 
 
+def test_relationship_shaped_model_is_error_under_strict_models() -> None:
+    # A model with neither a mapping nor columns is a relationship emitted as a
+    # model (e.g. sites_to_production_lines). Under strict_models (the Copilot
+    # proposal path) it is a hard error so the loop self-corrects before
+    # activation (P1).
+    result = validate_mdl(
+        mdl(models=[{"name": "sites_to_production_lines"}]),
+        strict_models=True,
+    )
+    assert result.valid is False
+    codes = [m.code for m in result.messages]
+    assert "model_missing_mapping_and_columns" in codes
+    # The two softer warnings are suppressed for that model (single clear error).
+    assert "model_without_mapping" not in codes
+    assert "model_without_columns" not in codes
+    error = next(
+        m for m in result.messages if m.code == "model_missing_mapping_and_columns"
+    )
+    assert error.severity == "error"
+    assert "relationships[]" in error.message
+
+
+def test_relationship_shaped_model_stays_lenient_by_default() -> None:
+    # Default (drafts) keeps the legacy lenient contract: bare model -> warnings,
+    # still valid. Only the Copilot proposal path opts into strict_models.
+    result = validate_mdl(mdl(models=[{"name": "sites_to_production_lines"}]))
+    codes = {m.code for m in result.messages}
+    assert codes == {"model_without_mapping", "model_without_columns"}
+    assert result.valid is True
+
+
+def test_model_with_columns_but_no_mapping_stays_a_warning() -> None:
+    # Regression guard: a calculated/CTE-style model (columns, no tableReference)
+    # is never swept into the new error, even under strict_models (DP1-narrow).
+    result = validate_mdl(
+        mdl(
+            models=[
+                {"name": "derived", "columns": [{"name": "x", "type": "VARCHAR"}]}
+            ]
+        ),
+        strict_models=True,
+    )
+    codes = [m.code for m in result.messages]
+    assert "model_without_mapping" in codes
+    assert "model_missing_mapping_and_columns" not in codes
+    assert result.valid is True  # warning only, not blocking
+
+
 def test_physical_validation_flags_unknown_table() -> None:
     result = validate_mdl(
         mdl(

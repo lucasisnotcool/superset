@@ -57,14 +57,17 @@ import {
   deleteMdlFile,
   getProjectReadiness,
   getProjectSemanticLayerState,
+  getSemanticJob,
   listMdlFiles,
   listSemanticDocuments,
   MdlFile,
   MdlFileStatus,
+  onboardSemanticProject,
+  OnboardingSelection,
   resolveSemanticProject,
-  runOnboarding,
   runReset,
   SemanticDocument,
+  SemanticJob,
   SemanticLayerState,
   SemanticProject,
   SemanticProjectReadinessStatus,
@@ -75,6 +78,8 @@ import SemanticLayerStateBadge from '../SemanticLayerStateBadge';
 import SemanticLayerImportDialog from './SemanticLayerImportDialog';
 import InstructionsPanel from './InstructionsPanel';
 import CopilotPanel from './CopilotPanel';
+import OnboardingTablePicker from './OnboardingTablePicker';
+import MdlProvenanceDialog from './MdlProvenanceDialog';
 import DocumentDetailPane from './DocumentDetailPane';
 import WorkspaceTree, { treeFromFiles } from './WorkspaceTree';
 
@@ -226,6 +231,14 @@ const defaultMdl = `{
 }
 `;
 
+// Onboarding runs asynchronously on the agent (threaded backend): the start call
+// returns the job in `running`, and the editor polls it to completion. Onboarding
+// can take minutes (it scales with table count + LLM latency), so the poll has a
+// generous wall-clock cap rather than the short fixed budget that previously made
+// the UI report a still-running job as done and then stop polling.
+const ONBOARDING_POLL_INTERVAL_MS = 2000;
+const ONBOARDING_POLL_MAX_ATTEMPTS = 450; // ~15 minutes at the interval above
+
 export interface SemanticLayerEditorProps {
   databaseId: number;
   catalogName: string | null;
@@ -258,6 +271,10 @@ export default function SemanticLayerEditor({
   const [readinessStatus, setReadinessStatus] =
     useState<SemanticProjectReadinessStatus | null>(null);
   const [readinessDetail, setReadinessDetail] = useState<string | null>(null);
+  // Id of the onboarding job the backend reports as in-flight (readiness =
+  // `indexing`). This lets the background poll resume after a remount/reload —
+  // when component state (`pendingJobId`) is gone but onboarding is still running.
+  const [readinessJobId, setReadinessJobId] = useState<string | null>(null);
   const [activeFileId, setActiveFileId] = useState<string | null>(null);
   const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(
     null,
@@ -265,7 +282,13 @@ export default function SemanticLayerEditor({
   const [editorPath, setEditorPath] = useState('models/new_model.json');
   const [editorValue, setEditorValue] = useState(defaultMdl);
   const [showImportDialog, setShowImportDialog] = useState(false);
+  const [showOnboardPicker, setShowOnboardPicker] = useState(false);
+  const [showProvenance, setShowProvenance] = useState(false);
   const [isOnboarding, setIsOnboarding] = useState(false);
+  // Id of an onboarding job that is still running after the start call returned
+  // (the threaded backend). A background effect polls it to completion; until
+  // then the Copilot rail stays in the `indexing` (spinner) state.
+  const [pendingJobId, setPendingJobId] = useState<string | null>(null);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
@@ -333,6 +356,7 @@ export default function SemanticLayerEditor({
       setState(null);
       setReadinessStatus(null);
       setReadinessDetail(null);
+      setReadinessJobId(null);
       return;
     }
     const nextProject = await resolveSemanticProject({
@@ -357,6 +381,7 @@ export default function SemanticLayerEditor({
     setState(nextState);
     setReadinessStatus(nextReadiness?.status ?? null);
     setReadinessDetail(nextReadiness?.detail ?? null);
+    setReadinessJobId(nextReadiness?.running_job_id ?? null);
     // Drop a stale document selection if it no longer exists (functional update
     // so `refresh` need not depend on the selection — see the activeFileId note).
     setSelectedDocumentId(prev =>
@@ -525,26 +550,47 @@ export default function SemanticLayerEditor({
       await refresh();
     }, t('Unable to duplicate MDL file'));
 
+  // Announce the result of a *completed* onboarding job. Only a terminal
+  // `completed` job reaches here — a `running` job (start returned before the
+  // threaded backend finished) is handed to the background poller instead, so we
+  // never report success while onboarding is still in flight.
+  const announceOnboardingComplete = useCallback(
+    (job: SemanticJob) => {
+      const warnings = job.result?.warnings ?? [];
+      if (warnings.length > 0) {
+        dispatch(
+          addWarningToast(
+            t('Onboarding completed with warnings: %s', warnings.join('; ')),
+          ),
+        );
+      } else {
+        dispatch(
+          addSuccessToast(t('Schema onboarded into the semantic layer.')),
+        );
+      }
+    },
+    [dispatch],
+  );
+
   const runOnboard = useCallback(
-    async (targetProjectId: string) => {
+    async (targetProjectId: string, selection?: OnboardingSelection) => {
       setIsOnboarding(true);
       try {
-        const job = await runOnboarding(targetProjectId);
+        // Start the job. An inline backend returns it already `completed`; the
+        // threaded prod backend returns it `running` for us to poll.
+        const job = await onboardSemanticProject(targetProjectId, selection);
         if (job.status === 'failed') {
           throw new Error(job.error || t('Onboarding failed'));
         }
-        const warnings = job.result?.warnings ?? [];
-        if (warnings.length > 0) {
-          dispatch(
-            addWarningToast(
-              t('Onboarding completed with warnings: %s', warnings.join('; ')),
-            ),
-          );
-        } else {
-          dispatch(
-            addSuccessToast(t('Schema onboarded into the semantic layer.')),
-          );
+        if (job.status === 'running') {
+          // Hand off to the background poller (keeps the rail in `indexing`)
+          // rather than reporting a premature success. The success/warning toast
+          // and the file refresh fire when the job actually finishes.
+          setPendingJobId(job.id);
+          await refresh();
+          return;
         }
+        announceOnboardingComplete(job);
         await refresh();
       } catch (ex) {
         dispatch(
@@ -556,8 +602,76 @@ export default function SemanticLayerEditor({
         setIsOnboarding(false);
       }
     },
-    [refresh, dispatch],
+    [refresh, dispatch, announceOnboardingComplete],
   );
+
+  // The onboarding job to poll: one we started this session (`pendingJobId`) or,
+  // after a remount/reload, the in-flight job the backend still reports via
+  // readiness. The latter is what lets the rail recover when component state was
+  // lost but onboarding is genuinely still running.
+  const pollJobId =
+    pendingJobId ?? (readinessStatus === 'indexing' ? readinessJobId : null);
+
+  // Background poll for an in-flight onboarding job. This makes the rail
+  // self-heal: it polls until the job is terminal (regardless of how long
+  // onboarding runs), then announces the outcome and refreshes so the spinner
+  // clears and the freshly onboarded models appear — no manual page reload needed.
+  useEffect(() => {
+    if (!pollJobId || !project) {
+      return undefined;
+    }
+    const projectId = project.id;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    let attemptsLeft = ONBOARDING_POLL_MAX_ATTEMPTS;
+
+    const poll = async () => {
+      let job: SemanticJob | null = null;
+      try {
+        job = await getSemanticJob(projectId, pollJobId);
+      } catch {
+        // Transient failure (e.g. agent restart): keep polling while the budget
+        // lasts rather than abandoning a job that may still be running.
+        job = null;
+      }
+      if (cancelled) {
+        return;
+      }
+      if (job && job.status !== 'running') {
+        setPendingJobId(null);
+        if (job.status === 'failed') {
+          dispatch(addDangerToast(job.error || t('Onboarding failed')));
+        } else {
+          announceOnboardingComplete(job);
+        }
+        await refresh();
+        return;
+      }
+      attemptsLeft -= 1;
+      if (attemptsLeft <= 0) {
+        // Give up the foreground spinner after the cap, but surface the truth and
+        // re-sync from the backend (which is the source of truth for readiness).
+        setPendingJobId(null);
+        dispatch(
+          addWarningToast(
+            t(
+              'Onboarding is taking longer than expected; it may still be ' +
+                'running. Refresh to check its status.',
+            ),
+          ),
+        );
+        await refresh();
+        return;
+      }
+      timer = setTimeout(poll, ONBOARDING_POLL_INTERVAL_MS);
+    };
+
+    timer = setTimeout(poll, ONBOARDING_POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [pollJobId, project, dispatch, announceOnboardingComplete, refresh]);
 
   // Destructive "start over": delete all MDL so the project returns to the empty
   // (un-onboarded) state. Does NOT re-onboard — the rail re-gates the Copilot
@@ -609,13 +723,13 @@ export default function SemanticLayerEditor({
   // mirrors the backend readiness gate (which 409s premature edits). The rail
   // renders one of four states; onboarding is shown as a separate bootstrap
   // process (never as synthetic chat), and a Copilot turn is only possible when
-  // `ready`. A foreground onboard (`isOnboarding`) is the local `indexing`
-  // signal — `runOnboard` blocks until the job is terminal, so the readiness
-  // endpoint is not polled during that window. Otherwise trust the backend
-  // status (it is the only source of truth for `failed`), with a local
-  // active-models fast-path for `ready` while readiness is still loading.
+  // `ready`. Starting an onboard (`isOnboarding`) or a job still being polled in
+  // the background (`pendingJobId`) is the local `indexing` signal. Otherwise
+  // trust the backend status (it is the only source of truth for `failed`), with
+  // a local active-models fast-path for `ready` while readiness is still loading.
+  const onboardingInFlight = isOnboarding || pollJobId !== null;
   const hasActiveModels = mdlFiles.some(file => file.status === 'active');
-  const railStatus: SemanticProjectReadinessStatus = isOnboarding
+  const railStatus: SemanticProjectReadinessStatus = onboardingInFlight
     ? 'indexing'
     : (readinessStatus ?? (hasActiveModels ? 'ready' : 'empty'));
 
@@ -640,11 +754,28 @@ export default function SemanticLayerEditor({
   return (
     <EditorRoot data-test="semantic-layer-editor">
       <EditorHeader>
-        <Flex vertical gap={0}>
-          <Typography.Title level={5} style={{ margin: 0 }}>
-            {project?.name || t('Semantic layer')}
-          </Typography.Title>
-          <SemanticLayerStateBadge state={state} />
+        <Flex align="center" gap="small">
+          <Flex vertical gap={0}>
+            <Flex align="center" gap="small">
+              <Typography.Title level={5} style={{ margin: 0 }}>
+                {project?.name || t('Semantic layer')}
+              </Typography.Title>
+              {/* Provenance lives beside the schema name — the history of THIS MDL
+                  directory, where a user expects to find it. */}
+              <Tooltip title={t('Provenance')}>
+                <Button
+                  buttonStyle="link"
+                  buttonSize="small"
+                  disabled={!project}
+                  icon={<Icons.HistoryOutlined iconSize="m" />}
+                  onClick={() => setShowProvenance(true)}
+                  aria-label={t('Provenance')}
+                  data-test="open-provenance"
+                />
+              </Tooltip>
+            </Flex>
+            <SemanticLayerStateBadge state={state} />
+          </Flex>
         </Flex>
         <Button
           buttonStyle={showCopilot ? 'primary' : 'tertiary'}
@@ -759,14 +890,22 @@ export default function SemanticLayerEditor({
                       {allActive ? t('Deactivate all') : t('Activate all')}
                     </Button>
                     <Flex gap="small" wrap="wrap">
-                      <Button
-                        buttonStyle="tertiary"
-                        disabled={!project || !canWrite || isLoading}
-                        onClick={() => setShowImportDialog(true)}
-                        icon={<Icons.UploadOutlined iconSize="m" />}
+                      <Tooltip
+                        title={t(
+                          'Upload a document (PDF, Word, Excel, PowerPoint, CSV, ' +
+                            'HTML) for the Copilot and viewer — or add MDL JSON / ' +
+                            'Markdown.',
+                        )}
                       >
-                        {t('Add…')}
-                      </Button>
+                        <Button
+                          buttonStyle="tertiary"
+                          disabled={!project || !canWrite || isLoading}
+                          onClick={() => setShowImportDialog(true)}
+                          icon={<Icons.UploadOutlined iconSize="m" />}
+                        >
+                          {t('Upload document')}
+                        </Button>
+                      </Tooltip>
                       <Button
                         buttonStyle="tertiary"
                         loading={isResetting}
@@ -774,7 +913,7 @@ export default function SemanticLayerEditor({
                           !project ||
                           !canWrite ||
                           isLoading ||
-                          isOnboarding ||
+                          onboardingInFlight ||
                           isResetting
                         }
                         onClick={() => setShowResetConfirm(true)}
@@ -905,7 +1044,8 @@ export default function SemanticLayerEditor({
                         onApplied={refresh}
                         readinessStatus={railStatus}
                         readinessDetail={readinessDetail}
-                        onOnboard={() => runOnboard(project.id)}
+                        onOnboard={() => setShowOnboardPicker(true)}
+                        onUpload={() => setShowImportDialog(true)}
                       />
                     </CopilotRail>
                   </Splitter.Panel>
@@ -941,6 +1081,25 @@ export default function SemanticLayerEditor({
         existingFiles={mdlFiles}
         canWrite={canWrite}
         onApplied={refresh}
+      />
+      <OnboardingTablePicker
+        open={showOnboardPicker}
+        databaseId={databaseId}
+        catalogName={catalogName}
+        schema={schemaName}
+        canWrite={canWrite}
+        onCancel={() => setShowOnboardPicker(false)}
+        onConfirm={selection => {
+          setShowOnboardPicker(false);
+          if (project) {
+            runOnboard(project.id, selection);
+          }
+        }}
+      />
+      <MdlProvenanceDialog
+        open={showProvenance}
+        projectId={project?.id ?? null}
+        onClose={() => setShowProvenance(false)}
       />
       <ConfirmModal
         show={showResetConfirm}

@@ -32,6 +32,8 @@ SemanticLayerStoreMode = Literal["memory", "sqlalchemy"]
 DocumentStorageMode = Literal["local", "s3"]
 IdentityProviderMode = Literal["static", "signed_header", "superset_session"]
 SupersetAuthMode = Literal["service_account", "user_session"]
+AgentEnvironment = Literal["development", "production"]
+SqlPolicyMode = Literal["strict", "permissive"]
 MigrationBootstrapMode = Literal["error", "stamp_existing"]
 ModelProviderMode = Literal[
     "ollama",
@@ -290,6 +292,40 @@ class AgentConfig:
     log_level: str = "INFO"
     suppress_superset_logs: bool = True
     local_superset_secret_key: str = "ai-agent-local-dev-secret-key-not-for-production"  # noqa: S105
+    #: Deployment environment. ``production`` enforces R-CFG: the SQL-safety
+    #: policy must never be the *sole* database boundary, so adapter/auth
+    #: combinations that bypass per-user Superset authorization are refused.
+    environment: AgentEnvironment = "development"
+    #: Multi-statement strictness for the SQL safety policy. ``strict`` (default)
+    #: blocks every multi-statement script; ``permissive`` allows a script only
+    #: when every statement in it is individually read-only. It can never relax
+    #: the mutating/opaque cases.
+    sql_policy_mode: SqlPolicyMode = "strict"
+
+    def __post_init__(self) -> None:
+        """Enforce the runtime-safety guardrails (R-CFG).
+
+        The ``local`` adapter executes SQL directly against the engine and the
+        ``service_account`` auth mode runs every user's SQL as a shared
+        principal — both bypass ``raise_for_access``/RLS as the requesting user,
+        leaving the deterministic SQL policy as the only guard. That is
+        acceptable for local development but not for a production deployment.
+        """
+
+        if self.environment != "production":
+            return
+        unsafe: list[str] = []
+        if self.superset_agent_adapter == "local":
+            unsafe.append("superset_agent_adapter='local'")
+        if self.superset_auth_mode == "service_account":
+            unsafe.append("superset_auth_mode='service_account'")
+        if unsafe:
+            raise ValueError(
+                "Unsafe AI-agent configuration for environment='production': "
+                + ", ".join(unsafe)
+                + ". Use the REST adapter with user-session auth (per-user "
+                "authorization), or set AI_AGENT_ENV=development for local use."
+            )
 
     @classmethod
     def from_env(cls) -> "AgentConfig":
@@ -796,6 +832,14 @@ class AgentConfig:
             local_superset_secret_key=os.getenv(
                 "AI_AGENT_LOCAL_SUPERSET_SECRET_KEY",
                 cls.local_superset_secret_key,
+            ),
+            environment=cast(
+                AgentEnvironment,
+                os.getenv("AI_AGENT_ENV", cls.environment).strip().lower(),
+            ),
+            sql_policy_mode=cast(
+                SqlPolicyMode,
+                os.getenv("AI_AGENT_SQL_POLICY", cls.sql_policy_mode).strip().lower(),
             ),
         )
 

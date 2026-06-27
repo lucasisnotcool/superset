@@ -234,3 +234,25 @@ class InMemorySemanticLayerStore:
             for stored_owner_id, event in self._events
             if stored_owner_id == owner_id and event.project_id == project_id
         ]
+
+    def delete_project_events(
+        self,
+        project_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+        types: frozenset[str] | None = None,
+    ) -> int:
+        kept: list[tuple[str, SemanticLayerEvent]] = []
+        deleted = 0
+        for stored_owner_id, event in self._events:
+            matches = (
+                stored_owner_id == owner_id
+                and event.project_id == project_id
+                and (types is None or event.type in types)
+            )
+            if matches:
+                deleted += 1
+            else:
+                kept.append((stored_owner_id, event))
+        self._events = kept
+        return deleted

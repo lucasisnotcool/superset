@@ -169,3 +169,51 @@ test('selects a raw/ document node by document id', async () => {
   expect(onSelectDocument).toHaveBeenCalledWith('doc-1');
   expect(onSelectFile).not.toHaveBeenCalled();
 });
+
+const treeWithDocStatus = (status: string): WorkspaceNode => ({
+  ...tree,
+  children: [
+    ...tree.children,
+    {
+      path: 'raw',
+      name: 'raw',
+      kind: 'folder',
+      editable: false,
+      status: '1 document(s)',
+      children: [
+        {
+          path: 'raw/doc-1',
+          name: 'scan.pdf',
+          kind: 'document',
+          editable: false,
+          status,
+          document_id: 'doc-1',
+          children: [],
+        },
+      ],
+    },
+  ],
+});
+
+test('flags a needs_ocr document in the tree', () => {
+  render(
+    <WorkspaceTree
+      root={treeWithDocStatus('needs_ocr')}
+      onSelectFile={jest.fn()}
+    />,
+  );
+
+  expect(screen.getByText('Needs OCR')).toBeInTheDocument();
+});
+
+test('does not badge a normally-extracted document in the tree', () => {
+  render(
+    <WorkspaceTree
+      root={treeWithDocStatus('extracted')}
+      onSelectFile={jest.fn()}
+    />,
+  );
+
+  // "Extracted" is the quiet, expected state — no attention badge in the tree.
+  expect(screen.queryByText('Extracted')).not.toBeInTheDocument();
+});

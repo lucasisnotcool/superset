@@ -17,6 +17,9 @@
  * under the License.
  */
 
+import rison from 'rison';
+import { SupersetClient } from '@superset-ui/core';
+
 export type AgentStatus = 'ok' | 'needs_review' | 'error';
 export type ExecutionMode = 'manual' | 'read_only' | 'auto';
 
@@ -27,9 +30,21 @@ export interface AgentTraceEvent {
   details: Record<string, unknown>;
 }
 
+export type SqlClassification =
+  | 'read_only'
+  | 'mutating'
+  | 'opaque'
+  | 'multi'
+  | 'unparseable';
+
 export interface SqlValidationResult {
   is_valid: boolean;
   is_read_only: boolean;
+  // Deterministic verdict from the backend SQL safety policy. Older backends
+  // may omit it, so treat as optional.
+  classification?: SqlClassification;
+  // Human-readable explanation of a block, surfaced to the user.
+  reason?: string | null;
   normalized_sql?: string | null;
   dialect?: string | null;
   errors: string[];
@@ -312,7 +327,9 @@ export interface ConversationArtifact {
 
 export type SemanticDocumentStatus =
   | 'uploaded'
+  | 'extracting'
   | 'extracted'
+  | 'needs_ocr'
   | 'needs_review'
   | 'approved'
   | 'indexed'
@@ -442,6 +459,9 @@ export interface AgentHealthResponse {
   // Effective embedding vector index: 'memory' | 'lancedb' | 'memory_fallback'.
   // 'memory_fallback' = LanceDB was configured but did not connect (C1).
   vector_index?: string;
+  // Effective max upload size for source documents (WREN_MAX_DOCUMENT_BYTES); the
+  // UI uses it to reject oversized files before the upload round-trip.
+  max_document_bytes?: number;
 }
 
 export type SemanticProjectVisibility = 'private' | 'db_access' | 'custom';
@@ -676,6 +696,50 @@ const semanticScopeParams = (scope: ConversationScope) => {
 
 export const getAgentHealth = () =>
   requestJson<AgentHealthResponse>('/health', { method: 'GET' });
+
+// Short-lived health memo so repeat callers (e.g. opening the upload dialog
+// multiple times) reuse one recent result instead of refetching /health each
+// time (RG3, plan_document_upload_residual_gaps.md). Failures are NOT cached, so
+// a later call can retry.
+let agentHealthCache: { at: number; value: AgentHealthResponse } | null = null;
+let agentHealthInFlight: Promise<AgentHealthResponse | null> | null = null;
+
+/** Reset the health memo (test hook). */
+export const resetAgentHealthCache = () => {
+  agentHealthCache = null;
+  agentHealthInFlight = null;
+};
+
+/**
+ * Best-effort cached health. Returns `null` (never rejects) when /health is
+ * unavailable so callers degrade to their own defaults — the fallback is silent
+ * for the user by design (the backend stays the source of truth); only a
+ * dev-facing debug line is emitted (RG4).
+ */
+export const getAgentHealthCached = (
+  maxAgeMs = 60_000,
+): Promise<AgentHealthResponse | null> => {
+  if (agentHealthCache && Date.now() - agentHealthCache.at < maxAgeMs) {
+    return Promise.resolve(agentHealthCache.value);
+  }
+  if (agentHealthInFlight) {
+    return agentHealthInFlight;
+  }
+  agentHealthInFlight = getAgentHealth()
+    .then(value => {
+      agentHealthCache = { at: Date.now(), value };
+      agentHealthInFlight = null;
+      return value;
+    })
+    .catch(() => {
+      // Degrade-closed: optional signal, never a user-facing error or a block.
+      // eslint-disable-next-line no-console
+      console.debug('[ai-agent] /health unavailable; using default limits');
+      agentHealthInFlight = null;
+      return null;
+    });
+  return agentHealthInFlight;
+};
 
 export const queryAgent = (payload: AgentQueryRequest) =>
   requestJson<AgentQueryResponse>('/agent/query', {
@@ -1387,10 +1451,167 @@ export const enrichProjectDocument = (projectId: string, documentId: string) =>
     { method: 'POST' },
   );
 
-export const onboardSemanticProject = (projectId: string) =>
+// -- Superset dataset/table helpers (registration gap, not the agent backend) --
+// These call Superset's own REST API (via SupersetClient for CSRF/session), not
+// the standalone agent. MDL onboarding consumes registered datasets only, so the
+// picker uses these to (a) count the schema's physical tables for the gap banner
+// and (b) register an unregistered physical table as a dataset inline.
+
+export interface PhysicalTablesResult {
+  count: number;
+  /** Physical table/view names in the schema (datasets may or may not exist). */
+  names: string[];
+}
+
+/**
+ * List the schema's physical tables/views (the same endpoint the SQL Lab tree
+ * uses). Un-paginated: one call returns the whole schema. Used only to size the
+ * "N of M registered" banner, never to render rows.
+ */
+export const listPhysicalTables = async (
+  databaseId: number,
+  schema: string,
+  catalog?: string | null,
+): Promise<PhysicalTablesResult> => {
+  const query = rison.encode({
+    force: false,
+    schema_name: schema,
+    ...(catalog ? { catalog_name: catalog } : {}),
+  });
+  const response = await SupersetClient.get({
+    endpoint: `/api/v1/database/${databaseId}/tables/?q=${query}`,
+  });
+  const result =
+    (response.json?.result as { value: string; type: string }[]) ?? [];
+  return {
+    count: (response.json?.count as number) ?? result.length,
+    names: result.map(item => item.value),
+  };
+};
+
+/**
+ * Register a physical table as a Superset dataset (so MDL can onboard it).
+ * Mirrors the Add Dataset flow's payload. Resolves with the new dataset id.
+ */
+export const createDataset = async (params: {
+  databaseId: number;
+  schema: string;
+  tableName: string;
+  catalog?: string | null;
+}): Promise<number> => {
+  const response = await SupersetClient.post({
+    endpoint: '/api/v1/dataset/',
+    jsonPayload: {
+      database: params.databaseId,
+      catalog: params.catalog ?? null,
+      schema: params.schema,
+      table_name: params.tableName,
+    },
+  });
+  return response.json.id as number;
+};
+
+export interface RegisteredTableNames {
+  names: string[];
+  /** True when the cap was hit before all pages were read (possible misclassify). */
+  truncated: boolean;
+}
+
+// Bound the authoritative-name scan. Registered datasets are typically far fewer
+// than physical tables, so this is rarely approached; it caps pathological cases.
+export const REGISTERED_NAME_SCAN_CAP = 5000;
+
+/**
+ * Fetch the COMPLETE set of registered dataset names for a schema (id+table_name
+ * only — `columns` projection keeps the payload tiny), paging at the DAO max of
+ * 1000/page until exhausted or the cap is reached. Decoupled from the picker's
+ * paginated *display* list so "unregistered" classification is authoritative
+ * rather than eventually-consistent (R1): a registered dataset on an unloaded
+ * display page is still known here, so it never flashes as "not registered".
+ */
+export const listAllRegisteredTableNames = async (
+  databaseId: number,
+  schema: string,
+  cap: number = REGISTERED_NAME_SCAN_CAP,
+): Promise<RegisteredTableNames> => {
+  const PAGE = 1000; // SQLALCHEMY_DAO_MAX_PAGE_SIZE
+  const names: string[] = [];
+  let page = 0;
+  let total = Infinity;
+  let truncated = false;
+  while (names.length < total) {
+    const query = rison.encode({
+      columns: ['id', 'table_name'],
+      filters: [
+        { col: 'database', opr: 'rel_o_m', value: databaseId },
+        { col: 'schema', opr: 'eq', value: schema },
+      ],
+      order_column: 'table_name',
+      order_direction: 'asc',
+      page,
+      page_size: PAGE,
+    });
+    // eslint-disable-next-line no-await-in-loop
+    const response = await SupersetClient.get({
+      endpoint: `/api/v1/dataset/?q=${query}`,
+    });
+    const result = (response.json?.result as { table_name: string }[]) ?? [];
+    total = (response.json?.count as number) ?? names.length + result.length;
+    result.forEach(item => names.push(item.table_name));
+    if (result.length === 0) break; // defensive: no progress
+    if (names.length >= cap) {
+      truncated = names.length < total;
+      break;
+    }
+    page += 1;
+  }
+  return { names, truncated };
+};
+
+/**
+ * Whether the current user may create datasets. Reads the FAB `_info` endpoint's
+ * `permissions` array (the same signal Superset's Dataset list uses to show its
+ * "Create Dataset" button). Used to gate inline registration on the *real*
+ * Dataset `can_write` rather than a project-write proxy.
+ */
+export const getDatasetWritePermission = async (): Promise<boolean> => {
+  const query = rison.encode({ keys: ['permissions'] });
+  const response = await SupersetClient.get({
+    endpoint: `/api/v1/dataset/_info?q=${query}`,
+  });
+  const permissions = (response.json?.permissions as string[]) ?? [];
+  return permissions.includes('can_write');
+};
+
+/**
+ * Which tables to onboard (Feature A). Absent/`undefined` ≡ whole schema (the
+ * legacy behavior). `mode:'include'` onboards exactly `datasetIds`; `mode:'all'`
+ * onboards every dataset in the schema minus `excludeDatasetIds`.
+ */
+export interface OnboardingSelection {
+  mode: 'all' | 'include';
+  datasetIds?: number[];
+  excludeDatasetIds?: number[];
+  search?: string | null;
+}
+
+const onboardingBody = (selection?: OnboardingSelection) => {
+  if (!selection) return {};
+  return {
+    mode: selection.mode,
+    dataset_ids: selection.datasetIds ?? [],
+    exclude_dataset_ids: selection.excludeDatasetIds ?? [],
+    search: selection.search ?? null,
+  };
+};
+
+export const onboardSemanticProject = (
+  projectId: string,
+  selection?: OnboardingSelection,
+) =>
   requestJson<SemanticJob>(
     `/agent/semantic-layer/projects/${projectId}/onboard`,
-    { method: 'POST' },
+    { method: 'POST', body: JSON.stringify(onboardingBody(selection)) },
   );
 
 /**
@@ -1421,40 +1642,14 @@ export const resetSemanticProject = (projectId: string) =>
     { method: 'POST' },
   );
 
-/**
- * Poll a semantic job until it reaches a terminal state. An inline backend
- * completes on the first response; a threaded backend is polled.
- */
-const pollSemanticJob = async (
-  projectId: string,
-  job: SemanticJob,
-  {
-    intervalMs = 1000,
-    attempts = 60,
-  }: { intervalMs?: number; attempts?: number },
-): Promise<SemanticJob> => {
-  let current = job;
-  let remaining = attempts;
-  while (current.status === 'running' && remaining > 0) {
-    // eslint-disable-next-line no-await-in-loop
-    await new Promise(resolve => {
-      setTimeout(resolve, intervalMs);
-    });
-    // eslint-disable-next-line no-await-in-loop
-    current = await getSemanticJob(projectId, current.id);
-    remaining -= 1;
-  }
-  return current;
-};
-
-/**
- * Start onboarding and resolve once the async job reaches a terminal state.
- */
-export const runOnboarding = async (
-  projectId: string,
-  opts: { intervalMs?: number; attempts?: number } = {},
-): Promise<SemanticJob> =>
-  pollSemanticJob(projectId, await onboardSemanticProject(projectId), opts);
+// NOTE: onboarding is started with ``onboardSemanticProject`` (returns the job in
+// its initial state — ``completed`` for an inline backend, ``running`` for the
+// threaded prod backend) and then polled with ``getSemanticJob`` until terminal.
+// There is deliberately no combined start-and-poll helper here: a fixed
+// foreground poll budget would mis-time real onboarding (which can run for
+// minutes) and report a still-``running`` job as done. The editor owns the poll
+// loop instead, so the spinner and file list stay in sync until the job is truly
+// terminal regardless of how long onboarding takes.
 
 /**
  * Reset a project (delete all MDL). No onboarding job is created — the project
@@ -1473,6 +1668,36 @@ export const materializeSemanticProject = (projectId: string) =>
 export const getProjectSemanticLayerState = (projectId: string) =>
   requestJson<SemanticLayerState>(
     `/agent/semantic-layer/projects/${projectId}/state`,
+    { method: 'GET' },
+  );
+
+// -- MDL provenance (Feature B) ---------------------------------------------
+
+export type ProvenanceKind =
+  | 'onboarding'
+  | 'enrichment'
+  | 'mdl_created'
+  | 'mdl_updated'
+  | 'mdl_activated'
+  | 'mdl_deleted';
+
+export interface ProvenanceEntry {
+  id: string;
+  kind: ProvenanceKind;
+  status: 'ok' | 'warning' | 'error';
+  summary: string;
+  created_at: string;
+  actor?: string | null;
+  detail: Record<string, unknown>;
+}
+
+/**
+ * The MDL directory's provenance timeline (onboarding / enrichment / CRUD),
+ * newest-first. Excludes document events and resets when the MDL is reset.
+ */
+export const getMdlProvenance = (projectId: string) =>
+  requestJson<ProvenanceEntry[]>(
+    `/agent/semantic-layer/projects/${projectId}/provenance`,
     { method: 'GET' },
   );
 

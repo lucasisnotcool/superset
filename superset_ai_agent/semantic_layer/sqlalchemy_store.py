@@ -377,6 +377,24 @@ class SqlAlchemySemanticLayerStore:
                 SemanticLayerEvent.model_validate(model.payload) for model in models
             ]
 
+    def delete_project_events(
+        self,
+        project_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+        types: frozenset[str] | None = None,
+    ) -> int:
+        with self.session_factory() as session:
+            statement = delete(AiAgentEvent).where(
+                AiAgentEvent.owner_id == owner_id,
+                AiAgentEvent.project_id == project_id,
+            )
+            if types is not None:
+                statement = statement.where(AiAgentEvent.type.in_(types))
+            result = session.execute(statement)
+            session.commit()
+            return int(result.rowcount or 0)
+
     @staticmethod
     def _get_document_model(
         session: Session,

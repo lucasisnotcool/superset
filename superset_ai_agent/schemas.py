@@ -54,10 +54,21 @@ class AgentQueryRequest(BaseModel):
 
 
 class SqlValidation(BaseModel):
-    """Validation result for generated SQL."""
+    """Validation result for generated SQL.
+
+    ``classification`` is the deterministic verdict from
+    ``superset_ai_agent.tools.sql_policy`` (backed by Superset core's
+    ``SQLScript``); ``reason`` is the user-facing explanation for a block (R3).
+    ``is_read_only`` is kept as the derived ``classification == "read_only"``
+    convenience so existing call sites and the execution gate stay stable.
+    """
 
     is_valid: bool
     is_read_only: bool
+    classification: Literal[
+        "read_only", "mutating", "opaque", "multi", "unparseable"
+    ] = "unparseable"
+    reason: str | None = None
     normalized_sql: str | None = None
     dialect: str | None = None
     errors: list[str] = Field(default_factory=list)
@@ -463,3 +474,6 @@ class HealthResponse(BaseModel):
     #: Effective embedding vector index: "memory" | "lancedb" | "memory_fallback".
     #: "memory_fallback" means LanceDB was configured but did not connect (C1).
     vector_index: str = "memory"
+    #: Effective max upload size for source documents (WREN_MAX_DOCUMENT_BYTES), so
+    #: the UI can reject oversized files before the upload round-trip.
+    max_document_bytes: int = 10_000_000

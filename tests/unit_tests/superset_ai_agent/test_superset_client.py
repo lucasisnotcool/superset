@@ -792,3 +792,81 @@ def _json_rpc_error(request_id: str, message: str) -> httpx.Response:
             "error": {"code": -32000, "message": message},
         },
     )
+
+
+# --- LocalSupersetClient self-defense (R6/R-LOCAL) ------------------------
+class _FakeApp:
+    def app_context(self):  # noqa: D401 - test stub
+        from contextlib import nullcontext
+
+        return nullcontext()
+
+
+class _FakeDatabase:
+    backend = "postgresql"
+
+    def __init__(self) -> None:
+        self.queried: list[str] = []
+
+    def get_df(self, sql: str, schema: str | None = None):
+        import pandas as pd
+
+        self.queried.append(sql)
+        return pd.DataFrame([{"a": 1}])
+
+
+class _FakeQuery:
+    def __init__(self, database: _FakeDatabase) -> None:
+        self._database = database
+
+    def filter_by(self, **_: object) -> "_FakeQuery":
+        return self
+
+    def one(self) -> _FakeDatabase:
+        return self._database
+
+
+class _FakeSession:
+    def __init__(self, database: _FakeDatabase) -> None:
+        self._database = database
+
+    def query(self, _model: object) -> _FakeQuery:
+        return _FakeQuery(self._database)
+
+
+class _FakeDb:
+    def __init__(self, database: _FakeDatabase) -> None:
+        self.session = _FakeSession(database)
+
+
+def _local_client_with_fake_db(
+    monkeypatch, database: _FakeDatabase
+) -> LocalSupersetClient:
+    import superset
+
+    client = LocalSupersetClient(AgentConfig())
+    client.__dict__["_app"] = _FakeApp()  # bypass the cached_property app boot
+    monkeypatch.setattr(superset, "db", _FakeDb(database), raising=False)
+    return client
+
+
+def test_local_adapter_refuses_mutating_sql(monkeypatch) -> None:
+    database = _FakeDatabase()
+    client = _local_client_with_fake_db(monkeypatch, database)
+
+    with pytest.raises(ValueError, match="non-read-only"):
+        client.execute_sql(database_id=1, sql="DELETE FROM birth_names")
+
+    # Fails closed before ever touching the engine.
+    assert database.queried == []
+
+
+def test_local_adapter_runs_read_only_and_pushes_limit(monkeypatch) -> None:
+    database = _FakeDatabase()
+    client = _local_client_with_fake_db(monkeypatch, database)
+
+    result = client.execute_sql(database_id=1, sql="SELECT a FROM t", limit=50)
+
+    assert database.queried == ["SELECT a FROM t\nLIMIT 50"]
+    assert result.audit is not None
+    assert result.audit.executed_sql == "SELECT a FROM t\nLIMIT 50"

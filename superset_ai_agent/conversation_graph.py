@@ -96,6 +96,7 @@ from superset_ai_agent.semantic_layer.wren_runtime import (
     materialize_request_semantic_project,
 )
 from superset_ai_agent.tools.sql import validate_read_only_sql
+from superset_ai_agent.tools.sql_policy import decide, SqlClassification
 
 logger = logging.getLogger(__name__)
 
@@ -1138,6 +1139,7 @@ class ConversationGraph:
             draft.sql,
             dialect=dialect,
             default_limit=self.config.default_sql_limit,
+            policy_mode=self.config.sql_policy_mode,
         )
         normalized_sql = validation.normalized_sql or draft.sql
         updated_draft = draft.model_copy(update={"sql": normalized_sql})
@@ -1152,9 +1154,14 @@ class ConversationGraph:
                 summary=(
                     "SQL passed read-only validation."
                     if validation.is_valid
-                    else "SQL failed read-only validation."
+                    else f"SQL blocked: {validation.reason or 'not read-only'}"
                 ),
-                details={"errors": validation.errors, "dialect": dialect},
+                details={
+                    "classification": validation.classification,
+                    "reason": validation.reason,
+                    "errors": validation.errors,
+                    "dialect": dialect,
+                },
             ),
         ]
         return {
@@ -1549,14 +1556,31 @@ class ConversationGraph:
         return "end"
 
     def _can_execute_sql(self, state: ConversationState) -> bool:
+        """Single execution gate: bounded retries + the policy decision (R4/R5).
+
+        The tier/approval decision is delegated to ``sql_policy.decide`` so the
+        read-only invariant lives in one tested place: a non-read-only
+        classification can never auto-run, and human approval (``approved_sql``
+        on the first iteration) runs only read-only SQL — it never promotes a
+        mutating/opaque/multi statement.
+        """
+
         validation = state.get("validation")
-        if not validation or not validation.is_valid or not validation.is_read_only:
+        if not validation:
             return False
         if state.get("sql_iterations", 0) >= self.config.max_agent_sql_iterations:
             return False
-        if state["request"].approved_sql and state.get("sql_iterations", 0) == 0:
-            return True
-        return state["request"].resolved_execution_mode() in {"read_only", "auto"}
+        request = state["request"]
+        approved = bool(request.approved_sql) and state.get("sql_iterations", 0) == 0
+        classification = SqlClassification(
+            kind=validation.classification,
+            reason=validation.reason or "",
+        )
+        return decide(
+            classification,
+            tier=request.resolved_execution_mode(),
+            approved=approved,
+        ).allow
 
     def _call_conversation_model(
         self,

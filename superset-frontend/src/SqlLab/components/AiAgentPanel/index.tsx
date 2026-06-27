@@ -76,6 +76,7 @@ import {
   type ConversationTurnResponse,
   type ExecutionMode,
   type SemanticLayerState,
+  type SqlClassification,
 } from './api';
 import AiChartPreview from './AiChartPreview';
 import AuditInfoPanel from './AuditInfoPanel';
@@ -555,6 +556,45 @@ const getValidationStatus = (artifact: ConversationArtifact) => {
     : ('invalid' as const);
 };
 
+// Short, friendly label for each deterministic classification the backend
+// SQL safety policy can return. Used as the headline of a blocked-SQL alert so
+// the user sees *why* a draft will not auto-run, not just that it is "invalid".
+const CLASSIFICATION_LABEL: Record<SqlClassification, string> = {
+  read_only: t('Read-only query'),
+  mutating: t('Blocked: this query writes data or changes server state'),
+  opaque: t('Blocked: this query could not be verified as read-only'),
+  multi: t('Blocked: only a single statement can run'),
+  unparseable: t('Blocked: this SQL could not be parsed'),
+};
+
+// Detailed, user-facing reason for a blocked draft. Prefers the backend
+// ``reason`` (new), falls back to the legacy ``errors`` array so older backends
+// keep working.
+const getValidationReason = (
+  artifact: ConversationArtifact,
+): string | undefined => {
+  const validation = artifact.validation;
+  if (!validation) {
+    return undefined;
+  }
+  if (validation.reason) {
+    return validation.reason;
+  }
+  return validation.errors.length ? validation.errors.join('\n') : undefined;
+};
+
+// Headline label for a blocked draft, derived from the classification when the
+// backend provides one.
+const getValidationLabel = (
+  artifact: ConversationArtifact,
+): string | undefined => {
+  const classification = artifact.validation?.classification;
+  if (classification && classification !== 'read_only') {
+    return CLASSIFICATION_LABEL[classification];
+  }
+  return undefined;
+};
+
 const getValidationTooltip = (artifact: ConversationArtifact) => {
   if (!artifact.validation) {
     return t('SQL validation status is unavailable.');
@@ -562,9 +602,11 @@ const getValidationTooltip = (artifact: ConversationArtifact) => {
   if (artifact.validation.is_valid) {
     return t('SQL is valid.');
   }
-  return artifact.validation.errors.length
-    ? artifact.validation.errors.join('\n')
-    : t('SQL is invalid.');
+  return (
+    getValidationReason(artifact) ??
+    getValidationLabel(artifact) ??
+    t('SQL is invalid.')
+  );
 };
 
 // Treat the transcript as "pinned" within a small slack of the bottom so the
@@ -1262,10 +1304,19 @@ const AiAgentPanel = () => {
                       </ValidationStatus>
                     </Tooltip>
                   </SqlBlockRow>
-                  {artifact.validation?.errors.length ? (
+                  {artifact.validation && !artifact.validation.is_valid ? (
                     <Alert
                       type="warning"
-                      message={artifact.validation.errors.join('\n')}
+                      message={
+                        getValidationLabel(artifact) ??
+                        getValidationReason(artifact) ??
+                        t('SQL is invalid.')
+                      }
+                      description={
+                        getValidationLabel(artifact)
+                          ? getValidationReason(artifact)
+                          : undefined
+                      }
                     />
                   ) : null}
                   {executionError ? (

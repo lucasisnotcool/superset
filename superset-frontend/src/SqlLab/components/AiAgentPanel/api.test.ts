@@ -17,8 +17,16 @@
  * under the License.
  */
 import fetchMock from 'fetch-mock';
+import { SupersetClient } from '@superset-ui/core';
 import {
   applyCopilotChangeset,
+  createDataset,
+  getDatasetWritePermission,
+  listAllRegisteredTableNames,
+  listPhysicalTables,
+  onboardSemanticProject,
+  getSemanticJob,
+  getMdlProvenance,
   createCopilotConversation,
   deleteCopilotConversation,
   getCopilotConversation,
@@ -41,6 +49,8 @@ import {
   executeConversationSql,
   getAgentBaseUrl,
   getAgentHealth,
+  getAgentHealthCached,
+  resetAgentHealthCache,
   getConversation,
   listMdlFiles,
   listConversations,
@@ -87,6 +97,42 @@ test('getAgentHealth requests health endpoint', async () => {
   expect(fetchMock.callHistory.calls('http://agent.local/health')).toHaveLength(
     1,
   );
+});
+
+test('getAgentHealthCached dedupes within the window and refetches after (RG3)', async () => {
+  resetAgentHealthCache();
+  fetchMock.get('http://agent.local/health', {
+    status: 'ok',
+    model_provider: 'ollama',
+    base_url: 'http://localhost:11434',
+    default_model: 'qwen2.5-coder:7b',
+    reachable: true,
+    max_document_bytes: 5_000_000,
+  });
+
+  const first = await getAgentHealthCached();
+  const second = await getAgentHealthCached();
+  expect(first?.max_document_bytes).toBe(5_000_000);
+  expect(second?.max_document_bytes).toBe(5_000_000);
+  // Two reads, one network call (cached within the window).
+  expect(fetchMock.callHistory.calls('http://agent.local/health')).toHaveLength(
+    1,
+  );
+
+  // maxAgeMs=0 forces the cache to be treated as stale -> a refetch.
+  await getAgentHealthCached(0);
+  expect(fetchMock.callHistory.calls('http://agent.local/health')).toHaveLength(
+    2,
+  );
+});
+
+test('getAgentHealthCached returns null on failure without throwing (RG4)', async () => {
+  resetAgentHealthCache();
+  fetchMock.get('http://agent.local/health', 500);
+
+  const result = await getAgentHealthCached();
+  // Degrade-closed: best-effort, never rejects; callers use their default.
+  expect(result).toBeNull();
 });
 
 test('queryAgent posts typed payload to agent backend', async () => {
@@ -146,6 +192,26 @@ test('validateSql posts SQL validation payload', async () => {
     sql: 'select 1',
     dialect: 'sqlite',
   });
+});
+
+test('validateSql surfaces the policy classification and reason', async () => {
+  fetchMock.post('http://agent.local/agent/validate-sql', {
+    is_valid: false,
+    is_read_only: false,
+    classification: 'mutating',
+    reason: 'Statement writes data or changes server state.',
+    normalized_sql: null,
+    dialect: 'sqlite',
+    errors: ['Statement writes data or changes server state.'],
+  });
+
+  const response = await validateSql('delete from t', 'sqlite');
+
+  expect(response.is_valid).toBe(false);
+  expect(response.classification).toBe('mutating');
+  expect(response.reason).toBe(
+    'Statement writes data or changes server state.',
+  );
 });
 
 test('conversation API helpers use typed conversation endpoints', async () => {
@@ -660,6 +726,227 @@ test('getProjectReadiness requests the readiness endpoint', async () => {
   expect(readiness.ready).toBe(true);
   expect(readiness.active_model_count).toBe(3);
   expect(fetchMock.callHistory.calls(`${base}/readiness`)).toHaveLength(1);
+});
+
+test('onboardSemanticProject sends the table selection body', async () => {
+  const base = 'http://agent.local/agent/semantic-layer/projects/project-1';
+  fetchMock.post(`${base}/onboard`, {
+    id: 'job-1',
+    kind: 'onboarding',
+    status: 'running',
+  });
+
+  await onboardSemanticProject('project-1', {
+    mode: 'include',
+    datasetIds: [1, 2],
+  });
+
+  const [call] = fetchMock.callHistory.calls(`${base}/onboard`);
+  expect(JSON.parse(String(call.options.body))).toEqual({
+    mode: 'include',
+    dataset_ids: [1, 2],
+    exclude_dataset_ids: [],
+    search: null,
+  });
+});
+
+test('onboardSemanticProject with no selection posts the whole-schema body', async () => {
+  const base = 'http://agent.local/agent/semantic-layer/projects/project-1';
+  fetchMock.post(`${base}/onboard`, {
+    id: 'job-1',
+    kind: 'onboarding',
+    status: 'running',
+  });
+
+  await onboardSemanticProject('project-1');
+
+  const [call] = fetchMock.callHistory.calls(`${base}/onboard`);
+  expect(JSON.parse(String(call.options.body))).toEqual({});
+});
+
+test('getSemanticJob fetches a job by id for polling', async () => {
+  const base = 'http://agent.local/agent/semantic-layer/projects/project-1';
+  fetchMock.get(`${base}/jobs/job-1`, {
+    id: 'job-1',
+    kind: 'onboarding',
+    status: 'completed',
+    project_id: 'project-1',
+    result: { project_id: 'project-1', model_count: 2, warnings: [] },
+  });
+
+  const job = await getSemanticJob('project-1', 'job-1');
+  expect(job.status).toBe('completed');
+  expect(job.result?.model_count).toBe(2);
+  expect(fetchMock.callHistory.calls(`${base}/jobs/job-1`)).toHaveLength(1);
+});
+
+test('getMdlProvenance requests the provenance endpoint', async () => {
+  const base = 'http://agent.local/agent/semantic-layer/projects/project-1';
+  fetchMock.get(`${base}/provenance`, [
+    {
+      id: 'e1',
+      kind: 'mdl_created',
+      status: 'ok',
+      summary: 'Created models/orders.json',
+      created_at: '2026-06-26T00:00:00Z',
+      detail: { path: 'models/orders.json' },
+    },
+  ]);
+
+  const entries = await getMdlProvenance('project-1');
+  expect(entries[0].kind).toBe('mdl_created');
+  expect(fetchMock.callHistory.calls(`${base}/provenance`)).toHaveLength(1);
+});
+
+test('listPhysicalTables queries the database tables endpoint via SupersetClient', async () => {
+  const get = jest.spyOn(SupersetClient, 'get').mockResolvedValue({
+    json: {
+      count: 2,
+      result: [
+        { value: 'orders', type: 'table' },
+        { value: 'orders_view', type: 'view' },
+      ],
+    },
+  } as any);
+
+  const result = await listPhysicalTables(1, 'public', 'prod');
+
+  expect(result).toEqual({ count: 2, names: ['orders', 'orders_view'] });
+  const endpoint = get.mock.calls[0][0].endpoint as string;
+  expect(endpoint).toContain('/api/v1/database/1/tables/?q=');
+  // The rison query carries the schema and catalog filters.
+  expect(decodeURIComponent(endpoint)).toContain('schema_name:public');
+  expect(decodeURIComponent(endpoint)).toContain('catalog_name:prod');
+  get.mockRestore();
+});
+
+test('listPhysicalTables omits the catalog filter when none is given', async () => {
+  const get = jest.spyOn(SupersetClient, 'get').mockResolvedValue({
+    json: { count: 0, result: [] },
+  } as any);
+
+  const result = await listPhysicalTables(1, 'public');
+
+  expect(result).toEqual({ count: 0, names: [] });
+  expect(
+    decodeURIComponent(get.mock.calls[0][0].endpoint as string),
+  ).not.toContain('catalog_name');
+  get.mockRestore();
+});
+
+test('createDataset posts the Add-Dataset payload and returns the new id', async () => {
+  const post = jest.spyOn(SupersetClient, 'post').mockResolvedValue({
+    json: { id: 42 },
+  } as any);
+
+  const id = await createDataset({
+    databaseId: 1,
+    schema: 'public',
+    tableName: 'orders',
+    catalog: 'prod',
+  });
+
+  expect(id).toBe(42);
+  expect(post).toHaveBeenCalledWith({
+    endpoint: '/api/v1/dataset/',
+    jsonPayload: {
+      database: 1,
+      catalog: 'prod',
+      schema: 'public',
+      table_name: 'orders',
+    },
+  });
+  post.mockRestore();
+});
+
+test('listAllRegisteredTableNames returns every name from a single page', async () => {
+  const get = jest.spyOn(SupersetClient, 'get').mockResolvedValue({
+    json: {
+      count: 2,
+      result: [{ table_name: 'orders' }, { table_name: 'customers' }],
+    },
+  } as any);
+
+  const { names, truncated } = await listAllRegisteredTableNames(1, 'public');
+
+  expect(names).toEqual(['orders', 'customers']);
+  expect(truncated).toBe(false);
+  // Projects to id+table_name only, keyed by schema.
+  const endpoint = decodeURIComponent(get.mock.calls[0][0].endpoint as string);
+  expect(endpoint).toContain('table_name');
+  expect(endpoint).toContain('schema');
+  get.mockRestore();
+});
+
+test('listAllRegisteredTableNames pages until the full count is read', async () => {
+  const page0 = Array.from({ length: 1000 }, (_, i) => ({
+    table_name: `t${i}`,
+  }));
+  const page1 = [{ table_name: 't1000' }];
+  const get = jest
+    .spyOn(SupersetClient, 'get')
+    .mockResolvedValueOnce({ json: { count: 1001, result: page0 } } as any)
+    .mockResolvedValueOnce({ json: { count: 1001, result: page1 } } as any);
+
+  const { names, truncated } = await listAllRegisteredTableNames(1, 'public');
+
+  expect(names).toHaveLength(1001);
+  expect(names[1000]).toBe('t1000');
+  expect(truncated).toBe(false);
+  expect(get).toHaveBeenCalledTimes(2);
+  get.mockRestore();
+});
+
+test('listAllRegisteredTableNames halts at the cap and reports truncation', async () => {
+  const fullPage = Array.from({ length: 1000 }, (_, i) => ({
+    table_name: `t${i}`,
+  }));
+  const get = jest
+    .spyOn(SupersetClient, 'get')
+    .mockResolvedValue({ json: { count: 9999, result: fullPage } } as any);
+
+  const { names, truncated } = await listAllRegisteredTableNames(
+    1,
+    'public',
+    2500,
+  );
+
+  // Stops once accumulated >= cap (3 pages of 1000 → 3000 ≥ 2500).
+  expect(names.length).toBeGreaterThanOrEqual(2500);
+  expect(truncated).toBe(true);
+  get.mockRestore();
+});
+
+test('getDatasetWritePermission reads can_write from the dataset _info endpoint', async () => {
+  const get = jest.spyOn(SupersetClient, 'get').mockResolvedValue({
+    json: { permissions: ['can_read', 'can_write', 'can_export'] },
+  } as any);
+
+  expect(await getDatasetWritePermission()).toBe(true);
+  const endpoint = get.mock.calls[0][0].endpoint as string;
+  expect(endpoint).toContain('/api/v1/dataset/_info?q=');
+  expect(decodeURIComponent(endpoint)).toContain('permissions');
+  get.mockRestore();
+});
+
+test('getDatasetWritePermission is false when can_write is absent', async () => {
+  const get = jest.spyOn(SupersetClient, 'get').mockResolvedValue({
+    json: { permissions: ['can_read'] },
+  } as any);
+
+  expect(await getDatasetWritePermission()).toBe(false);
+  get.mockRestore();
+});
+
+test('createDataset propagates a rejected request (e.g. 403 / duplicate)', async () => {
+  const post = jest
+    .spyOn(SupersetClient, 'post')
+    .mockRejectedValue(new Error('Forbidden'));
+
+  await expect(
+    createDataset({ databaseId: 1, schema: 'public', tableName: 'orders' }),
+  ).rejects.toThrow('Forbidden');
+  post.mockRestore();
 });
 
 test('API helpers surface FastAPI detail errors', async () => {

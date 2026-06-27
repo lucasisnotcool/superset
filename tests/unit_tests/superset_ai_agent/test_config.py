@@ -180,3 +180,55 @@ def test_agent_config_reads_azure_openai_environment(monkeypatch) -> None:
     assert config.azure_openai_structured_output == "json_object"
     assert config.default_model() == "sql-deployment"
     assert config.model_base_url() == "https://azure-openai.example.com"
+
+
+def test_agent_config_defaults_to_development_environment() -> None:
+    config = AgentConfig()
+
+    assert config.environment == "development"
+    # Defaults are the safe production-grade combo regardless of environment.
+    assert config.superset_agent_adapter == "rest"
+    assert config.superset_auth_mode == "user_session"
+
+
+def test_agent_config_production_rejects_local_adapter() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="local"):
+        AgentConfig(environment="production", superset_agent_adapter="local")
+
+
+def test_agent_config_production_rejects_service_account_auth() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="service_account"):
+        AgentConfig(
+            environment="production",
+            superset_auth_mode="service_account",
+        )
+
+
+def test_agent_config_production_allows_rest_user_session() -> None:
+    config = AgentConfig(
+        environment="production",
+        superset_agent_adapter="rest",
+        superset_auth_mode="user_session",
+    )
+
+    assert config.environment == "production"
+
+
+def test_agent_config_development_allows_local_adapter() -> None:
+    config = AgentConfig(environment="development", superset_agent_adapter="local")
+
+    assert config.superset_agent_adapter == "local"
+
+
+def test_agent_config_defaults_to_strict_sql_policy() -> None:
+    assert AgentConfig().sql_policy_mode == "strict"
+
+
+def test_agent_config_reads_sql_policy_mode_from_env(monkeypatch) -> None:
+    monkeypatch.setenv("AI_AGENT_SQL_POLICY", "PERMISSIVE")
+
+    assert AgentConfig.from_env().sql_policy_mode == "permissive"

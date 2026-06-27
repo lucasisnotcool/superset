@@ -44,6 +44,7 @@ from superset_ai_agent.schemas import (
     ExecutionResult,
     ModelInfo,
     SqlExecutionSource,
+    SqlValidation,
 )
 
 
@@ -987,3 +988,100 @@ def test_conversation_graph_engine_rewrite_reaches_execution_and_audit() -> None
     assert artifact.audit.engine == "fake"
     assert "main.birth_names" in (artifact.audit.native_sql or "")
     assert "birth_names" in (artifact.audit.semantic_sql or "")
+
+
+def _gate_graph() -> ConversationGraph:
+    """A ConversationGraph wired with fakes for exercising the execution gate."""
+
+    store = InMemoryConversationStore()
+    return ConversationGraph(
+        config=AgentConfig(),
+        model_client=FakeModelClient(
+            {"response_type": "answer", "message": "x", "sql": ""}
+        ),
+        context_provider=FakeContextProvider(),
+        superset_client=FakeSupersetClient(),
+        conversation_store=store,
+    )
+
+
+def _validation(kind: str) -> SqlValidation:
+    is_ro = kind == "read_only"
+    return SqlValidation(
+        is_valid=is_ro,
+        is_read_only=is_ro,
+        classification=kind,  # type: ignore[arg-type]
+        reason="blocked" if not is_ro else "Read-only query.",
+        normalized_sql="SELECT 1\nLIMIT 1000" if is_ro else None,
+    )
+
+
+def test_can_execute_sql_only_read_only_auto_runs_read_only_sql() -> None:
+    graph = _gate_graph()
+    scope = ConversationScope(database_id=1, dataset_ids=[16])
+    for tier, expected in (("manual", False), ("read_only", True), ("auto", True)):
+        state = {
+            "validation": _validation("read_only"),
+            "request": ConversationTurnRequest(
+                message="m", scope=scope, execution_mode=tier
+            ),
+            "sql_iterations": 0,
+        }
+        assert graph._can_execute_sql(state) is expected  # noqa: SLF001
+
+
+def test_can_execute_sql_blocks_non_read_only_in_every_tier() -> None:
+    graph = _gate_graph()
+    scope = ConversationScope(database_id=1, dataset_ids=[16])
+    for kind in ("mutating", "opaque", "multi", "unparseable"):
+        for tier in ("manual", "read_only", "auto"):
+            state = {
+                "validation": _validation(kind),
+                "request": ConversationTurnRequest(
+                    message="m", scope=scope, execution_mode=tier
+                ),
+                "sql_iterations": 0,
+            }
+            assert graph._can_execute_sql(state) is False  # noqa: SLF001
+
+
+def test_can_execute_sql_approval_never_promotes_mutating_sql() -> None:
+    # R4/R5: human approval runs read-only SQL but never a mutating statement.
+    graph = _gate_graph()
+    scope = ConversationScope(database_id=1, dataset_ids=[16])
+    approved_mutating = {
+        "validation": _validation("mutating"),
+        "request": ConversationTurnRequest(
+            message="Execute selected SQL.",
+            scope=scope,
+            execution_mode="auto",
+            approved_sql="DELETE FROM birth_names",
+        ),
+        "sql_iterations": 0,
+    }
+    assert graph._can_execute_sql(approved_mutating) is False  # noqa: SLF001
+
+    approved_read_only = {
+        "validation": _validation("read_only"),
+        "request": ConversationTurnRequest(
+            message="Execute selected SQL.",
+            scope=scope,
+            execution_mode="manual",
+            approved_sql="SELECT name FROM birth_names",
+        ),
+        "sql_iterations": 0,
+    }
+    assert graph._can_execute_sql(approved_read_only) is True  # noqa: SLF001
+
+
+def test_can_execute_sql_respects_iteration_cap() -> None:
+    graph = _gate_graph()
+    scope = ConversationScope(database_id=1, dataset_ids=[16])
+    state = {
+        "validation": _validation("read_only"),
+        "request": ConversationTurnRequest(
+            message="m", scope=scope, execution_mode="read_only"
+        ),
+        "sql_iterations": graph.config.max_agent_sql_iterations,
+    }
+    assert graph._can_execute_sql(state) is False  # noqa: SLF001

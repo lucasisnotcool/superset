@@ -35,6 +35,7 @@ import {
   SemanticDocument,
   WorkspaceNode,
 } from '../api';
+import { DocumentStatusTag, getDocumentStatusMeta } from './documentStatus';
 
 /**
  * Build a workspace tree from the editor's MDL files (folders from path
@@ -196,6 +197,12 @@ const NodeTitle = ({
 }) => {
   const invalid = node.validation?.valid === false;
   const actions = node.kind === 'mdl' ? renderActions?.(node) : null;
+  // Surface attention-worthy document states (extracting / needs_ocr / error)
+  // inline in the tree; normal states stay quiet to keep the tree uncluttered.
+  const documentStatus =
+    node.kind === 'document' && node.status ? node.status : null;
+  const showDocumentStatus =
+    documentStatus !== null && getDocumentStatusMeta(documentStatus).attention;
   return (
     <Flex
       align="center"
@@ -218,6 +225,9 @@ const NodeTitle = ({
             files — the Active/Draft toggle already shows that state (item 2). */}
         <NodeName ellipsis={{ tooltip: node.name }}>{node.name}</NodeName>
         {invalid ? <Tag color="error">{t('invalid')}</Tag> : null}
+        {showDocumentStatus && documentStatus ? (
+          <DocumentStatusTag status={documentStatus} />
+        ) : null}
       </Flex>
       {actions ? (
         // Keep clicks on the action control from toggling tree selection.

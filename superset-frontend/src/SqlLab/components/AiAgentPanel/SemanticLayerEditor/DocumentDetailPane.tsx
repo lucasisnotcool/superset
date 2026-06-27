@@ -41,6 +41,7 @@ import {
   SemanticDocument,
   summarizeSemanticDocument,
 } from '../api';
+import { DocumentStatusTag, formatBytes } from './documentStatus';
 
 export interface DocumentDetailPaneProps {
   document: SemanticDocument;
@@ -70,12 +71,6 @@ const Pre = styled.pre`
     font-size: ${theme.fontSizeSM}px;
   `}
 `;
-
-const formatBytes = (bytes: number) => {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-};
 
 const isMarkdown = (contentType: string) =>
   contentType.includes('markdown') || contentType.includes('text/plain');
@@ -189,12 +184,17 @@ const DocumentDetailPane = ({
         <Typography.Text type="secondary">
           {`${document.content_type} · ${formatBytes(document.size_bytes)}`}
         </Typography.Text>
-        {document.status === 'error' ? (
-          <Tag color="error">{t('error')}</Tag>
-        ) : (
-          <Tag>{document.status}</Tag>
-        )}
+        <DocumentStatusTag status={document.status} error={document.error} />
       </Flex>
+      {document.status === 'needs_ocr' ? (
+        <Typography.Text type="warning">
+          {t(
+            'No text could be read from this file — it looks scanned or ' +
+              'image-only. The original is stored and can be re-processed once ' +
+              'OCR is available.',
+          )}
+        </Typography.Text>
+      ) : null}
       <Tabs
         defaultActiveKey="text"
         css={css`

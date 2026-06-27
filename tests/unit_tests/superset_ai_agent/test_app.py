@@ -335,6 +335,8 @@ def test_health_and_models_use_injected_ollama_client() -> None:
     assert health["semantic_layer_persistent"] is False
     # Default keyword retriever → in-process memory index (C1 health signal).
     assert health["vector_index"] == "memory"
+    # The upload cap is published so the UI can reject oversized files up front.
+    assert health["max_document_bytes"] == 10_000_000
     assert client.get("/models").json()[0]["name"] == "qwen2.5-coder:7b"
 
 

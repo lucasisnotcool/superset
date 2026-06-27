@@ -168,6 +168,7 @@ class SemanticPipeline:
             plan.native_sql,
             dialect=dialect,
             default_limit=self.config.default_sql_limit,
+            policy_mode=self.config.sql_policy_mode,
         )
 
         execution_result: ExecutionResult | None = None

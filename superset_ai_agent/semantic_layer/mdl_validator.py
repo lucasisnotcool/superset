@@ -165,12 +165,17 @@ def validate_mdl(
     *,
     schema_index: SchemaIndex | None = None,
     strict_relationships: bool = False,
+    strict_models: bool = False,
 ) -> MdlValidationResult:
     """Validate one MDL JSON document (wren-core native shape).
 
     ``schema_index`` enables physical validation (R3). ``strict_relationships``
     turns unresolved relationship endpoints into errors instead of warnings;
     use it for merged project manifests where every model must be present.
+    ``strict_models`` turns a model with neither a physical mapping nor columns
+    (almost always a relationship emitted as a model) into an error instead of
+    two warnings; the Copilot proposal path sets it so the correction loop catches
+    the mistake before activation, while the default stays lenient for drafts.
     """
 
     parsed, parse_message = _parse_json(content)
@@ -195,7 +200,9 @@ def validate_mdl(
         )
 
     messages: list[MdlValidationMessage] = []
-    model_names = _validate_models(models, schema_index, messages)
+    model_names = _validate_models(
+        models, schema_index, messages, strict_models=strict_models
+    )
     _validate_views(views, messages)
     _validate_relationships(
         relationships,
@@ -228,6 +235,7 @@ def validate_project_manifest(
     schema_index: SchemaIndex | None = None,
     deep_validate: bool = False,
     dedup_models: bool = False,
+    strict_models: bool = False,
 ) -> MdlValidationResult:
     """Validate a merged set of MDL files as one project manifest.
 
@@ -273,6 +281,7 @@ def validate_project_manifest(
         merged_json,
         schema_index=schema_index,
         strict_relationships=True,
+        strict_models=strict_models,
     )
     result = MdlValidationResult(
         valid=result.valid,
@@ -300,6 +309,8 @@ def _validate_models(
     models: list[Any],
     schema_index: SchemaIndex | None,
     messages: list[MdlValidationMessage],
+    *,
+    strict_models: bool = False,
 ) -> set[str]:
     seen_names: set[str] = set()
     for index, model in enumerate(models):
@@ -330,6 +341,27 @@ def _validate_models(
         seen_names.add(name)
 
         table = _table_name(model)
+        model_columns = model.get("columns")
+        has_columns = isinstance(model_columns, list) and bool(model_columns)
+        if strict_models and table is None and not has_columns:
+            # A model with neither a physical mapping nor columns is invalid (and
+            # wren-core rejects it for the missing 'columns' field). The common
+            # cause is a join/relationship emitted as a model — point there. Only
+            # an ERROR under ``strict_models`` (the Copilot proposal path) so the
+            # correction loop catches it before the user accepts/activates; the
+            # default stays lenient (warnings) for incomplete drafts.
+            messages.append(
+                MdlValidationMessage(
+                    severity="error",
+                    message=(
+                        f"Model {name} has neither a physical mapping "
+                        "(tableReference/refSql) nor columns. If it represents a "
+                        "join, define it under relationships[] instead of models[]."
+                    ),
+                    code="model_missing_mapping_and_columns",
+                )
+            )
+            continue
         if table is None:
             messages.append(
                 MdlValidationMessage(

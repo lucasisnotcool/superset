@@ -15,6 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
+"""Back-compat tests for the ``validate_read_only_sql`` shim.
+
+Deep classification behaviour is covered in ``test_sql_policy.py``; these tests
+pin the :class:`SqlValidation` shape the graphs and API depend on.
+"""
+
 from __future__ import annotations
 
 from superset_ai_agent.tools.sql import validate_read_only_sql
@@ -29,6 +35,7 @@ def test_validate_read_only_sql_accepts_select_and_adds_limit() -> None:
 
     assert validation.is_valid is True
     assert validation.is_read_only is True
+    assert validation.classification == "read_only"
     assert validation.normalized_sql == "select name from birth_names\nLIMIT 20"
 
 
@@ -51,7 +58,9 @@ def test_validate_read_only_sql_blocks_destructive_statement() -> None:
 
     assert validation.is_valid is False
     assert validation.is_read_only is False
-    assert any("DROP" in error for error in validation.errors)
+    assert validation.classification == "mutating"
+    assert validation.reason
+    assert validation.errors  # block reason surfaced for the UI
 
 
 def test_validate_read_only_sql_blocks_multiple_statements() -> None:
@@ -61,10 +70,21 @@ def test_validate_read_only_sql_blocks_multiple_statements() -> None:
     )
 
     assert validation.is_valid is False
-    assert "Exactly one SQL statement is allowed." in validation.errors
+    assert validation.classification == "multi"
 
 
-def test_validate_read_only_sql_maps_postgresql_dialect() -> None:
+def test_validate_read_only_sql_does_not_false_positive_on_string_literal() -> None:
+    # The old keyword regex rejected this; the AST-based policy accepts it.
+    validation = validate_read_only_sql(
+        "select name from t where note = 'please DROP by'",
+        dialect="postgresql",
+    )
+
+    assert validation.is_valid is True
+    assert validation.classification == "read_only"
+
+
+def test_validate_read_only_sql_passes_engine_through_as_dialect() -> None:
     validation = validate_read_only_sql(
         "select name from birth_names",
         dialect="postgresql",
@@ -72,7 +92,7 @@ def test_validate_read_only_sql_maps_postgresql_dialect() -> None:
     )
 
     assert validation.is_valid is True
-    assert validation.dialect == "postgres"
+    assert validation.dialect == "postgresql"
     assert validation.normalized_sql == "select name from birth_names\nLIMIT 20"
 
 
@@ -86,3 +106,27 @@ def test_validate_read_only_sql_falls_back_for_unknown_dialect() -> None:
     assert validation.is_valid is True
     assert validation.dialect == "not_a_sqlglot_dialect"
     assert validation.normalized_sql == "select name from birth_names\nLIMIT 20"
+
+
+def test_validate_read_only_sql_permissive_allows_multi_read_only() -> None:
+    blocked = validate_read_only_sql("select 1; select 2 from t", dialect="postgresql")
+    assert blocked.is_valid is False
+    assert blocked.classification == "multi"
+
+    allowed = validate_read_only_sql(
+        "select 1; select 2 from t",
+        dialect="postgresql",
+        policy_mode="permissive",
+    )
+    assert allowed.is_valid is True
+    assert allowed.classification == "read_only"
+
+
+def test_validate_read_only_sql_permissive_still_blocks_multi_with_write() -> None:
+    validation = validate_read_only_sql(
+        "select 1; drop table t",
+        dialect="postgresql",
+        policy_mode="permissive",
+    )
+    assert validation.is_valid is False
+    assert validation.classification == "multi"

@@ -337,6 +337,118 @@ test('failed onboarding shows the error and a Retry button', async () => {
   expect(onOnboard).toHaveBeenCalledTimes(1);
 });
 
+test('invalid changeset items are excluded from the default accepted set (P3)', async () => {
+  // One valid create + one relationship-as-model that failed validation. The
+  // invalid item must default to rejected so it is not applied; the Apply button
+  // counts only the valid one.
+  const mixed = {
+    items: [
+      {
+        op: 'create',
+        path: 'models/orders.json',
+        proposed_content: '{"models":[{"name":"orders"}]}',
+        current_content: null,
+        validation: { valid: true, messages: [] },
+        summary: 'Add orders model',
+      },
+      {
+        op: 'create',
+        path: 'models/orders_to_customers.json',
+        proposed_content: '{"models":[{"name":"orders_to_customers"}]}',
+        current_content: null,
+        validation: {
+          valid: false,
+          messages: [
+            {
+              line: null,
+              column: null,
+              severity: 'error',
+              message:
+                'Model orders_to_customers has neither a physical mapping nor ' +
+                'columns. If it represents a join, define it under ' +
+                'relationships[] instead of models[].',
+              code: 'model_missing_mapping_and_columns',
+            },
+          ],
+        },
+        summary: 'Add join',
+      },
+    ],
+    manifest_validation: { valid: false, messages: [] },
+    warnings: [],
+    steps: [],
+    message: 'Proposed 2 changes.',
+  };
+  const sse = `event: complete\ndata: ${JSON.stringify({
+    type: 'complete',
+    changeset: mixed,
+  })}\n\n`;
+  global.fetch = jest.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    const method = init?.method ?? 'GET';
+    if (url.includes('/copilot/stream')) {
+      return Promise.resolve(streamResponse(sse));
+    }
+    if (/\/copilot\/conversations\/[^/]+$/.test(url)) {
+      return Promise.resolve(jsonResponse(threadAfterTurn));
+    }
+    if (url.endsWith('/copilot/conversations')) {
+      return Promise.resolve(
+        jsonResponse(method === 'POST' ? conversation() : []),
+      );
+    }
+    return Promise.resolve(jsonResponse({}));
+  }) as unknown as typeof fetch;
+
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+    />,
+  );
+  await userEvent.type(
+    screen.getByTestId('copilot-input'),
+    'model orders and its join to customers',
+  );
+  await userEvent.click(screen.getByTestId('copilot-send'));
+
+  // Only the valid item is accepted by default -> "Apply 1 accepted".
+  expect(await screen.findByText('Apply 1 accepted')).toBeInTheDocument();
+});
+
+test('ready view shows an Upload control that calls onUpload (RG2)', async () => {
+  installFetch();
+  const onUpload = jest.fn();
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+      onUpload={onUpload}
+    />,
+  );
+
+  await userEvent.click(screen.getByTestId('copilot-upload'));
+  expect(onUpload).toHaveBeenCalledTimes(1);
+});
+
+test('no Upload control when onUpload is not provided', () => {
+  installFetch();
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+    />,
+  );
+
+  expect(screen.queryByTestId('copilot-upload')).not.toBeInTheDocument();
+});
+
 test('persists the turn to a thread and survives reload via the API', async () => {
   // First mount: send a turn (creates a thread, persisted server-side).
   const fetchFn = installFetch();

@@ -711,6 +711,7 @@ class TextToSqlGraph:
             sql,
             dialect=dialect,
             default_limit=self.config.default_sql_limit,
+            policy_mode=self.config.sql_policy_mode,
         )
         normalized_sql = validation.normalized_sql or sql
         status: Literal["ok", "warning", "error"] = (

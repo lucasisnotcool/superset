@@ -133,6 +133,20 @@ def test_delete_file_produces_delete_item() -> None:
     assert changeset.items[0].proposed_content is None
 
 
+def test_delete_missing_file_returns_actionable_guidance() -> None:
+    # Deleting a non-existent path (e.g. a model name treated as a file) steers the
+    # agent toward rewriting the containing file rather than delete-by-name (P4).
+    toolset = MdlToolset([_file("models/orders.json", ORDERS)], schema_index=SCHEMA)
+
+    result = toolset.dispatch(
+        "delete_mdl_file", {"path": "models/sites_to_production_lines.json"}
+    )
+
+    assert "error" in result
+    assert "write_mdl_file" in result["error"]
+    assert "whole files by path" in result["error"]
+
+
 def test_get_physical_schema_returns_real_tables() -> None:
     toolset = MdlToolset([], schema_index=SCHEMA)
 

@@ -104,7 +104,8 @@ The current agent service is implemented in these files:
 | REST adapter | `superset_ai_agent/integrations/superset/rest.py::SupersetRestClient` |
 | MCP adapter | `superset_ai_agent/integrations/superset/mcp.py::SupersetMcpClient` |
 | Adapter factory | `superset_ai_agent/integrations/superset/factory.py::create_superset_client` |
-| SQL read-only validation | `superset_ai_agent/tools/sql.py::validate_read_only_sql` |
+| SQL safety policy (classify/decide/limit) | `superset_ai_agent/tools/sql_policy.py` (over `superset.sql.parse.SQLScript`) |
+| SQL read-only validation (shim) | `superset_ai_agent/tools/sql.py::validate_read_only_sql` |
 | SQL Lab AI frontend API | `superset-frontend/src/SqlLab/components/AiAgentPanel/api.ts` |
 | SQL Lab AI frontend panel | `superset-frontend/src/SqlLab/components/AiAgentPanel/index.tsx` |
 

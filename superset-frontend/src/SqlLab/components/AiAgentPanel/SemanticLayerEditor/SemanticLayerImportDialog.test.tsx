@@ -18,17 +18,30 @@
  */
 import fetchMock from 'fetch-mock';
 import {
+  fireEvent,
   render,
   screen,
   userEvent,
   waitFor,
 } from 'spec/helpers/testing-library';
+import { resetAgentHealthCache } from '../api';
 import SemanticLayerImportDialog from './SemanticLayerImportDialog';
+
+const XLSX_TYPE =
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 
 const originalAgentUrl = process.env.SUPERSET_AI_AGENT_URL;
 
 beforeEach(() => {
   process.env.SUPERSET_AI_AGENT_URL = 'http://agent.local/';
+  // The health memo is module-level; clear it so each test sees its own /health
+  // mock rather than a value cached by a previous test (RG3).
+  resetAgentHealthCache();
+  // The dialog reads the upload cap from /health on open; default it so the
+  // best-effort fetch resolves cleanly. Individual tests can override.
+  fetchMock.get('http://agent.local/health', {
+    max_document_bytes: 10_000_000,
+  });
 });
 
 afterEach(() => {
@@ -64,10 +77,11 @@ const renderDialog = (
   props: { existingFiles?: ReturnType<typeof makeMdlFile>[] } = {},
 ) => {
   const onApplied = jest.fn();
+  const onHide = jest.fn();
   render(
     <SemanticLayerImportDialog
       show
-      onHide={jest.fn()}
+      onHide={onHide}
       projectId="project-1"
       existingFiles={(props.existingFiles ?? []) as never}
       canWrite
@@ -77,17 +91,51 @@ const renderDialog = (
   // The modal renders into a portal on document.body, not the render container.
   const fileInput = () =>
     document.querySelector('input[type="file"]') as HTMLInputElement;
-  return { onApplied, fileInput };
+  return { onApplied, onHide, fileInput };
 };
 
-test('shows a deprecation notice steering enrichment to the MDL Copilot', () => {
-  renderDialog();
+test('shows the enrichment deprecation notice only once a Markdown file is staged', async () => {
+  const { fileInput } = renderDialog();
+  // Contextual (G1a): no blanket banner before anything is staged.
+  expect(
+    screen.queryByTestId('enrichment-deprecation-notice'),
+  ).not.toBeInTheDocument();
+
+  fetchMock.post(
+    'http://agent.local/agent/semantic-layer/projects/project-1/documents/text',
+    {
+      id: 'document-9',
+      project_id: 'project-1',
+      filename: 'glossary.md',
+      content_type: 'text/markdown',
+      size_bytes: 5,
+      status: 'needs_review',
+      scope: { database_id: 1, schema_name: 'main', dataset_ids: [] },
+      checksum: 'c',
+      storage_uri: 'mem://glossary.md',
+      warnings: [],
+      created_at: '2026-06-19T00:00:00Z',
+      updated_at: '2026-06-19T00:00:00Z',
+    },
+  );
+  fetchMock.post(
+    'http://agent.local/agent/semantic-layer/projects/project-1/documents/document-9/enrich',
+    {
+      source_document_id: 'document-9',
+      proposed_path: 'models/enriched.json',
+      proposed_content: '{"models":[{"name":"enriched"}]}',
+      validation: { valid: true, messages: [] },
+      warnings: [],
+    },
+  );
+
+  await userEvent.upload(
+    fileInput(),
+    makeFile('Gross moves glossary', 'glossary.md', 'text/markdown'),
+  );
 
   expect(
-    screen.getByTestId('enrichment-deprecation-notice'),
-  ).toBeInTheDocument();
-  expect(
-    screen.getByText('Enriching from a document? Use the MDL Copilot.'),
+    await screen.findByTestId('enrichment-deprecation-notice'),
   ).toBeInTheDocument();
 });
 
@@ -265,6 +313,164 @@ test('routes a dropped Markdown file through the enrichment pipeline', async () 
       ),
     ).toHaveLength(1);
   });
+});
+
+const DOCUMENTS_URL =
+  'http://agent.local/agent/semantic-layer/projects/project-1/documents';
+
+const makeDocResponse = (overrides: Record<string, unknown> = {}) => ({
+  id: 'document-x',
+  project_id: 'project-1',
+  filename: 'metrics.xlsx',
+  content_type:
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  size_bytes: 10,
+  status: 'extracted',
+  scope: { database_id: 1, schema_name: 'main', dataset_ids: [] },
+  checksum: 'c',
+  storage_uri: 'mem://metrics.xlsx',
+  warnings: [],
+  created_at: '2026-06-19T00:00:00Z',
+  updated_at: '2026-06-19T00:00:00Z',
+  ...overrides,
+});
+
+test('uploads a dropped Excel file as a source document and refreshes', async () => {
+  const { fileInput, onApplied } = renderDialog();
+  fetchMock.post(DOCUMENTS_URL, makeDocResponse());
+
+  await userEvent.upload(
+    fileInput(),
+    makeFile(
+      'binary',
+      'metrics.xlsx',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    ),
+  );
+
+  const item = await screen.findByTestId('semantic-import-item');
+  // Routed to the multipart source-document endpoint, not MDL / enrichment.
+  await waitFor(() =>
+    expect(fetchMock.callHistory.calls(DOCUMENTS_URL)).toHaveLength(1),
+  );
+  expect(item).toHaveTextContent('(document)');
+  expect(screen.getByText('Extracted')).toBeInTheDocument();
+  // The new doc is surfaced in the workspace (raw/) via a refresh.
+  await waitFor(() => expect(onApplied).toHaveBeenCalled());
+  // Already persisted — no per-item Save / no diff.
+  expect(
+    screen.queryByRole('button', { name: 'Save' }),
+  ).not.toBeInTheDocument();
+  expect(screen.queryByTestId('semantic-import-diff')).not.toBeInTheDocument();
+});
+
+test('flags an uploaded image-only PDF as needs_ocr', async () => {
+  const { fileInput } = renderDialog();
+  fetchMock.post(
+    DOCUMENTS_URL,
+    makeDocResponse({
+      id: 'doc-scan',
+      filename: 'scan.pdf',
+      content_type: 'application/pdf',
+      status: 'needs_ocr',
+    }),
+  );
+
+  await userEvent.upload(
+    fileInput(),
+    makeFile('%PDF-1.4 scan', 'scan.pdf', 'application/pdf'),
+  );
+
+  expect(await screen.findByText('Needs OCR')).toBeInTheDocument();
+});
+
+test('rejects an oversized file before any upload (G2)', async () => {
+  const { fileInput } = renderDialog();
+  fetchMock.post(DOCUMENTS_URL, makeDocResponse());
+
+  const big = makeFile('x', 'big.pdf', 'application/pdf');
+  // Fake a size over the 10 MB default cap without allocating 10 MB.
+  Object.defineProperty(big, 'size', { value: 10_000_001 });
+  await userEvent.upload(fileInput(), big);
+
+  const item = await screen.findByTestId('semantic-import-item');
+  expect(item).toHaveTextContent(/too large/i);
+  // No upload round-trip for a file rejected client-side.
+  expect(fetchMock.callHistory.calls(DOCUMENTS_URL)).toHaveLength(0);
+});
+
+test('honors the server-reported cap from /health, not just the default (G2)', async () => {
+  // Operator-tuned cap smaller than the FE default proves the guard tracks the
+  // backend rather than a hard-coded constant.
+  fetchMock.removeRoutes();
+  fetchMock.get('http://agent.local/health', { max_document_bytes: 100 });
+  fetchMock.post(DOCUMENTS_URL, makeDocResponse());
+  const { fileInput } = renderDialog();
+  await waitFor(() =>
+    expect(
+      fetchMock.callHistory.calls('http://agent.local/health'),
+    ).toHaveLength(1),
+  );
+
+  const file = makeFile('x', 'metrics.xlsx', XLSX_TYPE);
+  // 200 bytes: under the 10 MB default but over the live 100-byte cap.
+  Object.defineProperty(file, 'size', { value: 200 });
+  await userEvent.upload(fileInput(), file);
+
+  const item = await screen.findByTestId('semantic-import-item');
+  // The message quotes the live cap (100 B), not the default (9.5 MB).
+  expect(item).toHaveTextContent('100 B');
+  expect(fetchMock.callHistory.calls(DOCUMENTS_URL)).toHaveLength(0);
+});
+
+test('drag-drop rejects unsupported files like the picker (G3)', async () => {
+  renderDialog();
+  fetchMock.post(DOCUMENTS_URL, makeDocResponse());
+
+  const dropzone = screen.getByTestId('semantic-import-dropzone');
+  fireEvent.drop(dropzone, {
+    dataTransfer: {
+      files: [
+        makeFile('binary', 'metrics.xlsx', XLSX_TYPE),
+        makeFile('img', 'logo.png', 'image/png'),
+      ],
+    },
+  });
+
+  // The unsupported .png is skipped with a single message...
+  expect(
+    await screen.findByText(/Skipped 1 unsupported file/i),
+  ).toBeInTheDocument();
+  // ...and only the accepted .xlsx is staged (no per-file error row for the png).
+  const items = await screen.findAllByTestId('semantic-import-item');
+  expect(items).toHaveLength(1);
+  expect(items[0]).toHaveTextContent('metrics.xlsx');
+});
+
+test('a documents-only batch shows Done (not Save all) and just closes (G4)', async () => {
+  const { fileInput, onHide } = renderDialog();
+  fetchMock.post(DOCUMENTS_URL, makeDocResponse());
+
+  await userEvent.upload(
+    fileInput(),
+    makeFile('binary', 'metrics.xlsx', XLSX_TYPE),
+  );
+  await screen.findByTestId('semantic-import-item');
+
+  // Documents are already persisted -> nothing to "Save".
+  expect(
+    screen.queryByRole('button', { name: 'Save all' }),
+  ).not.toBeInTheDocument();
+  const done = screen.getByRole('button', { name: 'Done' });
+  await userEvent.click(done);
+
+  expect(onHide).toHaveBeenCalled();
+  // "Done" must not POST any MDL file.
+  expect(
+    fetchMock.callHistory.calls(
+      'http://agent.local/agent/semantic-layer/projects/project-1/mdl-files',
+    ),
+  ).toHaveLength(0);
 });
 
 test('surfaces enrichment proposal warnings (provider fallback)', async () => {

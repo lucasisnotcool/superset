@@ -35,6 +35,7 @@ import {
   Flex,
   Input,
   Tag,
+  Tooltip,
   Typography,
 } from '@superset-ui/core/components';
 import { Icons } from '@superset-ui/core/components/Icons';
@@ -87,6 +88,11 @@ export interface CopilotPanelProps {
   readinessDetail?: string | null;
   /** Start onboarding the schema (the required first step on an empty layer). */
   onOnboard: () => void;
+  /**
+   * Open the shared upload dialog so the user can add source documents for the
+   * Copilot to read. Optional: the panel renders without it (e.g. in isolation).
+   */
+  onUpload?: () => void;
 }
 
 type Decision = 'accepted' | 'rejected';
@@ -106,6 +112,7 @@ const CopilotPanel = ({
   readinessStatus,
   readinessDetail,
   onOnboard,
+  onUpload,
 }: CopilotPanelProps) => {
   const theme = useTheme();
   const isReady = readinessStatus === 'ready';
@@ -270,9 +277,14 @@ const CopilotPanel = ({
       const conversation = await getCopilotConversation(projectId, id);
       setMessages(conversation.messages);
       setPendingUser(null);
+      // Default valid items to accepted (the common "apply all" flow), but
+      // auto-exclude items that failed validation so a known-bad draft is never
+      // applied — and so the per-item Accept becomes a meaningful opt-in for
+      // them rather than a no-op on an already-accepted item (P3).
       const initial: Record<string, Decision> = {};
       result.items.forEach(item => {
-        initial[item.path] = 'accepted';
+        initial[item.path] =
+          item.validation?.valid === false ? 'rejected' : 'accepted';
       });
       setDecisions(initial);
       setChangeset(result);
@@ -525,6 +537,25 @@ const CopilotPanel = ({
             chat for cross-agent parity. */}
         {isReady ? (
           <Flex gap={theme.sizeUnit}>
+            {onUpload ? (
+              <Tooltip
+                title={t(
+                  'Upload a document (PDF, Word, Excel, PowerPoint, CSV, HTML) ' +
+                    'for the Copilot to read.',
+                )}
+              >
+                <Button
+                  buttonStyle="link"
+                  buttonSize="small"
+                  icon={<Icons.UploadOutlined />}
+                  disabled={!canWrite}
+                  onClick={onUpload}
+                  data-test="copilot-upload"
+                >
+                  {t('Upload')}
+                </Button>
+              </Tooltip>
+            ) : null}
             <Button
               buttonStyle="link"
               buttonSize="small"
@@ -656,8 +687,9 @@ const CopilotPanel = ({
               <Typography.Text type="secondary">
                 {t(
                   'Onboarding — building the base semantic layer from your ' +
-                    'schema. This is a one-time setup step, separate from the ' +
-                    'Copilot chat. The Copilot opens automatically when it’s ready.',
+                    'registered datasets. This is a one-time setup step, separate ' +
+                    'from the Copilot chat. The Copilot opens automatically when ' +
+                    'it’s ready.',
                 )}
               </Typography.Text>
             </>
@@ -670,7 +702,10 @@ const CopilotPanel = ({
                 )}
               </Typography.Text>
               <Typography.Text type="secondary">
-                {t('Check this schema’s access and try again.')}
+                {t(
+                  'Check that this schema has registered datasets you can ' +
+                    'access, then try again.',
+                )}
               </Typography.Text>
               <Button
                 buttonStyle="primary"
@@ -687,8 +722,10 @@ const CopilotPanel = ({
               <Typography.Text type="secondary">
                 {t(
                   'The MDL Copilot turns on after onboarding. Onboarding reads ' +
-                    'this schema’s permission-filtered tables and builds the base ' +
-                    'semantic layer — the required first step. Nothing else runs ' +
+                    'the tables you’ve registered as datasets in this schema and ' +
+                    'builds the base semantic layer — the required first step. ' +
+                    'Only registered tables can be onboarded; you can pick which ' +
+                    'ones (and register more) in the next step. Nothing else runs ' +
                     'until it’s ready.',
                 )}
               </Typography.Text>

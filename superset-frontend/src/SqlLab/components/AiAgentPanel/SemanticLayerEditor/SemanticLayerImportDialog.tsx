@@ -16,7 +16,14 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { ChangeEvent, DragEvent, useMemo, useRef, useState } from 'react';
+import {
+  ChangeEvent,
+  DragEvent,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import ReactDiffViewer from 'react-diff-viewer-continued';
 import { t } from '@apache-superset/core/translation';
 import {
@@ -32,12 +39,15 @@ import {
   createMdlFile,
   createProjectDocumentFromText,
   enrichProjectDocument,
+  getAgentHealthCached,
   MdlFile,
   MdlValidationResult,
   updateMdlFile,
+  uploadProjectSourceDocument,
 } from '../api';
+import { DocumentStatusTag, formatBytes } from './documentStatus';
 
-type StagedKind = 'mdl' | 'enrichment';
+type StagedKind = 'mdl' | 'enrichment' | 'document';
 type StagedStatus =
   | 'uploading'
   | 'enriching'
@@ -45,6 +55,7 @@ type StagedStatus =
   | 'saving'
   | 'draft'
   | 'active'
+  | 'uploaded'
   | 'error';
 
 interface StagedItem {
@@ -57,6 +68,8 @@ interface StagedItem {
   status: StagedStatus;
   error?: string;
   warnings?: string[];
+  /** For `kind: 'document'`, the persisted source document's lifecycle status. */
+  documentStatus?: string;
 }
 
 const DropZone = styled.button`
@@ -118,6 +131,28 @@ const isMarkdown = (filename: string) => /\.(md|markdown|txt)$/i.test(filename);
 
 const isJson = (filename: string) => /\.json$/i.test(filename);
 
+// Binary / tabular source documents uploaded for the MDL Copilot to read and for
+// the document viewer (not MDL files, not inline markdown enrichment). These are
+// sent to the multipart source-document endpoint and land in the `raw/` folder.
+const isSourceDocument = (filename: string) =>
+  /\.(csv|html?|pdf|docx|xlsx|pptx)$/i.test(filename);
+
+// Single source of truth for "can this dialog handle the file", shared by the
+// file-picker `accept` filter, the drop handler, and the staging classifier so the
+// two input paths (pick vs drop) stay consistent.
+const isAcceptedFile = (filename: string) =>
+  isJson(filename) || isMarkdown(filename) || isSourceDocument(filename);
+
+const ACCEPT_EXTENSIONS =
+  '.json,.md,.markdown,.txt,.csv,.html,.pdf,.docx,.xlsx,.pptx';
+
+// Pre-upload size guard. The backend remains the source of truth (it rejects
+// oversized uploads with HTTP 400); this constant is a UX hint so the user is not
+// made to wait for a round-trip. It mirrors the WREN_MAX_DOCUMENT_BYTES default
+// and is superseded by the server-reported limit once Phase 2 exposes it via
+// /health (plan_document_upload_ux_gaps.md G2).
+const DEFAULT_MAX_DOCUMENT_BYTES = 10_000_000;
+
 const isProcessing = (status: StagedStatus) =>
   status === 'uploading' || status === 'enriching' || status === 'saving';
 
@@ -128,7 +163,14 @@ const STATUS_LABELS: Record<StagedStatus, string> = {
   saving: t('Saving…'),
   draft: t('Draft'),
   active: t('Active'),
+  uploaded: t('Uploaded'),
   error: t('Error'),
+};
+
+const KIND_LABELS: Record<StagedKind, string> = {
+  mdl: t('MDL'),
+  enrichment: t('enriched'),
+  document: t('document'),
 };
 
 // Assign a collision-free path for a genuinely new file: if `base` is taken,
@@ -172,6 +214,12 @@ export default function SemanticLayerImportDialog({
   const [items, setItems] = useState<StagedItem[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [isBusy, setIsBusy] = useState(false);
+  // Effective upload cap. Starts at the documented default and is replaced by the
+  // server-reported limit (WREN_MAX_DOCUMENT_BYTES) so the client-side guard never
+  // drifts from an operator-tuned backend (plan_document_upload_ux_gaps.md G2).
+  const [maxDocumentBytes, setMaxDocumentBytes] = useState(
+    DEFAULT_MAX_DOCUMENT_BYTES,
+  );
   const inputRef = useRef<HTMLInputElement | null>(null);
   // Synchronous re-entry guard: a rapid double-click can fire two handlers before
   // React re-renders the disabled button, so block by id at call time.
@@ -181,6 +229,24 @@ export default function SemanticLayerImportDialog({
   // arrives (the source of the "MDL file already exists" race).
   const sessionFilesRef = useRef<Map<string, string>>(new Map());
   const theme = useTheme();
+
+  // Pull the real cap when the dialog opens; cached so repeat opens don't refetch
+  // (RG3). Best-effort — `getAgentHealthCached` returns null (never rejects) on
+  // failure, so the guard keeps its default limit.
+  useEffect(() => {
+    if (!show) {
+      return undefined;
+    }
+    let active = true;
+    getAgentHealthCached().then(health => {
+      if (active && typeof health?.max_document_bytes === 'number') {
+        setMaxDocumentBytes(health.max_document_bytes);
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, [show]);
 
   const existingByPath = (path: string) =>
     existingFiles.find(file => file.path === path) || null;
@@ -199,7 +265,6 @@ export default function SemanticLayerImportDialog({
     if (!projectId) {
       return;
     }
-    setError(null);
     setIsBusy(true);
     // Stage a placeholder for every dropped file up front so the user gets
     // immediate "Uploading…"/"Enriching…" feedback while each file is read and
@@ -208,18 +273,39 @@ export default function SemanticLayerImportDialog({
     setItems(current => [
       ...current,
       ...entries.map(({ file, id }) => {
-        const supported = isJson(file.name) || isMarkdown(file.name);
+        const document = isSourceDocument(file.name);
+        const typeSupported = isAcceptedFile(file.name);
+        // Pre-upload size guard (G2): reject oversized files before the upload
+        // round-trip; the backend still enforces the real cap.
+        const oversized = file.size > maxDocumentBytes;
+        const supported = typeSupported && !oversized;
+        let kind: StagedKind = 'mdl';
+        if (document) {
+          kind = 'document';
+        } else if (isMarkdown(file.name)) {
+          kind = 'enrichment';
+        }
+        let error: string | undefined;
+        if (oversized) {
+          error = t('File is too large (%(size)s). The limit is %(max)s.', {
+            size: formatBytes(file.size),
+            max: formatBytes(maxDocumentBytes),
+          });
+        } else if (!typeSupported) {
+          error = t(
+            'Unsupported file type. Add JSON/Markdown, or a ' +
+              'CSV, HTML, PDF, Word, Excel, or PowerPoint document.',
+          );
+        }
         return {
           id,
           filename: file.name,
           path: file.name,
           content: '',
-          kind: (isMarkdown(file.name) ? 'enrichment' : 'mdl') as StagedKind,
+          kind,
           validation: null,
           status: (supported ? 'uploading' : 'error') as StagedStatus,
-          error: supported
-            ? undefined
-            : t('Unsupported file type. Drop a .json or .md file.'),
+          error,
         };
       }),
     ]);
@@ -230,9 +316,34 @@ export default function SemanticLayerImportDialog({
       ...existingFiles.map(file => file.path),
       ...items.map(item => item.path),
     ]);
+    let uploadedDocument = false;
     try {
       for (const { file, id } of entries) {
-        if (isJson(file.name)) {
+        // Skip files the placeholder already rejected (oversized / unsupported)
+        // so the guard holds for both the picker and drop paths.
+        if (file.size > maxDocumentBytes || !isAcceptedFile(file.name)) {
+          continue; // eslint-disable-line no-continue
+        }
+        if (isSourceDocument(file.name)) {
+          // Binary / tabular documents are uploaded as source documents for the
+          // MDL Copilot and the viewer (multipart). They are persisted on upload
+          // — there is no MDL content to review/apply — so they reach a terminal
+          // staged state showing the extraction status (extracted / extracting /
+          // needs_ocr / error).
+          // eslint-disable-next-line no-await-in-loop
+          const document = await uploadProjectSourceDocument(projectId, file);
+          uploadedDocument = true;
+          patchItem(id, {
+            kind: 'document',
+            path: document.filename,
+            status: 'uploaded',
+            documentStatus: document.status,
+            error:
+              document.status === 'error'
+                ? (document.error ?? undefined)
+                : undefined,
+          });
+        } else if (isJson(file.name)) {
           // JSON is treated as a new MDL file. Give a genuinely-new file a unique
           // path so it does not collide with an unrelated existing file.
           // eslint-disable-next-line no-await-in-loop
@@ -265,6 +376,12 @@ export default function SemanticLayerImportDialog({
             status: 'pending',
           });
         }
+      }
+      if (uploadedDocument) {
+        // Surface the new source document(s) in the workspace `raw/` folder
+        // (and to the Copilot) right away. One refresh after the batch keeps the
+        // project re-resolve cost down.
+        await onApplied();
       }
     } catch (ex) {
       setError(ex instanceof Error ? ex.message : t('Unable to read files'));
@@ -315,12 +432,33 @@ export default function SemanticLayerImportDialog({
 
   const onDrop = (event: DragEvent<HTMLButtonElement>) => {
     event.preventDefault();
-    if (event.dataTransfer?.files?.length) {
-      stageFiles(event.dataTransfer.files);
+    const dropped = Array.from(event.dataTransfer?.files ?? []);
+    if (!dropped.length) {
+      return;
+    }
+    // Mirror the file picker's `accept` filter so drop and pick behave the same:
+    // unsupported drops are rejected with a single message instead of becoming a
+    // row of per-file errors.
+    const accepted = dropped.filter(file => isAcceptedFile(file.name));
+    const skipped = dropped.length - accepted.length;
+    // Set once here (stageFiles no longer clears `error`) so the skip note
+    // survives staging; clears any stale error when nothing was skipped.
+    setError(
+      skipped > 0
+        ? t(
+            'Skipped %(n)s unsupported file(s). Accepted: documents (CSV, HTML, ' +
+              'PDF, Word, Excel, PowerPoint), MDL JSON, or Markdown.',
+            { n: skipped },
+          )
+        : null,
+    );
+    if (accepted.length) {
+      stageFiles(accepted);
     }
   };
 
   const onPick = (event: ChangeEvent<HTMLInputElement>) => {
+    setError(null);
     if (event.target.files?.length) {
       stageFiles(event.target.files);
     }
@@ -407,11 +545,20 @@ export default function SemanticLayerImportDialog({
     onHide();
   };
 
+  // Whether anything in the batch still needs an explicit apply. Uploaded source
+  // documents are already persisted (terminal), so a documents-only batch has
+  // nothing to "Save" — the primary action becomes a plain "Done" (G4). Markdown
+  // enrichment is deprecated; surface its notice only when one is staged (G1a).
+  const hasApplyable = items.some(
+    item => item.status === 'pending' || item.status === 'draft',
+  );
+  const hasEnrichment = items.some(item => item.kind === 'enrichment');
+
   return (
     <Modal
       show={show}
       onHide={close}
-      title={t('Add to semantic layer')}
+      title={t('Upload documents & MDL')}
       width="80vw"
       maxWidth="1100px"
       footer={[
@@ -422,24 +569,27 @@ export default function SemanticLayerImportDialog({
           buttonStyle="primary"
           loading={isBusy}
           disabled={!canWrite || isBusy || items.length === 0}
-          onClick={() => persistAll()}
+          onClick={() => (hasApplyable ? persistAll() : close())}
         >
-          {t('Save all')}
+          {hasApplyable ? t('Save all') : t('Done')}
         </Button>,
       ]}
     >
       {error && <Alert type="error" message={error} />}
-      <Alert
-        type="info"
-        showIcon
-        data-test="enrichment-deprecation-notice"
-        message={t('Enriching from a document? Use the MDL Copilot.')}
-        description={t(
-          'Markdown enrichment here is deprecated. The MDL Copilot reads your ' +
-            'uploaded documents, proposes reviewable edits, and preserves ' +
-            'governance metadata. Upload JSON here for raw MDL files.',
-        )}
-      />
+      {hasEnrichment && (
+        <Alert
+          type="info"
+          showIcon
+          data-test="enrichment-deprecation-notice"
+          message={t('Enriching from a document? Use the MDL Copilot.')}
+          description={t(
+            'Markdown enrichment here is deprecated. The MDL Copilot reads your ' +
+              'uploaded documents, proposes reviewable edits, and preserves ' +
+              'governance metadata. Upload documents (below) for the Copilot to ' +
+              'read, or JSON for raw MDL files.',
+          )}
+        />
+      )}
       <DropZone
         type="button"
         data-test="semantic-import-dropzone"
@@ -452,17 +602,23 @@ export default function SemanticLayerImportDialog({
       >
         <Icons.UploadOutlined iconSize="l" />
         <Typography.Text strong>
-          {t('Drop MDL JSON or Markdown files, or click to browse')}
+          {t(
+            'Drop documents (PDF, Word, Excel, PowerPoint, CSV, HTML), MDL ' +
+              'JSON, or Markdown — or click to browse',
+          )}
         </Typography.Text>
         <Typography.Text type="secondary">
-          {t('JSON is added as a new MDL file; Markdown is enriched.')}
+          {t(
+            'Documents are uploaded for the Copilot and viewer; JSON is added as ' +
+              'a new MDL file; Markdown enrichment is deprecated.',
+          )}
         </Typography.Text>
       </DropZone>
       <HiddenInput
         ref={inputRef}
         type="file"
         multiple
-        accept=".json,.md,.markdown,.txt"
+        accept={ACCEPT_EXTENSIONS}
         onChange={onPick}
       />
       <StagedList>
@@ -472,16 +628,23 @@ export default function SemanticLayerImportDialog({
               <Typography.Text strong>
                 {item.path}{' '}
                 <Typography.Text type="secondary">
-                  ({item.kind === 'enrichment' ? t('enriched') : t('MDL')})
+                  ({KIND_LABELS[item.kind]})
                 </Typography.Text>
               </Typography.Text>
               <StatusRow data-test="semantic-import-item-status">
                 {isProcessing(item.status) && (
                   <Icons.LoadingOutlined iconSize="m" spin />
                 )}
-                <Typography.Text type="secondary">
-                  {STATUS_LABELS[item.status]}
-                </Typography.Text>
+                {item.kind === 'document' && item.documentStatus ? (
+                  <DocumentStatusTag
+                    status={item.documentStatus}
+                    error={item.error}
+                  />
+                ) : (
+                  <Typography.Text type="secondary">
+                    {STATUS_LABELS[item.status]}
+                  </Typography.Text>
+                )}
               </StatusRow>
             </Flex>
             {item.error && <Alert type="error" message={item.error} />}
@@ -513,22 +676,26 @@ export default function SemanticLayerImportDialog({
                 />
               </div>
             )}
-            <Flex gap="small" justify="flex-end">
-              <Button
-                buttonStyle="primary"
-                buttonSize="small"
-                loading={item.status === 'saving'}
-                disabled={
-                  !canWrite ||
-                  isBusy ||
-                  !item.content ||
-                  isProcessing(item.status)
-                }
-                onClick={() => persistItem(item)}
-              >
-                {t('Save')}
-              </Button>
-            </Flex>
+            {/* Source documents are persisted on upload — there is no MDL
+                content to review or apply — so they show no per-item Save. */}
+            {item.kind !== 'document' && (
+              <Flex gap="small" justify="flex-end">
+                <Button
+                  buttonStyle="primary"
+                  buttonSize="small"
+                  loading={item.status === 'saving'}
+                  disabled={
+                    !canWrite ||
+                    isBusy ||
+                    !item.content ||
+                    isProcessing(item.status)
+                  }
+                  onClick={() => persistItem(item)}
+                >
+                  {t('Save')}
+                </Button>
+              </Flex>
+            )}
           </StagedItemRoot>
         ))}
       </StagedList>

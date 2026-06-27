@@ -165,6 +165,19 @@ class SemanticLayerStore(Protocol):
     ) -> list[SemanticLayerEvent]:
         """List semantic-layer events for a semantic project."""
 
+    def delete_project_events(
+        self,
+        project_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+        types: frozenset[str] | None = None,
+    ) -> int:
+        """Delete a project's events (optionally only the given ``types``).
+
+        Returns the number deleted. Used by MDL reset to purge the provenance log
+        while leaving document events (which outlive a reset) intact.
+        """
+
 
 def scope_hash(scope: ConversationScope) -> str:
     """Return a stable hash for a Superset semantic-layer scope."""

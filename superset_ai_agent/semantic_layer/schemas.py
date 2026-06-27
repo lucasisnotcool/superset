@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -52,8 +52,34 @@ SemanticLayerEventType = Literal[
     "onboarding_started",
     "onboarding_completed",
     "onboarding_failed",
+    # MDL provenance (plan_onboarding_selection_and_provenance_impl.md, Feature B).
+    # These record the editing history of the MDL directory and are deleted on reset.
+    "mdl_created",
+    "mdl_updated",
+    "mdl_activated",
+    "mdl_deleted",
+    "document_enriched",
 ]
 SemanticJobStatus = Literal["running", "completed", "failed"]
+
+#: Event types that make up the MDL provenance timeline (Feature B). Document
+#: upload/extract events are intentionally excluded — documents survive an MDL reset,
+#: so their events must not be purged with the provenance log (delete-on-reset).
+PROVENANCE_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        "onboarding_started",
+        "onboarding_completed",
+        "onboarding_failed",
+        "mdl_created",
+        "mdl_updated",
+        "mdl_activated",
+        "mdl_deleted",
+        "document_enriched",
+    }
+)
+#: Max provenance entries returned by the read route (newest-first). History is
+#: bounded per onboarding cycle by delete-on-reset; this caps pathological growth.
+PROVENANCE_HISTORY_CAP = 500
 
 
 def _utc_now() -> datetime:
@@ -115,6 +141,10 @@ class SemanticLayerEvent(BaseModel):
     document_id: str | None = None
     state: SemanticLayerState | None = None
     message: str
+    #: Structured, event-specific provenance payload (path, file_id, source_type,
+    #: dataset_ids, status transition, etc.). Round-trips via the event row's JSON
+    #: ``payload`` column — no DB migration required.
+    detail: dict[str, Any] | None = None
     created_at: datetime = Field(default_factory=_utc_now)
 
 
@@ -243,6 +273,28 @@ class WrenMaterializationResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+OnboardingMode = Literal["all", "include"]
+
+
+class OnboardingRequest(BaseModel):
+    """Which tables to onboard into the semantic layer (Feature A).
+
+    The unit is a Superset *dataset* (a registered table). An empty request means
+    ``mode="all"`` with no excludes — exactly the legacy whole-schema onboard, so
+    existing callers are unchanged.
+
+    - ``mode="include"``: onboard exactly ``dataset_ids``.
+    - ``mode="all"``: onboard every dataset in the project's schema, minus
+      ``exclude_dataset_ids``, optionally narrowed by a ``search`` (table-name
+      substring). With no search/excludes this is the full-schema path.
+    """
+
+    mode: OnboardingMode = "all"
+    dataset_ids: list[int] = Field(default_factory=list)
+    exclude_dataset_ids: list[int] = Field(default_factory=list)
+    search: str | None = None
+
+
 class OnboardingResult(BaseModel):
     """Result of generating base MDL from schema introspection."""
 
@@ -251,6 +303,74 @@ class OnboardingResult(BaseModel):
     model_count: int = 0
     activated_count: int = 0
     warnings: list[str] = Field(default_factory=list)
+
+
+ProvenanceKind = Literal[
+    "onboarding",
+    "enrichment",
+    "mdl_created",
+    "mdl_updated",
+    "mdl_activated",
+    "mdl_deleted",
+]
+
+
+class ProvenanceEntry(BaseModel):
+    """One entry in the MDL directory's provenance timeline (Feature B).
+
+    A flattened, UI-ready projection of a provenance ``SemanticLayerEvent`` — the
+    dialog renders these directly (reusing the AI Explain timeline shell).
+    """
+
+    id: str
+    kind: ProvenanceKind
+    status: Literal["ok", "warning", "error"] = "ok"
+    summary: str
+    created_at: datetime
+    actor: str | None = None
+    detail: dict[str, Any] = Field(default_factory=dict)
+
+
+#: Maps provenance ``SemanticLayerEventType`` values to the dialog's ``ProvenanceKind``.
+#: Onboarding start/fail collapse onto the ``onboarding`` kind (status conveys outcome);
+#: ``document_enriched`` maps to ``enrichment``.
+_PROVENANCE_KIND_BY_EVENT: dict[str, ProvenanceKind] = {
+    "onboarding_started": "onboarding",
+    "onboarding_completed": "onboarding",
+    "onboarding_failed": "onboarding",
+    "document_enriched": "enrichment",
+    "mdl_created": "mdl_created",
+    "mdl_updated": "mdl_updated",
+    "mdl_activated": "mdl_activated",
+    "mdl_deleted": "mdl_deleted",
+}
+
+
+def provenance_from_event(event: SemanticLayerEvent) -> ProvenanceEntry | None:
+    """Project a provenance event into a ``ProvenanceEntry`` (else ``None``).
+
+    Non-provenance events (e.g. ``document_uploaded``) return ``None`` so the
+    timeline shows only MDL-directory operations.
+    """
+
+    kind = _PROVENANCE_KIND_BY_EVENT.get(event.type)
+    if kind is None:
+        return None
+    detail = event.detail or {}
+    status: Literal["ok", "warning", "error"] = "ok"
+    if event.type == "onboarding_failed":
+        status = "error"
+    elif detail.get("warnings"):
+        status = "warning"
+    return ProvenanceEntry(
+        id=event.id,
+        kind=kind,
+        status=status,
+        summary=event.message,
+        created_at=event.created_at,
+        actor=detail.get("actor"),
+        detail=detail,
+    )
 
 
 SemanticProjectReadinessStatus = Literal["empty", "indexing", "ready", "failed"]

@@ -700,6 +700,100 @@ test('keeps the retry SQL execute button enabled after an earlier SQL failed', a
   expect(executeButtons[1]).toBeEnabled();
 });
 
+test('surfaces the classification label and reason for a blocked draft', async () => {
+  const conversation = {
+    id: 'conversation-1',
+    title: 'Blocked',
+    owner_id: 'local',
+    scope: {
+      database_id: 1,
+      schema_name: null,
+      dataset_ids: [],
+      query_editor_id: null,
+      current_sql: null,
+      selected_text: null,
+    },
+    messages: [],
+    created_at: '2026-06-19T00:00:00Z',
+    updated_at: '2026-06-19T00:00:00Z',
+  };
+  const blockedSql = 'DELETE FROM birth_names';
+  const turnConversation = {
+    ...conversation,
+    messages: [
+      {
+        id: 'message-1',
+        role: 'user',
+        content: 'delete everything',
+        created_at: '2026-06-19T00:00:00Z',
+        artifacts: [],
+      },
+      {
+        id: 'message-2',
+        role: 'assistant',
+        content: 'I drafted SQL but it cannot run.',
+        created_at: '2026-06-19T00:00:00Z',
+        artifacts: [
+          {
+            id: 'art-blocked',
+            type: 'sql',
+            sql: blockedSql,
+            explanation: null,
+            validation: {
+              is_valid: false,
+              is_read_only: false,
+              classification: 'mutating',
+              reason: 'Statement writes data or changes server state.',
+              normalized_sql: null,
+              dialect: 'sqlite',
+              errors: ['Statement writes data or changes server state.'],
+            },
+            execution_result: null,
+            trace: [],
+          },
+        ],
+      },
+    ],
+  };
+
+  fetchMock.post('http://agent.local/agent/conversations', conversation);
+  fetchMock.post(
+    'http://agent.local/agent/conversations/conversation-1/messages/stream',
+    404,
+  );
+  fetchMock.post(
+    'http://agent.local/agent/conversations/conversation-1/messages',
+    {
+      status: 'needs_review',
+      conversation_id: 'conversation-1',
+      message: turnConversation.messages[1],
+      artifacts: turnConversation.messages[1].artifacts,
+      trace: [],
+      conversation: turnConversation,
+    },
+  );
+
+  render(<AiAgentPanel />, { useRedux: true, initialState });
+
+  await userEvent.type(
+    screen.getByPlaceholderText('Ask about this database'),
+    'q',
+  );
+  await userEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+  await screen.findByText('I drafted SQL but it cannot run.');
+  // The classification headline explains *why* the draft is blocked, and the
+  // backend reason is shown as the detail.
+  expect(
+    screen.getByText('Blocked: this query writes data or changes server state'),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText('Statement writes data or changes server state.'),
+  ).toBeInTheDocument();
+  // A non-read-only draft can never be executed.
+  expect(screen.getByRole('button', { name: 'Execute' })).toBeDisabled();
+});
+
 const buildTurn = () => {
   const conversation = {
     id: 'conversation-1',

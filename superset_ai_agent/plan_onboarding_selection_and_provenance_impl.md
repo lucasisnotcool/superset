@@ -279,6 +279,31 @@ Two independent features over the MDL lifecycle:
   explicit B-4 sub-item; degrade to generic mdl_* until the `ChangesetItem.source_document_id`
   contract add lands.
 
+# As-built status (2026-06-26 — implemented)
+
+All phases landed and tested. Backend `612 passed`; frontend AiAgentPanel
+`173 passed / 24 suites`; tsc clean; backend mypy clean on changed files.
+
+- **Feature A:** `OnboardingRequest` (schemas) → `_resolve_onboarding_dataset_ids`
+  + `_onboarding_context(dataset_ids)` (forwarded via `get_full_schema`, which
+  already honors `request.dataset_ids` — open item #1 confirmed) → route accepts the
+  body → `runOnboarding(selection)` + `OnboardingTablePicker` (paged dataset API via
+  `SupersetClient`, checkbox/shift-range/cmd-toggle/select-all-matching+excludes/
+  context-menu/count/load-on-scroll) opened from the Onboard CTA.
+- **Feature B:** event types + `detail` (no migration) + `ProvenanceEntry` +
+  `provenance_from_event` → best-effort `_emit_mdl_provenance` on create/update/
+  activate/delete + onboarding detail → `delete_project_events(types=PROVENANCE_*)`
+  on reset (documents preserved) → `GET …/provenance` (newest-first, capped 500) →
+  `MdlProvenanceDialog` (Explain shell) opened from a history icon beside the schema
+  name.
+
+**Deferred (documented):** **R-B6** — the enrichment→source-document link. The
+apply path writes `source_type="copilot"` with no `source_document_id`, so an
+applied enrichment currently shows as a generic `mdl_created`/`mdl_updated`
+provenance entry (still captured), not a dedicated `document_enriched` entry. Folding
+it in needs a small `ChangesetItem.source_document_id` contract add through the
+Copilot apply path.
+
 # Open items to confirm during build
 1. Provider `get_context`/`get_agent_context` reliably forwards `dataset_ids` for onboarding
    (A-2) — else call the client `get_agent_context(dataset_ids=…)` directly.

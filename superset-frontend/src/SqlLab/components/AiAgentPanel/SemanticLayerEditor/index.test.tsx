@@ -255,9 +255,44 @@ test('does not auto-onboard an empty schema; shows the Onboard CTA instead', asy
   ).toHaveLength(0);
 });
 
-test('clicking Onboard from the empty state starts onboarding', async () => {
+test('the provenance button opens the MDL history dialog', async () => {
+  mockBaseRoutes([mdlFile('a', 'models/a.json')]);
+  fetchMock.get(
+    'http://agent.local/agent/semantic-layer/projects/project-1/provenance',
+    [
+      {
+        id: 'e1',
+        kind: 'mdl_created',
+        status: 'ok',
+        summary: 'Created models/a.json',
+        created_at: '2026-06-26T00:00:00Z',
+        detail: { path: 'models/a.json' },
+      },
+    ],
+  );
+
+  render(
+    <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="main" />,
+    { useRedux: true },
+  );
+
+  await userEvent.click(await screen.findByTestId('open-provenance'));
+
+  // The dialog loads and renders the directory's history.
+  expect(await screen.findByText('Created models/a.json')).toBeInTheDocument();
+});
+
+test('clicking Onboard opens the table picker, then onboards the selection', async () => {
   mockBaseRoutes([]);
   mockOnboard();
+  // The picker lists registered datasets from Superset's dataset API.
+  fetchMock.get('glob:*/api/v1/dataset/?q=*', {
+    result: [
+      { id: 1, table_name: 'orders' },
+      { id: 2, table_name: 'customers' },
+    ],
+    count: 2,
+  });
 
   render(
     <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="main" />,
@@ -267,16 +302,88 @@ test('clicking Onboard from the empty state starts onboarding', async () => {
   await screen.findByTestId('copilot-onboard');
   await userEvent.click(screen.getByTestId('copilot-onboard'));
 
+  // Picker opens — no onboarding has fired yet (selection is required first).
+  await screen.findByText('orders');
+  expect(
+    fetchMock.callHistory.calls(
+      'http://agent.local/agent/semantic-layer/projects/project-1/onboard',
+    ),
+  ).toHaveLength(0);
+
+  // Select one table and confirm → onboarding runs with that selection.
+  const checkboxes = await screen.findAllByTestId('picker-checkbox');
+  await userEvent.click(checkboxes[0]);
+  await userEvent.click(screen.getByTestId('picker-confirm'));
+
   await waitFor(() => {
-    expect(
-      fetchMock.callHistory.calls(
-        'http://agent.local/agent/semantic-layer/projects/project-1/onboard',
-      ),
-    ).toHaveLength(1);
+    const calls = fetchMock.callHistory.calls(
+      'http://agent.local/agent/semantic-layer/projects/project-1/onboard',
+    );
+    expect(calls).toHaveLength(1);
+    expect(JSON.parse(String(calls[0].options.body))).toEqual({
+      mode: 'include',
+      dataset_ids: [1],
+      exclude_dataset_ids: [],
+      search: null,
+    });
   });
 });
 
-test('opens the Add dialog with a drop zone', async () => {
+test('registers an unregistered physical table from the picker, then onboards it', async () => {
+  mockBaseRoutes([]);
+  mockOnboard();
+  // One registered dataset…
+  fetchMock.get('glob:*/api/v1/dataset/?q=*', {
+    result: [{ id: 1, table_name: 'orders' }],
+    count: 1,
+  });
+  // …but the schema physically has a second table that isn't a dataset yet.
+  fetchMock.get('glob:*/api/v1/database/*/tables/?q=*', {
+    count: 2,
+    result: [
+      { value: 'orders', type: 'table' },
+      { value: 'shipments', type: 'table' },
+    ],
+  });
+  // Registering it returns a new dataset id.
+  fetchMock.post('glob:*/api/v1/dataset/', { id: 99 });
+
+  render(
+    <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="main" />,
+    { useRedux: true },
+  );
+
+  await screen.findByTestId('copilot-onboard');
+  await userEvent.click(screen.getByTestId('copilot-onboard'));
+
+  // The unregistered table appears in its own section and is checkable.
+  const unreg = await screen.findAllByTestId('picker-unregistered-checkbox');
+  expect(unreg).toHaveLength(1);
+  await userEvent.click(unreg[0]); // shipments
+  await userEvent.click(screen.getByTestId('picker-confirm'));
+
+  // It is registered as a dataset…
+  await waitFor(() =>
+    expect(fetchMock.callHistory.calls('glob:*/api/v1/dataset/')).toHaveLength(
+      1,
+    ),
+  );
+  // …then onboarded by the new dataset id.
+  await waitFor(() => {
+    const calls = fetchMock.callHistory.calls(
+      'http://agent.local/agent/semantic-layer/projects/project-1/onboard',
+    );
+    expect(calls).toHaveLength(1);
+    expect(JSON.parse(String(calls[0].options.body))).toEqual({
+      mode: 'include',
+      dataset_ids: [99],
+      exclude_dataset_ids: [],
+      search: null,
+    });
+  });
+});
+
+test('opens the upload-document dialog with a drop zone', async () => {
   mockBaseRoutes([mdlFile('a', 'models/a.json')]);
 
   render(
@@ -288,7 +395,10 @@ test('opens the Add dialog with a drop zone', async () => {
     expect(screen.getByText('Database 1.prod.main')).toBeInTheDocument();
   });
 
-  await userEvent.click(screen.getByRole('button', { name: /Add/i }));
+  // The discoverable "Upload document" entry opens the shared upload dialog (G1b).
+  await userEvent.click(
+    screen.getByRole('button', { name: /Upload document/i }),
+  );
 
   await waitFor(() => {
     expect(screen.getByTestId('semantic-import-dropzone')).toBeInTheDocument();
@@ -338,3 +448,241 @@ test('Reset confirms, deletes all MDL, and does NOT re-onboard', async () => {
     ),
   ).toHaveLength(0);
 });
+
+test(
+  'async onboarding stays indexing while the job runs, then unblocks the rail ' +
+    'and shows the new models once it completes — no premature success',
+  async () => {
+    // Reproduces the threaded-backend timeline: the start call returns a still
+    // `running` job, the backend finishes later, and the editor must poll the
+    // job to completion (not report success early and stop). `onboarded` flips
+    // the schema's state once the job reports `completed`, mirroring the backend
+    // activating the base models.
+    let onboarded = false;
+    const activeFile = mdlFile('moves', 'models/moves.json');
+    const emptyReadiness = {
+      status: 'empty',
+      ready: false,
+      has_active_models: false,
+      active_model_count: 0,
+      detail: 'Schema has not been onboarded yet.',
+    };
+
+    fetchMock.post(
+      'http://agent.local/agent/semantic-layer/projects/resolve',
+      project,
+    );
+    fetchMock.get(
+      'http://agent.local/agent/semantic-layer/projects/project-1/mdl-files',
+      () => (onboarded ? [activeFile] : []),
+    );
+    fetchMock.get(
+      'http://agent.local/agent/semantic-layer/projects/project-1/readiness',
+      () => (onboarded ? readinessFor([activeFile]) : emptyReadiness),
+    );
+    fetchMock.get(
+      'http://agent.local/agent/semantic-layer/projects/project-1/state',
+      {
+        project_id: 'project-1',
+        database_id: 1,
+        catalog_name: 'prod',
+        schema_name: 'main',
+        dataset_ids: [],
+        document_count: 0,
+        last_error: null,
+      },
+    );
+    // The start call returns the job in `running` (threaded backend), NOT done.
+    fetchMock.post(
+      'http://agent.local/agent/semantic-layer/projects/project-1/onboard',
+      {
+        id: 'job-1',
+        kind: 'onboarding',
+        status: 'running',
+        project_id: 'project-1',
+        created_at: '2026-06-19T00:00:00Z',
+        updated_at: '2026-06-19T00:00:00Z',
+      },
+    );
+    // The background poll: still running on the first tick, completed on the
+    // second — and the completion is what makes the schema `ready`.
+    let jobPolls = 0;
+    fetchMock.get(
+      'http://agent.local/agent/semantic-layer/projects/project-1/jobs/job-1',
+      () => {
+        jobPolls += 1;
+        if (jobPolls >= 2) {
+          onboarded = true;
+          return {
+            id: 'job-1',
+            kind: 'onboarding',
+            status: 'completed',
+            project_id: 'project-1',
+            created_at: '2026-06-19T00:00:00Z',
+            updated_at: '2026-06-19T00:00:00Z',
+            result: {
+              project_id: 'project-1',
+              model_count: 1,
+              activated_count: 1,
+              warnings: [],
+              files: [activeFile],
+            },
+          };
+        }
+        return {
+          id: 'job-1',
+          kind: 'onboarding',
+          status: 'running',
+          project_id: 'project-1',
+          created_at: '2026-06-19T00:00:00Z',
+          updated_at: '2026-06-19T00:00:00Z',
+        };
+      },
+    );
+    fetchMock.get('glob:*/api/v1/dataset/?q=*', {
+      result: [{ id: 1, table_name: 'orders' }],
+      count: 1,
+    });
+
+    render(
+      <SemanticLayerEditor
+        databaseId={1}
+        catalogName="prod"
+        schemaName="main"
+      />,
+      { useRedux: true },
+    );
+
+    // Kick off onboarding through the table picker.
+    await userEvent.click(await screen.findByTestId('copilot-onboard'));
+    const checkboxes = await screen.findAllByTestId('picker-checkbox');
+    await userEvent.click(checkboxes[0]);
+    await userEvent.click(screen.getByTestId('picker-confirm'));
+
+    // The job is polled in the background while it runs…
+    await waitFor(
+      () =>
+        expect(
+          fetchMock.callHistory.calls(
+            'http://agent.local/agent/semantic-layer/projects/project-1/jobs/job-1',
+          ).length,
+        ).toBeGreaterThanOrEqual(1),
+      { timeout: 6000 },
+    );
+    // …and the rail must remain in the bootstrap (indexing) state — it must NOT
+    // flip to the chat composer while the job is still running.
+    expect(screen.getByTestId('copilot-not-ready')).toBeInTheDocument();
+    expect(screen.queryByTestId('copilot-input')).not.toBeInTheDocument();
+
+    // Once the job completes, the rail self-heals: the Copilot chat mounts and the
+    // freshly onboarded model appears in the browser — without a manual reload.
+    expect(
+      await screen.findByTestId('copilot-input', undefined, { timeout: 6000 }),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId('copilot-not-ready')).not.toBeInTheDocument();
+    expect(
+      await screen.findByText('moves.json', undefined, { timeout: 6000 }),
+    ).toBeInTheDocument();
+  },
+  20000,
+);
+
+test(
+  'resumes polling a job already in flight on mount (remount/reload) and ' +
+    'unblocks the rail when it finishes — no user action needed',
+  async () => {
+    // Simulates re-opening the editor while a previous onboarding is still
+    // running: there is no `pendingJobId` in component state, so the rail must
+    // recover from the backend-reported in-flight job (readiness.running_job_id).
+    let onboarded = false;
+    const activeFile = mdlFile('moves', 'models/moves.json');
+    const indexingReadiness = {
+      status: 'indexing',
+      ready: false,
+      has_active_models: false,
+      active_model_count: 0,
+      running_job_id: 'job-9',
+      detail: 'Onboarding in progress; the semantic layer is initializing.',
+    };
+
+    fetchMock.post(
+      'http://agent.local/agent/semantic-layer/projects/resolve',
+      project,
+    );
+    fetchMock.get(
+      'http://agent.local/agent/semantic-layer/projects/project-1/mdl-files',
+      () => (onboarded ? [activeFile] : []),
+    );
+    fetchMock.get(
+      'http://agent.local/agent/semantic-layer/projects/project-1/readiness',
+      () => (onboarded ? readinessFor([activeFile]) : indexingReadiness),
+    );
+    fetchMock.get(
+      'http://agent.local/agent/semantic-layer/projects/project-1/state',
+      {
+        project_id: 'project-1',
+        database_id: 1,
+        catalog_name: 'prod',
+        schema_name: 'main',
+        dataset_ids: [],
+        document_count: 0,
+        last_error: null,
+      },
+    );
+    // Observing the job complete flips the schema to onboarded, mirroring the
+    // backend having activated the models by the time the job reports `completed`.
+    fetchMock.get(
+      'http://agent.local/agent/semantic-layer/projects/project-1/jobs/job-9',
+      () => {
+        onboarded = true;
+        return {
+          id: 'job-9',
+          kind: 'onboarding',
+          status: 'completed',
+          project_id: 'project-1',
+          created_at: '2026-06-19T00:00:00Z',
+          updated_at: '2026-06-19T00:00:00Z',
+          result: {
+            project_id: 'project-1',
+            model_count: 1,
+            activated_count: 1,
+            warnings: [],
+            files: [activeFile],
+          },
+        };
+      },
+    );
+
+    render(
+      <SemanticLayerEditor
+        databaseId={1}
+        catalogName="prod"
+        schemaName="main"
+      />,
+      { useRedux: true },
+    );
+
+    // On mount the rail shows the indexing bootstrap (no chat) — onboarding is
+    // still running per the backend.
+    expect(await screen.findByTestId('copilot-not-ready')).toBeInTheDocument();
+    expect(screen.queryByTestId('copilot-input')).not.toBeInTheDocument();
+
+    // The editor resumes polling the reported job; once it reports complete the
+    // schema is onboarded and the rail unblocks without any user interaction.
+    await waitFor(
+      () =>
+        expect(
+          fetchMock.callHistory.calls(
+            'http://agent.local/agent/semantic-layer/projects/project-1/jobs/job-9',
+          ).length,
+        ).toBeGreaterThanOrEqual(1),
+      { timeout: 6000 },
+    );
+
+    expect(
+      await screen.findByTestId('copilot-input', undefined, { timeout: 6000 }),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId('copilot-not-ready')).not.toBeInTheDocument();
+  },
+  20000,
+);

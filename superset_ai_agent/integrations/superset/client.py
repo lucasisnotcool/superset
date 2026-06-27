@@ -27,7 +27,6 @@ from pydantic import BaseModel, Field
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.schemas import AuditInfo, ExecutionResult, SqlExecutionSource
 from superset_ai_agent.semantic_layer.uri_fingerprint import (
-    fingerprint_database_identity,
     fingerprint_database_uri,
 )
 
@@ -322,9 +321,31 @@ class LocalSupersetClient:
         with self._app.app_context():
             from superset import db
             from superset.models.core import Database
+            from superset_ai_agent.tools.sql_policy import apply_limit, classify_sql
 
             database = db.session.query(Database).filter_by(id=database_id).one()
-            dataframe = database.get_df(sql, schema=schema_name)
+            engine = getattr(database, "backend", None)
+
+            # R6/R-LOCAL: the local adapter executes directly against the engine
+            # with no raise_for_access/RLS backstop, so it must defend itself —
+            # independently of whatever the graph validated — and fail closed on
+            # anything not classified read-only. Honours the same policy mode as
+            # the graph so a permissive multi-statement read-only script is not
+            # refused here after the graph allowed it.
+            classification = classify_sql(
+                sql, engine=engine, policy_mode=self.config.sql_policy_mode
+            )
+            if not classification.is_read_only:
+                raise ValueError(
+                    "Refusing to execute non-read-only SQL on the local adapter: "
+                    f"{classification.reason}"
+                )
+
+            # Push the cap into the query (apply_limit is a no-op when a
+            # top-level LIMIT already exists) so we do not materialise an
+            # unbounded result set into memory before truncating.
+            bounded_sql = apply_limit(sql, engine=engine, default_limit=limit)
+            dataframe = database.get_df(bounded_sql, schema=schema_name)
             if len(dataframe) > limit:
                 dataframe = dataframe.head(limit)
             return ExecutionResult(
@@ -333,7 +354,7 @@ class LocalSupersetClient:
                 row_count=len(dataframe),
                 audit=AuditInfo(
                     adapter="local",
-                    executed_sql=sql,
+                    executed_sql=bounded_sql,
                     database_id=database_id,
                     catalog_name=catalog_name,
                     schema_name=schema_name,

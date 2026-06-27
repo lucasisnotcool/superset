@@ -53,6 +53,22 @@ INVALID = json.dumps(
     }
 )
 
+# A relationship emitted as a model (no tableReference/refSql, no columns) — the
+# exact failure from the field report. Under strict_models the proposal-time
+# validation errors, so the loop must self-correct (P1/P2).
+RELATIONSHIP_AS_MODEL = json.dumps(
+    {
+        "models": [
+            {
+                "name": "orders",
+                "tableReference": {"schema": "public", "table": "orders"},
+                "columns": [{"name": "id", "type": "BIGINT"}],
+            },
+            {"name": "orders_to_customers"},  # relationship masquerading as a model
+        ]
+    }
+)
+
 
 class ScriptedModel:
     """Returns a pre-scripted sequence of ModelResults, ignoring inputs."""
@@ -140,6 +156,40 @@ def test_loop_runs_correction_when_validation_fails() -> None:
     assert changeset.manifest_validation.valid is True
     assert changeset.items[0].op == "create"
     assert any(s.kind == "copilot_correct" for s in changeset.steps)
+
+
+def test_loop_self_corrects_relationship_emitted_as_model() -> None:
+    # The model first emits a join as a model (orders_to_customers, no mapping/
+    # columns); strict_models makes proposal-time validation error, so the loop
+    # feeds it back and the model fixes it — before the user ever sees the
+    # changeset (so it can't be applied and fail at activation).
+    model = ScriptedModel(
+        [
+            _write_call("models/orders.json", RELATIONSHIP_AS_MODEL),
+            ModelResult(content="done"),  # validate -> error -> correct
+            _write_call("models/orders.json", VALID),  # moved the join out
+            ModelResult(content="Moved the join into relationships."),
+        ]
+    )
+    toolset = MdlToolset([], schema_index=SCHEMA)
+
+    changeset = run_copilot_loop(
+        model_client=model,
+        toolset=toolset,
+        user_message="model orders and its relationship to customers",
+        max_correction_retries=1,
+    )
+
+    assert changeset.manifest_validation.valid is True
+    assert any(s.kind == "copilot_correct" for s in changeset.steps)
+    # The correction prompt carried the actionable relationship guidance.
+    correction_msgs = [
+        m.content
+        for call in model.calls
+        for m in call["messages"]
+        if "relationships[]" in (m.content or "")
+    ]
+    assert correction_msgs
 
 
 def test_loop_degrades_when_model_emits_no_tool_calls() -> None:

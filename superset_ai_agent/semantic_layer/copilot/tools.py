@@ -294,7 +294,9 @@ class MdlToolset:
         self._working[path] = content
         if args.get("summary"):
             self._summaries[path] = str(args["summary"])
-        validation = validate_mdl(content, schema_index=self._schema_index)
+        validation = validate_mdl(
+            content, schema_index=self._schema_index, strict_models=True
+        )
         result = {"path": path, "validation": validation.model_dump(mode="json")}
         if restored:
             result["note"] = (
@@ -307,7 +309,17 @@ class MdlToolset:
     def _delete_mdl_file(self, args: dict[str, Any]) -> dict[str, Any]:
         path = self._require_path(args)
         if path not in self._working:
-            return {"error": f"No MDL file at {path!r} to delete."}
+            # Deletion is whole-file by path; there is no per-model delete. A model
+            # lives inside a file's models[]/relationships[], so removing or moving
+            # one means rewriting that file with write_mdl_file (P4).
+            return {
+                "error": (
+                    f"No MDL file at {path!r} to delete. Deletion removes whole "
+                    "files by path; to remove or relocate a model (for example a "
+                    "join wrongly placed in models[]), rewrite its containing file "
+                    "with write_mdl_file."
+                )
+            }
         del self._working[path]
         if args.get("summary"):
             self._summaries[path] = str(args["summary"])
@@ -407,6 +419,9 @@ class MdlToolset:
             schema_index=self._schema_index,
             deep_validate=self._deep_validate,
             dedup_models=True,
+            # Catch relationships-emitted-as-models in-loop (dep-free) so the
+            # Copilot self-corrects before the user accepts/activates (P1).
+            strict_models=True,
         )
 
     def build_changeset(self, *, message: str = "") -> Changeset:
@@ -422,7 +437,9 @@ class MdlToolset:
                         path=path,
                         proposed_content=content,
                         validation=validate_mdl(
-                            content, schema_index=self._schema_index
+                            content,
+                            schema_index=self._schema_index,
+                            strict_models=True,
                         ),
                         summary=self._summaries.get(path, f"Create {path}"),
                     )
@@ -436,7 +453,9 @@ class MdlToolset:
                         current_content=original.content,
                         proposed_content=content,
                         validation=validate_mdl(
-                            content, schema_index=self._schema_index
+                            content,
+                            schema_index=self._schema_index,
+                            strict_models=True,
                         ),
                         summary=self._summaries.get(path, f"Update {path}"),
                     )

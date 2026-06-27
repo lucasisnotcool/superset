@@ -45,7 +45,9 @@ treat that as defense-in-depth — be correct from the first token.
   region rollups, calendar buckets, shift remaps, ratios.
 - **Relationships:** entries in `relationships[]`, each with `name`, exactly two
   `models`, a `joinType` ∈ {`ONE_TO_ONE`,`ONE_TO_MANY`,`MANY_TO_ONE`,`MANY_TO_MANY`},
-  and a `condition` join expression.
+  and a `condition` join expression. **NEVER emit a join as a `models[]` entry** — a
+  model needs a `tableReference`/`refSql` and `columns`; one with neither (e.g.
+  `orders_to_customers`) is invalid and blocks activation.
 - **Metrics:** in `metrics[]`, with a `baseObject` and `measure`/`dimension`. A
   **row-level exclusion lives INSIDE the measure `expression`** (a `CASE WHEN …` or
   `FILTER (WHERE …)`) — there is no separate filter field. **Prefer an aggregate
