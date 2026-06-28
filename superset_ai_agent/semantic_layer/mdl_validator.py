@@ -69,9 +69,7 @@ class SchemaIndex:
             if not dataset.table_name:
                 continue
             table = dataset.table_name.lower()
-            columns = {
-                column.name.lower() for column in dataset.columns if column.name
-            }
+            columns = {column.name.lower() for column in dataset.columns if column.name}
             tables[table] = columns
             types = {
                 column.name.lower(): column.type
@@ -104,8 +102,7 @@ class SchemaIndex:
         if types:
             index.column_types = {
                 str(table).lower(): {
-                    str(column).lower(): str(type_)
-                    for column, type_ in cols.items()
+                    str(column).lower(): str(type_) for column, type_ in cols.items()
                 }
                 for table, cols in types.items()
             }
@@ -119,9 +116,7 @@ class SchemaIndex:
     def typed_tables(self) -> dict[str, dict[str, str]]:
         """Table → {column: type} for prompt grounding; empty when no types known."""
 
-        return {
-            table: dict(cols) for table, cols in self.column_types.items() if cols
-        }
+        return {table: dict(cols) for table, cols in self.column_types.items() if cols}
 
     def has_types(self) -> bool:
         return any(self.column_types.values())
@@ -140,9 +135,7 @@ class SchemaIndex:
             return table.lower() in self.tables_by_schema.get(schema.lower(), {})
         return table.lower() in self.tables
 
-    def has_column(
-        self, table: str, column: str, schema: str | None = None
-    ) -> bool:
+    def has_column(self, table: str, column: str, schema: str | None = None) -> bool:
         if schema and self.tables_by_schema:
             scoped = self.tables_by_schema.get(schema.lower(), {})
             return column.lower() in scoped.get(table.lower(), set())
@@ -251,7 +244,14 @@ _TYPE_FAMILIES: dict[str, tuple[str, ...]] = {
     # "BIT" is intentionally excluded — it is boolean in some dialects, numeric in
     # others, so flagging it cross-family would be a false positive.
     "numeric": (
-        "INT", "DEC", "NUMERIC", "NUMBER", "FLOAT", "DOUBLE", "REAL", "SERIAL",
+        "INT",
+        "DEC",
+        "NUMERIC",
+        "NUMBER",
+        "FLOAT",
+        "DOUBLE",
+        "REAL",
+        "SERIAL",
         "MONEY",
     ),
 }
@@ -563,9 +563,7 @@ def _validate_columns(
         if column_name in seen_columns:
             messages.append(
                 MdlValidationMessage(
-                    message=(
-                        f"Duplicate column {model_name}.{column_name}."
-                    ),
+                    message=(f"Duplicate column {model_name}.{column_name}."),
                     code="duplicate_column",
                 )
             )
@@ -597,6 +595,16 @@ def _validate_column_semantics(
 
     is_calculated = bool(column.get("isCalculated"))
     is_relationship = bool(column.get("relationship"))
+    # Match physical existence/type on the column's PHYSICAL name, not its logical
+    # handle: the seed may sanitize a non-identifier name (``2003`` → ``_2003``)
+    # and map it back via ``expression`` + ``properties.superset_column_name``. The
+    # SchemaIndex is keyed by raw physical names, so resolve to that here (D-A).
+    properties = column.get("properties")
+    physical_name = column_name
+    if isinstance(properties, dict):
+        mapped = properties.get("superset_column_name")
+        if isinstance(mapped, str) and mapped:
+            physical_name = mapped
     if is_calculated and not column.get("expression"):
         messages.append(
             MdlValidationMessage(
@@ -623,8 +631,7 @@ def _validate_column_semantics(
     if not (table_known and table is not None and not is_relationship):
         return
     if (
-        not is_calculated
-        and not schema_index.has_column(table, column_name, schema)  # type: ignore[union-attr]
+        not is_calculated and not schema_index.has_column(table, physical_name, schema)  # type: ignore[union-attr]
     ):
         messages.append(
             MdlValidationMessage(
@@ -637,7 +644,13 @@ def _validate_column_semantics(
         )
     # C3: reject an unambiguous cross-family type mismatch on a physical column.
     mismatch = _type_mismatch_message(
-        schema_index, table, model_name, column_name, column, is_calculated
+        schema_index,
+        table,
+        model_name,
+        column_name,
+        column,
+        is_calculated,
+        physical_name=physical_name,
     )
     if mismatch is not None:
         messages.append(mismatch)
@@ -650,6 +663,8 @@ def _type_mismatch_message(
     column_name: str,
     column: dict[str, Any],
     is_calculated: bool,
+    *,
+    physical_name: str | None = None,
 ) -> MdlValidationMessage | None:
     """Cross-family type-mismatch error for a physical-mapped column (C3), or None.
 
@@ -661,7 +676,8 @@ def _type_mismatch_message(
 
     if schema_index is None or is_calculated:
         return None
-    catalog_family = _type_family(schema_index.column_type(table, column_name))
+    lookup = physical_name or column_name
+    catalog_family = _type_family(schema_index.column_type(table, lookup))
     proposed_type = column.get("type")
     proposed_family = (
         _type_family(proposed_type) if isinstance(proposed_type, str) else None
@@ -672,7 +688,7 @@ def _type_mismatch_message(
         or catalog_family == proposed_family
     ):
         return None
-    catalog_type = schema_index.column_type(table, column_name)
+    catalog_type = schema_index.column_type(table, lookup)
     return MdlValidationMessage(
         message=(
             f"Column {model_name}.{column_name} is typed '{proposed_type}' "
@@ -701,8 +717,7 @@ def _validate_views(
             messages.append(
                 MdlValidationMessage(
                     message=(
-                        f"View {view.get('name') or index + 1} is missing a "
-                        "statement."
+                        f"View {view.get('name') or index + 1} is missing a statement."
                     ),
                     code="missing_view_statement",
                 )
@@ -799,8 +814,7 @@ def _validate_metrics(
                     severity="error" if strict else "warning",
                     message=(
                         f"Metric {name} references base object '{base}' that is "
-                        "not defined"
-                        + ("." if strict else " in this file.")
+                        "not defined" + ("." if strict else " in this file.")
                     ),
                     code="unresolved_metric_base",
                 )
@@ -875,8 +889,7 @@ def _validate_cubes(
                     severity="error" if strict else "warning",
                     message=(
                         f"Cube {name} references base object '{base}' that is "
-                        "not defined"
-                        + ("." if strict else " in this file.")
+                        "not defined" + ("." if strict else " in this file.")
                     ),
                     code="unresolved_cube_base",
                 )
@@ -986,8 +999,7 @@ def _validate_cube_measures(
             messages.append(
                 MdlValidationMessage(
                     message=(
-                        f"Cube measure {cube_name}.{measure_name} is missing a "
-                        "type."
+                        f"Cube measure {cube_name}.{measure_name} is missing a type."
                     ),
                     code="cube_measure_without_type",
                 )

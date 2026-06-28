@@ -131,9 +131,7 @@ class LlmWrenClient:
             enabled=True,
             available=True,
             matched_models=[
-                str(model.get("name"))
-                for model in ranked
-                if model.get("name")
+                str(model.get("name")) for model in ranked if model.get("name")
             ][: self.config.wren_context_limit],
             context_items=context_items,
         )
@@ -266,8 +264,7 @@ class LlmWrenClient:
         provider-fallback warning is attached so the degradation is visible.
         """
 
-        effective = self._effective_files_content(project)
-        if effective:
+        if effective := self._effective_files_content(project):
             path, content = effective[0]
             proposed_content = json.dumps(content, indent=2)
             proposed_path = path
@@ -420,8 +417,7 @@ class LlmWrenClient:
                 "database_backend": project.database_backend,
             },
             "datasets": [
-                dataset.model_dump(mode="json")
-                for dataset in superset_context.datasets
+                dataset.model_dump(mode="json") for dataset in superset_context.datasets
             ],
         }
         # W3: structure is seeded deterministically from the permission-filtered
@@ -561,9 +557,7 @@ class LlmWrenClient:
         models: list[dict[str, Any]] = []
         for _path, payload in self._effective_files_content(project):
             models.extend(
-                model
-                for model in payload.get("models", [])
-                if isinstance(model, dict)
+                model for model in payload.get("models", []) if isinstance(model, dict)
             )
         return models
 
@@ -948,9 +942,7 @@ def _full_proposed_manifest(
     """
 
     proposed_models = [
-        model
-        for model in proposed.get("models", []) or []
-        if isinstance(model, dict)
+        model for model in proposed.get("models", []) or [] if isinstance(model, dict)
     ]
     proposed_names = {
         model.get("name")
@@ -963,9 +955,7 @@ def _full_proposed_manifest(
         if isinstance(name, str) and name not in proposed_names:
             merged_models.append(model)
     relationships = [
-        rel
-        for rel in proposed.get("relationships", []) or []
-        if isinstance(rel, dict)
+        rel for rel in proposed.get("relationships", []) or [] if isinstance(rel, dict)
     ]
     return merged_models, relationships
 
@@ -992,9 +982,7 @@ def _reconcile_overlay_with_base(
             continue
         base_model = base_by_name.get(model.get("name"))
         if isinstance(base_model, dict):
-            merged_models.append(
-                _merge_model_preserving_structure(base_model, model)
-            )
+            merged_models.append(_merge_model_preserving_structure(base_model, model))
         else:
             merged_models.append(dict(model))
     out = dict(overlay)
@@ -1101,6 +1089,13 @@ def _overlay_model_semantics(
     }
     for column in seed.get("columns", []):
         match = llm_columns.get(column.get("name"))
+        if not match:
+            # The model keys semantics by the catalog name it was shown; when the
+            # seed sanitized that name (``2003`` → ``_2003``) fall back to the
+            # physical name so a renamed column still receives its description.
+            physical = (column.get("properties") or {}).get("superset_column_name")
+            if physical:
+                match = llm_columns.get(physical)
         if not match:
             continue
         if match.get("description"):

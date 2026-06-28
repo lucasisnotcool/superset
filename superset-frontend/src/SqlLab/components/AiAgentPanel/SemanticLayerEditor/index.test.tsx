@@ -890,6 +890,63 @@ test('opens by projectId without resolving by schema (F1 first-class entry)', as
   ).toHaveLength(0);
 });
 
+test('Lab entry (no schema): a refresh-triggering action keeps the project selected', async () => {
+  // Reproduces the "UI autocloses / deselects" bug: in the MDL Lab the entry tab
+  // carries no schema, so a scope-based refresh would `setProject(null)` and blank
+  // the workspace on every mutation (onboard start, changeset apply, reset…). The
+  // id-aware refresh must keep the open project selected.
+  mockBaseRoutes([mdlFile('a', 'models/a.json')]);
+  mockReset();
+  mockOnboard();
+  fetchMock.get(
+    'http://agent.local/agent/semantic-layer/projects/project-1',
+    project,
+  );
+  fetchMock.get(
+    'http://agent.local/agent/semantic-layer/projects/project-1/documents',
+    [],
+  );
+  fetchMock.get('begin:http://agent.local/agent/semantic-layer/projects?', [
+    project,
+  ]);
+
+  render(
+    <SemanticLayerEditor
+      databaseId={1}
+      catalogName="prod"
+      schemaName=""
+      projectId="project-1"
+    />,
+    { useRedux: true },
+  );
+
+  await screen.findByTestId('mdl-workspace');
+
+  // Reset routes through the scope-agnostic refresh path.
+  await userEvent.click(screen.getByRole('button', { name: /Reset/i }));
+  const dialog = await screen.findByRole('dialog');
+  await userEvent.click(
+    within(dialog).getByRole('button', { name: /^Reset$/i }),
+  );
+  await waitFor(() =>
+    expect(
+      fetchMock.callHistory.calls(
+        'http://agent.local/agent/semantic-layer/projects/project-1/reset',
+      ),
+    ).toHaveLength(1),
+  );
+
+  // Still open: the workspace stays, the empty state never shows, and the project
+  // was never re-resolved by schema.
+  expect(screen.getByTestId('mdl-workspace')).toBeInTheDocument();
+  expect(screen.queryByTestId('mdl-empty')).not.toBeInTheDocument();
+  expect(
+    fetchMock.callHistory.calls(
+      'http://agent.local/agent/semantic-layer/projects/resolve',
+    ),
+  ).toHaveLength(0);
+});
+
 test('browses the database projects and opens a second one (F1/F2)', async () => {
   mockBaseRoutes([mdlFile('a', 'models/a.json')]);
   const project2 = {

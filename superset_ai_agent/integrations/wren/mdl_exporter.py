@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 import json  # noqa: TID251 - standalone agent JSON contract
-import re
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +26,11 @@ from superset_ai_agent.integrations.superset.client import (
     ColumnSummary,
     DatasetMetadata,
     MetricSummary,
+)
+from superset_ai_agent.semantic_layer.column_identity import (
+    physical_column_reference,
+    resolve_column_type,
+    safe_identifier as _safe_identifier,
 )
 
 
@@ -112,32 +116,48 @@ def measure_from_metric(metric: MetricSummary) -> dict[str, Any]:
 
 
 def column_to_field(column: ColumnSummary) -> dict[str, Any]:
-    """Map a Superset column to a Wren column (wren-core native shape)."""
+    """Map a Superset column to a Wren column (wren-core native shape).
 
+    Structure is authoritative from the catalog. Two robustness rules (see
+    ``semantic_layer.column_identity``):
+
+    - **Identity (D-A):** the logical ``name`` is sanitized to a wren-core-safe
+      handle; when that changes the name (e.g. ``2003`` → ``_2003``, ``% growth``
+      → ``growth``) an ``expression`` is emitted that maps the handle back to the
+      real physical column, so it both validates and queries correctly.
+    - **Type (D-B):** the type is resolved via the deterministic fail-closed
+      ladder. A column whose type can't be resolved stays **untyped** (validation
+      then blocks activation) and is tagged ``inferred_type=unknown`` so it never
+      silently activates with a guessed type; a generic-resolved type is tagged
+      ``inferred_type=generic`` for auditability.
+    """
+
+    logical_name = _safe_identifier(column.name)
+    resolved_type, inferred = resolve_column_type(column)
+    properties: dict[str, Any] = {
+        "superset_column_name": column.name,
+        "is_time": True if column.is_dttm else None,
+    }
+    if resolved_type is None:
+        properties["inferred_type"] = "unknown"
+    elif inferred:
+        properties["inferred_type"] = "generic"
     return _drop_none(
         {
-            "name": _safe_identifier(column.name),
-            "type": column.type,
+            "name": logical_name,
+            "type": resolved_type,
             "isCalculated": False,
-            "description": column.description,
-            "properties": _drop_none(
-                {
-                    "superset_column_name": column.name,
-                    "is_time": True if column.is_dttm else None,
-                }
+            # Only present when sanitizing renamed the column; wren-core then
+            # resolves the handle to the quoted physical column.
+            "expression": (
+                physical_column_reference(column.name)
+                if logical_name != column.name
+                else None
             ),
+            "description": column.description,
+            "properties": _drop_none(properties),
         }
     )
-
-
-def _safe_identifier(value: str) -> str:
-    normalized = re.sub(r"[^A-Za-z0-9_]+", "_", value.strip())
-    normalized = normalized.strip("_")
-    if not normalized:
-        return "unnamed"
-    if normalized[0].isdigit():
-        return f"_{normalized}"
-    return normalized
 
 
 def _drop_none(value: dict[str, Any]) -> dict[str, Any]:

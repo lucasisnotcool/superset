@@ -164,7 +164,17 @@ export default function AutoOnboardModal({
       title={t('Auto-onboard from a document')}
       data-test="auto-onboard-modal"
       footer={
-        <Flex justify="space-between" align="center" style={{ width: '100%' }}>
+        // A host element (not a function component like `Flex`) so Superset's
+        // Modal does not clone-inject its `closeModal` prop into a DOM node
+        // (which React warns about as an unknown attribute).
+        <div
+          style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            width: '100%',
+          }}
+        >
           <Typography.Text type="secondary" data-test="auto-onboard-count">
             {hasPendingSelection
               ? t('Waiting for documents to finish processing…')
@@ -183,7 +193,7 @@ export default function AutoOnboardModal({
               {t('Onboard with Copilot')}
             </Button>
           </Flex>
-        </Flex>
+        </div>
       }
     >
       <Flex vertical gap={theme.sizeUnit * 2}>

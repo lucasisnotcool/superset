@@ -475,7 +475,74 @@ export default function SemanticLayerEditor({
     };
   }, [project, scope, databaseId, catalogName]);
 
+  // Apply a freshly-loaded project's contents to state without changing which
+  // project is open. Shared by both refresh paths so the "open project" and
+  // "resolve by scope" flows stay byte-identical in how they hydrate the editor.
+  const applyProjectData = useCallback(
+    (
+      nextProject: SemanticProject,
+      nextFiles: MdlFile[],
+      nextState: SemanticLayerState | null,
+      nextDocuments: SemanticDocument[],
+      nextReadiness: {
+        status?: SemanticProjectReadinessStatus | null;
+        detail?: string | null;
+        running_job_id?: string | null;
+      } | null,
+    ) => {
+      setProject(nextProject);
+      setMdlFiles(nextFiles);
+      setState(nextState);
+      setDocuments(nextDocuments);
+      setReadinessStatus(nextReadiness?.status ?? null);
+      setReadinessDetail(nextReadiness?.detail ?? null);
+      setReadinessJobId(nextReadiness?.running_job_id ?? null);
+      // Drop a stale document selection if it no longer exists (functional update
+      // so callers need not depend on the selection — see the activeFileId note).
+      setSelectedDocumentId(prev =>
+        prev && nextDocuments.some(document => document.id === prev)
+          ? prev
+          : null,
+      );
+      // Initialize the file selection only when nothing valid is selected yet;
+      // never override the user's current file/edits on a background refresh.
+      const current = activeFileIdRef.current;
+      const stillSelected =
+        current && nextFiles.some(file => file.id === current);
+      if (!stillSelected) {
+        const firstFile = nextFiles[0] || null;
+        activeFileIdRef.current = firstFile?.id ?? null;
+        setActiveFileId(firstFile?.id ?? null);
+        if (firstFile) {
+          setEditorPath(firstFile.path);
+          setEditorValue(firstFile.content);
+        }
+      }
+    },
+    [],
+  );
+
+  // Single source of truth for "which project is loaded". When a project is
+  // explicitly open (``selectedProjectIdRef``), reload it BY ID — never re-derive
+  // it from ambient scope. The Lab entry carries no schema, so the scope
+  // resolve-or-create path would otherwise ``setProject(null)`` and deselect the
+  // project on EVERY mutation refresh (onboard start, changeset apply, file save,
+  // upload…). Scope resolve-or-create runs only when nothing is selected yet —
+  // the legacy schema-tree entry's initial load. The id path NEVER nulls the
+  // selection.
   const refresh = useCallback(async () => {
+    const selectedId = selectedProjectIdRef.current;
+    if (selectedId) {
+      const [target, files, projectState, docs, readiness] = await Promise.all([
+        getSemanticProject(selectedId),
+        listMdlFiles(selectedId),
+        getProjectSemanticLayerState(selectedId),
+        listProjectDocuments(selectedId).catch(() => [] as SemanticDocument[]),
+        getProjectReadiness(selectedId).catch(() => null),
+      ]);
+      applyProjectData(target, files, projectState, docs, readiness);
+      return;
+    }
     if (!scope.schema_name) {
       setProject(null);
       setMdlFiles([]);
@@ -503,35 +570,14 @@ export default function SemanticLayerEditor({
         // failure (rail falls back to the local active-models heuristic).
         getProjectReadiness(nextProject.id).catch(() => null),
       ]);
-    setProject(nextProject);
-    setMdlFiles(nextFiles);
-    setDocuments(nextDocuments);
-    setState(nextState);
-    setReadinessStatus(nextReadiness?.status ?? null);
-    setReadinessDetail(nextReadiness?.detail ?? null);
-    setReadinessJobId(nextReadiness?.running_job_id ?? null);
-    // Drop a stale document selection if it no longer exists (functional update
-    // so `refresh` need not depend on the selection — see the activeFileId note).
-    setSelectedDocumentId(prev =>
-      prev && nextDocuments.some(document => document.id === prev)
-        ? prev
-        : null,
+    applyProjectData(
+      nextProject,
+      nextFiles,
+      nextState,
+      nextDocuments,
+      nextReadiness,
     );
-    // Initialize the selection only when nothing valid is selected yet; never
-    // override the user's current file/edits on a background refresh.
-    const current = activeFileIdRef.current;
-    const stillSelected =
-      current && nextFiles.some(file => file.id === current);
-    if (!stillSelected) {
-      const firstFile = nextFiles[0] || null;
-      activeFileIdRef.current = firstFile?.id ?? null;
-      setActiveFileId(firstFile?.id ?? null);
-      if (firstFile) {
-        setEditorPath(firstFile.path);
-        setEditorValue(firstFile.content);
-      }
-    }
-  }, [scope]);
+  }, [scope, applyProjectData]);
 
   useEffect(() => {
     // Project-keyed entry (F1) owns loading; skip the scope resolve-or-create so
@@ -613,48 +659,10 @@ export default function SemanticLayerEditor({
     [dispatch],
   );
 
-  // Refresh the CURRENTLY OPEN project by its id — not by scope. The scope-based
-  // `refresh` re-resolves a project from (database, schema); in the Lab the entry
-  // tab carries no schema, so that path would null the selection. Onboarding and
-  // the background poller use this so starting/finishing a job never deselects or
-  // blanks the workspace. Falls back to the scope resolve only for the legacy
-  // schema-tree entry (no explicitly-selected project).
-  const refreshOpenProject = useCallback(async () => {
-    const id = selectedProjectIdRef.current;
-    if (!id) {
-      await refresh();
-      return;
-    }
-    const [target, files, projectState, docs, readiness] = await Promise.all([
-      getSemanticProject(id),
-      listMdlFiles(id),
-      getProjectSemanticLayerState(id),
-      listProjectDocuments(id).catch(() => [] as SemanticDocument[]),
-      getProjectReadiness(id).catch(() => null),
-    ]);
-    // Identity-stable: same project id, refreshed contents. Never setProject(null).
-    setProject(target);
-    setMdlFiles(files);
-    setState(projectState);
-    setDocuments(docs);
-    setReadinessStatus(readiness?.status ?? null);
-    setReadinessDetail(readiness?.detail ?? null);
-    setReadinessJobId(readiness?.running_job_id ?? null);
-    setSelectedDocumentId(prev =>
-      prev && docs.some(document => document.id === prev) ? prev : null,
-    );
-    const current = activeFileIdRef.current;
-    const stillSelected = current && files.some(file => file.id === current);
-    if (!stillSelected) {
-      const firstFile = files[0] || null;
-      activeFileIdRef.current = firstFile?.id ?? null;
-      setActiveFileId(firstFile?.id ?? null);
-      if (firstFile) {
-        setEditorPath(firstFile.path);
-        setEditorValue(firstFile.content);
-      }
-    }
-  }, [refresh]);
+  // ``refresh`` is now id-aware (it reloads the open project by id and never
+  // deselects), so this is just an alias kept for the onboarding/poller call
+  // sites that document intent ("refresh the open project").
+  const refreshOpenProject = refresh;
 
   // First-class entry (F1/DP4): when launched with a `projectId`, open that project
   // by id (reusing the browser's tested open path) instead of resolving by schema.
@@ -1620,6 +1628,11 @@ export default function SemanticLayerEditor({
                           bootstrap view (help text + Onboard/Retry) instead of the
                           chat — onboarding is shown as a separate process. */}
                               <CopilotPanel
+                                // Key by project id so the panel's thread state is
+                                // fully isolated per project — switching projects
+                                // never carries a foreign conversation/changeset
+                                // into the newly opened one.
+                                key={project.id}
                                 projectId={project.id}
                                 canWrite={canWrite}
                                 onApplied={refresh}
@@ -1628,6 +1641,9 @@ export default function SemanticLayerEditor({
                                 onOnboard={() => setShowOnboardPicker(true)}
                                 onAutoOnboard={() => setShowAutoOnboard(true)}
                                 kickstart={kickstart ?? undefined}
+                                // Clear once consumed so an Apply→refresh remount
+                                // cannot re-fire the same auto-onboard turn.
+                                onKickstartHandled={() => setKickstart(null)}
                                 onDocumentsChanged={refresh}
                               />
                             </CopilotRail>

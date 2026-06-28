@@ -18,13 +18,15 @@
 """Typed authoring contract for LLM-generated MDL.
 
 The model never hand-writes serialized text. It fills this **typed, native-shape**
-object (camelCase, matching wren-core), and *we* serialize it to canonical JSON
-with :func:`serialize_manifest`. Two failure classes are eliminated at the source:
+object (camelCase, matching wren-core), eliminating *parse errors from
+hand-written text* (colons, quoting, indentation) at the source.
 
-- *parse errors from hand-written text* (colons, quoting, indentation): impossible,
-  because the model returns structured fields, not a string;
-- *missing column ``type``*: impossible, because ``AuthoredColumn.type`` is a
-  required field — the response schema will not validate without it.
+Onboarding seeds **structure deterministically from the catalog** (the "W3"
+split) and overlays only *semantics* from the model — so the model's structural
+fields (column ``type``, ``tableReference``) are never consumed. ``type`` is
+therefore **optional** here (D-D): forcing the model to echo a type it can't
+influence only raised structured-output parse failures for no benefit. The
+authoritative type comes from the catalog via ``column_identity.resolve_column_type``.
 
 The schema is passed to the model via ``model_json_schema(by_alias=True)`` so the
 provider sees the native camelCase field names. ``extra="allow"`` keeps room for
@@ -59,12 +61,15 @@ class AuthoredTableReference(BaseModel):
 
 
 class AuthoredColumn(BaseModel):
-    """A model column. ``type`` is required — wren-core rejects a typeless column."""
+    """A model column. ``type`` is optional: onboarding takes the authoritative
+    type from the catalog (D-D), and enrichment preserves the base column's type —
+    the model's ``type`` is never consumed structurally, so requiring it only added
+    parse friction."""
 
     model_config = _AUTHORING_CONFIG
 
     name: str
-    type: str
+    type: str | None = None
     description: str | None = None
     is_calculated: bool = False
     expression: str | None = None

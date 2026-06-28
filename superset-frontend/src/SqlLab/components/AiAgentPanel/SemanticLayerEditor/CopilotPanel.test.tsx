@@ -969,3 +969,112 @@ test('a kickstart is ignored without write permission', async () => {
     ),
   ).toHaveLength(0);
 });
+
+test('auto-resumes the latest thread for the project on open', async () => {
+  // "Latest user-convo per project shown on open": with a prior thread and no
+  // stored active id, the panel resumes the most recent one without a click.
+  installFetch({
+    history: [
+      {
+        id: 'conv-1',
+        title: 'model the orders table',
+        owner_id: 'local',
+        kind: 'copilot',
+        project_id: 'project-1',
+        database_id: 1,
+        updated_at: '2026-06-19T00:00:00Z',
+        last_message: 'Created the orders model.',
+      },
+    ],
+  });
+
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+    />,
+  );
+
+  // Resumed read-only (from the transcript), no manual history click needed.
+  expect(
+    await screen.findByText('Created the orders model.'),
+  ).toBeInTheDocument();
+  expect(screen.queryByTestId('copilot-apply')).not.toBeInTheDocument();
+});
+
+test('switching projects clears the previous project transcript (no cross-project leak)', async () => {
+  // Bug fix: the panel must not carry project-1's conversation into project-2.
+  const fetchFn = jest.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (/\/projects\/project-1\/copilot\/conversations\/[^/]+$/.test(url)) {
+      return Promise.resolve(jsonResponse(threadAfterTurn));
+    }
+    if (url.endsWith('/projects/project-1/copilot/conversations')) {
+      return Promise.resolve(
+        jsonResponse([
+          {
+            id: 'conv-1',
+            title: 'model the orders table',
+            owner_id: 'local',
+            kind: 'copilot',
+            project_id: 'project-1',
+            updated_at: '2026-06-19T00:00:00Z',
+          },
+        ]),
+      );
+    }
+    if (url.includes('/projects/project-2/copilot/conversations')) {
+      return Promise.resolve(jsonResponse([])); // project-2 has no threads
+    }
+    return Promise.resolve(jsonResponse({}));
+  });
+  global.fetch = fetchFn as unknown as typeof fetch;
+
+  const { rerender } = render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+    />,
+  );
+  expect(
+    await screen.findByText('Created the orders model.'),
+  ).toBeInTheDocument();
+
+  // Open project-2 → the project-1 transcript must be gone.
+  rerender(
+    <CopilotPanel
+      projectId="project-2"
+      canWrite
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+    />,
+  );
+  await waitFor(() =>
+    expect(
+      screen.queryByText('Created the orders model.'),
+    ).not.toBeInTheDocument(),
+  );
+});
+
+test('a kickstart notifies the parent so it can be cleared (no refire)', async () => {
+  installFetch();
+  const onKickstartHandled = jest.fn();
+
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="empty"
+      onOnboard={jest.fn()}
+      kickstart={{ token: 7, message: AUTO_MSG, documents: [ingestedDoc()] }}
+      onKickstartHandled={onKickstartHandled}
+    />,
+  );
+
+  await screen.findByText('Created the orders model.');
+  expect(onKickstartHandled).toHaveBeenCalledTimes(1);
+});

@@ -19,7 +19,9 @@ under the License.
 
 # Review & Proposal: Onboarding Seed Robustness (column identity + types)
 
-Status: **proposed (review only, no code changed)** · Date: 2026-06-28
+Status: **IMPLEMENTED** (I1–I6, D-A/B/C/D) · Date: 2026-06-28
+Re-anchored: 2026-06-28 after commit `1a46b8f639` (see §0a).
+As-built status + residual risks: see §10.
 Scope: the **internal** onboard pipeline — deterministic seed generation, LLM
 overlay, and MDL validation. Explicitly **out of scope**: table selection /
 registration before onboarding, and the job/poll/readiness machinery after it.
@@ -60,6 +62,40 @@ Both are deterministic, reproducible, and fixable deterministically — no model
 retry needed. The proposal below adds a **round-trip-safe column-identity** path,
 a **type-resolution ladder**, and a **single source of truth** shared by the seed
 builder and the validator, plus targeted LLM-logic refinements.
+
+---
+
+## 0a. Re-scan & re-anchor (post-`1a46b8f639`)
+
+Another agent shipped **`1a46b8f639` "Extend MDL and MDL Copilot with
+cross-schema capability"** — which implemented `plan_copilot_onboarding_spec.md`
+(Copilot-driven onboarding), **not** this seed-robustness spec. Confirmed by
+re-scan of the working tree (git clean):
+
+- **Seed builder untouched → RC1 & RC2 fully live.** `mdl_exporter.py` is
+  unchanged: `column_to_field` still does `name=_safe_identifier(column.name)`
+  ([mdl_exporter.py:119](integrations/wren/mdl_exporter.py#L119)), `type=column.type`
+  ([:120](integrations/wren/mdl_exporter.py#L120)), no `expression`. Both root
+  causes reproduce exactly as described.
+- **`ColumnSummary` still lacks `type_generic`** ([client.py:52-56](integrations/superset/client.py#L52-L56))
+  — the I2 fallback source is still unplumbed.
+- **Validation matching unchanged** — `_validate_column_semantics` still passes the
+  *renamed* MDL `name` straight into `has_column`
+  ([mdl_validator.py:625-627](semantic_layer/mdl_validator.py#L625-L627)); the
+  `superset_column_name` property is still never read back.
+- **New, usable primitive:** the commit added `SchemaIndex.columns_for(table,
+  schema)` ([mdl_validator.py:154](semantic_layer/mdl_validator.py#L154)) plus a
+  `search`/`_table_match_score` discovery helper. `columns_for` is the natural
+  accessor for the I1/I3 physical-identity match — build on it rather than adding
+  a parallel one.
+- **Positive interplay with the shipped Copilot onboarding.** That spec ungates
+  the Copilot and adds reviewable tools (`find_tables`, `propose_metric`,
+  `add_project_schema`). This makes I5's "surface the typeless tail as a
+  Copilot-actionable fix-it changeset" concrete — the tail becomes a
+  `propose_*`-style proposal, not a dead-end warning.
+
+**Net:** the diagnosis stands verbatim; only line anchors drifted (+87 lines in
+`mdl_validator.py`). Anchors below and in §7 are refreshed to the current tree.
 
 ---
 
@@ -240,14 +276,144 @@ The structure/semantics split is correct and should stay. Targeted changes:
 
 ---
 
-## 4. Decision points (consolidated)
+## 4. Decision points — restated, with sourced recommendations & implications
 
-| ID | Decision | Options | Recommendation |
-|---|---|---|---|
-| **D-A** | Column identity strategy | (a) keep-raw + quote; (b) rename + physical-map | Spike wren-core first; **(a)** if it accepts quoted physical names, else **(b)**. |
-| **D-B** | Truly-typeless columns | (a) draft + actionable warning; (b) default `VARCHAR` + activate | **(a)** — ladder resolves most; don't risk silent numeric→string corruption on the tail. |
-| **D-C** | LLM type inference for the tail | (a) never; (b) constrained last-resort, draft-only | **(a)** for now; revisit as a draft-only, tagged last resort if the tail is non-trivial in practice. |
-| **D-D** | Slim the onboarding prompt to semantics-only | (a) yes; (b) keep structure echo | **(a)** — overlay already ignores structure; less cost + fewer parse failures. |
+Summary table first; full reasoning, sources, and codebase/functionality
+implications follow.
+
+| ID | Decision | Recommendation (confidence) |
+|---|---|---|
+| **D-A** | How to represent columns whose physical name isn't a clean identifier | **(b) Rename + `expression` physical-map** — Wren's documented mechanism (high; gate on a one-off engine compile test) |
+| **D-B** | What to do with columns that have *no* resolvable type after the ladder | **(a) Fail-closed: draft + per-column warning**, never auto-default (high) |
+| **D-C** | Use the LLM to infer missing types? | **(a) Never in the seed path**; optional draft-only, tagged last resort (high) |
+| **D-D** | Slim the onboarding prompt to semantics-only? | **(a) Yes** — overlay already discards structure (high) |
+
+### D-A — Column identity for non-identifier physical names
+
+**Restate.** Physical columns named `2003`, `% growth`, `col-name`, accented
+text, etc. are not legal bare identifiers. Today `_safe_identifier` rewrites them
+to a sanitized handle (`_2003`) with **no link back to the real column**, which
+breaks validation matching *and* the SQL wren-core would generate. We must choose
+how a renamed column keeps a physical mapping.
+
+- **(a) Keep-raw + quote.** Stop sanitizing; emit `name` = the raw physical name
+  and rely on the engine quoting it in generated SQL.
+- **(b) Rename + `expression` physical-map.** Keep the clean logical `name`
+  (`_2003`) and emit `expression = "\"2003\""` (the quoted physical column) as the
+  physical reference.
+
+**Best practice / sources.** Wren's own modeling docs state you "use an
+expression to refer to the physical column and **rename it by setting the `name`
+as the alias** of this column" — i.e. (b) is the **vendor-sanctioned** pattern,
+not a workaround ([Wren — Model](https://docs.getwren.ai/oss/engine/guide/modeling/model),
+[Wren — What is MDL](https://docs.getwren.ai/oss/concepts/what_is_mdl)). It also
+matches the general semantic-layer norm (dbt/LookML) of separating a clean
+**logical** name from the **physical** identifier and quoting the latter.
+
+**Recommendation: (b)**, gated on a one-off wren-core compile test to lock the
+exact quoting/escaping. Rationale: it is what Wren documents; it preserves clean
+logical names, which matter because NL→SQL retrieval and the Copilot key on column
+*names* — (a) would pollute those with quotes/odd characters and risks wren-core
+rejecting a non-identifier as a model column name.
+
+**Implications.**
+- *Codebase:* `column_to_field` emits a conditional `expression` only when
+  `_safe_identifier(name) != name`; the I3 shared helper produces
+  `(logical_name, physical_ref)`. Validation's existence check resolves the
+  **physical** column (via the expression / `superset_column_name`) before
+  `has_column`, reusing the new `columns_for` accessor. Scope: `mdl_exporter.py`,
+  `mdl_validator.py::_validate_column_semantics`, the shared helper. Localized;
+  no schema/migration change.
+- *Functionality:* leading-digit / special-char columns onboard, validate, and
+  query correctly; the false "does not exist" disappears; logical names stay
+  retrieval-friendly. Cost: slightly more verbose MDL (expression on renamed
+  columns only). Residual risk: wrong quote/escape → engine error — retired by the
+  compile test + §6 regression cases.
+
+### D-B — Columns with no resolvable type after the ladder
+
+**Restate.** After the I2 ladder (raw `type` → `type_generic` → `is_dttm`), a few
+columns may still have no type. Block them (draft + warning) or guess a default
+and activate?
+
+- **(a) Fail-closed:** keep the model **draft**, emit a precise per-column
+  warning, never auto-activate a guessed type.
+- **(b) Fail-open:** assign a default (e.g. `VARCHAR`) and activate so the table
+  onboards immediately.
+
+**Best practice / sources.** Industry consensus is **fail-closed**: silent type
+coercion (e.g. forcing a numeric column to string) corrupts data and produces
+hard-to-debug downstream failures; engines like Delta Lake **fail the write** on
+schema mismatch rather than guess, and Azure Data Flow's quiet cast-to-null is
+cited as the anti-pattern ([DEV — Schema Validation Passed, So Why Did My
+Pipeline Fail?](https://dev.to/sumit_agarwal_9af86ae465b/schema-validation-passed-so-why-did-my-pipeline-fail-2coj),
+[Databricks — schema enforcement on write](https://docs.databricks.com/aws/en/error-messages/error-classes)).
+
+**Recommendation: (a).** The ladder — especially `type_generic` — should resolve
+the overwhelming majority *correctly*; reserving the rare genuine-unknown for a
+human/Copilot confirmation is far safer than defaulting `num_california` to
+`VARCHAR` and silently breaking every metric over it.
+
+**Implications.**
+- *Codebase:* the ladder lives in the I3 helper; onboarding.py *already* keeps
+  invalid models as draft, so the blocking path needs no new branch — only a
+  richer, structured warning (tag `properties.inferred_type="unknown"`) so the
+  Copilot can pick it up. Scope: helper + `onboarding.py` warning shape.
+- *Functionality:* clean-catalog tables onboard fully; only tables with a
+  genuinely missing type wait on a quick type confirmation. Correctness is
+  preserved; no silently-wrong aggregations. Trade-off: those specific tables
+  aren't immediately queryable — acceptable, and strictly better than wrong
+  results.
+
+### D-C — LLM-inferred types for the tail
+
+**Restate.** Should the LLM fill a missing `type` as a fallback?
+
+**Best practice / sources.** Text-to-SQL/semantic-layer research is consistent:
+LLMs hallucinate **schema-level** facts — nonexistent columns, invented
+types/metrics — and the mitigation is to **ground structure in the catalog** and
+use the model for *semantics* + validation-feedback loops, never as the source of
+structural truth ([Wren — Reducing Hallucinations in Text-to-SQL](https://www.getwren.ai/post/reducing-hallucinations-in-text-to-sql-building-trust-and-accuracy-in-data-access),
+[arXiv 2512.22250 — Hallucination Detection for Text-to-SQL](https://arxiv.org/abs/2512.22250)).
+This *is* the codebase's existing W3 split.
+
+**Recommendation: (a) never in the seed path.** A `type` drives casts and
+aggregations — exactly the load-bearing structural field the architecture
+deliberately keeps the model away from. If a last resort is ever wanted, gate it
+as a **constrained** (enum of wren types), low-temperature, **draft-only**,
+`inferred_type="model"`-tagged suggestion a human approves — HITL, not
+auto-applied.
+
+**Implications.**
+- *Codebase:* no change now; the overlay stays semantics-only. A future opt-in is
+  an isolated flagged call outside the deterministic seed path.
+- *Functionality:* preserves the core trust property ("the layer never invents
+  structure"); the typeless tail is handled deterministically + HITL.
+
+### D-D — Slim the onboarding prompt to semantics-only
+
+**Restate.** The prompt tells the model to re-emit `name`/`tableReference`/`type`
+exactly, but `_overlay_model_semantics` discards everything except
+descriptions/properties. Keep the structure echo or drop it?
+
+**Best practice / sources.** Structured-output reliability guidance: request only
+the fields you consume — large structural echoes raise parse-failure rate,
+latency, and token cost for no benefit; schema-aware designs feed rich metadata
+*in* but keep the model's *output* minimal ([Wren — Reducing Hallucinations](https://www.getwren.ai/post/reducing-hallucinations-in-text-to-sql-building-trust-and-accuracy-in-data-access)).
+Here the structure echo is provably dead output (the overlay drops it).
+
+**Recommendation: (a) slim it** to "semantics keyed by column name"
+(descriptions, synonyms).
+
+**Implications.**
+- *Codebase:* edit `prompts/wren_onboarding.md` and shrink
+  `proposal_response_schema()`; overlay logic is unchanged (already reads only
+  desc/props). Existing onboarding snapshot tests confirm identical structure
+  output.
+- *Functionality:* fewer structured-output parse failures (today a parse failure
+  drops *all* enrichment to the `_PROVIDER_FALLBACK_WARNING` path), lower
+  cost/latency, clearer contract. Zero change to structure (already
+  deterministic).
 
 ---
 
@@ -281,15 +447,17 @@ The structure/semantics split is correct and should stay. Targeted changes:
 
 ## 7. File touchpoints (proposal — no edits made)
 
-| File:symbol | Change |
+> Anchors re-verified against the tree at commit `1a46b8f639`.
+
+| File:symbol (current line) | Change |
 |---|---|
-| `integrations/wren/mdl_exporter.py::column_to_field, _safe_identifier` | Physical mapping for renamed columns (I1); call the shared identity/type helper (I2/I3). |
-| `integrations/superset/client.py::ColumnSummary, _serialize_dataset` | Add `type_generic`; populate from Superset `TableColumn.type_generic` (I2). |
-| `semantic_layer/mdl_validator.py::_validate_column_semantics, SchemaIndex` | Match existence on physical identity; host/share the identity helper (I1/I3). |
-| `integrations/wren/llm_client.py::generate_base_model` | Deterministic repair pass before `validate_mdl` (I4). |
-| `prompts/wren_onboarding.md` | Slim to semantics-keyed-by-column-name (I5/D-D). |
-| `semantic_layer/onboarding.py` | Surface the typeless tail as a structured, Copilot-actionable result, not a flat warning string (I5). |
-| `tests/unit_tests/superset_ai_agent/` | Add the §6 regression suite. |
+| `integrations/wren/mdl_exporter.py::column_to_field` (114), `_safe_identifier` (133) | Physical `expression` mapping for renamed columns (I1/D-A); call the shared identity/type helper (I2/I3). |
+| `integrations/superset/client.py::ColumnSummary` (52), `_serialize_dataset` (418, `type=column.type` @422) | Add `type_generic`; populate from Superset `TableColumn.type_generic` (I2). |
+| `semantic_layer/mdl_validator.py::_validate_column_semantics` (585; existence check 625-637), `SchemaIndex` (46; `from_agent_context` 64; `has_column` 143; `column_type` 151; **`columns_for` 154 — reuse**) | Match existence on **physical** identity via `columns_for` (I1/D-A); host the shared identity helper (I3). |
+| `integrations/wren/llm_client.py::generate_base_model` (406), `_overlay_model_semantics` (1083) | Deterministic repair pass before `validate_mdl` (I4); semantics-only overlay unchanged. |
+| `prompts/wren_onboarding.md` + `semantic_layer/mdl_authoring.py::proposal_response_schema` | Slim to semantics-keyed-by-column-name (I5/D-D). |
+| `semantic_layer/onboarding.py` (validate 97; draft branch 112; auto-activate 122) | Surface the typeless tail as a structured, Copilot-actionable result, not a flat warning string (I5; ties into the shipped `propose_*` tools). |
+| `tests/unit_tests/superset_ai_agent/` (alongside the new `test_mdl_validator.py`) | Add the §6 regression suite. |
 
 ---
 
@@ -301,3 +469,82 @@ pathway, and preserves the W3 structure-from-catalog / semantics-from-model
 invariant that makes the layer trustworthy. It removes two deterministic defect
 classes at their source rather than papering over them with model retries or
 suppressed validation.
+
+---
+
+## 10. As-built status & residual risks (2026-06-28)
+
+**Delivered (all items, in sequence, each test-locked):**
+
+- **I2 — type ladder + `type_generic` plumbed.** New
+  `semantic_layer/column_identity.py` (`safe_identifier`, `physical_column_reference`,
+  `resolve_column_type`). `ColumnSummary.type_generic` added + populated in
+  `LocalSupersetClient._serialize_dataset` via `_generic_type_name`.
+  *(test_column_identity.py — 11 cases.)*
+- **I1/I3/D-A — round-trip-safe identity.** `column_to_field` emits a quoted
+  `expression` physical-map when sanitizing renames a column, tags
+  `inferred_type`, and resolves type via the ladder; `_safe_identifier` now
+  delegates to the shared helper. `mdl_validator._validate_column_semantics` +
+  `_type_mismatch_message` resolve the **physical** name (`superset_column_name`)
+  before `has_column`/type lookups. Overlay also falls back to the physical name.
+  *(test_onboarding_seed_robustness.py — leading-digit, special-char, round-trip
+  invariant.)*
+- **I4 — end-to-end.** `onboard_schema_project` now **activates** a table with
+  leading-digit + generic-typed columns (the original failure), and keeps a
+  truly-typeless table **draft** with a per-column warning. *(Onboarding-level
+  tests with the deterministic client + `InMemoryMdlFileStore`.)*
+- **I5/D-D — semantics-only authoring.** `AuthoredColumn.type` optional; prompt
+  `wren_onboarding.md` slimmed to descriptions/synonyms. *(Typeless authored
+  column parses; overlay applies without an authored type.)*
+- **I5/D-B/D-C — fail-closed tail.** Unresolved types stay untyped +
+  `inferred_type=unknown`; never guessed, never model-invented.
+
+**Verification:** full `pytest tests/unit_tests/superset_ai_agent/` → **963
+passed, 11 skipped**; ruff + ruff-format clean on touched files; mypy introduces
+**zero** new errors (the 36 reported are pre-existing baseline in
+`persistence/models.py`, `wren_core_validator.py`, and the other agent's
+`SchemaIndex.search`, identical with these changes stashed).
+
+**Residual risks & gaps (for the next session):**
+
+1. **R-A (engine compile, the D-A spike — NOT yet run).** The `expression`
+   physical-map is implemented per Wren's documented "expression-as-physical-
+   rename", and validates + unit-tests green, but it has **not** been compiled by a
+   live wren-core engine. Risk: wren-core's exact quoting/escaping for a
+   non-calculated column with a quoted `expression` differs from `"name"`. *Action:*
+   run one real onboard of `birth_france_by_region` (or `test_mdl_compile`/
+   `wren_core_validator` against a renamed column) before relying on it in prod.
+2. **R-B (enrichment new-column type).** Making `AuthoredColumn.type` optional is
+   safe for onboarding (type is deterministic) and for enrichment of *existing*
+   columns (base type preserved), but a **genuinely new** column introduced via
+   enrichment may now arrive typeless → it fails physical validation and stays
+   draft (fail-closed, not silent). If new-column enrichment is common, consider a
+   separate strict schema for that path rather than the shared `AuthoredColumn`.
+3. **R-C (`type_generic` only on the local adapter).** The fallback is populated by
+   `LocalSupersetClient`; a remote/HTTP Superset adapter that doesn't send
+   `type_generic` degrades to the `is_dttm`→`TIMESTAMP`→untyped tail. Acceptable
+   (fail-closed) but means the typeless-tail rate is adapter-dependent.
+4. **R-D (snapshot path types).** `SchemaIndex.from_snapshot` remains names-only,
+   so on a Superset outage the cross-family type-mismatch check still degrades to
+   off. Unchanged by this work; noted for completeness.
+
+**User-expectation ↔ UI gaps (post-onboarding surface, out of this scope but
+flagged):**
+
+- **G-1 — the typeless tail is invisible in the UI.** Backend now tags
+  `properties.inferred_type=unknown` and emits a per-column warning, but the
+  onboarding result still surfaces as a **flat warning string**
+  ([onboarding.py:112-121](semantic_layer/onboarding.py#L112-L121)); the editor has
+  no per-column "needs a type" affordance. The shipped Copilot tools
+  (`propose_metric`, etc.) make a fix-it changeset feasible — a natural next task to
+  turn the tag into a one-click/agent fix. Until then a user sees "draft, can't
+  activate" with the reason buried in a toast/warning list.
+- **G-2 — `inferred_type=generic` is silent.** A column typed from its generic
+  family (e.g. `num_california`→`DOUBLE`) activates with no UI signal that the type
+  was inferred rather than catalog-declared. Low risk (family is correct), but a
+  small "inferred" badge would set expectations honestly.
+- **G-3 — renamed columns show their logical handle.** `2003` displays as `_2003`
+  in the model/editor; the physical name lives in `properties.superset_column_name`
+  and the `expression`. Correct, but a user scanning the model may not recognize
+  `_2003`. A display-name affordance (use `superset_column_name` as the label)
+  would close the recognition gap.

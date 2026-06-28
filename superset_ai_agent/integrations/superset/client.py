@@ -52,6 +52,10 @@ class DatabaseIdentity(BaseModel):
 class ColumnSummary(BaseModel):
     name: str
     type: str | None = None
+    #: Superset ``GenericDataType`` family name (``TEMPORAL``/``NUMERIC``/
+    #: ``STRING``/``BOOLEAN``) when known. A deterministic fallback for columns the
+    #: catalog left untyped — see ``semantic_layer.column_identity``.
+    type_generic: str | None = None
     is_dttm: bool = False
     description: str | None = None
 
@@ -415,11 +419,26 @@ class LocalSupersetClient:
         )
 
     @staticmethod
+    def _generic_type_name(column: Any) -> str | None:
+        """Superset ``GenericDataType`` family name for a column, or ``None``.
+
+        ``type_generic`` is an ``IntEnum`` (``TEMPORAL``/``NUMERIC``/``STRING``/
+        ``BOOLEAN``); we keep just its name so the wren layer never imports
+        Superset enums. Tolerant of columns/adapters that don't expose it.
+        """
+
+        generic = getattr(column, "type_generic", None)
+        if generic is None:
+            return None
+        return getattr(generic, "name", None) or str(generic)
+
+    @staticmethod
     def _serialize_dataset(dataset: Any) -> DatasetMetadata:
         columns = [
             ColumnSummary(
                 name=column.column_name,
                 type=column.type,
+                type_generic=LocalSupersetClient._generic_type_name(column),
                 is_dttm=bool(column.is_dttm),
                 description=column.description,
             )

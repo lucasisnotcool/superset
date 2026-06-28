@@ -122,6 +122,64 @@ master-detail surface where the ProjectBrowser is the master and a project's wor
 
 ---
 
+## As-built — "UI autocloses / deselects project" fix (selection lifecycle)
+
+**Symptom:** the workspace deselected the open project too often — after auto-onboard started, after
+accepting a Copilot changeset, and on other mutations.
+
+**Root cause (architectural).** Project selection had **two refresh paths** and the wrong one was the default:
+- `refresh()` — *scope-based*: re-resolves a project from ambient `(database, schema)` and, when
+  `scope.schema_name` is empty, runs `setProject(null)` + clears the workspace.
+- `refreshOpenProject()` — *id-based*: reloads the open project by id, never nulls.
+
+The MDL Lab entry tab carries **no schema** (`schemaName=''`), so every caller of the scope-based `refresh()`
+hit the `!scope.schema_name` guard and **deselected** the project. `refreshOpenProject` was wired into only
+`runOnboard` + the poller; **~10 other handlers still called `refresh()`** — including `onApplied={refresh}`
+(accept changeset) and the auto-onboard `onConfirm`. So onboard *start*, changeset *apply*, file save/delete,
+upload, and reset each blanked the workspace.
+
+This is two anti-patterns at once: **dual source of truth** for "which project is open" (`project` state +
+`selectedProjectIdRef`) and an **overloaded function** (`refresh` conflated *resolve-or-create by scope* with
+*reload the open project*).
+
+**Comparison with Superset patterns.** SQL Lab keys the editor off the **active tab / `queryEditor.id`** in
+Redux and never re-derives the active editor from ambient db/schema; data is reloaded **by id**, not by
+re-resolving context. Newer Superset data access uses **RTK Query hooks keyed by id** (e.g. `useSchemasQuery`,
+already used by the schema pickers) that cache + refetch by key. The MDL Lab violated this by re-resolving the
+project from ambient scope on every refresh.
+
+**Fix applied (`SemanticLayerEditor/index.tsx`).** `refresh()` is now **id-aware and the single source of
+truth**: if a project is explicitly open (`selectedProjectIdRef`), it reloads **by id** and never nulls the
+selection; it falls back to scope resolve-or-create **only when nothing is selected yet** (the legacy
+schema-tree entry's initial load). The id/scope bodies share an `applyProjectData()` helper. `refreshOpenProject`
+is now a thin alias to `refresh`. Net effect: **every** existing `refresh()` caller (accept-changeset, auto-onboard,
+save, delete, reset, upload) is correct in the Lab with one change, instead of auditing each call site.
+
+Also fixed: the Superset `Modal` clones a **function-component** `footer` to inject `closeModal`
+([Modal.tsx](../../superset-frontend/packages/superset-ui-core/src/components/Modal/Modal.tsx) `typeof footer.type === 'function'`),
+so a `<Flex>`-root footer leaked `closeModal` onto a DOM node (React warning). `AutoOnboardModal` and
+`OnboardingTablePicker` now use a host `<div>` footer root (type is a string → no injection).
+
+**Recommended follow-ups (not yet done):**
+1. **Lift selection to a tiny reducer/context** (or RTK Query keyed on `project.id`) so reloads are *declarative*
+   (`useGetProjectQuery(id)`), eliminating the imperative `refresh()` sprinkled across ~10 handlers — the
+   Superset-idiomatic end state.
+2. The live **document-status poll** is gated on `scope.schema_name` so it is **inert in the Lab** (no schema);
+   re-key it on `project?.id` like the rest of the workspace.
+3. **`closeModal` leak** also affects any other `<Flex>`-root modal footer in the codebase — apply the host-root
+   pattern or pass `footer` as an array.
+4. The antd `Select` "setState during SelectTrigger render" warning in `NewProjectModal` is an rc-select internal
+   (multiple-mode virtual list); benign and best left to an antd upgrade.
+5. `GET/POST /projects/{id}/documents` returned **400** on a particular upload — surface the upload error to the
+   user (toast) instead of swallowing; investigate the offending file (likely a `register_document` `ValueError`:
+   unsupported type / size / extraction). Separate from the deselect.
+
+**Tests:** new regression `index.test.tsx` — "Lab entry (no schema): a refresh-triggering action keeps the project
+selected" (Reset in a `projectId` entry keeps `mdl-workspace`, never shows `mdl-empty`, never re-resolves by
+schema). Full editor suite green for all touched files (index 20, OnboardingTablePicker 18, AutoOnboardModal).
+Pre-existing flakiness in `CopilotPanel.test.tsx` (in-progress `CopilotPanel.tsx` edits, unrelated) is not from
+this change.
+
 ## Step 1 — Audit (source-backed)
 
 ### 1.1 The two confusingly-similar surfaces (ask 4)

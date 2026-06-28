@@ -105,6 +105,12 @@ export interface CopilotPanelProps {
    */
   kickstart?: CopilotKickstart;
   /**
+   * Called once the panel has consumed a `kickstart` (fired its turn). The parent
+   * must clear the kickstart so a later remount (e.g. after Apply → refresh) does
+   * not re-fire the same onboarding turn.
+   */
+  onKickstartHandled?: () => void;
+  /**
    * Called after attaching persists one or more documents, so the editor can
    * refresh its document list and the new files appear in the workspace tree.
    */
@@ -147,6 +153,7 @@ const CopilotPanel = ({
   onOnboard,
   onAutoOnboard,
   kickstart,
+  onKickstartHandled,
   onDocumentsChanged,
 }: CopilotPanelProps) => {
   const theme = useTheme();
@@ -224,7 +231,7 @@ const CopilotPanel = ({
   }, [projectId]);
 
   const resumeConversation = useCallback(
-    async (id: string) => {
+    async (id: string, { closeHistory = true } = {}) => {
       setError(null);
       resetProposal();
       try {
@@ -232,7 +239,9 @@ const CopilotPanel = ({
         setConversationId(conversation.id);
         setMessages(conversation.messages);
         setPendingUser(null);
-        setIsHistoryOpen(false);
+        // Auto-resume (on open) must not yank a history panel the user just
+        // opened; only an explicit history-item resume closes it.
+        if (closeHistory) setIsHistoryOpen(false);
         localStorage.setItem(activeThreadKey(projectId), conversation.id);
       } catch (caught) {
         // A thread deleted elsewhere (e.g. another device) is gone, not an error:
@@ -270,18 +279,48 @@ const CopilotPanel = ({
     return conversation.id;
   }, [conversationId, projectId]);
 
-  // On open (and when the layer becomes ready) load the history list and resume
-  // the last active thread so the transcript survives a page reload.
+  // On project change (and first open) hard-reset the thread state, then load the
+  // project's history and resume its latest conversation. This is what scopes the
+  // Copilot to the *currently open* project: without the reset, the previous
+  // project's conversationId/transcript/changeset would leak into the new one — and
+  // sending would POST a foreign conversationId (→ 404 "conversation not found").
+  // Not gated on readiness: an empty project can still have a prior (doc-driven)
+  // onboarding thread to show on open.
   useEffect(() => {
-    if (!isReady) return;
-    refreshSummaries();
-    const stored = localStorage.getItem(activeThreadKey(projectId));
-    if (stored && stored !== conversationId) {
-      resumeConversation(stored);
-    }
-    // Resume/refresh only on project or readiness change, not on every keystroke.
+    let cancelled = false;
+    // Clear synchronously so no foreign-project state is ever shown/sent.
+    setConversationId(null);
+    setMessages([]);
+    setPendingUser(null);
+    setInput('');
+    setAttachedDocs([]);
+    setAttachPollGaveUp(false);
+    setError(null);
+    resetProposal();
+    setIsHistoryOpen(false);
+    (async () => {
+      let list: ConversationSummary[] = [];
+      try {
+        list = await listCopilotConversations(projectId);
+      } catch {
+        // History is non-critical; a transient failure should not break the chat.
+      }
+      if (cancelled) return;
+      setSummaries(list);
+      // Prefer the per-project active thread (this device); else the most recent
+      // thread for the project — "the latest user-convo per project on open". A
+      // stored id that was deleted elsewhere 404s in resumeConversation, which
+      // forgets it and falls back to an empty chat (no error).
+      const stored = localStorage.getItem(activeThreadKey(projectId));
+      const target = stored ?? list[0]?.id ?? null;
+      if (target) resumeConversation(target, { closeHistory: false });
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // Re-run only when the open project changes (resume helpers are stable per id).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectId, isReady]);
+  }, [projectId]);
 
   const handleAttach = useCallback(
     async (event: ChangeEvent<HTMLInputElement>) => {
@@ -474,13 +513,16 @@ const CopilotPanel = ({
   );
 
   // Fire the kickstart exactly once per new token (the guard prevents a re-render
-  // — e.g. isRunning toggling — from re-sending the same onboarding turn).
+  // — e.g. isRunning toggling — from re-sending the same onboarding turn), then
+  // tell the parent to clear it so a later remount (Apply → refresh) cannot
+  // re-fire the same onboarding turn.
   const lastKickstartToken = useRef<number | null>(null);
   useEffect(() => {
     if (!kickstart || kickstart.token === lastKickstartToken.current) return;
     lastKickstartToken.current = kickstart.token;
     runKickstart(kickstart.message, kickstart.documents);
-  }, [kickstart, runKickstart]);
+    onKickstartHandled?.();
+  }, [kickstart, runKickstart, onKickstartHandled]);
 
   const acceptedItems = useMemo(
     () =>
