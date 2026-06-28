@@ -38,54 +38,44 @@ const physicalPage = (names: string[]) =>
     },
   }) as any;
 
-const DEFAULT_DATASETS = [
-  { id: 1, table_name: 'orders' },
-  { id: 2, table_name: 'customers' },
-  { id: 3, table_name: 'products' },
-];
-
-/**
- * URL-aware SupersetClient.get: the picker calls both the dataset list endpoint
- * (registered rows) and the physical-tables endpoint (the full schema). Physical
- * tables include the registered ones; the picker derives "unregistered" as the
- * set difference. Default: physical == registered, so no banner / no unregistered
- * rows unless a test passes extra physicalNames.
- */
 const infoPage = (permissions: string[]) => ({ json: { permissions } }) as any;
 
-const mockSupersetGet = ({
-  datasets = DEFAULT_DATASETS,
-  datasetCount = datasets.length,
-  physicalNames = datasets.map(d => d.table_name),
-  permissions = ['can_read', 'can_write'],
-  // The AUTHORITATIVE registered names (columns-projected list call). Defaults to
-  // the display datasets, so by default the display + authoritative views agree.
-  registeredAll,
-}: {
-  datasets?: { id: number; table_name: string }[];
-  datasetCount?: number;
-  physicalNames?: string[];
-  permissions?: string[];
-  registeredAll?: string[];
-} = {}) =>
+interface SchemaFixture {
+  datasets: { id: number; table_name: string }[];
+  physical?: string[];
+}
+
+const PUBLIC: SchemaFixture = {
+  datasets: [
+    { id: 1, table_name: 'orders' },
+    { id: 2, table_name: 'customers' },
+    { id: 3, table_name: 'products' },
+  ],
+};
+
+/**
+ * URL-aware SupersetClient.get keyed by schema. The picker fully scans each
+ * schema's registered datasets (columns-projected dataset list) and its physical
+ * tables; this mock routes by the schema embedded in the rison query so a
+ * multi-schema tree returns distinct rows per schema.
+ */
+const mockSupersetGet = (
+  bySchema: Record<string, SchemaFixture> = { public: PUBLIC },
+  permissions: string[] = ['can_read', 'can_write'],
+) =>
   jest.spyOn(SupersetClient, 'get').mockImplementation(({ endpoint }: any) => {
     const url = String(endpoint);
     if (url.includes('/_info')) return Promise.resolve(infoPage(permissions));
-    if (url.includes('/tables/')) {
-      return Promise.resolve(physicalPage(physicalNames));
-    }
-    // The authoritative scan projects `columns:!(id,table_name)`; the display
-    // list does not — branch on that to let tests diverge the two views.
-    if (url.includes('columns')) {
-      const names = registeredAll ?? datasets.map(d => d.table_name);
-      return Promise.resolve(
-        datasetsPage(
-          names.map((table_name, id) => ({ id, table_name })),
-          names.length,
-        ),
-      );
-    }
-    return Promise.resolve(datasetsPage(datasets, datasetCount));
+    const schema = Object.keys(bySchema).find(
+      name =>
+        url.includes(`value:${name})`) || url.includes(`schema_name:${name})`),
+    );
+    const entry = schema ? bySchema[schema] : undefined;
+    const datasets = entry?.datasets ?? [];
+    const physical = entry?.physical ?? datasets.map(d => d.table_name);
+    if (url.includes('/tables/'))
+      return Promise.resolve(physicalPage(physical));
+    return Promise.resolve(datasetsPage(datasets, datasets.length));
   });
 
 beforeEach(() => {
@@ -96,7 +86,10 @@ afterEach(() => {
   jest.restoreAllMocks();
 });
 
-const renderPicker = (onConfirm = jest.fn()) => {
+const renderPicker = (
+  onConfirm = jest.fn(),
+  props: Partial<React.ComponentProps<typeof OnboardingTablePicker>> = {},
+) => {
   render(
     <OnboardingTablePicker
       open
@@ -104,19 +97,24 @@ const renderPicker = (onConfirm = jest.fn()) => {
       schema="public"
       onCancel={jest.fn()}
       onConfirm={onConfirm}
+      {...props}
     />,
   );
   return onConfirm;
 };
 
-test('lists datasets and onboards the checked subset', async () => {
-  const onConfirm = renderPicker();
-
-  // Rows load from the dataset API.
+test('renders a schema header with its tables nested under it', async () => {
+  renderPicker();
+  expect(await screen.findByTestId('picker-schema-header')).toHaveTextContent(
+    'public',
+  );
   expect(await screen.findByText('orders')).toBeInTheDocument();
   expect(screen.getByText('customers')).toBeInTheDocument();
+});
 
-  // Check two rows.
+test('onboards the checked subset as an explicit include list', async () => {
+  const onConfirm = renderPicker();
+
   const checkboxes = await screen.findAllByTestId('picker-checkbox');
   await userEvent.click(checkboxes[0]); // orders (id 1)
   await userEvent.click(checkboxes[2]); // products (id 3)
@@ -130,81 +128,140 @@ test('lists datasets and onboards the checked subset', async () => {
   });
 });
 
-test('select-all-matching sends mode=all with exclusions', async () => {
-  const onConfirm = renderPicker();
+test('a schema can be collapsed and expanded like the SQL DB browser', async () => {
+  renderPicker();
   await screen.findByText('orders');
 
-  await userEvent.click(screen.getByText('Select all'));
-  expect(screen.getByTestId('picker-count')).toHaveTextContent(
-    'All 3 matching selected',
+  // Collapsing the schema hides its tables…
+  await userEvent.click(screen.getByTestId('picker-schema-header'));
+  await waitFor(() =>
+    expect(screen.queryByText('orders')).not.toBeInTheDocument(),
+  );
+  // …and the header is still shown so it can be expanded again.
+  await userEvent.click(screen.getByTestId('picker-schema-header'));
+  expect(await screen.findByText('orders')).toBeInTheDocument();
+});
+
+test('cross-schema: selections add up across schemas and the count reflects the total', async () => {
+  jest.restoreAllMocks();
+  mockSupersetGet({
+    public: {
+      datasets: [
+        { id: 1, table_name: 'orders' },
+        { id: 2, table_name: 'customers' },
+      ],
+    },
+    sales: {
+      datasets: [
+        { id: 10, table_name: 'leads' },
+        { id: 11, table_name: 'deals' },
+      ],
+    },
+  });
+  const onConfirm = jest.fn();
+  render(
+    <OnboardingTablePicker
+      open
+      databaseId={1}
+      schemas={['public', 'sales']}
+      primarySchema="public"
+      onCancel={jest.fn()}
+      onConfirm={onConfirm}
+    />,
   );
 
-  // Uncheck one → it becomes an exclusion.
-  const checkboxes = screen.getAllByTestId('picker-checkbox');
-  await userEvent.click(checkboxes[1]); // customers (id 2)
-  expect(screen.getByTestId('picker-count')).toHaveTextContent(
-    'All 2 matching selected',
+  // Both schemas render as headers in the tree.
+  await waitFor(() =>
+    expect(screen.getAllByTestId('picker-schema-header')).toHaveLength(2),
   );
+  // Tables from BOTH schemas are listed (all expanded by default).
+  await screen.findByText('orders');
+  await screen.findByText('leads');
+
+  // Row checkboxes are ordered public rows then sales rows.
+  const checkboxes = await screen.findAllByTestId('picker-checkbox');
+  await userEvent.click(checkboxes[0]); // public.orders (id 1)
+  expect(screen.getByTestId('picker-count')).toHaveTextContent('1 selected');
+  await userEvent.click(checkboxes[2]); // sales.leads (id 10)
+  // The count is the cross-schema total, not just the visible schema's.
+  expect(screen.getByTestId('picker-count')).toHaveTextContent('2 selected');
 
   await userEvent.click(screen.getByTestId('picker-confirm'));
   expect(onConfirm).toHaveBeenCalledWith({
-    mode: 'all',
-    excludeDatasetIds: [2],
-    search: null,
+    mode: 'include',
+    datasetIds: [1, 10],
   });
 });
 
-test('select-all also checks the listed unregistered tables', async () => {
+test('per-schema select-all checks every table in that schema only', async () => {
   jest.restoreAllMocks();
-  // Schema has an extra physical table that isn't a registered dataset.
   mockSupersetGet({
-    physicalNames: ['orders', 'customers', 'products', 'events'],
+    public: {
+      datasets: [
+        { id: 1, table_name: 'orders' },
+        { id: 2, table_name: 'customers' },
+      ],
+    },
+    sales: { datasets: [{ id: 10, table_name: 'leads' }] },
   });
-  const onConfirm = renderPicker();
-  await screen.findByText('orders');
-  // The unregistered row is listed.
-  expect(await screen.findByText('events')).toBeInTheDocument();
-
-  await userEvent.click(screen.getByText('Select all'));
-  // Count covers the 3 registered datasets + the 1 unregistered table.
-  expect(screen.getByTestId('picker-count')).toHaveTextContent(
-    'All 4 matching selected',
+  const onConfirm = jest.fn();
+  render(
+    <OnboardingTablePicker
+      open
+      databaseId={1}
+      schemas={['public', 'sales']}
+      primarySchema="public"
+      onCancel={jest.fn()}
+      onConfirm={onConfirm}
+    />,
   );
-  // The unregistered checkbox is now checked, like the registered rows.
-  expect(screen.getByTestId('picker-unregistered-checkbox')).toBeChecked();
-
-  // Confirm registers & onboards: the unregistered table is created first, then
-  // the all-minus-excludes registered selection is sent.
-  jest
-    .spyOn(SupersetClient, 'post')
-    .mockResolvedValue({ json: { id: 99 } } as any);
-  await userEvent.click(screen.getByTestId('picker-confirm'));
   await waitFor(() =>
-    expect(onConfirm).toHaveBeenCalledWith({
-      mode: 'all',
-      excludeDatasetIds: [],
-      search: null,
-    }),
+    expect(screen.getAllByTestId('picker-schema-checkbox')).toHaveLength(2),
   );
+
+  // Toggle the primary schema's header checkbox → both its tables, not sales'.
+  await userEvent.click(screen.getAllByTestId('picker-schema-checkbox')[0]);
+  expect(screen.getByTestId('picker-count')).toHaveTextContent('2 selected');
+
+  await userEvent.click(screen.getByTestId('picker-confirm'));
+  expect(onConfirm).toHaveBeenCalledWith({
+    mode: 'include',
+    datasetIds: [1, 2],
+  });
 });
 
-test('select-all leaves unregistered tables alone without register permission', async () => {
+test('Select all spans every schema; Clear empties the selection', async () => {
   jest.restoreAllMocks();
   mockSupersetGet({
-    physicalNames: ['orders', 'customers', 'products', 'events'],
-    permissions: ['can_read'], // no can_write → cannot register
+    public: { datasets: [{ id: 1, table_name: 'orders' }] },
+    sales: { datasets: [{ id: 10, table_name: 'leads' }] },
   });
-  renderPicker();
-  await screen.findByText('orders');
-  await screen.findByText('events');
+  const onConfirm = jest.fn();
+  render(
+    <OnboardingTablePicker
+      open
+      databaseId={1}
+      schemas={['public', 'sales']}
+      primarySchema="public"
+      onCancel={jest.fn()}
+      onConfirm={onConfirm}
+    />,
+  );
+  await screen.findByText('leads');
 
   await userEvent.click(screen.getByText('Select all'));
-  // Only the 3 registered datasets are selected; the unregistered row stays off
-  // (its checkbox is disabled) so no bulk registration is implied.
-  expect(screen.getByTestId('picker-count')).toHaveTextContent(
-    'All 3 matching selected',
-  );
-  expect(screen.getByTestId('picker-unregistered-checkbox')).not.toBeChecked();
+  expect(screen.getByTestId('picker-count')).toHaveTextContent('2 selected');
+
+  await userEvent.click(screen.getByText('Clear'));
+  expect(screen.getByTestId('picker-count')).toHaveTextContent('0 selected');
+  expect(screen.getByTestId('picker-confirm')).toBeDisabled();
+
+  await userEvent.click(screen.getByText('Select all'));
+  await userEvent.click(screen.getByTestId('picker-confirm'));
+  expect(onConfirm).toHaveBeenCalledWith({
+    mode: 'include',
+    datasetIds: [1, 10],
+  });
 });
 
 test('confirm is disabled with nothing selected', async () => {
@@ -213,7 +270,7 @@ test('confirm is disabled with nothing selected', async () => {
   expect(screen.getByTestId('picker-confirm')).toBeDisabled();
 });
 
-test('shift-click selects a contiguous range of loaded rows', async () => {
+test('shift-click selects a contiguous range of rows', async () => {
   const onConfirm = renderPicker();
   await screen.findByText('orders');
   const rows = screen.getAllByTestId('picker-row');
@@ -229,15 +286,25 @@ test('shift-click selects a contiguous range of loaded rows', async () => {
   });
 });
 
-test('empty state shows when the schema has no registered tables', async () => {
+test('search filters the tables shown under each schema', async () => {
+  renderPicker();
+  await screen.findByText('orders');
+
+  await userEvent.type(screen.getByTestId('picker-search'), 'cust');
+  await waitFor(() =>
+    expect(screen.queryByText('orders')).not.toBeInTheDocument(),
+  );
+  expect(screen.getByText('customers')).toBeInTheDocument();
+});
+
+test('empty state shows when no schema has registered tables', async () => {
   jest.restoreAllMocks();
-  mockSupersetGet({ datasets: [], physicalNames: [] });
+  mockSupersetGet({ public: { datasets: [], physical: [] } });
   renderPicker();
 
   await waitFor(() =>
     expect(screen.getByText(/No registered tables found/)).toBeInTheDocument(),
   );
-  // The dead end is now actionable: a deep link to the Add Dataset flow.
   expect(screen.getByTestId('picker-register-link-empty')).toHaveAttribute(
     'href',
     '/dataset/add/',
@@ -245,85 +312,39 @@ test('empty state shows when the schema has no registered tables', async () => {
   expect(screen.getByTestId('picker-confirm')).toBeDisabled();
 });
 
-// 3 registered datasets, 30 physical tables → 27 unregistered.
-const THIRTY_PHYSICAL = [
-  ...DEFAULT_DATASETS.map(d => d.table_name),
-  ...Array.from({ length: 27 }, (_, i) => `extra_${i}`),
-];
+// 3 registered + 2 unregistered physical tables.
+const WITH_UNREGISTERED: SchemaFixture = {
+  datasets: PUBLIC.datasets,
+  physical: [...PUBLIC.datasets.map(d => d.table_name), 'shipments', 'refunds'],
+};
 
-test('gap banner appears when the schema has unregistered physical tables', async () => {
+test('lists unregistered physical tables under their schema for inline registration', async () => {
   jest.restoreAllMocks();
-  mockSupersetGet({ physicalNames: THIRTY_PHYSICAL });
-  renderPicker();
-
-  const banner = await screen.findByTestId('picker-gap-banner');
-  expect(banner).toHaveTextContent('3 of 30 tables');
-  expect(banner).toHaveTextContent('public');
-  expect(screen.getByTestId('picker-register-link')).toHaveAttribute(
-    'href',
-    '/dataset/add/',
-  );
-});
-
-test('classifies against the authoritative set, not just the loaded display page', async () => {
-  jest.restoreAllMocks();
-  // Display page shows only `orders`, but the authoritative scan knows
-  // `customers` is registered too. `shipments` is the only true unregistered one.
-  mockSupersetGet({
-    datasets: [{ id: 1, table_name: 'orders' }],
-    registeredAll: ['orders', 'customers'],
-    physicalNames: ['orders', 'customers', 'shipments'],
-  });
+  mockSupersetGet({ public: WITH_UNREGISTERED });
   renderPicker();
 
   await screen.findByText('orders');
+  expect(
+    await screen.findByTestId('picker-unregistered-header'),
+  ).toHaveTextContent('Not registered (2)');
   const unreg = await screen.findAllByTestId('picker-unregistered-row');
-  expect(unreg).toHaveLength(1);
-  expect(unreg[0]).toHaveTextContent('shipments');
-  // `customers` is NOT offered for registration (already a dataset).
-  expect(screen.queryByText('customers')).not.toBeInTheDocument();
+  expect(unreg).toHaveLength(2);
 });
 
-test('gap banner is hidden when every physical table is registered', async () => {
-  renderPicker(); // default: 3 registered == 3 physical
-  await screen.findByText('orders');
-  expect(screen.queryByTestId('picker-gap-banner')).not.toBeInTheDocument();
-});
-
-test('returning to the tab (window focus) refetches the dataset list', async () => {
-  const spy = jest.spyOn(SupersetClient, 'get');
-  renderPicker();
-  await screen.findByText('orders');
-  const before = spy.mock.calls.length;
-
-  window.dispatchEvent(new Event('focus'));
-
-  await waitFor(() => expect(spy.mock.calls.length).toBeGreaterThan(before));
-});
-
-// 3 registered + 2 unregistered physical tables (shipments, refunds).
-const WITH_UNREGISTERED = [
-  ...DEFAULT_DATASETS.map(d => d.table_name),
-  'shipments',
-  'refunds',
-];
-
-test('registers checked unregistered tables, then onboards the full set', async () => {
+test('registers checked unregistered tables, then onboards the full include set', async () => {
   jest.restoreAllMocks();
-  mockSupersetGet({ physicalNames: WITH_UNREGISTERED });
+  mockSupersetGet({ public: WITH_UNREGISTERED });
   const post = jest
     .spyOn(SupersetClient, 'post')
     .mockResolvedValueOnce({ json: { id: 101 } } as any)
     .mockResolvedValueOnce({ json: { id: 102 } } as any);
   const onConfirm = renderPicker();
 
-  // One registered dataset + the two unregistered tables.
   await screen.findByText('orders');
   await userEvent.click(screen.getAllByTestId('picker-checkbox')[0]); // orders (id 1)
   const unregRows = await screen.findAllByTestId(
     'picker-unregistered-checkbox',
   );
-  expect(unregRows).toHaveLength(2);
   await userEvent.click(unregRows[0]); // shipments
   await userEvent.click(unregRows[1]); // refunds
 
@@ -352,20 +373,56 @@ test('registers checked unregistered tables, then onboards the full set', async 
   );
 });
 
-test('unregistered section explains datasets get default columns + the current owner', async () => {
+test('registers unregistered tables in the SCHEMA they belong to (cross-schema)', async () => {
   jest.restoreAllMocks();
-  mockSupersetGet({ physicalNames: WITH_UNREGISTERED });
-  renderPicker();
+  mockSupersetGet({
+    public: { datasets: [{ id: 1, table_name: 'orders' }] },
+    sales: {
+      datasets: [{ id: 10, table_name: 'leads' }],
+      physical: ['leads', 'prospects'], // prospects unregistered in sales
+    },
+  });
+  const post = jest
+    .spyOn(SupersetClient, 'post')
+    .mockResolvedValueOnce({ json: { id: 200 } } as any);
+  const onConfirm = jest.fn();
+  render(
+    <OnboardingTablePicker
+      open
+      databaseId={1}
+      schemas={['public', 'sales']}
+      primarySchema="public"
+      onCancel={jest.fn()}
+      onConfirm={onConfirm}
+    />,
+  );
 
-  await screen.findByText('orders');
-  const hint = await screen.findByTestId('picker-register-hint');
-  expect(hint).toHaveTextContent('default columns');
-  expect(hint).toHaveTextContent('you as owner');
+  // The unregistered 'prospects' belongs to sales; register it there.
+  const unreg = await screen.findByText('prospects');
+  await userEvent.click(unreg);
+  await userEvent.click(screen.getByTestId('picker-confirm'));
+
+  await waitFor(() => expect(post).toHaveBeenCalledTimes(1));
+  expect(post.mock.calls[0][0]).toEqual({
+    endpoint: '/api/v1/dataset/',
+    jsonPayload: {
+      database: 1,
+      catalog: null,
+      schema: 'sales', // NOT the primary schema
+      table_name: 'prospects',
+    },
+  });
+  await waitFor(() =>
+    expect(onConfirm).toHaveBeenCalledWith({
+      mode: 'include',
+      datasetIds: [200],
+    }),
+  );
 });
 
 test('a registration failure keeps the picker open and surfaces the error', async () => {
   jest.restoreAllMocks();
-  mockSupersetGet({ physicalNames: WITH_UNREGISTERED });
+  mockSupersetGet({ public: WITH_UNREGISTERED });
   const post = jest
     .spyOn(SupersetClient, 'post')
     .mockResolvedValueOnce({ json: { id: 101 } } as any) // shipments ok
@@ -381,7 +438,6 @@ test('a registration failure keeps the picker open and surfaces the error', asyn
   await userEvent.click(screen.getByTestId('picker-confirm'));
 
   await waitFor(() => expect(post).toHaveBeenCalledTimes(2));
-  // Stays open, no onboarding, and the failure is shown.
   expect(onConfirm).not.toHaveBeenCalled();
   expect(await screen.findByText(/Could not register/)).toHaveTextContent(
     'refunds',
@@ -392,17 +448,16 @@ test('virtualizes a large unregistered list to a bounded number of DOM rows', as
   jest.restoreAllMocks();
   const many = Array.from({ length: 2000 }, (_, i) => `phys_${i}`);
   mockSupersetGet({
-    datasets: [{ id: 1, table_name: 'orders' }],
-    registeredAll: ['orders'],
-    physicalNames: ['orders', ...many], // 2000 unregistered
+    public: {
+      datasets: [{ id: 1, table_name: 'orders' }],
+      physical: ['orders', ...many],
+    },
   });
   renderPicker();
 
-  // The header confirms the full set is known…
   expect(
     await screen.findByText(/Not registered \(2000\)/),
   ).toBeInTheDocument();
-  // …but only a windowed slice is mounted in the DOM.
   expect(screen.getAllByTestId('picker-unregistered-row').length).toBeLessThan(
     60,
   );
@@ -410,17 +465,8 @@ test('virtualizes a large unregistered list to a bounded number of DOM rows', as
 
 test('unregistered tables are read-only without project write permission', async () => {
   jest.restoreAllMocks();
-  mockSupersetGet({ physicalNames: WITH_UNREGISTERED });
-  render(
-    <OnboardingTablePicker
-      open
-      databaseId={1}
-      schema="public"
-      canWrite={false}
-      onCancel={jest.fn()}
-      onConfirm={jest.fn()}
-    />,
-  );
+  mockSupersetGet({ public: WITH_UNREGISTERED });
+  renderPicker(jest.fn(), { canWrite: false });
 
   await screen.findByText('orders');
   const unregRows = await screen.findAllByTestId(
@@ -431,12 +477,8 @@ test('unregistered tables are read-only without project write permission', async
 
 test('unregistered tables are read-only without real dataset can_write', async () => {
   jest.restoreAllMocks();
-  // Project write is granted, but the user lacks Dataset can_write.
-  mockSupersetGet({
-    physicalNames: WITH_UNREGISTERED,
-    permissions: ['can_read'],
-  });
-  renderPicker(); // canWrite defaults to true
+  mockSupersetGet({ public: WITH_UNREGISTERED }, ['can_read']);
+  renderPicker();
 
   await screen.findByText('orders');
   await waitFor(() =>
@@ -449,26 +491,13 @@ test('unregistered tables are read-only without real dataset can_write', async (
   ).toBeInTheDocument();
 });
 
-test('registration stays enabled when the _info permission lookup fails', async () => {
-  jest.restoreAllMocks();
-  // Dataset list + tables resolve; only the _info lookup rejects.
-  jest.spyOn(SupersetClient, 'get').mockImplementation(({ endpoint }: any) => {
-    const url = String(endpoint);
-    if (url.includes('/_info')) return Promise.reject(new Error('nope'));
-    if (url.includes('/tables/')) {
-      return Promise.resolve(physicalPage(WITH_UNREGISTERED));
-    }
-    return Promise.resolve(
-      datasetsPage(DEFAULT_DATASETS, DEFAULT_DATASETS.length),
-    );
-  });
+test('returning to the tab (window focus) refetches the schemas', async () => {
+  const spy = jest.spyOn(SupersetClient, 'get');
   renderPicker();
-
   await screen.findByText('orders');
-  // Permissive fallback: rows remain enabled (the create POST still enforces).
-  await waitFor(() =>
-    expect(
-      screen.getAllByTestId('picker-unregistered-checkbox')[0],
-    ).toBeEnabled(),
-  );
+  const before = spy.mock.calls.length;
+
+  window.dispatchEvent(new Event('focus'));
+
+  await waitFor(() => expect(spy.mock.calls.length).toBeGreaterThan(before));
 });

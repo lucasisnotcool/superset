@@ -131,6 +131,61 @@ def test_build_mdl_facts_flattens_models_columns_metrics_relationships() -> None
     assert "Gross minus refunds" in net.text
 
 
+def test_build_mdl_facts_spans_models_across_schemas() -> None:
+    # §5.6.7 / multi-schema: coverage audits the whole project MDL, not one schema.
+    # Two base models live in different physical schemas (in separate files), joined
+    # by a cross-schema relationship — facts must include both and the join.
+    sales = json.dumps(
+        {
+            "models": [
+                {
+                    "name": "orders",
+                    "description": "Sales orders",
+                    "tableReference": {"schema": "sales", "table": "orders"},
+                    "columns": [{"name": "customer_id", "type": "BIGINT"}],
+                }
+            ]
+        }
+    )
+    crm = json.dumps(
+        {
+            "models": [
+                {
+                    "name": "customers",
+                    "description": "CRM customers",
+                    "tableReference": {"schema": "crm", "table": "customers"},
+                    "columns": [{"name": "id", "type": "BIGINT"}],
+                }
+            ],
+            "relationships": [
+                {
+                    "name": "order_customer",
+                    "models": ["orders", "customers"],
+                    "joinType": "MANY_TO_ONE",
+                    "condition": "orders.customer_id = customers.id",
+                }
+            ],
+        }
+    )
+    sales_file = _file(content=sales)
+    crm_file = MdlFile(
+        project_id="p1",
+        path="models/customers.json",
+        filename="customers.json",
+        content=crm,
+        checksum="y",
+    )
+
+    refs = {fact.ref for fact in build_mdl_facts([sales_file, crm_file])}
+
+    # Both schemas' models + columns and the cross-schema relationship are audited.
+    assert "model:orders" in refs
+    assert "model:customers" in refs
+    assert "column:orders.customer_id" in refs
+    assert "column:customers.id" in refs
+    assert "relationship:order_customer" in refs
+
+
 def test_build_mdl_facts_skips_unparseable_and_deleted() -> None:
     facts = build_mdl_facts(
         [_file(content="{not json"), _file(status="deleted")],

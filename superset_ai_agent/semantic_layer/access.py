@@ -287,19 +287,33 @@ class SemanticAccessService:
         project: SemanticProject,
         context: AgentContext | None,
     ) -> SemanticProject:
-        if project.owner_id == identity.owner_id:
-            return project.model_copy(update={"permission": "admin"}, deep=True)
+        # F5/DP2: permission is derived purely from the caller's level of access to
+        # the project's database — no ownership/admin tier. FULL access (the user can
+        # see the database's datasets) → write; PARTIAL → read. ``private``/legacy
+        # projects stay read-only regardless.
+        _ = identity
         access_level = _access_level_from_context(context)
         permission = (
             "write"
             if (
                 project.visibility == "db_access"
-                and self.semantic_full_access_grants_write
                 and access_level == SemanticAccessLevel.FULL
             )
             else "read"
         )
         return project.model_copy(update={"permission": permission}, deep=True)
+
+    def enrich_request(
+        self,
+        request: SemanticProjectResolveRequest,
+    ) -> SemanticProjectResolveRequest:
+        """Public: resolve the database identity (URI fingerprint) onto a request.
+
+        Used by the explicit create path so a Lab-created project shares the same
+        cross-instance identity as one created via resolve.
+        """
+
+        return self._request_with_database_identity(request)
 
     def _request_with_database_identity(
         self,

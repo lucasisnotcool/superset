@@ -154,11 +154,24 @@ export default function InstructionsPanel({
 
   return (
     <PanelRoot data-test="semantic-layer-instructions">
-      <Typography.Paragraph type="secondary" style={{ margin: 0 }}>
-        {t(
-          'Instructions steer SQL generation for this schema. Only your own ' +
-            'instructions are listed.',
+      {/*
+        DP-NEW: a project's documents, models, and history are shared with everyone
+        who has access to its database, but instructions are deliberately personal
+        (like the agent's SQL memory). Say so plainly so a shared-project user is
+        never surprised that teammates can't see — or aren't steered by — these.
+      */}
+      <Alert
+        type="info"
+        showIcon
+        data-test="instructions-personal-note"
+        message={t(
+          'Your instructions are personal. They steer SQL generation for this ' +
+            'schema for you only — other users with access to this database ' +
+            "don't see or share them (unlike the project's documents and models).",
         )}
+      />
+      <Typography.Paragraph type="secondary" style={{ margin: 0 }}>
+        {t('Only your own instructions are listed below.')}
       </Typography.Paragraph>
       {canWrite && (
         <Flex vertical gap="small">

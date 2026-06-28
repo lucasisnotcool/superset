@@ -31,10 +31,13 @@ import { Icons } from '@superset-ui/core/components/Icons';
 import {
   CoverageReport,
   getCoverageRun,
+  getCoverageStatus,
   getMdlProvenance,
   ProvenanceActorType,
   ProvenanceEntry,
   ProvenanceKind,
+  ToolActionKind,
+  ToolCallRecord,
 } from '../api';
 import { CopyButton } from '../AgentStepDetail';
 import { CoverageReportBody } from './CoverageReportModal';
@@ -104,6 +107,7 @@ const KIND_LABELS: Record<ProvenanceKind, string> = {
   mdl_updated: t('Edited model'),
   mdl_activated: t('Activated model'),
   mdl_deleted: t('Deleted model'),
+  project_created: t('Created project'),
 };
 
 const ACTOR_LABELS: Record<ProvenanceActorType, string> = {
@@ -167,6 +171,67 @@ const detailLine = (entry: ProvenanceEntry): string | null => {
   return (detail.path as string | undefined) ?? null;
 };
 
+// How many member files to show before collapsing behind a "+N more" toggle —
+// keeps the timeline scannable (the aggregator pattern) while one click reveals
+// the full per-file breakdown the literal ask wants ("agent wrote to a, b, …").
+const MEMBER_PREVIEW = 3;
+
+// Per-verb labels for the rollup line. Zero-count verbs are omitted upstream.
+const ACTION_VERBS: Record<ToolActionKind, (n: number) => string> = {
+  onboard: n => t('Onboarded %s table(s)', n),
+  write: n => t('Wrote %s file(s)', n),
+  relate: n => t('Added %s relationship(s)', n),
+  delete: n => t('Deleted %s file(s)', n),
+};
+const ACTION_ORDER: ToolActionKind[] = ['onboard', 'write', 'relate', 'delete'];
+
+const toolCalls = (entry: ProvenanceEntry): ToolCallRecord[] => {
+  const raw = entry.detail?.tool_calls;
+  return Array.isArray(raw) ? (raw as ToolCallRecord[]) : [];
+};
+
+// The aggregator rollup: "Onboarded 3 tables · Wrote 4 files". Reads the
+// server-derived action_summary (counts the full ledger, even when capped).
+const actionRollup = (entry: ProvenanceEntry): string | null => {
+  const summary = entry.detail?.action_summary as
+    | Record<string, number>
+    | undefined;
+  if (!summary) return null;
+  const parts = ACTION_ORDER.filter(action => (summary[action] ?? 0) > 0).map(
+    action => ACTION_VERBS[action](summary[action]),
+  );
+  return parts.length > 0 ? parts.join(' · ') : null;
+};
+
+// Ordered, de-duplicated file paths the agent touched this turn (ledger first,
+// falling back to the changeset-level paths for legacy/hand entries).
+const memberPaths = (entry: ProvenanceEntry): string[] => {
+  const seen = new Set<string>();
+  const ordered: string[] = [];
+  const push = (path: unknown) => {
+    if (typeof path === 'string' && !seen.has(path)) {
+      seen.add(path);
+      ordered.push(path);
+    }
+  };
+  toolCalls(entry).forEach(call => (call.paths || []).forEach(push));
+  if (ordered.length === 0) {
+    const paths = entry.detail?.paths;
+    if (Array.isArray(paths)) paths.forEach(push);
+  }
+  return ordered;
+};
+
+// path → source document id (R-B6): the doc a written file was derived from.
+const sourceDocByPath = (entry: ProvenanceEntry): Map<string, string> => {
+  const map = new Map<string, string>();
+  toolCalls(entry).forEach(call => {
+    const docId = call.source_document_ids?.[0];
+    if (docId) (call.paths || []).forEach(path => map.set(path, docId));
+  });
+  return map;
+};
+
 export interface MdlProvenanceDialogProps {
   open: boolean;
   projectId?: string | null;
@@ -184,6 +249,11 @@ const MdlProvenanceDialog = ({
   const [entries, setEntries] = useState<ProvenanceEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // True while a background coverage run is in flight for the current version —
+  // rendered as a synthetic "analysing" row at the top of the timeline.
+  const [coverageRunning, setCoverageRunning] = useState(false);
+  // Entry ids whose full per-file member list is expanded (else previewed).
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
   // Coverage drill-in: a stored report opened from a `coverage` timeline entry.
   const [report, setReport] = useState<CoverageReport | null>(null);
   const [reportLoading, setReportLoading] = useState(false);
@@ -199,6 +269,16 @@ const MdlProvenanceDialog = ({
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
       setLoading(false);
+    }
+    // Coverage runs in the background under the latest/supersede policy; surface an
+    // in-flight run as a synthetic top row (best-effort, never breaks the timeline).
+    // The same COVERAGE_EVENT_TYPES subscription re-runs `load`, so this clears to a
+    // `coverage_completed` entry when the run finishes.
+    try {
+      const status = await getCoverageStatus(projectId);
+      setCoverageRunning(status.running === true);
+    } catch {
+      setCoverageRunning(false);
     }
   }, [projectId]);
 
@@ -298,10 +378,42 @@ const MdlProvenanceDialog = ({
       ) : null}
 
       <div data-test="provenance-timeline">
+        {coverageRunning ? (
+          <Row data-test="provenance-coverage-running">
+            <Icons.LoadingOutlined spin css={css({ marginTop: 4 })} />
+            <Body>
+              <Typography.Text strong>{t('Coverage')}</Typography.Text>
+              <Typography.Text type="secondary">
+                {t('Analysing the active model against the project documents…')}
+              </Typography.Text>
+            </Body>
+          </Row>
+        ) : null}
         {entries.map(entry => {
           const secondary = detailLine(entry);
           const actorType = entry.actor_type ?? 'system';
+          // DP10: in a shared project a teammate's edit must not read as "You".
+          // Show "You" only when the viewer is the actor; otherwise the author's
+          // captured name (username/email), falling back to the actor id then a
+          // generic "Teammate" label for historical/unnamed entries.
+          const actorLabel =
+            actorType === 'user' && entry.is_self === false
+              ? (entry.actor_name ?? entry.actor ?? t('Teammate'))
+              : ACTOR_LABELS[actorType];
           const documents = documentRefs(entry);
+          const docNameById = new Map(
+            documents
+              .filter(doc => doc.id)
+              .map(doc => [doc.id as string, doc.filename ?? doc.id]),
+          );
+          const rollup = actionRollup(entry);
+          const files = memberPaths(entry);
+          const docByPath = sourceDocByPath(entry);
+          const isExpanded = expanded.has(entry.id);
+          const shownFiles = isExpanded
+            ? files
+            : files.slice(0, MEMBER_PREVIEW);
+          const hiddenCount = files.length - shownFiles.length;
           const conversationId = entry.detail?.conversation_id as
             | string
             | undefined;
@@ -319,7 +431,7 @@ const MdlProvenanceDialog = ({
                       color={ACTOR_COLORS[actorType]}
                       data-test="provenance-actor"
                     >
-                      {ACTOR_LABELS[actorType]}
+                      {actorLabel}
                     </Tag>
                   </Flex>
                   <Stamp>{stampLine(entry)}</Stamp>
@@ -331,6 +443,67 @@ const MdlProvenanceDialog = ({
                       {secondary}
                       {entry.actor ? ` · ${entry.actor}` : ''}
                     </Typography.Text>
+                  ) : null}
+                  {rollup ? (
+                    <Typography.Text
+                      type="secondary"
+                      strong
+                      data-test="provenance-rollup"
+                    >
+                      {rollup}
+                    </Typography.Text>
+                  ) : null}
+                  {files.length > 0 ? (
+                    <Flex wrap gap="small" data-test="provenance-files">
+                      {shownFiles.map(path => {
+                        const docId = docByPath.get(path);
+                        const docName = docId
+                          ? (docNameById.get(docId) ?? docId)
+                          : null;
+                        return (
+                          <Tag
+                            key={path}
+                            icon={<Icons.FileOutlined />}
+                            data-test="provenance-file"
+                          >
+                            {path}
+                            {docName ? ` ← ${docName}` : ''}
+                          </Tag>
+                        );
+                      })}
+                      {hiddenCount > 0 ? (
+                        <Button
+                          type="link"
+                          size="small"
+                          onClick={() =>
+                            setExpanded(prev => {
+                              const next = new Set(prev);
+                              next.add(entry.id);
+                              return next;
+                            })
+                          }
+                          data-test="provenance-files-expand"
+                        >
+                          {t('+%s more', hiddenCount)}
+                        </Button>
+                      ) : null}
+                      {isExpanded && files.length > MEMBER_PREVIEW ? (
+                        <Button
+                          type="link"
+                          size="small"
+                          onClick={() =>
+                            setExpanded(prev => {
+                              const next = new Set(prev);
+                              next.delete(entry.id);
+                              return next;
+                            })
+                          }
+                          data-test="provenance-files-collapse"
+                        >
+                          {t('Show less')}
+                        </Button>
+                      ) : null}
+                    </Flex>
                   ) : null}
                   {documents.length > 0 ? (
                     <Flex wrap gap="small" data-test="provenance-documents">

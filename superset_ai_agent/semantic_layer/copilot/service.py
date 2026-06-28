@@ -32,6 +32,7 @@ from superset_ai_agent.conversations.schemas import (
     ConversationArtifact,
 )
 from superset_ai_agent.llm.base import ChatMessage, ModelClient
+from superset_ai_agent.llm.embeddings import Embedder
 from superset_ai_agent.semantic_layer.copilot.loop import (
     build_system_prompt,
     run_copilot_loop,
@@ -43,6 +44,7 @@ from superset_ai_agent.semantic_layer.copilot.schemas import (
     CopilotInspector,
     InstructionView,
     SkillDescriptor,
+    ToolCallRecord,
     ToolDescriptor,
 )
 from superset_ai_agent.semantic_layer.copilot.tools import DocumentReader, MdlToolset
@@ -121,6 +123,7 @@ def run_copilot(
     project_id: str | None = None,
     owner_id: str | None = None,
     retrieve_k: int = 8,
+    embedder: Embedder | None = None,
 ) -> Changeset:
     """Run one agentic MDL-editing turn against the project's files.
 
@@ -138,6 +141,11 @@ def run_copilot(
         project_id=project_id,
         owner_id=owner_id,
         retrieve_k=retrieve_k,
+        # Coverage self-review (read-only ``run_coverage`` tool) reuses the turn's
+        # model client + retrieval embedder; instructions ground the audit.
+        model_client=model_client,
+        embedder=embedder,
+        instructions=instructions,
     )
     return run_copilot_loop(
         model_client=model_client,
@@ -188,6 +196,12 @@ def apply_changeset_items(
 
     applied: list[MdlFile] = []
     for item in items:
+        # R-B6: a file the agent derived from a single source document is recorded
+        # as ``enriched_markdown`` + linked to that document; everything else the
+        # Copilot writes stays a generic ``copilot`` edit.
+        source_type = item.source_type or (
+            "enriched_markdown" if item.source_document_id else "copilot"
+        )
         if item.op == "create":
             if not item.proposed_content:
                 continue
@@ -197,7 +211,8 @@ def apply_changeset_items(
                     MdlFileCreateRequest(
                         path=item.path,
                         content=item.proposed_content,
-                        source_type="copilot",
+                        source_type=source_type,
+                        source_document_id=item.source_document_id,
                     ),
                     owner_id=owner_id,
                     validation=item.validation,
@@ -209,7 +224,15 @@ def apply_changeset_items(
             applied.append(
                 store.update(
                     item.file_id,
-                    MdlFileUpdateRequest(content=item.proposed_content),
+                    MdlFileUpdateRequest(
+                        content=item.proposed_content,
+                        # Only re-stamp origin when this edit is doc-grounded;
+                        # a plain agent edit must not relabel a manual file.
+                        source_type=(
+                            source_type if item.source_document_id else None
+                        ),
+                        source_document_id=item.source_document_id,
+                    ),
                     owner_id=owner_id,
                     validation=item.validation,
                 )
@@ -240,13 +263,22 @@ def changeset_from_conversation(conversation: Conversation) -> Changeset | None:
     return None
 
 
+#: Ceiling on tool-call records folded into one apply event's detail. Bounds the
+#: stored ``payload`` JSON for a pathological turn (R3); the per-verb
+#: ``action_summary`` is always computed over the *full* set, so a truncated
+#: ledger still rolls up correctly — only the expandable member list is capped.
+TOOL_CALL_DETAIL_CAP = 100
+
+
 def apply_provenance_payload(
     *,
     items: list[ChangesetItem],
     owner_id: str,
+    actor_name: str | None = None,
     conversation_id: str | None,
     summary: str | None,
     documents: list[dict[str, str | None]],
+    tool_calls: list[ToolCallRecord] | None = None,
 ) -> tuple[str, str, dict[str, object]]:
     """Build the (event_type, message, detail) for an agent-apply provenance event.
 
@@ -254,7 +286,10 @@ def apply_provenance_payload(
     documents — retrieved passages or inline attachments (``documents`` non-empty)
     — else a generic ``copilot_edit``. ``ops``/``paths`` derive from the accepted
     items; ``documents`` are ``{id, filename}`` pairs (id is ``None`` for inline
-    attachments, which have no persisted document).
+    attachments, which have no persisted document). ``tool_calls`` (when present)
+    are folded into ``detail.tool_calls`` with a derived ``action_summary``
+    per-verb rollup so the timeline can present "onboarded 3 · wrote 4" without
+    re-deriving it client-side.
     """
 
     ops = {"create": 0, "update": 0, "delete": 0}
@@ -278,6 +313,20 @@ def apply_provenance_payload(
         "paths": paths,
         "documents": documents,
     }
+    if actor_name:
+        detail["actor_name"] = actor_name
+    records = tool_calls or []
+    if records:
+        # Roll up over the FULL ledger (before any cap) so counts stay honest.
+        action_summary: dict[str, int] = {}
+        for record in records:
+            action_summary[record.action] = action_summary.get(record.action, 0) + 1
+        detail["action_summary"] = action_summary
+        stored = [record.model_dump(mode="json") for record in records]
+        if len(stored) > TOOL_CALL_DETAIL_CAP:
+            detail["tool_calls_truncated"] = len(stored) - TOOL_CALL_DETAIL_CAP
+            stored = stored[:TOOL_CALL_DETAIL_CAP]
+        detail["tool_calls"] = stored
     return event_type, label, detail
 
 

@@ -24,6 +24,7 @@ from superset_ai_agent.semantic_layer.schemas import (
     actor_type_for,
     coalesce_user_runs,
     OnboardingRequest,
+    PROVENANCE_EVENT_TYPES,
     provenance_from_event,
     ProvenanceEntry,
     SemanticLayerEvent,
@@ -80,7 +81,9 @@ def test_onboarding_request_include_round_trips() -> None:
 
 
 def test_event_detail_round_trips() -> None:
-    event = _event("mdl_created", detail={"path": "models/orders.json", "file_id": "f1"})
+    event = _event(
+        "mdl_created", detail={"path": "models/orders.json", "file_id": "f1"}
+    )
     restored = SemanticLayerEvent.model_validate(event.model_dump(mode="json"))
     assert restored.detail == {"path": "models/orders.json", "file_id": "f1"}
 
@@ -96,7 +99,8 @@ def test_provenance_mapping_covers_kinds_and_status() -> None:
     assert created.detail["path"] == "models/o.json"
 
     activated = provenance_from_event(_event("mdl_activated"))
-    assert activated is not None and activated.kind == "mdl_activated"
+    assert activated is not None
+    assert activated.kind == "mdl_activated"
 
     failed = provenance_from_event(_event("onboarding_failed"))
     assert failed is not None
@@ -106,10 +110,59 @@ def test_provenance_mapping_covers_kinds_and_status() -> None:
     warned = provenance_from_event(
         _event("onboarding_completed", detail={"warnings": ["x"]})
     )
-    assert warned is not None and warned.status == "warning"
+    assert warned is not None
+    assert warned.status == "warning"
 
     enriched = provenance_from_event(_event("document_enriched"))
-    assert enriched is not None and enriched.kind == "enrichment"
+    assert enriched is not None
+    assert enriched.kind == "enrichment"
+
+
+def test_every_mdl_mutation_event_is_purged_on_reset() -> None:
+    # R5 (reset-leak guard): every event type the apply/onboarding/CRUD paths can
+    # emit for an MDL mutation must be in PROVENANCE_EVENT_TYPES, or it would
+    # survive a reset and leave a stale timeline. Tool-call detail rides INSIDE
+    # these events (no new top-level type), so adding the ledger introduced none.
+    mutation_event_types = {
+        "onboarding_started",
+        "onboarding_completed",
+        "onboarding_failed",
+        "mdl_created",
+        "mdl_updated",
+        "mdl_activated",
+        "mdl_deleted",
+        "document_enriched",
+        "mdl_agent_edit",
+    }
+    assert mutation_event_types <= set(PROVENANCE_EVENT_TYPES)
+
+
+def test_provenance_captures_actor_name_when_present() -> None:
+    # DP10/FP2: the author's display name is captured at write time so a shared
+    # project's timeline can name who made a hand edit (no cross-user lookup).
+    named = provenance_from_event(
+        _event(
+            "mdl_updated",
+            detail={
+                "source_type": "manual",
+                "actor": "superset:7",
+                "actor_name": "alice",
+            },
+        )
+    )
+    assert named is not None
+    assert named.actor == "superset:7"
+    assert named.actor_name == "alice"
+
+    # Historical events without a captured name project a null actor_name.
+    unnamed = provenance_from_event(
+        _event(
+            "mdl_updated",
+            detail={"source_type": "manual", "actor": "superset:7"},
+        )
+    )
+    assert unnamed is not None
+    assert unnamed.actor_name is None
 
 
 def test_non_provenance_events_map_to_none() -> None:
@@ -154,7 +207,8 @@ def test_provenance_sets_actor_type_for_new_kinds() -> None:
     user_edit = provenance_from_event(
         _event("mdl_updated", detail={"source_type": "manual"})
     )
-    assert user_edit is not None and user_edit.actor_type == "user"
+    assert user_edit is not None
+    assert user_edit.actor_type == "user"
 
 
 def test_coalesce_collapses_consecutive_user_edits() -> None:
@@ -204,3 +258,44 @@ def test_coalesce_preserves_newest_first_order_with_system_entries() -> None:
     assert [e.id for e in coalesced] == ["u3", "onb", "u1", "cov"]
     assert coalesced[0].edit_count == 2  # u3 + u2 merged
     assert coalesced[2].edit_count == 1  # u1 alone
+
+
+def test_coalesce_splits_user_runs_by_actor() -> None:
+    # DP10: in a shared project, two users' contiguous edits must NOT merge into one
+    # mis-attributed "Edited N times" — only same-actor runs coalesce.
+    base = _BASE
+    entries = [
+        ProvenanceEntry(
+            id="b1",
+            kind="mdl_updated",
+            summary="bob edit",
+            created_at=base + timedelta(minutes=3),
+            actor="bob",
+            actor_type="user",
+            detail={},
+        ),
+        ProvenanceEntry(
+            id="a2",
+            kind="mdl_updated",
+            summary="alice edit 2",
+            created_at=base + timedelta(minutes=2),
+            actor="alice",
+            actor_type="user",
+            detail={},
+        ),
+        ProvenanceEntry(
+            id="a1",
+            kind="mdl_updated",
+            summary="alice edit 1",
+            created_at=base + timedelta(minutes=1),
+            actor="alice",
+            actor_type="user",
+            detail={},
+        ),
+    ]  # newest-first
+    result = coalesce_user_runs(entries)
+    assert len(result) == 2
+    assert result[0].actor == "bob"
+    assert result[0].edit_count == 1
+    assert result[1].actor == "alice"
+    assert result[1].edit_count == 2

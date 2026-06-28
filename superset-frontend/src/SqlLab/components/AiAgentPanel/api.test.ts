@@ -43,6 +43,7 @@ import {
   createSemanticLayerEventSource,
   createProjectSemanticLayerEventSource,
   deleteMdlFile,
+  duplicateSemanticProject,
   enrichProjectDocument,
   getSemanticLayerState,
   deleteConversation,
@@ -1029,4 +1030,41 @@ test('semantic-layer event source includes Superset credentials', () => {
       init: { withCredentials: true },
     },
   ]);
+});
+
+test('duplicateSemanticProject sends include_documents when requested (DP6)', async () => {
+  const clone = { id: 'clone-1', name: 'Base (copy)' };
+  fetchMock.post(
+    'http://agent.local/agent/semantic-layer/projects/p1/duplicate',
+    clone,
+  );
+
+  await duplicateSemanticProject('p1', null, true);
+
+  const [call] = fetchMock.callHistory.calls(
+    'http://agent.local/agent/semantic-layer/projects/p1/duplicate',
+  );
+  expect(JSON.parse(String(call.options.body))).toEqual({
+    name: null,
+    include_documents: true,
+  });
+});
+
+test('duplicateSemanticProject defaults include_documents to false', async () => {
+  fetchMock.post(
+    'http://agent.local/agent/semantic-layer/projects/p1/duplicate',
+    {
+      id: 'clone-1',
+    },
+  );
+
+  await duplicateSemanticProject('p1');
+
+  const [call] = fetchMock.callHistory.calls(
+    'http://agent.local/agent/semantic-layer/projects/p1/duplicate',
+  );
+  expect(JSON.parse(String(call.options.body))).toEqual({
+    name: null,
+    include_documents: false,
+  });
 });

@@ -307,10 +307,15 @@ class SupersetRestClient:
                 _normalize_dataset(self.get_dataset_raw(dataset_id))
                 for dataset_id in dataset_ids
             ]
-            return _filter_datasets_by_scope(
-                datasets,
-                schema_name=schema_name,
-            )
+            # An explicit id selection is authoritative: bound it to the requested
+            # database, but do NOT narrow by a single schema_name — that would
+            # silently drop datasets in the project's other schemas (cross-schema
+            # onboarding). The database bound prevents cross-database leakage.
+            return [
+                dataset
+                for dataset in datasets
+                if dataset.database_id in {0, database_id}
+            ]
         payload = self.list_datasets_raw(
             database_id=database_id,
             schema_name=schema_name,
@@ -630,18 +635,6 @@ def _normalize_metric(data: dict[str, Any]) -> MetricSummary:
         expression=data.get("expression"),
         description=data.get("description"),
     )
-
-
-def _filter_datasets_by_scope(
-    datasets: list[DatasetMetadata],
-    *,
-    schema_name: str | None,
-) -> list[DatasetMetadata]:
-    return [
-        dataset
-        for dataset in datasets
-        if _dataset_matches_scope(dataset, schema_name=schema_name)
-    ]
 
 
 def _dataset_matches_scope(

@@ -66,6 +66,9 @@ SemanticLayerEventType = Literal[
     # runs (plan_provenance_and_coverage_impl.md, Features A & B).
     "mdl_agent_edit",
     "coverage_completed",
+    # Project lifecycle: the origin entry stamped on a duplicated project
+    # (plan_mdl_lab_spec.md DP8) recording its ``duplicated_from`` lineage.
+    "mdl_project_created",
 ]
 SemanticJobStatus = Literal["running", "completed", "failed"]
 
@@ -84,6 +87,7 @@ PROVENANCE_EVENT_TYPES: frozenset[str] = frozenset(
         "document_enriched",
         "mdl_agent_edit",
         "coverage_completed",
+        "mdl_project_created",
     }
 )
 #: Max provenance entries returned by the read route (newest-first). History is
@@ -177,6 +181,31 @@ MdlFileSourceType = Literal[
 ]
 MdlContentType = Literal["application/json"]
 
+#: Max characters kept from a slugified name (leaves room for a ``-NN`` suffix).
+_SLUG_MAX_LEN = 80
+
+
+def slugify_project_name(name: str) -> str:
+    """Return a lowercase, hyphenated, identity-safe slug for a project name.
+
+    Non-alphanumeric runs collapse to a single hyphen; leading/trailing hyphens are
+    stripped; empty input falls back to ``project``. Uniqueness within a database is
+    the store's responsibility (it appends ``-2``, ``-3`` on collision).
+    """
+
+    lowered = (name or "").strip().lower()
+    out: list[str] = []
+    prev_hyphen = False
+    for char in lowered:
+        if char.isalnum():
+            out.append(char)
+            prev_hyphen = False
+        elif not prev_hyphen:
+            out.append("-")
+            prev_hyphen = True
+    slug = "".join(out).strip("-")[:_SLUG_MAX_LEN].strip("-")
+    return slug or "project"
+
 
 class SemanticProject(BaseModel):
     """Wren semantic project spanning one or more schemas of a database.
@@ -189,6 +218,9 @@ class SemanticProject(BaseModel):
 
     id: str = Field(default_factory=_new_id)
     name: str
+    #: URL/identity-safe handle, unique within (database, catalog). Derived from
+    #: ``name`` when not supplied; the store guarantees uniqueness (collision suffix).
+    slug: str = ""
     description: str | None = None
     owner_id: str
     database_uri_fingerprint: str
@@ -206,14 +238,19 @@ class SemanticProject(BaseModel):
     created_at: datetime = Field(default_factory=_utc_now)
     updated_at: datetime = Field(default_factory=_utc_now)
     deleted_at: datetime | None = None
+    #: Transient, response-only: the latest complete coverage score (0–1) for the
+    #: project's active MDL, populated only by the list/get routes so the MDL Lab
+    #: browser can show a per-project coverage badge without an N+1 status fetch.
+    #: ``None`` when coverage has never completed (or is disabled).
+    coverage_score: float | None = None
 
     @model_validator(mode="after")
-    def _sync_schema_set(self) -> "SemanticProject":
-        """Keep ``schema_name`` (primary) and ``schema_names`` (full set) consistent.
+    def _sync_identity(self) -> "SemanticProject":
+        """Keep the schema set consistent and ensure a derived ``slug``.
 
-        The primary is always element 0 of the set; the set is de-duplicated and
-        order-preserving. A project constructed with only ``schema_name`` gets a
-        one-element set, so single-schema projects are unchanged.
+        The primary schema is always element 0 of the de-duplicated set. ``slug``
+        defaults to a slugified ``name`` (the store layer makes it unique within the
+        database/catalog); a single-schema, name-only project is unchanged otherwise.
         """
 
         names = normalize_schema_names(self.schema_name, self.schema_names)
@@ -222,6 +259,8 @@ class SemanticProject(BaseModel):
                 self.schema_names = names
             if self.schema_name != names[0]:
                 self.schema_name = names[0]
+        if not self.slug:
+            self.slug = slugify_project_name(self.name)
         return self
 
 
@@ -236,6 +275,9 @@ class SemanticProjectResolveRequest(BaseModel):
     #: Optional additional schemas to scope the project to (primary stays
     #: ``schema_name``). Back-compat: callers may send only ``schema_name``.
     schema_names: list[str] | None = None
+    #: Optional explicit project name (the MDL Lab "create named project" path).
+    #: When absent the default schema-derived name is used.
+    name: str | None = None
     supplied_uri: str | None = None
     database_uri_fingerprint: str | None = None
     create_if_missing: bool = True
@@ -244,6 +286,22 @@ class SemanticProjectResolveRequest(BaseModel):
         """Ordered, de-duplicated requested schema set with the primary first."""
 
         return normalize_schema_names(self.schema_name, self.schema_names)
+
+
+class SemanticProjectRenameRequest(BaseModel):
+    """Rename a semantic project (the MDL Lab rename action)."""
+
+    name: str
+
+
+class SemanticProjectDuplicateRequest(BaseModel):
+    """Duplicate a semantic project; optional new name (default ``<source> (copy)``)."""
+
+    name: str | None = None
+    #: DP6 opt-in: also copy the project's BI documents + chunks into the clone and
+    #: re-embed them under the clone's vector scope. Default off — the structural
+    #: clone (MDL + schema set) carries no documents/coverage/history.
+    include_documents: bool = False
 
 
 class MdlValidationMessage(BaseModel):
@@ -299,6 +357,12 @@ class MdlFileUpdateRequest(BaseModel):
     path: str | None = None
     content: str | None = None
     status: MdlFileStatus | None = None
+    #: Re-stamp the file's origin (e.g. agent enrichment grounded on a document
+    #: changes ``copilot`` → ``enriched_markdown``). ``None`` leaves it unchanged.
+    source_type: MdlFileSourceType | None = None
+    #: Link the file to the source document it was (re-)derived from (R-B6).
+    #: ``None`` leaves the existing link unchanged.
+    source_document_id: str | None = None
 
 
 class MdlEnrichmentProposal(BaseModel):
@@ -362,6 +426,7 @@ ProvenanceKind = Literal[
     "mdl_updated",
     "mdl_activated",
     "mdl_deleted",
+    "project_created",
 ]
 
 #: Who is responsible for a timeline entry. Drives the dialog's icon/label and,
@@ -384,7 +449,16 @@ class ProvenanceEntry(BaseModel):
     summary: str
     created_at: datetime
     actor: str | None = None
+    #: Human-readable author name (username/email) captured at write time (DP10).
+    #: ``None`` for historical events / system actors; the UI falls back to ``actor``
+    #: (the owner id) then to a generic "Teammate" label.
+    actor_name: str | None = None
     actor_type: ActorType = "system"
+    #: True when the viewer is the actor (DP10). Computed at read time by the
+    #: endpoint, which knows the requesting identity; drives "You" vs the actor's id
+    #: in a shared (multi-user) project. Defaults True so single-user history reads
+    #: unchanged.
+    is_self: bool = True
     #: Number of raw events merged into this entry (>1 only for coalesced user runs).
     edit_count: int = 1
     #: Earliest timestamp in a coalesced user run (``None`` when ``edit_count == 1``).
@@ -406,6 +480,7 @@ _PROVENANCE_KIND_BY_EVENT: dict[str, ProvenanceKind] = {
     "mdl_updated": "mdl_updated",
     "mdl_activated": "mdl_activated",
     "mdl_deleted": "mdl_deleted",
+    "mdl_project_created": "project_created",
 }
 
 
@@ -417,7 +492,7 @@ def actor_type_for(kind: ProvenanceKind, source_type: str | None) -> ActorType:
     system (onboarding/coverage) entries always stand alone.
     """
 
-    if kind in ("onboarding", "coverage"):
+    if kind in ("onboarding", "coverage", "project_created"):
         return "system"
     if kind in ("enrichment", "copilot_edit"):
         return "agent"
@@ -455,6 +530,7 @@ def provenance_from_event(event: SemanticLayerEvent) -> ProvenanceEntry | None:
         summary=event.message,
         created_at=event.created_at,
         actor=detail.get("actor"),
+        actor_name=detail.get("actor_name"),
         actor_type=actor_type_for(kind, detail.get("source_type")),
         detail=detail,
     )
@@ -527,6 +603,11 @@ def coalesce_user_runs(entries: list[ProvenanceEntry]) -> list[ProvenanceEntry]:
 
     for entry in entries:
         if _is_user_edit(entry):
+            # Only merge a contiguous run by the SAME actor — in a shared project
+            # (DP10) two users' adjacent edits must stay distinct rows, not collapse
+            # into one mis-attributed "Edited N times".
+            if run and run[-1].actor != entry.actor:
+                flush()
             run.append(entry)
             continue
         flush()

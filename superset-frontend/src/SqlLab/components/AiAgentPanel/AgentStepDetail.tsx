@@ -23,6 +23,7 @@ import {
   Button,
   Collapse,
   Icons,
+  Radio,
   Tag,
 } from '@superset-ui/core/components';
 import type {
@@ -170,6 +171,50 @@ const Sql = ({ label, sql }: { label: string; sql?: string | null }) =>
       </dd>
     </Field>
   ) : null;
+
+type SqlForm = 'native' | 'semantic';
+
+// The semantic->native rewrite carries two forms of the same query: the
+// authored form against bare model names, and the native form with
+// schema-qualified tables that actually ran. When both are present this offers
+// a toggle that defaults to the native (executed) form — execution truth, and
+// the only form that disambiguates which physical schema each table resolved to
+// under a multi-schema project — with the authored form one click away. When
+// only one form is present it falls back to a single labeled block.
+const SqlRewrite = ({
+  semanticSql,
+  nativeSql,
+}: {
+  semanticSql?: string | null;
+  nativeSql?: string | null;
+}) => {
+  const [form, setForm] = useState<SqlForm>('native');
+  if (!semanticSql || !nativeSql) {
+    if (nativeSql) {
+      return <Sql label={t('Native SQL')} sql={nativeSql} />;
+    }
+    return <Sql label={t('Semantic SQL')} sql={semanticSql} />;
+  }
+  return (
+    <Field>
+      <dt>{t('SQL')}</dt>
+      <dd>
+        <Radio.GroupWrapper
+          options={[
+            { label: t('Native (executed)'), value: 'native' },
+            { label: t('Semantic (authored)'), value: 'semantic' },
+          ]}
+          value={form}
+          onChange={event => setForm(event.target.value as SqlForm)}
+          optionType="button"
+          buttonStyle="solid"
+          size="small"
+        />
+        <CodeBlock code={form === 'native' ? nativeSql : semanticSql} />
+      </dd>
+    </Field>
+  );
+};
 
 const TagRow = styled.div`
   ${({ theme }) => css`
@@ -533,7 +578,10 @@ function DetailBody({ detail }: { detail: Detail }) {
             label={t('Warnings')}
             value={detail.warnings.join('; ') || null}
           />
-          <Sql label={t('Semantic SQL')} sql={detail.semantic_sql} />
+          <SqlRewrite
+            semanticSql={detail.semantic_sql}
+            nativeSql={detail.native_sql}
+          />
         </List>
       );
     case 'validate_sql':

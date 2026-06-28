@@ -278,11 +278,15 @@ class LocalSupersetClient:
             from superset.connectors.sqla.models import SqlaTable
 
             query = db.session.query(SqlaTable).filter_by(database_id=database_id)
-            if schema_name is not None:
-                query = query.filter_by(schema=schema_name)
             if dataset_ids:
+                # An explicit id selection is authoritative: it identifies datasets
+                # by primary key, so it must NOT be further narrowed by schema_name
+                # (that would silently drop a valid cross-schema selection). The
+                # database_id filter above still bounds it to the requested DB.
                 query = query.filter(SqlaTable.id.in_(dataset_ids))
             else:
+                if schema_name is not None:
+                    query = query.filter_by(schema=schema_name)
                 query = query.order_by(SqlaTable.id).limit(limit)
             return [self._serialize_dataset(dataset) for dataset in query.all()]
 

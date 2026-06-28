@@ -69,8 +69,11 @@ def test_project_resolution_is_one_project_per_database_catalog_schema() -> None
 
     assert shared_project.id == owner_project.id
     assert shared_project.name == "Sales.prod.pipeline"
-    assert shared_project.permission == "read"
-    assert store.get(owner_project.id, owner_id="owner").permission == "admin"
+    # F5/DP2: access is database-derived, not ownership. The store baseline grants a
+    # db_access project "write" to any caller (the access service refines per the
+    # caller's DB-access level); there is no owner-admin tier.
+    assert shared_project.permission == "write"
+    assert store.get(owner_project.id, owner_id="owner").permission == "write"
 
 
 def test_project_resolution_can_refuse_creation() -> None:

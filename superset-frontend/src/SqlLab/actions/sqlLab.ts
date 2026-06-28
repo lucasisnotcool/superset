@@ -848,18 +848,6 @@ export function setActiveQueryEditor(queryEditor: QueryEditor): SqlLabAction {
   };
 }
 
-export const buildSemanticLayerEditorId = (
-  databaseId: number,
-  catalogName: string | null | undefined,
-  schemaName: string,
-): string =>
-  // Avoid ':' as a delimiter: this id is used as the antd Tabs `key`, which
-  // antd threads into generated DOM `id`/`aria-controls` attributes. Colons
-  // are valid in HTML ids but are CSS pseudo-class syntax, so any unescaped
-  // selector built from this id (including testing-library's accessibility
-  // checks) breaks with a SyntaxError.
-  `semantic-layer__${databaseId}__${catalogName ?? 'none'}__${schemaName}`;
-
 export function setActiveSemanticLayerEditor(
   semanticLayerEditorId: string | null,
 ): SqlLabAction {
@@ -878,14 +866,24 @@ export function closeSemanticLayerEditor(
   };
 }
 
-export function openSemanticLayerEditor(
+// A browse-first "MDL Lab" tab is scoped to a database (F5: a project belongs to a
+// database, not a schema), so its id omits the schema. Distinct prefix from the
+// schema-bound editor so the two never collide.
+export const buildMdlLabId = (
   databaseId: number,
   catalogName: string | null | undefined,
-  schemaName: string,
+): string => `semantic-layer-lab__${databaseId}__${catalogName ?? 'none'}`;
+
+export function openMdlLab(
+  databaseId: number,
+  catalogName: string | null | undefined,
 ): SqlLabThunkAction {
+  // The first-class MDL Lab destination: open the project browser for a whole
+  // database (no schema preselected). Reuses the semantic-layer tab machinery; the
+  // editor renders browse-first because the tab carries no `schemaName`.
   return function (dispatch: AppDispatch, getState: GetState) {
     const { sqlLab } = getState();
-    const id = buildSemanticLayerEditorId(databaseId, catalogName, schemaName);
+    const id = buildMdlLabId(databaseId, catalogName);
     const exists = sqlLab.semanticLayerEditors.some(tab => tab.id === id);
     if (!exists) {
       dispatch({
@@ -894,7 +892,6 @@ export function openSemanticLayerEditor(
           id,
           databaseId,
           catalogName: catalogName ?? null,
-          schemaName,
         },
       });
     }

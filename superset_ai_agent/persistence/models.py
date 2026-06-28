@@ -28,6 +28,7 @@ from sqlalchemy import (
     JSON,
     String,
     Text,
+    text,
     UniqueConstraint,
 )
 from sqlalchemy.orm import declarative_base, relationship
@@ -214,21 +215,35 @@ class AiAgentEvent(Base):
 
 
 class AiAgentSemanticProject(Base):
-    """Schema-scoped Wren semantic project."""
+    """A Wren semantic project over one database (may span its schemas).
+
+    Identity is ``(database_uri_fingerprint, catalog_name, slug)`` — a database can
+    hold many named projects, and a project can be duplicated. ``schema_name`` is the
+    primary schema (the wren-core namespace) but no longer part of project identity.
+    ``owner_id`` is retained as ``created_by`` audit only; access is DB-access-derived.
+    """
 
     __tablename__ = "ai_agent_semantic_projects"
     __table_args__ = (
-        UniqueConstraint(
+        # Partial unique index: one **active** project per (database, catalog, slug).
+        # A plain unique constraint over a nullable ``deleted_at`` would not enforce
+        # this (SQL treats NULL as distinct), so soft-deleted rows are excluded via
+        # the ``deleted_at IS NULL`` predicate — real DB-level identity enforcement.
+        Index(
+            "uq_ai_agent_semantic_project_slug_active",
             "database_uri_fingerprint",
             "catalog_name",
-            "schema_name",
-            "deleted_at",
-            name="uq_ai_agent_semantic_project_scope_deleted",
+            "slug",
+            unique=True,
+            sqlite_where=text("deleted_at IS NULL"),
+            postgresql_where=text("deleted_at IS NULL"),
         ),
     )
 
     id = Column(String(36), primary_key=True)
     name = Column(String(255), nullable=False)
+    #: URL/identity-safe unique handle within (database, catalog); derived from name.
+    slug = Column(String(255), index=True, nullable=False)
     description = Column(Text, nullable=True)
     owner_id = Column(String(255), index=True, nullable=False)
     database_uri_fingerprint = Column(String(128), index=True, nullable=False)

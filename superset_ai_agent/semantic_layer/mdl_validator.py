@@ -151,6 +151,93 @@ class SchemaIndex:
     def column_type(self, table: str, column: str) -> str | None:
         return self.column_types.get(table.lower(), {}).get(column.lower())
 
+    def columns_for(self, table: str, schema: str | None = None) -> list[str]:
+        """Sorted column names for a (schema, table); empty when unknown."""
+
+        if schema and self.tables_by_schema:
+            scoped = self.tables_by_schema.get(schema.lower(), {})
+            return sorted(scoped.get(table.lower(), set()))
+        return sorted(self.tables.get(table.lower(), set()))
+
+    def search(
+        self, query: str, *, schema: str | None = None, limit: int = 10
+    ) -> list[tuple[str | None, str, float]]:
+        """Rank physical tables by keyword overlap with ``query`` (best first).
+
+        Returns ``(schema, table, score)`` triples — the physical ``schema`` is
+        carried when known (live/multi-schema index) else ``None`` (names-only
+        snapshot). Keyword scoring only (no embeddings), so it degrades
+        gracefully everywhere and **never surfaces a table outside the
+        permission-filtered index**. An empty result is the honest "no table in
+        this database matches" signal the agent should report rather than invent.
+        """
+
+        terms = _tokenize(query)
+        if not terms:
+            return []
+        candidates: list[tuple[str | None, str, set[str]]] = []
+        if schema and self.tables_by_schema:
+            scoped = self.tables_by_schema.get(schema.lower(), {})
+            candidates = [
+                (schema.lower(), table, cols) for table, cols in scoped.items()
+            ]
+        elif self.tables_by_schema:
+            for schema_name, tables in self.tables_by_schema.items():
+                for table, cols in tables.items():
+                    candidates.append((schema_name, table, cols))
+        else:
+            # Names-only snapshot (or single-schema live index without schema map).
+            candidates = [(None, table, cols) for table, cols in self.tables.items()]
+        scored: list[tuple[float, str, str | None]] = []
+        for schema_name, table, columns in candidates:
+            score = _table_match_score(terms, table, columns)
+            if score > 0:
+                scored.append((score, table, schema_name))
+        scored.sort(key=lambda row: (-row[0], row[1]))
+        capped = scored[: max(1, limit)]
+        return [(schema_name, table, score) for score, table, schema_name in capped]
+
+
+def _tokenize(text: str) -> list[str]:
+    """Lowercase alphanumeric tokens (``order_items`` → ``order``, ``items``)."""
+
+    tokens: list[str] = []
+    current: list[str] = []
+    for char in text.lower():
+        if char.isalnum():
+            current.append(char)
+        elif current:
+            tokens.append("".join(current))
+            current = []
+    if current:
+        tokens.append("".join(current))
+    return tokens
+
+
+def _table_match_score(terms: list[str], table: str, columns: set[str]) -> float:
+    """Keyword-overlap score of a query against one table's name + columns.
+
+    A table-name hit weighs most, then a name substring (handles ``orders`` ↔
+    ``order``), then a column hit. Returns ``0.0`` when nothing matches so the
+    caller can drop the table from the candidate set.
+    """
+
+    name_tokens = set(_tokenize(table))
+    column_tokens: set[str] = set()
+    for column in columns:
+        column_tokens.update(_tokenize(column))
+    score = 0.0
+    for term in terms:
+        if term in name_tokens:
+            score += 3.0
+        elif any(term in token or token in term for token in name_tokens):
+            score += 2.0
+        elif term in column_tokens:
+            score += 1.0
+        elif any(term in token or token in term for token in column_tokens):
+            score += 0.5
+    return score
+
 
 #: Coarse type families for the C3 cross-family mismatch check. Substring match on
 #: the base type (params stripped), so VARCHAR(255)→string, BIGINT→numeric. Anything

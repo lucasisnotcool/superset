@@ -215,12 +215,13 @@ def test_find_document_by_checksum_misses(store) -> None:
         store.find_document_by_checksum("project-1", "other-hash", owner_id="user-1")
         is None
     )
-    # Owner isolation: the same bytes under a different owner do not match.
+    # F5/DP11: dedup is project-scoped — the same bytes under a *different* owner in
+    # the same project now ARE a duplicate (see test_db_access_scoping). The miss
+    # that remains: the same bytes in another project are a distinct artifact.
     assert (
         store.find_document_by_checksum("project-1", "hash-1", owner_id="intruder")
-        is None
+        is not None
     )
-    # Project isolation: the same bytes in another project are a distinct artifact.
     assert (
         store.find_document_by_checksum("other-project", "hash-1", owner_id="user-1")
         is None

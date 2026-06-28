@@ -54,16 +54,23 @@ import { Splitter } from 'src/components/Splitter';
 import {
   ConversationScope,
   createMdlFile,
+  createSemanticProject,
   deleteMdlFile,
+  deleteSemanticProject,
+  duplicateSemanticProject,
   getProjectReadiness,
   getProjectSemanticLayerState,
   getSemanticJob,
+  getSemanticProject,
   listMdlFiles,
+  listProjectDocuments,
   listSemanticDocuments,
+  listSemanticProjects,
   MdlFile,
   MdlFileStatus,
   onboardSemanticProject,
   OnboardingSelection,
+  renameSemanticProject,
   resolveSemanticProject,
   runReset,
   SemanticDocument,
@@ -77,12 +84,15 @@ import {
 import SemanticLayerStateBadge from '../SemanticLayerStateBadge';
 import useDocumentIngestion from '../useDocumentIngestion';
 import InstructionsPanel from './InstructionsPanel';
-import CopilotPanel from './CopilotPanel';
+import NewProjectModal from './NewProjectModal';
+import CopilotPanel, { type CopilotKickstart } from './CopilotPanel';
 import OnboardingTablePicker from './OnboardingTablePicker';
+import AutoOnboardModal from './AutoOnboardModal';
 import MdlProvenanceDialog from './MdlProvenanceDialog';
 import CoverageBadge from './CoverageBadge';
 import SchemaSetControl from './SchemaSetControl';
 import DocumentDetailPane from './DocumentDetailPane';
+import ProjectBrowser, { ProjectBrowserProject } from './ProjectBrowser';
 import WorkspaceTree, { treeFromFiles } from './WorkspaceTree';
 import { isPendingDocumentStatus } from './documentStatus';
 
@@ -100,14 +110,38 @@ const EditorRoot = styled.div`
   `}
 `;
 
-const EditorHeader = styled.div`
+// The selected project's workspace fills the Lab's detail (right) panel.
+const WorkspacePane = styled.div`
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  height: 100%;
+`;
+
+// A thin, project-scoped action strip — the few project-level controls relocated
+// from the removed global header (schema set, provenance, Copilot toggle). It is a
+// toolbar, not a title bar: the project's identity is implied by the browser.
+const WorkspaceStrip = styled.div`
   ${({ theme }) => css`
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: ${theme.sizeUnit * 2}px;
-    padding: ${theme.sizeUnit * 3}px;
+    padding: ${theme.sizeUnit * 2}px ${theme.sizeUnit * 3}px;
     border-bottom: 1px solid ${theme.colorBorderSecondary};
+    flex-wrap: wrap;
+  `}
+`;
+
+const EmptyWorkspace = styled.div`
+  ${({ theme }) => css`
+    display: flex;
+    flex: 1;
+    align-items: center;
+    justify-content: center;
+    padding: ${theme.sizeUnit * 6}px;
+    color: ${theme.colorTextSecondary};
   `}
 `;
 
@@ -263,13 +297,32 @@ export interface SemanticLayerEditorProps {
   /** Additional schemas to seed the project's set with (primary stays
    * `schemaName`). Optional; the editor also lets a user add schemas in-place. */
   schemaNames?: string[];
+  /**
+   * First-class entry (F1/DP4): open this project by id instead of resolving the
+   * default project for `(databaseId, catalogName, schemaName)`. When set, the
+   * editor is project-keyed (the Lab/deep-link entry); when absent it keeps the
+   * legacy schema-tree resolve-or-create behavior. The scope props still bound the
+   * database for the project browser.
+   */
+  projectId?: string;
 }
+
+// The templated first turn the Auto-onboard flow sends on the user's behalf. It
+// names the doc-driven onboarding steps (read → map → onboard → relate → review)
+// so the Copilot follows the onboarding skill; the message is visible in the
+// transcript (not hidden) so the user sees and can steer the conversation.
+const AUTO_ONBOARD_MESSAGE =
+  'Read the attached document(s) and onboard the tables they describe from ' +
+  'this database, then add the relationships and enrich the models with the ' +
+  'definitions, synonyms, and metrics the document specifies. Show me one ' +
+  'changeset to review.';
 
 export default function SemanticLayerEditor({
   databaseId,
   catalogName,
   schemaName,
   schemaNames,
+  projectId,
 }: SemanticLayerEditorProps) {
   const dispatch = useDispatch();
   // Ordered, de-duplicated requested schema set with the primary (`schemaName`)
@@ -295,6 +348,20 @@ export default function SemanticLayerEditor({
   );
 
   const [project, setProject] = useState<SemanticProject | null>(null);
+  // MDL Lab project browser (F1/F2): the database's projects + which one is open.
+  // ``selectedProjectIdRef`` makes the scope-resolve refresh prefer an explicitly
+  // opened project without re-arming on every selection change.
+  const [projects, setProjects] = useState<SemanticProject[]>([]);
+  const [projectsReloadSignal, setProjectsReloadSignal] = useState(0);
+  const selectedProjectIdRef = useRef<string | null>(null);
+  const [renameTarget, setRenameTarget] = useState<SemanticProject | null>(
+    null,
+  );
+  const [renameValue, setRenameValue] = useState('');
+  const [duplicateTarget, setDuplicateTarget] =
+    useState<SemanticProject | null>(null);
+  const [duplicateIncludeDocs, setDuplicateIncludeDocs] = useState(false);
+  const [showNewProject, setShowNewProject] = useState(false);
   const [mdlFiles, setMdlFiles] = useState<MdlFile[]>([]);
   const [documents, setDocuments] = useState<SemanticDocument[]>([]);
   const [state, setState] = useState<SemanticLayerState | null>(null);
@@ -315,6 +382,12 @@ export default function SemanticLayerEditor({
   const [editorPath, setEditorPath] = useState('models/new_model.json');
   const [editorValue, setEditorValue] = useState(defaultMdl);
   const [showOnboardPicker, setShowOnboardPicker] = useState(false);
+  const [showAutoOnboard, setShowAutoOnboard] = useState(false);
+  // The kickstart handed to the Copilot when the user confirms Auto-onboard. A
+  // fresh `token` (monotonic counter, not a wall-clock — kept deterministic for
+  // tests) fires exactly one document-grounded onboarding turn.
+  const [kickstart, setKickstart] = useState<CopilotKickstart | null>(null);
+  const kickstartTokenRef = useRef(0);
   const [showProvenance, setShowProvenance] = useState(false);
   const [isOnboarding, setIsOnboarding] = useState(false);
   // Id of an onboarding job that is still running after the start call returned
@@ -385,6 +458,23 @@ export default function SemanticLayerEditor({
     [mdlFiles, documents],
   );
 
+  // The scope that drives schema-aware sub-views (instructions, graph, onboarding)
+  // is derived from the OPENED PROJECT, not the entry tab — the Lab is browse-first
+  // and may carry no schema, so the project (its primary schema + full set) is the
+  // source of truth once one is open. Falls back to the tab scope before any open.
+  const projectScope: ConversationScope = useMemo(() => {
+    if (!project) {
+      return scope;
+    }
+    return {
+      database_id: project.default_database_id ?? databaseId,
+      catalog_name: project.catalog_name ?? catalogName,
+      schema_name: project.schema_name,
+      schema_names: project.schema_names ?? [project.schema_name],
+      dataset_ids: [],
+    };
+  }, [project, scope, databaseId, catalogName]);
+
   const refresh = useCallback(async () => {
     if (!scope.schema_name) {
       setProject(null);
@@ -444,6 +534,12 @@ export default function SemanticLayerEditor({
   }, [scope]);
 
   useEffect(() => {
+    // Project-keyed entry (F1) owns loading; skip the scope resolve-or-create so
+    // the two paths never race. Legacy schema-tree entry (no `projectId`) is
+    // unchanged — identical to before, keeping the existing editor tests stable.
+    if (projectId) {
+      return;
+    }
     refresh().catch(ex => {
       dispatch(
         addDangerToast(
@@ -451,7 +547,273 @@ export default function SemanticLayerEditor({
         ),
       );
     });
-  }, [refresh, dispatch]);
+  }, [refresh, dispatch, projectId]);
+
+  // F1/F2: load the database's projects for the browser. Tolerant — a failure (or
+  // an unscoped database) just yields an empty list; never blocks the editor.
+  useEffect(() => {
+    let cancelled = false;
+    listSemanticProjects(databaseId, catalogName ?? null, null)
+      .then(list => {
+        if (!cancelled) setProjects(list);
+      })
+      .catch(() => {
+        if (!cancelled) setProjects([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [databaseId, catalogName, projectsReloadSignal]);
+
+  const reloadProjects = useCallback(
+    () => setProjectsReloadSignal(signal => signal + 1),
+    [],
+  );
+
+  // Open a project by id (F2): loads its files/state/documents/readiness and marks
+  // it as the explicitly-selected project so a scope refresh won't clobber it.
+  const openProject = useCallback(
+    async (target: SemanticProject) => {
+      selectedProjectIdRef.current = target.id;
+      setIsLoading(true);
+      try {
+        const [files, projectState, docs, readiness] = await Promise.all([
+          listMdlFiles(target.id),
+          getProjectSemanticLayerState(target.id),
+          listProjectDocuments(target.id).catch(() => [] as SemanticDocument[]),
+          getProjectReadiness(target.id).catch(() => null),
+        ]);
+        setProject(target);
+        setMdlFiles(files);
+        setState(projectState);
+        setDocuments(docs);
+        setReadinessStatus(readiness?.status ?? null);
+        setReadinessDetail(readiness?.detail ?? null);
+        setReadinessJobId(readiness?.running_job_id ?? null);
+        const firstFile = files[0] || null;
+        activeFileIdRef.current = firstFile?.id ?? null;
+        setActiveFileId(firstFile?.id ?? null);
+        if (firstFile) {
+          setEditorPath(firstFile.path);
+          setEditorValue(firstFile.content);
+        } else {
+          setEditorPath('models/new_model.json');
+          setEditorValue(defaultMdl);
+        }
+      } catch (ex) {
+        dispatch(
+          addDangerToast(
+            ex instanceof Error ? ex.message : t('Unable to open project'),
+          ),
+        );
+      } finally {
+        setIsLoading(false);
+      }
+    },
+    [dispatch],
+  );
+
+  // Refresh the CURRENTLY OPEN project by its id — not by scope. The scope-based
+  // `refresh` re-resolves a project from (database, schema); in the Lab the entry
+  // tab carries no schema, so that path would null the selection. Onboarding and
+  // the background poller use this so starting/finishing a job never deselects or
+  // blanks the workspace. Falls back to the scope resolve only for the legacy
+  // schema-tree entry (no explicitly-selected project).
+  const refreshOpenProject = useCallback(async () => {
+    const id = selectedProjectIdRef.current;
+    if (!id) {
+      await refresh();
+      return;
+    }
+    const [target, files, projectState, docs, readiness] = await Promise.all([
+      getSemanticProject(id),
+      listMdlFiles(id),
+      getProjectSemanticLayerState(id),
+      listProjectDocuments(id).catch(() => [] as SemanticDocument[]),
+      getProjectReadiness(id).catch(() => null),
+    ]);
+    // Identity-stable: same project id, refreshed contents. Never setProject(null).
+    setProject(target);
+    setMdlFiles(files);
+    setState(projectState);
+    setDocuments(docs);
+    setReadinessStatus(readiness?.status ?? null);
+    setReadinessDetail(readiness?.detail ?? null);
+    setReadinessJobId(readiness?.running_job_id ?? null);
+    setSelectedDocumentId(prev =>
+      prev && docs.some(document => document.id === prev) ? prev : null,
+    );
+    const current = activeFileIdRef.current;
+    const stillSelected = current && files.some(file => file.id === current);
+    if (!stillSelected) {
+      const firstFile = files[0] || null;
+      activeFileIdRef.current = firstFile?.id ?? null;
+      setActiveFileId(firstFile?.id ?? null);
+      if (firstFile) {
+        setEditorPath(firstFile.path);
+        setEditorValue(firstFile.content);
+      }
+    }
+  }, [refresh]);
+
+  // First-class entry (F1/DP4): when launched with a `projectId`, open that project
+  // by id (reusing the browser's tested open path) instead of resolving by schema.
+  // Additive — inert when no `projectId` is provided, so legacy entry is unchanged.
+  useEffect(() => {
+    if (!projectId) {
+      return undefined;
+    }
+    let cancelled = false;
+    getSemanticProject(projectId)
+      .then(target => (cancelled ? undefined : openProject(target)))
+      .catch(ex => {
+        if (!cancelled) {
+          dispatch(
+            addDangerToast(
+              ex instanceof Error ? ex.message : t('Unable to open project'),
+            ),
+          );
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, openProject, dispatch]);
+
+  // "New project" opens a dialog to name the project and choose its schema set
+  // (a project covers one database but may span several schemas); the first chosen
+  // schema is the primary. Creation proves DB access to every chosen schema.
+  const handleCreateSubmit = useCallback(
+    async ({
+      name,
+      schemaNames: chosen,
+    }: {
+      name: string;
+      schemaNames: string[];
+    }) => {
+      if (chosen.length === 0) {
+        return;
+      }
+      setShowNewProject(false);
+      try {
+        const created = await createSemanticProject({
+          database_id: databaseId,
+          catalog_name: catalogName ?? null,
+          schema_name: chosen[0],
+          schema_names: chosen,
+          name: name || undefined,
+        });
+        reloadProjects();
+        await openProject(created);
+        dispatch(addSuccessToast(t('Project created.')));
+      } catch (ex) {
+        dispatch(
+          addDangerToast(
+            ex instanceof Error ? ex.message : t('Unable to create project'),
+          ),
+        );
+      }
+    },
+    [databaseId, catalogName, openProject, reloadProjects, dispatch],
+  );
+
+  // Duplicate opens a confirm dialog so the user can choose whether to also copy
+  // the BI documents (DP6 opt-in); the default clone is structure-only.
+  const handleDuplicateProject = useCallback(
+    (projectId: string) => {
+      const target = projects.find(p => p.id === projectId);
+      if (target) {
+        setDuplicateTarget(target);
+        setDuplicateIncludeDocs(false);
+      }
+    },
+    [projects],
+  );
+
+  const handleDuplicateConfirm = useCallback(async () => {
+    if (!duplicateTarget) return;
+    const target = duplicateTarget;
+    const includeDocuments = duplicateIncludeDocs;
+    setDuplicateTarget(null);
+    try {
+      const clone = await duplicateSemanticProject(
+        target.id,
+        null,
+        includeDocuments,
+      );
+      reloadProjects();
+      await openProject(clone);
+      dispatch(addSuccessToast(t('Project duplicated.')));
+    } catch (ex) {
+      dispatch(
+        addDangerToast(
+          ex instanceof Error ? ex.message : t('Unable to duplicate project'),
+        ),
+      );
+    }
+  }, [
+    duplicateTarget,
+    duplicateIncludeDocs,
+    openProject,
+    reloadProjects,
+    dispatch,
+  ]);
+
+  const handleDeleteProject = useCallback(
+    async (projectId: string) => {
+      try {
+        await deleteSemanticProject(projectId);
+        reloadProjects();
+        if (selectedProjectIdRef.current === projectId) {
+          selectedProjectIdRef.current = null;
+          await refresh();
+        }
+        dispatch(addSuccessToast(t('Project deleted.')));
+      } catch (ex) {
+        dispatch(
+          addDangerToast(
+            ex instanceof Error ? ex.message : t('Unable to delete project'),
+          ),
+        );
+      }
+    },
+    [refresh, reloadProjects, dispatch],
+  );
+
+  const handleRenameSubmit = useCallback(async () => {
+    if (!renameTarget) return;
+    const name = renameValue.trim();
+    if (!name) return;
+    try {
+      const renamed = await renameSemanticProject(renameTarget.id, name);
+      reloadProjects();
+      setRenameTarget(null);
+      if (selectedProjectIdRef.current === renamed.id) setProject(renamed);
+      dispatch(addSuccessToast(t('Project renamed.')));
+    } catch (ex) {
+      dispatch(
+        addDangerToast(
+          ex instanceof Error ? ex.message : t('Unable to rename project'),
+        ),
+      );
+    }
+  }, [renameTarget, renameValue, reloadProjects, dispatch]);
+
+  const browserProjects: ProjectBrowserProject[] = useMemo(
+    () =>
+      projects.map(item => ({
+        id: item.id,
+        name: item.name,
+        slug: item.slug ?? '',
+        primarySchema: item.schema_name,
+        schemaCount: item.schema_names?.length || 1,
+        databaseLabel: item.database_label ?? null,
+        permission: item.permission === 'read' ? 'read' : 'write',
+        updatedAt: item.updated_at,
+        coverageScore: item.coverage_score ?? null,
+      })),
+    [projects],
+  );
 
   // Widen the project to cover another schema. Re-resolves with the expanded set
   // (the backend proves access to the new schema before associating it), then
@@ -675,11 +1037,11 @@ export default function SemanticLayerEditor({
           // rather than reporting a premature success. The success/warning toast
           // and the file refresh fire when the job actually finishes.
           setPendingJobId(job.id);
-          await refresh();
+          await refreshOpenProject();
           return;
         }
         announceOnboardingComplete(job);
-        await refresh();
+        await refreshOpenProject();
       } catch (ex) {
         dispatch(
           addDangerToast(
@@ -690,7 +1052,7 @@ export default function SemanticLayerEditor({
         setIsOnboarding(false);
       }
     },
-    [refresh, dispatch, announceOnboardingComplete],
+    [refreshOpenProject, dispatch, announceOnboardingComplete],
   );
 
   // The onboarding job to poll: one we started this session (`pendingJobId`) or,
@@ -732,7 +1094,7 @@ export default function SemanticLayerEditor({
         } else {
           announceOnboardingComplete(job);
         }
-        await refresh();
+        await refreshOpenProject();
         return;
       }
       attemptsLeft -= 1;
@@ -748,7 +1110,7 @@ export default function SemanticLayerEditor({
             ),
           ),
         );
-        await refresh();
+        await refreshOpenProject();
         return;
       }
       timer = setTimeout(poll, ONBOARDING_POLL_INTERVAL_MS);
@@ -759,7 +1121,13 @@ export default function SemanticLayerEditor({
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [pollJobId, project, dispatch, announceOnboardingComplete, refresh]);
+  }, [
+    pollJobId,
+    project,
+    dispatch,
+    announceOnboardingComplete,
+    refreshOpenProject,
+  ]);
 
   // Live workspace tree: while any document is still extracting, re-fetch the
   // document list so its status badge advances to terminal without a manual
@@ -891,366 +1259,423 @@ export default function SemanticLayerEditor({
 
   return (
     <EditorRoot data-test="semantic-layer-editor">
-      <EditorHeader>
-        <Flex align="center" gap="small">
-          <Flex vertical gap={0}>
-            <Flex align="center" gap="small">
-              <Typography.Title level={5} style={{ margin: 0 }}>
-                {project?.name || t('Semantic layer')}
-              </Typography.Title>
-              {/* Provenance lives beside the schema name — the history of THIS MDL
-                  directory, where a user expects to find it. */}
-              <Tooltip title={t('Provenance')}>
-                <Button
-                  buttonStyle="link"
-                  buttonSize="small"
-                  disabled={!project}
-                  icon={<Icons.HistoryOutlined iconSize="m" />}
-                  onClick={() => setShowProvenance(true)}
-                  aria-label={t('Provenance')}
-                  data-test="open-provenance"
-                />
-              </Tooltip>
-              <CoverageBadge
-                projectId={project?.id}
-                // Only the active set drives coverage; key on it so draft edits
-                // don't trigger redundant status refetches (SSE handles the rest).
-                refreshSignal={mdlFiles
-                  .filter(file => file.status === 'active')
-                  .map(file => `${file.id}:${file.checksum}`)
-                  .join(',')}
-              />
-            </Flex>
-            <SemanticLayerStateBadge state={state} />
-            {project && (
-              <SchemaSetControl
-                schemaNames={project.schema_names ?? [project.schema_name]}
-                primarySchema={project.schema_name}
-                databaseId={databaseId}
-                catalogName={catalogName}
-                canEdit={canWrite}
-                onAddSchema={addSchema}
-              />
-            )}
-          </Flex>
-        </Flex>
-        <Button
-          buttonStyle={showCopilot ? 'primary' : 'tertiary'}
-          buttonSize="small"
-          icon={<Icons.CommentOutlined iconSize="m" />}
-          onClick={() => setShowCopilot(value => !value)}
-          data-test="toggle-copilot"
+      {/* MDL Lab master–detail: the project browser is the master (left); the
+          selected project's workspace (Models / Instructions / Graph + Copilot) is
+          the detail (right). There is no global header — project-level controls live
+          in the workspace strip, and per-project status in the browser rows. */}
+      <EditorSplitter>
+        <Splitter.Panel
+          collapsible={{ start: true, end: true, showCollapsibleIcon: true }}
+          defaultSize={300}
+          min={220}
         >
-          {t('Copilot')}
-        </Button>
-      </EditorHeader>
-      <ContentTabs
-        defaultActiveKey="models"
-        items={[
-          {
-            key: 'models',
-            label: t('Models'),
-            children: (
-              <EditorSplitter>
-                <Splitter.Panel
-                  collapsible={{
-                    start: true,
-                    end: true,
-                    showCollapsibleIcon: true,
-                  }}
-                  defaultSize={260}
-                  min={180}
-                >
-                  <BrowserPane>
-                    {!scope.schema_name && (
-                      <Alert
-                        type="warning"
-                        message={t('Select a database and schema.')}
-                      />
-                    )}
-                    <Flex gap="small" wrap="wrap">
-                      <Button
-                        buttonStyle="primary"
-                        disabled={!project || !canWrite || isLoading}
-                        onClick={() => saveFile()}
-                        icon={<Icons.SaveOutlined iconSize="m" />}
-                      >
-                        {t('Save')}
-                      </Button>
-                      <Button
-                        buttonStyle="tertiary"
-                        disabled={!project || !canWrite || isLoading}
-                        onClick={startNewFile}
-                        icon={<Icons.PlusOutlined iconSize="m" />}
-                      >
-                        {t('New')}
-                      </Button>
-                    </Flex>
-                    <ScrollList>
-                      <WorkspaceTree
-                        root={workspaceRoot}
-                        activeFileId={activeFileId}
-                        activeDocumentId={selectedDocumentId}
-                        onSelectFile={fileId => {
-                          const file = mdlFiles.find(
-                            item => item.id === fileId,
-                          );
-                          if (file) {
-                            selectFile(file);
-                          }
-                        }}
-                        onSelectDocument={selectDocument}
-                        onDuplicateFile={duplicateFile}
-                        onDeleteFiles={deleteFiles}
-                        renderActions={node => {
-                          const file = mdlFiles.find(
-                            item => item.id === node.file_id,
-                          );
-                          if (!file) {
-                            return null;
-                          }
-                          return (
-                            <Tooltip title={STATUS_TOGGLE_HELP}>
-                              <Switch
-                                size="small"
-                                checked={file.status === 'active'}
-                                disabled={!canWrite || isLoading}
-                                checkedChildren={t('Active')}
-                                unCheckedChildren={t('Draft')}
-                                onChange={checked =>
-                                  toggleFileStatus(file, checked)
-                                }
-                              />
-                            </Tooltip>
-                          );
-                        }}
-                      />
-                    </ScrollList>
+          <BrowserPane>
+            <ProjectBrowser
+              projects={browserProjects}
+              loading={isLoading}
+              activeProjectId={project?.id ?? null}
+              onOpen={projectId => {
+                const target = projects.find(p => p.id === projectId);
+                if (target) openProject(target);
+              }}
+              onCreate={() => setShowNewProject(true)}
+              onDuplicate={handleDuplicateProject}
+              onRename={projectId => {
+                const target = projects.find(p => p.id === projectId);
+                if (target) {
+                  setRenameTarget(target);
+                  setRenameValue(target.name);
+                }
+              }}
+              onDelete={handleDeleteProject}
+            />
+          </BrowserPane>
+        </Splitter.Panel>
+        <Splitter.Panel className="semantic-editor-center-panel">
+          {project ? (
+            <WorkspacePane data-test="mdl-workspace">
+              <WorkspaceStrip>
+                <SchemaSetControl
+                  schemaNames={project.schema_names ?? [project.schema_name]}
+                  primarySchema={project.schema_name}
+                  databaseId={databaseId}
+                  catalogName={catalogName}
+                  canEdit={canWrite}
+                  onAddSchema={addSchema}
+                />
+                <Flex align="center" gap="small" wrap="wrap">
+                  <SemanticLayerStateBadge state={state} />
+                  <CoverageBadge
+                    projectId={project.id}
+                    refreshSignal={mdlFiles
+                      .filter(file => file.status === 'active')
+                      .map(file => `${file.id}:${file.checksum}`)
+                      .join(',')}
+                  />
+                  <Tooltip title={t('Provenance')}>
                     <Button
-                      block
-                      buttonStyle="tertiary"
-                      disabled={
-                        !project ||
-                        !canWrite ||
-                        isLoading ||
-                        mdlFiles.length === 0
-                      }
-                      onClick={() => setAllStatuses(!allActive)}
-                      icon={
-                        allActive ? (
-                          <Icons.MinusCircleOutlined iconSize="m" />
-                        ) : (
-                          <Icons.CheckCircleOutlined iconSize="m" />
-                        )
-                      }
-                    >
-                      {allActive ? t('Deactivate all') : t('Activate all')}
-                    </Button>
-                    <Flex gap="small" wrap="wrap">
-                      <input
-                        ref={uploadInputRef}
-                        type="file"
-                        multiple
-                        accept=".json,.md,.markdown,.txt,.csv,.html,.pdf,.docx,.xlsx,.pptx"
-                        css={css`
-                          display: none;
-                        `}
-                        onChange={handleUpload}
-                        data-test="semantic-upload-input"
-                      />
-                      <Tooltip
-                        title={t(
-                          'Upload a document (PDF, Word, Excel, PowerPoint, CSV, ' +
-                            'HTML, Markdown, JSON). It is added to the workspace ' +
-                            'and vectorized for the Copilot and viewer.',
-                        )}
-                      >
-                        <Button
-                          buttonStyle="tertiary"
-                          disabled={
-                            !project || !canWrite || isLoading || isIngesting
-                          }
-                          loading={isIngesting}
-                          onClick={() => uploadInputRef.current?.click()}
-                          icon={<Icons.UploadOutlined iconSize="m" />}
-                          data-test="semantic-upload-document"
+                      buttonStyle="link"
+                      buttonSize="small"
+                      icon={<Icons.HistoryOutlined iconSize="m" />}
+                      onClick={() => setShowProvenance(true)}
+                      aria-label={t('Provenance')}
+                      data-test="open-provenance"
+                    />
+                  </Tooltip>
+                  <Button
+                    buttonStyle={showCopilot ? 'primary' : 'tertiary'}
+                    buttonSize="small"
+                    icon={<Icons.CommentOutlined iconSize="m" />}
+                    onClick={() => setShowCopilot(value => !value)}
+                    data-test="toggle-copilot"
+                  >
+                    {t('Copilot')}
+                  </Button>
+                </Flex>
+              </WorkspaceStrip>
+              <ContentTabs
+                defaultActiveKey="models"
+                items={[
+                  {
+                    key: 'models',
+                    label: t('Models'),
+                    children: (
+                      <EditorSplitter>
+                        <Splitter.Panel
+                          collapsible={{
+                            start: true,
+                            end: true,
+                            showCollapsibleIcon: true,
+                          }}
+                          defaultSize={260}
+                          min={180}
                         >
-                          {t('Upload document')}
-                        </Button>
-                      </Tooltip>
-                      <Button
-                        buttonStyle="tertiary"
-                        loading={isResetting}
-                        disabled={
-                          !project ||
-                          !canWrite ||
-                          isLoading ||
-                          onboardingInFlight ||
-                          isResetting
-                        }
-                        onClick={() => setShowResetConfirm(true)}
-                        icon={<Icons.ReloadOutlined iconSize="m" />}
-                      >
-                        {isResetting ? t('Resetting…') : t('Reset')}
-                      </Button>
-                    </Flex>
-                  </BrowserPane>
-                </Splitter.Panel>
-                <Splitter.Panel className="semantic-editor-center-panel">
-                  <EditorPane>
-                    {selectedDocument ? (
-                      <DocumentDetailPane
-                        document={selectedDocument}
-                        canWrite={canWrite}
-                        onDeleted={() => {
-                          setSelectedDocumentId(null);
-                          refresh();
-                        }}
-                        onChanged={refresh}
-                      />
-                    ) : (
-                      <>
-                        <Flex align="center" gap="small">
-                          <Input
-                            value={editorPath}
-                            disabled={!canWrite || isLoading}
-                            onChange={(event: ChangeEvent<HTMLInputElement>) =>
-                              setEditorPath(event.target.value)
-                            }
-                          />
-                          {isDirty && (
-                            <Tooltip title={t('You have unsaved changes')}>
-                              <Tag
-                                color="warning"
-                                data-test="mdl-dirty-indicator"
+                          <BrowserPane>
+                            <Flex gap="small" wrap="wrap">
+                              <Button
+                                buttonStyle="primary"
+                                disabled={!project || !canWrite || isLoading}
+                                onClick={() => saveFile()}
+                                icon={<Icons.SaveOutlined iconSize="m" />}
                               >
-                                {t('Unsaved')}
-                              </Tag>
-                            </Tooltip>
-                          )}
-                        </Flex>
-                        <StyledEditorHost
-                          id={`semantic-mdl-${project?.id || 'empty'}`}
-                          height="100%"
-                          language="json"
-                          onChange={setEditorValue}
-                          readOnly={!canWrite || isLoading}
-                          value={editorValue}
-                          width="100%"
-                          annotations={editorAnnotations}
-                        />
-                        {activeFile?.validation &&
-                          !activeFile.validation.valid && (
-                            <Alert
-                              type="warning"
-                              message={activeFile.validation.messages
-                                .map(message => message.message)
-                                .join('\n')}
-                            />
-                          )}
-                        <Flex justify="space-between" gap="small" wrap="wrap">
-                          <Flex gap="small" wrap="wrap">
+                                {t('Save')}
+                              </Button>
+                              <Button
+                                buttonStyle="tertiary"
+                                disabled={!project || !canWrite || isLoading}
+                                onClick={startNewFile}
+                                icon={<Icons.PlusOutlined iconSize="m" />}
+                              >
+                                {t('New')}
+                              </Button>
+                            </Flex>
+                            <ScrollList>
+                              <WorkspaceTree
+                                root={workspaceRoot}
+                                activeFileId={activeFileId}
+                                activeDocumentId={selectedDocumentId}
+                                onSelectFile={fileId => {
+                                  const file = mdlFiles.find(
+                                    item => item.id === fileId,
+                                  );
+                                  if (file) {
+                                    selectFile(file);
+                                  }
+                                }}
+                                onSelectDocument={selectDocument}
+                                onDuplicateFile={duplicateFile}
+                                onDeleteFiles={deleteFiles}
+                                renderActions={node => {
+                                  const file = mdlFiles.find(
+                                    item => item.id === node.file_id,
+                                  );
+                                  if (!file) {
+                                    return null;
+                                  }
+                                  return (
+                                    <Tooltip title={STATUS_TOGGLE_HELP}>
+                                      <Switch
+                                        size="small"
+                                        checked={file.status === 'active'}
+                                        disabled={!canWrite || isLoading}
+                                        checkedChildren={t('Active')}
+                                        unCheckedChildren={t('Draft')}
+                                        onChange={checked =>
+                                          toggleFileStatus(file, checked)
+                                        }
+                                      />
+                                    </Tooltip>
+                                  );
+                                }}
+                              />
+                            </ScrollList>
                             <Button
-                              buttonStyle="primary"
-                              disabled={!project || !canWrite || isLoading}
-                              onClick={() => saveFile()}
-                              icon={<Icons.SaveOutlined iconSize="m" />}
-                            >
-                              {t('Save draft')}
-                            </Button>
-                            <Button
-                              buttonStyle="tertiary"
-                              disabled={!project || !canWrite || isLoading}
-                              onClick={() => saveFile('active')}
-                              icon={<Icons.CheckCircleOutlined iconSize="m" />}
-                            >
-                              {t('Activate')}
-                            </Button>
-                            <Button
+                              block
                               buttonStyle="tertiary"
                               disabled={
-                                !activeFile || isLoading || isValidating
+                                !project ||
+                                !canWrite ||
+                                isLoading ||
+                                mdlFiles.length === 0
                               }
-                              loading={isValidating}
-                              onClick={validateActiveFile}
-                              icon={<Icons.CheckCircleOutlined iconSize="m" />}
-                              data-test="mdl-validate"
+                              onClick={() => setAllStatuses(!allActive)}
+                              icon={
+                                allActive ? (
+                                  <Icons.MinusCircleOutlined iconSize="m" />
+                                ) : (
+                                  <Icons.CheckCircleOutlined iconSize="m" />
+                                )
+                              }
                             >
-                              {t('Validate')}
+                              {allActive
+                                ? t('Deactivate all')
+                                : t('Activate all')}
                             </Button>
-                          </Flex>
-                          <Button
-                            buttonStyle="danger"
-                            disabled={
-                              !activeFile || !project || !canWrite || isLoading
-                            }
-                            onClick={() => activeFile && deleteFile(activeFile)}
-                            icon={<Icons.DeleteOutlined iconSize="m" />}
+                            <Flex gap="small" wrap="wrap">
+                              <input
+                                ref={uploadInputRef}
+                                type="file"
+                                multiple
+                                accept=".json,.md,.markdown,.txt,.csv,.html,.pdf,.docx,.xlsx,.pptx"
+                                css={css`
+                                  display: none;
+                                `}
+                                onChange={handleUpload}
+                                data-test="semantic-upload-input"
+                              />
+                              <Tooltip
+                                title={t(
+                                  'Upload a document (PDF, Word, Excel, PowerPoint, CSV, ' +
+                                    'HTML, Markdown, JSON). It is added to the workspace ' +
+                                    'and vectorized for the Copilot and viewer.',
+                                )}
+                              >
+                                <Button
+                                  buttonStyle="tertiary"
+                                  disabled={
+                                    !project ||
+                                    !canWrite ||
+                                    isLoading ||
+                                    isIngesting
+                                  }
+                                  loading={isIngesting}
+                                  onClick={() =>
+                                    uploadInputRef.current?.click()
+                                  }
+                                  icon={<Icons.UploadOutlined iconSize="m" />}
+                                  data-test="semantic-upload-document"
+                                >
+                                  {t('Upload document')}
+                                </Button>
+                              </Tooltip>
+                              <Button
+                                buttonStyle="tertiary"
+                                loading={isResetting}
+                                disabled={
+                                  !project ||
+                                  !canWrite ||
+                                  isLoading ||
+                                  onboardingInFlight ||
+                                  isResetting
+                                }
+                                onClick={() => setShowResetConfirm(true)}
+                                icon={<Icons.ReloadOutlined iconSize="m" />}
+                              >
+                                {isResetting ? t('Resetting…') : t('Reset')}
+                              </Button>
+                            </Flex>
+                          </BrowserPane>
+                        </Splitter.Panel>
+                        <Splitter.Panel className="semantic-editor-center-panel">
+                          <EditorPane>
+                            {selectedDocument ? (
+                              <DocumentDetailPane
+                                document={selectedDocument}
+                                canWrite={canWrite}
+                                onDeleted={() => {
+                                  setSelectedDocumentId(null);
+                                  refresh();
+                                }}
+                                onChanged={refresh}
+                              />
+                            ) : (
+                              <>
+                                <Flex align="center" gap="small">
+                                  <Input
+                                    value={editorPath}
+                                    disabled={!canWrite || isLoading}
+                                    onChange={(
+                                      event: ChangeEvent<HTMLInputElement>,
+                                    ) => setEditorPath(event.target.value)}
+                                  />
+                                  {isDirty && (
+                                    <Tooltip
+                                      title={t('You have unsaved changes')}
+                                    >
+                                      <Tag
+                                        color="warning"
+                                        data-test="mdl-dirty-indicator"
+                                      >
+                                        {t('Unsaved')}
+                                      </Tag>
+                                    </Tooltip>
+                                  )}
+                                </Flex>
+                                <StyledEditorHost
+                                  id={`semantic-mdl-${project?.id || 'empty'}`}
+                                  height="100%"
+                                  language="json"
+                                  onChange={setEditorValue}
+                                  readOnly={!canWrite || isLoading}
+                                  value={editorValue}
+                                  width="100%"
+                                  annotations={editorAnnotations}
+                                />
+                                {activeFile?.validation &&
+                                  !activeFile.validation.valid && (
+                                    <Alert
+                                      type="warning"
+                                      message={activeFile.validation.messages
+                                        .map(message => message.message)
+                                        .join('\n')}
+                                    />
+                                  )}
+                                <Flex
+                                  justify="space-between"
+                                  gap="small"
+                                  wrap="wrap"
+                                >
+                                  <Flex gap="small" wrap="wrap">
+                                    <Button
+                                      buttonStyle="primary"
+                                      disabled={
+                                        !project || !canWrite || isLoading
+                                      }
+                                      onClick={() => saveFile()}
+                                      icon={<Icons.SaveOutlined iconSize="m" />}
+                                    >
+                                      {t('Save draft')}
+                                    </Button>
+                                    <Button
+                                      buttonStyle="tertiary"
+                                      disabled={
+                                        !project || !canWrite || isLoading
+                                      }
+                                      onClick={() => saveFile('active')}
+                                      icon={
+                                        <Icons.CheckCircleOutlined iconSize="m" />
+                                      }
+                                    >
+                                      {t('Activate')}
+                                    </Button>
+                                    <Button
+                                      buttonStyle="tertiary"
+                                      disabled={
+                                        !activeFile || isLoading || isValidating
+                                      }
+                                      loading={isValidating}
+                                      onClick={validateActiveFile}
+                                      icon={
+                                        <Icons.CheckCircleOutlined iconSize="m" />
+                                      }
+                                      data-test="mdl-validate"
+                                    >
+                                      {t('Validate')}
+                                    </Button>
+                                  </Flex>
+                                  <Button
+                                    buttonStyle="danger"
+                                    disabled={
+                                      !activeFile ||
+                                      !project ||
+                                      !canWrite ||
+                                      isLoading
+                                    }
+                                    onClick={() =>
+                                      activeFile && deleteFile(activeFile)
+                                    }
+                                    icon={<Icons.DeleteOutlined iconSize="m" />}
+                                  >
+                                    {t('Delete')}
+                                  </Button>
+                                </Flex>
+                              </>
+                            )}
+                          </EditorPane>
+                        </Splitter.Panel>
+                        {showCopilot && project ? (
+                          <Splitter.Panel
+                            collapsible={{
+                              start: true,
+                              end: true,
+                              showCollapsibleIcon: true,
+                            }}
+                            defaultSize={360}
+                            min={280}
                           >
-                            {t('Delete')}
-                          </Button>
-                        </Flex>
-                      </>
-                    )}
-                  </EditorPane>
-                </Splitter.Panel>
-                {showCopilot && project ? (
-                  <Splitter.Panel
-                    collapsible={{
-                      start: true,
-                      end: true,
-                      showCollapsibleIcon: true,
-                    }}
-                    defaultSize={360}
-                    min={280}
-                  >
-                    <CopilotRail data-test="copilot-rail">
-                      {/* The panel stays mounted in every state so its chat
+                            <CopilotRail data-test="copilot-rail">
+                              {/* The panel stays mounted in every state so its chat
                           transcript survives empty↔ready transitions (e.g. after
                           reset) within a session. When not `ready` it renders a
                           bootstrap view (help text + Onboard/Retry) instead of the
                           chat — onboarding is shown as a separate process. */}
-                      <CopilotPanel
-                        projectId={project.id}
+                              <CopilotPanel
+                                projectId={project.id}
+                                canWrite={canWrite}
+                                onApplied={refresh}
+                                readinessStatus={railStatus}
+                                readinessDetail={readinessDetail}
+                                onOnboard={() => setShowOnboardPicker(true)}
+                                onAutoOnboard={() => setShowAutoOnboard(true)}
+                                kickstart={kickstart ?? undefined}
+                                onDocumentsChanged={refresh}
+                              />
+                            </CopilotRail>
+                          </Splitter.Panel>
+                        ) : null}
+                      </EditorSplitter>
+                    ),
+                  },
+                  {
+                    key: 'instructions',
+                    label: t('Instructions'),
+                    children: (
+                      <InstructionsPanel
+                        scope={projectScope}
                         canWrite={canWrite}
-                        onApplied={refresh}
-                        readinessStatus={railStatus}
-                        readinessDetail={readinessDetail}
-                        onOnboard={() => setShowOnboardPicker(true)}
-                        onDocumentsChanged={refresh}
                       />
-                    </CopilotRail>
-                  </Splitter.Panel>
-                ) : null}
-              </EditorSplitter>
-            ),
-          },
-          {
-            key: 'instructions',
-            label: t('Instructions'),
-            children: <InstructionsPanel scope={scope} canWrite={canWrite} />,
-          },
-          {
-            key: 'graph',
-            label: t('Graph'),
-            children: (
-              <Suspense fallback={null}>
-                <SchemaGraph
-                  mdlFiles={mdlFiles}
-                  databaseId={databaseId}
-                  catalogName={catalogName}
-                  schemaName={schemaName}
-                />
-              </Suspense>
-            ),
-          },
-        ]}
-      />
+                    ),
+                  },
+                  {
+                    key: 'graph',
+                    label: t('Graph'),
+                    children: (
+                      <Suspense fallback={null}>
+                        <SchemaGraph
+                          mdlFiles={mdlFiles}
+                          databaseId={databaseId}
+                          catalogName={catalogName}
+                          schemaName={projectScope.schema_name ?? schemaName}
+                        />
+                      </Suspense>
+                    ),
+                  },
+                ]}
+              />
+            </WorkspacePane>
+          ) : (
+            <EmptyWorkspace data-test="mdl-empty">
+              {t('Select a project to open, or create one.')}
+            </EmptyWorkspace>
+          )}
+        </Splitter.Panel>
+      </EditorSplitter>
       <OnboardingTablePicker
         open={showOnboardPicker}
         databaseId={databaseId}
         catalogName={catalogName}
-        schema={schemaName}
+        schemas={project?.schema_names ?? [schemaName]}
+        primarySchema={project?.schema_name ?? schemaName}
         canWrite={canWrite}
         onCancel={() => setShowOnboardPicker(false)}
         onConfirm={selection => {
@@ -1258,6 +1683,28 @@ export default function SemanticLayerEditor({
           if (project) {
             runOnboard(project.id, selection);
           }
+        }}
+      />
+      <AutoOnboardModal
+        open={showAutoOnboard}
+        canWrite={canWrite}
+        documents={documents}
+        isUploading={isIngesting}
+        onUpload={async files => (await ingest(files)).map(r => r.document)}
+        onCancel={() => setShowAutoOnboard(false)}
+        onConfirm={selected => {
+          setShowAutoOnboard(false);
+          if (!selected.length) return;
+          // Make sure the rail is visible, then fire one kickstart turn.
+          setShowCopilot(true);
+          kickstartTokenRef.current += 1;
+          setKickstart({
+            token: kickstartTokenRef.current,
+            message: AUTO_ONBOARD_MESSAGE,
+            documents: selected,
+          });
+          // The uploaded docs now live in the workspace; refresh the tree.
+          refresh();
         }}
       />
       <MdlProvenanceDialog
@@ -1281,6 +1728,58 @@ export default function SemanticLayerEditor({
             'Uploaded documents are kept, so you can re-enrich afterward. This ' +
             'cannot be undone.',
         )}
+      />
+      <ConfirmModal
+        show={!!renameTarget}
+        onHide={() => setRenameTarget(null)}
+        onConfirm={handleRenameSubmit}
+        confirmText={t('Rename')}
+        title={t('Rename project')}
+        body={
+          <Input
+            data-test="project-rename-input"
+            value={renameValue}
+            onChange={event => setRenameValue(event.target.value)}
+            onPressEnter={handleRenameSubmit}
+            placeholder={t('Project name')}
+          />
+        }
+      />
+      <NewProjectModal
+        open={showNewProject}
+        databaseId={databaseId}
+        catalogName={catalogName}
+        onSubmit={handleCreateSubmit}
+        onCancel={() => setShowNewProject(false)}
+      />
+      <ConfirmModal
+        show={!!duplicateTarget}
+        onHide={() => setDuplicateTarget(null)}
+        onConfirm={handleDuplicateConfirm}
+        confirmText={t('Duplicate')}
+        title={t('Duplicate project')}
+        body={
+          <Flex vertical gap="small">
+            <Typography.Text>
+              {t(
+                'Creates a copy of this project’s models and schema set with a ' +
+                  'fresh history.',
+              )}
+            </Typography.Text>
+            <Flex align="center" gap="small">
+              <Switch
+                size="small"
+                checked={duplicateIncludeDocs}
+                onChange={setDuplicateIncludeDocs}
+                data-test="duplicate-include-documents"
+                aria-label={t('Also copy uploaded documents')}
+              />
+              <Typography.Text>
+                {t('Also copy uploaded documents')}
+              </Typography.Text>
+            </Flex>
+          </Flex>
+        }
       />
     </EditorRoot>
   );

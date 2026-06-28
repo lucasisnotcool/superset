@@ -31,9 +31,9 @@ def _seed(connection: sa.Connection) -> None:
     connection.execute(
         sa.text(
             "INSERT INTO ai_agent_semantic_projects "
-            "(id,name,owner_id,database_uri_fingerprint,schema_name,visibility,"
+            "(id,name,slug,owner_id,database_uri_fingerprint,schema_name,visibility,"
             "status,created_at,updated_at,current_version_id) VALUES "
-            "('p1','proj','o','fp','public','db_access','active',"
+            "('p1','proj','proj','o','fp','public','db_access','active',"
             "CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'v1')"
         )
     )

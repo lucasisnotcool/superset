@@ -232,6 +232,24 @@ afterEach(() => {
   jest.restoreAllMocks();
 });
 
+test('header shows the title and the thread actions (stacked, both visible)', async () => {
+  // UP1: the title and the action buttons are siblings in a vertical header, so a
+  // narrow rail never breaks "MDL Copilot" one char per line — both render together.
+  installFetch();
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+    />,
+  );
+
+  expect(screen.getByText('MDL Copilot')).toBeInTheDocument();
+  expect(screen.getByTestId('copilot-new-chat')).toBeInTheDocument();
+  expect(screen.getByTestId('copilot-history-toggle')).toBeInTheDocument();
+});
+
 test('streams the copilot, shows a diff, and applies accepted changes', async () => {
   const fetchFn = installFetch();
   const onApplied = jest.fn();
@@ -324,7 +342,7 @@ test('opens the inspector drawer and loads agent context', async () => {
   expect(await screen.findByText('You are MDL Copilot.')).toBeInTheDocument();
 });
 
-test('empty layer shows an Onboard call-to-action instead of the chat', async () => {
+test('empty layer opens the chat with an Onboard banner (F4 ungate)', async () => {
   installFetch();
   const onOnboard = jest.fn();
   render(
@@ -336,15 +354,11 @@ test('empty layer shows an Onboard call-to-action instead of the chat', async ()
     />,
   );
 
-  // Bootstrap view, not chat: no composer, no coverage/inspector affordances.
-  expect(screen.getByTestId('copilot-not-ready')).toBeInTheDocument();
-  expect(screen.queryByTestId('copilot-input')).not.toBeInTheDocument();
-  expect(
-    screen.queryByTestId('copilot-coverage-toggle'),
-  ).not.toBeInTheDocument();
-  expect(
-    screen.queryByTestId('copilot-inspector-toggle'),
-  ).not.toBeInTheDocument();
+  // F4: the chat is available even on an empty project (it can drive onboarding),
+  // and the one-click whole-schema onboard affordance is preserved as a banner.
+  expect(screen.getByTestId('copilot-input')).toBeInTheDocument();
+  expect(screen.queryByTestId('copilot-not-ready')).not.toBeInTheDocument();
+  expect(screen.getByTestId('copilot-onboard-banner')).toBeInTheDocument();
 
   await userEvent.click(screen.getByTestId('copilot-onboard'));
   expect(onOnboard).toHaveBeenCalledTimes(1);
@@ -885,4 +899,73 @@ test('a stale stored thread that 404s is forgotten, not surfaced as an error', a
     ).toBeNull(),
   );
   expect(screen.getByTestId('copilot-input')).toBeInTheDocument();
+});
+
+const AUTO_MSG = 'Read the attached document(s) and onboard the tables.';
+
+test('a kickstart fires one document-grounded onboarding turn (and not twice)', async () => {
+  // Auto-onboard: the parent passes a kickstart and the panel sends one turn with
+  // the documents attached — no manual typing.
+  const fetchFn = installFetch();
+  const docs = [ingestedDoc()];
+
+  const { rerender } = render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="empty"
+      onOnboard={jest.fn()}
+      kickstart={{ token: 1, message: AUTO_MSG, documents: docs }}
+    />,
+  );
+
+  expect(
+    await screen.findByText('Created the orders model.'),
+  ).toBeInTheDocument();
+
+  const streamCall = fetchFn.mock.calls.find(([url]) =>
+    String(url).endsWith('/copilot/stream'),
+  );
+  const body = JSON.parse((streamCall?.[1] as RequestInit).body as string);
+  expect(body.message).toBe(AUTO_MSG);
+  expect(body.attachments[0].text).toContain('Quarterly revenue');
+
+  const streamCount = () =>
+    fetchFn.mock.calls.filter(([url]) =>
+      String(url).endsWith('/copilot/stream'),
+    ).length;
+  const before = streamCount();
+  // A re-render with the SAME token must not re-fire the turn (the guard).
+  rerender(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="empty"
+      onOnboard={jest.fn()}
+      kickstart={{ token: 1, message: AUTO_MSG, documents: docs }}
+    />,
+  );
+  expect(streamCount()).toBe(before);
+});
+
+test('a kickstart is ignored without write permission', async () => {
+  const fetchFn = installFetch();
+
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite={false}
+      readinessStatus="empty"
+      onOnboard={jest.fn()}
+      kickstart={{ token: 1, message: AUTO_MSG, documents: [ingestedDoc()] }}
+    />,
+  );
+
+  // The banner renders (component settled); the read-only kickstart sent nothing.
+  await screen.findByTestId('copilot-onboard');
+  expect(
+    fetchFn.mock.calls.filter(([url]) =>
+      String(url).endsWith('/copilot/stream'),
+    ),
+  ).toHaveLength(0);
 });

@@ -60,9 +60,12 @@ afterEach(() => {
 });
 
 const renderPanel = (props: Partial<{ canWrite: boolean }> = {}) =>
-  render(<InstructionsPanel scope={scope} canWrite={props.canWrite ?? true} />, {
-    useRedux: true,
-  });
+  render(
+    <InstructionsPanel scope={scope} canWrite={props.canWrite ?? true} />,
+    {
+      useRedux: true,
+    },
+  );
 
 test('lists existing instructions for the scope', async () => {
   fetchMock.get(LIST_URL, [makeInstruction()]);
@@ -70,6 +73,16 @@ test('lists existing instructions for the scope', async () => {
   expect(
     await screen.findByText('Always filter out test accounts'),
   ).toBeInTheDocument();
+});
+
+test('shows a clear note that instructions are personal, not shared', async () => {
+  // DP-NEW: the rest of a shared project is visible to all DB-authorized users,
+  // but instructions are personal — the UI must say so explicitly.
+  fetchMock.get(LIST_URL, []);
+  renderPanel();
+  const note = await screen.findByTestId('instructions-personal-note');
+  expect(note).toHaveTextContent(/personal/i);
+  expect(note).toHaveTextContent(/other users with access to this database/i);
 });
 
 test('renders an empty state when there are no instructions', async () => {
@@ -94,7 +107,9 @@ test('creates an instruction and refreshes the list', async () => {
     screen.getByTestId('instruction-input'),
     'Always filter out test accounts',
   );
-  await userEvent.click(screen.getByRole('button', { name: /Add instruction/ }));
+  await userEvent.click(
+    screen.getByRole('button', { name: /Add instruction/ }),
+  );
 
   await waitFor(() =>
     expect(fetchMock.callHistory.calls(CREATE_URL)).toHaveLength(1),
@@ -119,7 +134,9 @@ test('sends is_global when "Always apply" is toggled on', async () => {
 
   await userEvent.type(screen.getByTestId('instruction-input'), 'Use UTC');
   await userEvent.click(screen.getByRole('switch'));
-  await userEvent.click(screen.getByRole('button', { name: /Add instruction/ }));
+  await userEvent.click(
+    screen.getByRole('button', { name: /Add instruction/ }),
+  );
 
   await waitFor(() =>
     expect(fetchMock.callHistory.calls(CREATE_URL)).toHaveLength(1),
@@ -172,6 +189,6 @@ test('surfaces a load error without crashing', async () => {
   renderPanel();
   // The panel renders its static help copy even when the list load fails.
   expect(
-    await screen.findByText(/Instructions steer SQL generation/),
+    await screen.findByText(/Only your own instructions are listed/),
   ).toBeInTheDocument();
 });

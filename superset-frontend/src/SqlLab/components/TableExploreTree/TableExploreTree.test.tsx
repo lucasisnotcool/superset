@@ -29,7 +29,7 @@ import userEvent from '@testing-library/user-event';
 import type { Store } from 'redux';
 import reducerIndex from 'spec/helpers/reducerIndex';
 import { initialState, defaultQueryEditor } from 'src/SqlLab/fixtures';
-import { buildSemanticLayerEditorId } from 'src/SqlLab/actions/sqlLab';
+import { buildMdlLabId } from 'src/SqlLab/actions/sqlLab';
 import type { SqlLabRootState } from 'src/SqlLab/types';
 
 import { ViewLocations } from 'src/SqlLab/contributions';
@@ -40,8 +40,7 @@ import {
 import TableExploreTree from '.';
 
 const getSqlLabState = (store: Store) =>
-  (store.getState() as unknown as { sqlLab: SqlLabRootState['sqlLab'] })
-    .sqlLab;
+  (store.getState() as unknown as { sqlLab: SqlLabRootState['sqlLab'] }).sqlLab;
 
 jest.mock(
   'react-virtualized-auto-sizer',
@@ -361,11 +360,9 @@ test('closes a schema while searchTerm is active and keeps it closed', async () 
   expect(screen.getByText('public')).toBeInTheDocument();
 });
 
-test('clicking a schema row\'s "Open semantic layer" action dispatches openSemanticLayerEditor for that row, not the active editor', async () => {
-  // Regression test for the bug where semantic-layer access was bound to
-  // whatever schema the active query editor's dropdown had selected, instead
-  // of the specific schema row the user clicked in the tree (which can show
-  // multiple schemas at once).
+test('the per-schema semantic-layer action is gone (UP3: MDL Lab is the only entry)', async () => {
+  // The schema-tree row no longer opens a schema-bound editor; the database-level
+  // "Open MDL Lab" toolbar action is the single entry point.
   const store = createStore(getInitialState(), reducerIndex);
   render(<TableExploreTree queryEditorId={mockedQueryEditorId} />, { store });
 
@@ -373,27 +370,27 @@ test('clicking a schema row\'s "Open semantic layer" action dispatches openSeman
     expect(screen.getByText('public')).toBeInTheDocument();
   });
 
-  // Hover-revealed action buttons render a <span role="button"> with no
-  // visible text or aria-label; target it via its data-test attribute
-  // (testIdAttribute is configured to 'data-test' in spec/helpers/setup.ts),
-  // the same convention used by the existing pin/refresh schema actions.
-  const action = screen.getByTestId('semantic-layer-public');
-  fireEvent.click(action);
+  expect(screen.queryByTestId('semantic-layer-public')).not.toBeInTheDocument();
+});
 
-  const expectedId = buildSemanticLayerEditorId(
-    mockedDatabase.id,
-    null,
-    'public',
-  );
+test('the toolbar "Open MDL Lab" action opens a browse-first, schema-less Lab tab', async () => {
+  // F1 first-class destination: a database-wide project browser (no schema).
+  const store = createStore(getInitialState(), reducerIndex);
+  render(<TableExploreTree queryEditorId={mockedQueryEditorId} />, { store });
+
+  await waitFor(() => {
+    expect(screen.getByText('public')).toBeInTheDocument();
+  });
+
+  fireEvent.click(screen.getByTestId('open-mdl-lab'));
+
+  const expectedId = buildMdlLabId(mockedDatabase.id, null);
   expect(getSqlLabState(store).semanticLayerEditors).toEqual([
     {
       id: expectedId,
       databaseId: mockedDatabase.id,
       catalogName: null,
-      schemaName: 'public',
     },
   ]);
-  expect(getSqlLabState(store).activeSemanticLayerEditorId).toEqual(
-    expectedId,
-  );
+  expect(getSqlLabState(store).activeSemanticLayerEditorId).toEqual(expectedId);
 });

@@ -164,9 +164,7 @@ test('loads the project once per scope without re-fetch loops', async () => {
     { useRedux: true },
   );
 
-  await waitFor(() => {
-    expect(screen.getByText('Database 1.prod.main')).toBeInTheDocument();
-  });
+  await screen.findByTestId('mdl-workspace');
 
   // Selecting the first file must not re-trigger the load effect: the project
   // is resolved and listed exactly once for the scope.
@@ -193,9 +191,7 @@ test('shows the Copilot rail by default and toggles it off', async () => {
     { useRedux: true },
   );
 
-  await waitFor(() => {
-    expect(screen.getByText('Database 1.prod.main')).toBeInTheDocument();
-  });
+  await screen.findByTestId('mdl-workspace');
   await waitFor(() => {
     expect(screen.getByTestId('copilot-rail')).toBeInTheDocument();
   });
@@ -205,9 +201,10 @@ test('shows the Copilot rail by default and toggles it off', async () => {
   expect(screen.queryByTestId('copilot-rail')).not.toBeInTheDocument();
 });
 
-test('blocks the Copilot with an onboarding prompt until a base model is active', async () => {
-  // A project with only draft (non-active) MDL is not "ready": the Copilot rail
-  // shows the onboarding bootstrap view rather than the chat.
+test('opens the Copilot on a not-yet-ready project with an Onboard banner (F4)', async () => {
+  // F4: a project with only draft (non-active) MDL is "empty" but the Copilot is
+  // available — it can drive onboarding. The chat mounts alongside an Onboard
+  // banner (the one-click whole-schema affordance is preserved).
   const draftFile = { ...mdlFile('a', 'models/a.json'), status: 'draft' };
   mockBaseRoutes([draftFile]);
 
@@ -216,14 +213,12 @@ test('blocks the Copilot with an onboarding prompt until a base model is active'
     { useRedux: true },
   );
 
+  await screen.findByTestId('mdl-workspace');
   await waitFor(() => {
-    expect(screen.getByText('Database 1.prod.main')).toBeInTheDocument();
+    expect(screen.getByTestId('copilot-input')).toBeInTheDocument();
   });
-  await waitFor(() => {
-    expect(screen.getByTestId('copilot-not-ready')).toBeInTheDocument();
-  });
-  // The chat surface is gated; the onboarding CTA is shown instead.
-  expect(screen.queryByTestId('copilot-input')).not.toBeInTheDocument();
+  expect(screen.queryByTestId('copilot-not-ready')).not.toBeInTheDocument();
+  expect(screen.getByTestId('copilot-onboard-banner')).toBeInTheDocument();
   expect(screen.getByTestId('copilot-onboard')).toBeInTheDocument();
 });
 
@@ -241,7 +236,7 @@ test('mounts the Copilot once a base model is active (ready)', async () => {
   expect(screen.queryByTestId('copilot-not-ready')).not.toBeInTheDocument();
 });
 
-test('does not auto-onboard an empty schema; shows the Onboard CTA instead', async () => {
+test('does not auto-onboard an empty schema; offers the Onboard banner (F4)', async () => {
   mockBaseRoutes([]);
   mockOnboard();
 
@@ -251,17 +246,38 @@ test('does not auto-onboard an empty schema; shows the Onboard CTA instead', asy
   );
 
   await waitFor(() => {
-    expect(screen.getByTestId('copilot-not-ready')).toBeInTheDocument();
+    expect(screen.getByTestId('copilot-input')).toBeInTheDocument();
   });
-  // The explicit onboarding CTA is shown and no chat composer is mounted.
+  // F4: the chat is available on an empty project; the one-click onboard affordance
+  // is offered as a banner (the agent can also onboard from a doc).
+  expect(screen.getByTestId('copilot-onboard-banner')).toBeInTheDocument();
   expect(screen.getByTestId('copilot-onboard')).toBeInTheDocument();
-  expect(screen.queryByTestId('copilot-input')).not.toBeInTheDocument();
   // Critically: onboarding is NOT fired automatically.
   expect(
     fetchMock.callHistory.calls(
       'http://agent.local/agent/semantic-layer/projects/project-1/onboard',
     ),
   ).toHaveLength(0);
+});
+
+test('the Auto-onboard banner button opens the document picker modal', async () => {
+  // Wiring: the primary empty-state action opens AutoOnboardModal (the doc-driven
+  // onboarding entry). The kickstart-through-stream path is covered by the
+  // CopilotPanel + AutoOnboardModal unit suites.
+  mockBaseRoutes([]);
+  mockOnboard();
+
+  render(
+    <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="main" />,
+    { useRedux: true },
+  );
+
+  await screen.findByTestId('copilot-auto-onboard');
+  // The manual path is demoted to a secondary button, still present.
+  expect(screen.getByTestId('copilot-onboard')).toBeInTheDocument();
+
+  await userEvent.click(screen.getByTestId('copilot-auto-onboard'));
+  expect(await screen.findByTestId('auto-onboard-modal')).toBeInTheDocument();
 });
 
 test('the provenance button opens the MDL history dialog', async () => {
@@ -418,9 +434,7 @@ test('Upload document ingests files through the shared pipeline (no dialog)', as
     { useRedux: true },
   );
 
-  await waitFor(() => {
-    expect(screen.getByText('Database 1.prod.main')).toBeInTheDocument();
-  });
+  await screen.findByTestId('mdl-workspace');
 
   // The button stays, but the legacy staging dialog is gone — Upload now runs the
   // same persist+vectorize pipeline as Copilot Attach, just without a chat.
@@ -491,9 +505,7 @@ test('Reset confirms, deletes all MDL, and does NOT re-onboard', async () => {
     { useRedux: true },
   );
 
-  await waitFor(() => {
-    expect(screen.getByText('Database 1.prod.main')).toBeInTheDocument();
-  });
+  await screen.findByTestId('mdl-workspace');
 
   // Clicking Reset opens a confirmation dialog and does NOT call the endpoint yet.
   await userEvent.click(screen.getByRole('button', { name: /Reset/i }));
@@ -762,3 +774,178 @@ test(
   },
   20000,
 );
+
+test('browse-first MDL Lab (no schema) lists projects and does not resolve', async () => {
+  // F1 destination: opened for a whole database with no schema. The project
+  // browser lists the database's projects; nothing is resolved/created until the
+  // user opens one.
+  mockBaseRoutes([]);
+  const project2 = { ...project, id: 'project-2', name: 'Second Project' };
+  fetchMock.get('begin:http://agent.local/agent/semantic-layer/projects?', [
+    project,
+    project2,
+  ]);
+
+  render(
+    <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="" />,
+    { useRedux: true },
+  );
+
+  // The browser shows the database's projects …
+  await waitFor(() => {
+    expect(screen.getByText('Second Project')).toBeInTheDocument();
+  });
+  // … the browse hint is shown …
+  expect(screen.getByText(/Select a project to open/)).toBeInTheDocument();
+  // … and nothing was resolved/created by schema.
+  expect(
+    fetchMock.callHistory.calls(
+      'http://agent.local/agent/semantic-layer/projects/resolve',
+    ),
+  ).toHaveLength(0);
+});
+
+test('shows the empty workspace until a project is opened (UP4)', async () => {
+  // The Lab is master-detail: with no project selected the detail pane shows the
+  // empty state and no workspace (Models/Instructions/Graph live under a project).
+  mockBaseRoutes([]);
+  fetchMock.get('begin:http://agent.local/agent/semantic-layer/projects?', [
+    project,
+  ]);
+
+  render(
+    <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="" />,
+    { useRedux: true },
+  );
+
+  expect(await screen.findByTestId('mdl-empty')).toBeInTheDocument();
+  expect(screen.queryByTestId('mdl-workspace')).not.toBeInTheDocument();
+});
+
+test('"New project" opens the schema-picker dialog (UP2)', async () => {
+  mockBaseRoutes([]);
+  fetchMock.get('begin:http://agent.local/agent/semantic-layer/projects?', [
+    project,
+  ]);
+  fetchMock.get('glob:*/api/v1/database/*/schemas/*', { result: [] });
+
+  render(
+    <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="" />,
+    { useRedux: true },
+  );
+
+  await screen.findByTestId('project-new');
+  await userEvent.click(screen.getByTestId('project-new'));
+
+  // The create dialog (name + schema multi-select) appears instead of an
+  // immediate schema-less create.
+  expect(await screen.findByTestId('new-project-schemas')).toBeInTheDocument();
+  expect(screen.getByTestId('new-project-create')).toBeDisabled();
+});
+
+test('opens by projectId without resolving by schema (F1 first-class entry)', async () => {
+  mockBaseRoutes([mdlFile('a', 'models/a.json')]);
+  // Project-keyed entry loads the project by id (GET /projects/{id}) + its docs.
+  fetchMock.get(
+    'http://agent.local/agent/semantic-layer/projects/project-1',
+    project,
+  );
+  fetchMock.get(
+    'http://agent.local/agent/semantic-layer/projects/project-1/documents',
+    [],
+  );
+  fetchMock.get('begin:http://agent.local/agent/semantic-layer/projects?', [
+    project,
+  ]);
+
+  render(
+    <SemanticLayerEditor
+      databaseId={1}
+      catalogName="prod"
+      schemaName="main"
+      projectId="project-1"
+    />,
+    { useRedux: true },
+  );
+
+  // The name shows in both the header and the browser row, so match ≥1.
+  await waitFor(() => {
+    expect(screen.getAllByText('Database 1.prod.main').length).toBeGreaterThan(
+      0,
+    );
+  });
+  // It loaded the project by id …
+  await waitFor(() => {
+    expect(
+      fetchMock.callHistory.calls(
+        'http://agent.local/agent/semantic-layer/projects/project-1',
+      ),
+    ).toHaveLength(1);
+  });
+  // … and never resolved by schema (the legacy entry is bypassed).
+  expect(
+    fetchMock.callHistory.calls(
+      'http://agent.local/agent/semantic-layer/projects/resolve',
+    ),
+  ).toHaveLength(0);
+});
+
+test('browses the database projects and opens a second one (F1/F2)', async () => {
+  mockBaseRoutes([mdlFile('a', 'models/a.json')]);
+  const project2 = {
+    ...project,
+    id: 'project-2',
+    name: 'Second Project',
+    slug: 'second-project',
+  };
+  // The MDL Lab project list for the database (tolerant `begin:` matcher).
+  fetchMock.get('begin:http://agent.local/agent/semantic-layer/projects?', [
+    project,
+    project2,
+  ]);
+  // Opening project-2 loads its own files/state/readiness/documents by id.
+  fetchMock.get(
+    'http://agent.local/agent/semantic-layer/projects/project-2/mdl-files',
+    [{ ...mdlFile('p2', 'models/p2.json'), project_id: 'project-2' }],
+  );
+  fetchMock.get(
+    'http://agent.local/agent/semantic-layer/projects/project-2/readiness',
+    readinessFor([{ status: 'active' }]),
+  );
+  fetchMock.get(
+    'http://agent.local/agent/semantic-layer/projects/project-2/state',
+    {
+      project_id: 'project-2',
+      database_id: 1,
+      catalog_name: 'prod',
+      schema_name: 'main',
+      dataset_ids: [],
+      document_count: 0,
+      last_error: null,
+    },
+  );
+  fetchMock.get(
+    'http://agent.local/agent/semantic-layer/projects/project-2/documents',
+    [],
+  );
+
+  render(
+    <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="main" />,
+    { useRedux: true },
+  );
+
+  // Both projects are listed in the browser.
+  await waitFor(() => {
+    expect(screen.getByText('Second Project')).toBeInTheDocument();
+  });
+
+  // Open the second project → it loads by id (proves the switch wiring).
+  await userEvent.click(screen.getByText('Second Project'));
+  await waitFor(() => {
+    expect(
+      fetchMock.callHistory.calls(
+        'http://agent.local/agent/semantic-layer/projects/project-2/mdl-files',
+      ),
+    ).toHaveLength(1);
+  });
+});

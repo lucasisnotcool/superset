@@ -28,13 +28,21 @@ from __future__ import annotations
 
 import json  # noqa: TID251 - standalone agent JSON contract
 import logging
+from types import SimpleNamespace
 from typing import Any, Callable, Protocol
 
 from superset_ai_agent.conversations.store import DEFAULT_OWNER_ID
-from superset_ai_agent.llm.base import ToolSpec
+from superset_ai_agent.llm.base import ModelClient, ToolSpec
+from superset_ai_agent.llm.embeddings import Embedder
+from superset_ai_agent.semantic_layer.copilot.coverage import (
+    CoverageDocument,
+    run_directory_coverage,
+)
 from superset_ai_agent.semantic_layer.copilot.schemas import (
     Changeset,
     ChangesetItem,
+    ToolActionKind,
+    ToolCallRecord,
 )
 from superset_ai_agent.semantic_layer.document_chunks import (
     DocumentChunk,
@@ -46,6 +54,7 @@ from superset_ai_agent.semantic_layer.document_retriever import (
     find_exact_duplicate_matches,
 )
 from superset_ai_agent.semantic_layer.mdl_files import normalize_mdl_path
+from superset_ai_agent.semantic_layer.mdl_schema import JOIN_TYPES
 from superset_ai_agent.semantic_layer.mdl_validator import (
     SchemaIndex,
     validate_mdl,
@@ -58,6 +67,12 @@ from superset_ai_agent.semantic_layer.schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Default cap on ``read_document`` output. Bounds context cost on a large BI doc
+#: while still letting the agent see the whole spec; the agent can raise it via
+#: ``max_chars`` or page with ``search_documents``. Aligned with the frontend's
+#: 200KB attach slice (this is the read-side equivalent, kept a touch smaller).
+_READ_DOCUMENT_MAX_CHARS = 100_000
 
 
 class DocumentReader(Protocol):
@@ -97,6 +112,10 @@ class MdlToolset:
         project_id: str | None = None,
         owner_id: str | None = None,
         retrieve_k: int = 8,
+        model_client: ModelClient | None = None,
+        embedder: Embedder | None = None,
+        instructions: list[str] | None = None,
+        coverage_self_audit_limit: int = 2,
     ) -> None:
         self._originals: dict[str, MdlFile] = {f.path: f for f in files}
         #: Mutable staging copy seeded with every original file's content.
@@ -116,6 +135,25 @@ class MdlToolset:
         #: Document ids the agent pulled passages from (search_documents) — the
         #: enrichment-provenance signal, stamped onto the built changeset.
         self._referenced_document_ids: list[str] = []
+        #: Per-mutating-call provenance ledger (write/delete/onboard/relate),
+        #: stamped onto the built changeset's ``tool_calls``.
+        self._tool_calls: list[ToolCallRecord] = []
+        #: Watermark into ``_referenced_document_ids``: docs searched *since the
+        #: previous mutating call* are the grounding for the next one. Lets a
+        #: search→write pair attribute the searched doc to the written file (R-B6).
+        self._grounding_watermark = 0
+        #: path → source document id, when a single doc grounded the write. Read by
+        #: ``build_changeset`` to stamp each item's ``source_document_id``.
+        self._file_grounding: dict[str, str] = {}
+        #: Coverage self-review deps (read-only ``run_coverage`` tool). The model
+        #: client drives claim extraction/judging; the audit is per-turn capped and
+        #: memoized so the agent can review-then-refine without unbounded LLM cost.
+        self._model_client = model_client
+        self._embedder = embedder
+        self._instructions = instructions or []
+        self._coverage_self_audit_limit = coverage_self_audit_limit
+        self._coverage_audits_done = 0
+        self._coverage_memo: dict[str, dict[str, Any]] = {}
 
     @property
     def _documents_available(self) -> bool:
@@ -193,6 +231,148 @@ class MdlToolset:
                 parameters={"type": "object", "properties": {}},
             ),
             ToolSpec(
+                name="find_tables",
+                description=(
+                    "Find the physical tables in this database that match a "
+                    "free-text query — use it to map an entity a BI doc names "
+                    "(e.g. 'customer orders') to the real tables to onboard, "
+                    "instead of reading the whole schema. Returns only the top "
+                    "candidates with their columns/types; an empty result means "
+                    "no table in the project's accessible schemas matches."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Entity / table name to look for.",
+                        },
+                        "schema": {
+                            "type": "string",
+                            "description": (
+                                "Restrict to one physical schema (multi-schema "
+                                "project); omit to search every accessible schema."
+                            ),
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max candidate tables (default 10).",
+                        },
+                    },
+                    "required": ["query"],
+                },
+            ),
+            ToolSpec(
+                name="propose_onboard_table",
+                description=(
+                    "Onboard one physical table as a base MDL model in one step: "
+                    "generates a model from the real columns/types and stages it. "
+                    "Use this to bring a table referenced by a BI doc into the "
+                    "project (optionally specifying its schema for a multi-schema "
+                    "project). The table must exist in the project's accessible "
+                    "schemas; relationships are added separately with write_mdl_file."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "table": {
+                            "type": "string",
+                            "description": "Physical table name to onboard.",
+                        },
+                        "schema": {
+                            "type": "string",
+                            "description": (
+                                "Physical schema of the table (for a multi-schema "
+                                "project); omit for a single-schema project."
+                            ),
+                        },
+                    },
+                    "required": ["table"],
+                },
+            ),
+            ToolSpec(
+                name="propose_onboard_tables",
+                description=(
+                    "Onboard several physical tables in one step — the cross-schema "
+                    "BI-doc flow: pass the tables a document names and each is staged "
+                    "as a base model from its real columns/types. Every table must "
+                    "exist in the project's accessible schemas; unknown tables are "
+                    "rejected per-item. Add the joins afterwards with "
+                    "propose_relationships."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "tables": {
+                            "type": "array",
+                            "description": (
+                                "Tables to onboard. Each item is an object "
+                                "{table, schema?} (schema for a multi-schema project)."
+                            ),
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "table": {"type": "string"},
+                                    "schema": {"type": "string"},
+                                },
+                                "required": ["table"],
+                            },
+                        },
+                    },
+                    "required": ["tables"],
+                },
+            ),
+            ToolSpec(
+                name="propose_relationships",
+                description=(
+                    "Stage joins between already-onboarded models as a reviewable "
+                    "changeset — use after onboarding tables to wire up the "
+                    "cross-schema relationships a BI doc describes. Both endpoint "
+                    "models must already exist in the project."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "relationships": {
+                            "type": "array",
+                            "description": "Relationships (joins) to add.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {
+                                        "type": "string",
+                                        "description": "Optional relationship name.",
+                                    },
+                                    "models": {
+                                        "type": "array",
+                                        "description": (
+                                            "Exactly two model names to join."
+                                        ),
+                                        "items": {"type": "string"},
+                                    },
+                                    "joinType": {
+                                        "type": "string",
+                                        "description": (
+                                            "ONE_TO_ONE | ONE_TO_MANY | MANY_TO_ONE "
+                                            "| MANY_TO_MANY."
+                                        ),
+                                    },
+                                    "condition": {
+                                        "type": "string",
+                                        "description": (
+                                            "Join condition, e.g. "
+                                            "'orders.customer_id = customers.id'."
+                                        ),
+                                    },
+                                },
+                                "required": ["models", "joinType", "condition"],
+                            },
+                        },
+                    },
+                    "required": ["relationships"],
+                },
+            ),
+            ToolSpec(
                 name="list_documents",
                 description=(
                     "List the uploaded reference documents (glossaries, specs) for "
@@ -223,6 +403,45 @@ class MdlToolset:
                 },
             ),
             ToolSpec(
+                name="read_document",
+                description=(
+                    "Read the full text of one uploaded document by id — use it to "
+                    "extract the complete set of entities, joins, and metric "
+                    "definitions a BI doc describes (search_documents only returns "
+                    "top passages and can miss the section that lists them). Text "
+                    "is truncated past 'max_chars'."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "document_id": {
+                            "type": "string",
+                            "description": "Id of the document (see list_documents).",
+                        },
+                        "max_chars": {
+                            "type": "integer",
+                            "description": (
+                                "Max characters to return (default "
+                                f"{_READ_DOCUMENT_MAX_CHARS})."
+                            ),
+                        },
+                    },
+                    "required": ["document_id"],
+                },
+            ),
+            ToolSpec(
+                name="run_coverage",
+                description=(
+                    "Audit how well the current (staged) MDL captures the "
+                    "information in the project's documents — your self-review step "
+                    "after onboarding/enriching. Returns a score and the specific "
+                    "claims that are missing or only partially modeled, so you can "
+                    "add what's left before handing the changeset to the user. "
+                    "Read-only; capped per turn."
+                ),
+                parameters={"type": "object", "properties": {}},
+            ),
+            ToolSpec(
                 name="find_duplicate_documents",
                 description=(
                     "Find exact-duplicate passages across the uploaded documents "
@@ -242,17 +461,65 @@ class MdlToolset:
             "delete_mdl_file": self._delete_mdl_file,
             "validate_project": self._validate_project,
             "get_physical_schema": self._get_physical_schema,
+            "find_tables": self._find_tables,
+            "read_document": self._read_document,
+            "propose_onboard_table": self._propose_onboard_table,
+            "propose_onboard_tables": self._propose_onboard_tables,
+            "propose_relationships": self._propose_relationships,
             "list_documents": self._list_documents,
             "search_documents": self._search_documents,
+            "run_coverage": self._run_coverage,
             "find_duplicate_documents": self._find_duplicate_documents,
         }.get(name)
         if handler is None:
             return {"error": f"Unknown tool {name!r}."}
         try:
-            return handler(arguments or {})
+            result = handler(arguments or {})
         except Exception as ex:  # pylint: disable=broad-except
             logger.warning("Copilot tool %s failed: %s", name, ex)
-            return {"error": str(ex)}
+            result = {"error": str(ex)}
+        if name in _MUTATING_ACTIONS:
+            self._record_mutation(name, arguments or {}, result)
+        return result
+
+    # -- provenance ledger -------------------------------------------------
+
+    def _record_mutation(
+        self, name: str, args: dict[str, Any], result: dict[str, Any]
+    ) -> None:
+        """Append one ``ToolCallRecord`` for a mutating tool call (best-effort).
+
+        Records the verb, the files touched (from the tool result, which the
+        diff later treats as authoritative for paths), the docs that grounded
+        this call (the ``search_documents`` delta since the previous mutation —
+        a single-doc grounding is stamped per-file for R-B6), and a
+        sensitivity-aware argument *shape* (names/counts only, never MDL JSON).
+        """
+
+        # Grounding = docs searched since the previous mutating call.
+        grounding = self._referenced_document_ids[self._grounding_watermark :]
+        self._grounding_watermark = len(self._referenced_document_ids)
+
+        action = _MUTATING_ACTIONS[name]
+        paths, args_summary, detail = _summarize_mutation(name, args, result)
+        status = "error" if isinstance(result, dict) and "error" in result else "ok"
+        if status == "error":
+            detail = str(result.get("error")) if isinstance(result, dict) else detail
+        self._tool_calls.append(
+            ToolCallRecord(
+                tool=name,
+                action=action,
+                paths=paths,
+                source_document_ids=list(grounding),
+                args_summary=args_summary,
+                status=status,
+                detail=detail,
+            )
+        )
+        # R-B6: a single grounding doc links the written file(s) to their source.
+        if status == "ok" and len(grounding) == 1:
+            for path in paths:
+                self._file_grounding[path] = grounding[0]
 
     # -- tool implementations ---------------------------------------------
 
@@ -339,6 +606,292 @@ class MdlToolset:
             result["column_types"] = self._schema_index.typed_tables()
         return result
 
+    def _find_tables(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Rank the project's physical tables against a free-text query (read-only).
+
+        Targeted discovery for the doc→table mapping step: returns only the top
+        candidates with their columns, never the whole schema (which floods the
+        context on a real warehouse). Ranks over the permission-filtered
+        ``SchemaIndex``, so a table outside the project's accessible schemas is
+        never surfaced — and an empty result is the honest "no match" signal.
+        """
+
+        query = args.get("query")
+        if not isinstance(query, str) or not query.strip():
+            return {"error": "find_tables requires a 'query' string."}
+        if self._schema_index is None:
+            return {"tables": [], "note": "No physical schema available."}
+        schema = args.get("schema")
+        schema = schema if isinstance(schema, str) and schema.strip() else None
+        raw_limit = args.get("limit")
+        limit = raw_limit if isinstance(raw_limit, int) and raw_limit > 0 else 10
+        matches = self._schema_index.search(query, schema=schema, limit=limit)
+        tables: list[dict[str, Any]] = []
+        for match_schema, table, score in matches:
+            columns: list[dict[str, Any]] = []
+            for column in self._schema_index.columns_for(table, match_schema):
+                entry: dict[str, Any] = {"name": column}
+                column_type = self._schema_index.column_type(table, column)
+                if column_type:
+                    entry["type"] = column_type
+                columns.append(entry)
+            candidate: dict[str, Any] = {
+                "table": table,
+                "columns": columns,
+                "score": round(score, 2),
+            }
+            if match_schema:
+                candidate["schema"] = match_schema
+            tables.append(candidate)
+        return {"tables": tables}
+
+    def _read_document(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Return one document's full extracted text (read-only, bounded).
+
+        Complements ``search_documents`` (top-k passages) for *extraction* tasks
+        where the agent needs the whole BI doc to enumerate every entity/join/
+        metric. Falls back to the document's chunks when the flat extract is
+        absent; truncates past ``max_chars`` and flags it.
+        """
+
+        document_id = args.get("document_id")
+        if not isinstance(document_id, str) or not document_id.strip():
+            return {"error": "read_document requires a 'document_id' string."}
+        if not self._documents_available:
+            return {"error": "No documents available."}
+        assert self._document_store is not None
+        assert self._project_id is not None
+        raw_max = args.get("max_chars")
+        max_chars = (
+            raw_max
+            if isinstance(raw_max, int) and raw_max > 0
+            else _READ_DOCUMENT_MAX_CHARS
+        )
+        documents = self._document_store.list_project_documents(
+            self._project_id, owner_id=self._owner_id
+        )
+        document = next((doc for doc in documents if doc.id == document_id), None)
+        if document is None:
+            return {"error": f"No document {document_id!r} in this project."}
+        text = document.extracted_text or ""
+        if not text:
+            chunks = [
+                chunk
+                for chunk in self._document_store.list_project_chunks(
+                    self._project_id, owner_id=self._owner_id
+                )
+                if chunk.document_id == document_id
+            ]
+            chunks.sort(key=lambda chunk: chunk.chunk_index)
+            text = "\n".join(chunk.text for chunk in chunks)
+        return {
+            "filename": document.filename,
+            "text": text[:max_chars],
+            "truncated": len(text) > max_chars,
+        }
+
+    def _propose_onboard_table(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Generate + stage a base model for one physical table (R1-safe).
+
+        Builds the model from the permission-filtered ``SchemaIndex`` only — a table
+        absent from the project's accessible schemas is rejected, never invented —
+        then routes through ``write_mdl_file`` so the same validation + staging apply.
+        """
+
+        table = args.get("table")
+        if not isinstance(table, str) or not table.strip():
+            return {"error": "propose_onboard_table requires a 'table' name."}
+        schema = args.get("schema")
+        schema = schema if isinstance(schema, str) and schema.strip() else None
+        return self._stage_onboard_table(table, schema)
+
+    def _propose_onboard_tables(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Onboard several physical tables in one call (the BI-doc, cross-schema flow).
+
+        Each item ``{table, schema?}`` is staged through the same R1-safe path as the
+        singular tool: every table is checked against the project's accessible schemas
+        and rejected (never invented) if absent. Valid tables are staged; rejected ones
+        are reported per-table so the agent can correct the batch — partial success is
+        intentional (one bad name shouldn't drop the rest of a multi-schema onboard).
+        """
+
+        items = args.get("tables")
+        if not isinstance(items, list) or not items:
+            return {
+                "error": (
+                    "propose_onboard_tables requires a non-empty 'tables' list of "
+                    "{table, schema?} objects."
+                )
+            }
+        onboarded: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
+        for item in items:
+            if isinstance(item, str):
+                table, schema = item, None
+            elif isinstance(item, dict):
+                raw_table = item.get("table")
+                table = raw_table if isinstance(raw_table, str) else ""
+                raw_schema = item.get("schema")
+                schema = (
+                    raw_schema
+                    if isinstance(raw_schema, str) and raw_schema.strip()
+                    else None
+                )
+            else:
+                rejected.append({"table": item, "error": "Invalid table entry."})
+                continue
+            if not table.strip():
+                rejected.append({"table": table, "error": "Missing table name."})
+                continue
+            result = self._stage_onboard_table(table, schema)
+            if "error" in result:
+                rejected.append({"table": table, "error": result["error"]})
+            else:
+                onboarded.append({"table": table, "path": result.get("path")})
+        return {"onboarded": onboarded, "rejected": rejected}
+
+    def _stage_onboard_table(self, table: str, schema: str | None) -> dict[str, Any]:
+        """Shared R1-safe onboarding core for the singular + plural onboard tools."""
+
+        if self._schema_index is None:
+            return {"error": "No physical schema is available to onboard from."}
+        if not self._schema_index.has_table(table, schema):
+            qualified = f"{schema}.{table}" if schema else table
+            return {
+                "error": (
+                    f"Table '{qualified}' is not in the project's accessible "
+                    "schemas; add the schema to the project before onboarding it."
+                )
+            }
+        table_ref: dict[str, Any] = {"table": table}
+        if schema:
+            table_ref["schema"] = schema
+        columns_payload: list[dict[str, Any]] = []
+        for column in self._schema_index.columns_for(table, schema):
+            entry: dict[str, Any] = {"name": column}
+            column_type = self._schema_index.column_type(table, column)
+            if column_type:
+                entry["type"] = column_type
+            columns_payload.append(entry)
+        model: dict[str, Any] = {
+            "name": _safe_model_name(table),
+            "tableReference": table_ref,
+            "columns": columns_payload,
+        }
+        content = json.dumps({"models": [model]}, indent=2)
+        path = f"models/{_safe_model_name(table)}.json"
+        result = self._write_mdl_file(
+            {"path": path, "content": content, "summary": f"Onboard {table}"}
+        )
+        result["onboarded_table"] = table
+        return result
+
+    def _propose_relationships(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Stage cross-model relationships (joins) as a reviewable changeset.
+
+        Relationships connect models that were *already* onboarded through the
+        access-proof path, so the R1 schema-in-set invariant is upheld upstream: this
+        tool only joins existing logical models, never reaches a physical table. Each
+        ``{models:[m1,m2], joinType, condition, name?}`` is checked — both endpoints
+        must be defined models, ``joinType`` must be a known wren-core join type, and a
+        non-empty ``condition`` is required — then staged under ``relationships/``.
+        """
+
+        items = args.get("relationships")
+        if not isinstance(items, list) or not items:
+            return {
+                "error": (
+                    "propose_relationships requires a non-empty 'relationships' list "
+                    "of {models:[m1,m2], joinType, condition, name?} objects."
+                )
+            }
+        known_models = self._working_model_names()
+        staged: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                rejected.append({"relationship": item, "error": "Invalid entry."})
+                continue
+            endpoints = item.get("models")
+            if (
+                not isinstance(endpoints, list)
+                or len(endpoints) != 2
+                or not all(isinstance(m, str) and m.strip() for m in endpoints)
+            ):
+                rejected.append(
+                    {"relationship": item, "error": "Need exactly two model names."}
+                )
+                continue
+            missing = [m for m in endpoints if m not in known_models]
+            if missing:
+                rejected.append(
+                    {
+                        "relationship": item,
+                        "error": (
+                            f"Unknown model(s) {missing}; onboard them first "
+                            "(propose_onboard_table) before relating them."
+                        ),
+                    }
+                )
+                continue
+            join_type = item.get("joinType")
+            if not isinstance(join_type, str) or join_type.upper() not in JOIN_TYPES:
+                rejected.append(
+                    {
+                        "relationship": item,
+                        "error": (
+                            f"Invalid joinType {join_type!r}; expected one of "
+                            f"{sorted(JOIN_TYPES)}."
+                        ),
+                    }
+                )
+                continue
+            condition = item.get("condition")
+            if not isinstance(condition, str) or not condition.strip():
+                rejected.append(
+                    {"relationship": item, "error": "A 'condition' is required."}
+                )
+                continue
+            name = item.get("name")
+            name = (
+                name
+                if isinstance(name, str) and name.strip()
+                else f"{endpoints[0]}_{endpoints[1]}"
+            )
+            relationship: dict[str, Any] = {
+                "name": name,
+                "models": endpoints,
+                "joinType": join_type.upper(),
+                "condition": condition,
+            }
+            content = json.dumps({"relationships": [relationship]}, indent=2)
+            path = f"relationships/{_safe_model_name(name)}.json"
+            result = self._write_mdl_file(
+                {
+                    "path": path,
+                    "content": content,
+                    "summary": f"Relate {endpoints[0]} ↔ {endpoints[1]}",
+                }
+            )
+            staged.append({"name": name, "path": result.get("path")})
+        return {"staged": staged, "rejected": rejected}
+
+    def _working_model_names(self) -> set[str]:
+        """Collect the names of every model defined across the working set."""
+
+        names: set[str] = set()
+        for content in self._working.values():
+            try:
+                parsed = json.loads(content)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            for model in parsed.get("models", []):
+                if isinstance(model, dict) and isinstance(model.get("name"), str):
+                    names.add(model["name"])
+        return names
+
     # -- document tools (read-only RAG over the uploaded corpus) -----------
 
     def _list_documents(self, _args: dict[str, Any]) -> dict[str, Any]:
@@ -415,6 +968,102 @@ class MdlToolset:
             ]
         }
 
+    def _coverage_documents(self) -> list[CoverageDocument]:
+        """Build the audit corpus from the project's documents (chunks→text)."""
+
+        if self._document_store is None or self._project_id is None:
+            return []
+        chunks_by_doc: dict[str, list[DocumentChunk]] = {}
+        for chunk in self._document_store.list_project_chunks(
+            self._project_id, owner_id=self._owner_id
+        ):
+            chunks_by_doc.setdefault(chunk.document_id, []).append(chunk)
+        documents: list[CoverageDocument] = []
+        for document in self._document_store.list_project_documents(
+            self._project_id, owner_id=self._owner_id
+        ):
+            doc_chunks = sorted(
+                chunks_by_doc.get(document.id, []), key=lambda c: c.chunk_index
+            )
+            text = "\n\n".join(c.text for c in doc_chunks) or (
+                document.extracted_text or ""
+            )
+            if text.strip():
+                documents.append(
+                    CoverageDocument(
+                        document_id=document.id,
+                        filename=document.filename,
+                        text=text,
+                    )
+                )
+        return documents
+
+    def _run_coverage(self, _args: dict[str, Any]) -> dict[str, Any]:
+        """Self-review the staged MDL against the project documents (read-only).
+
+        Audits the *working* set (the agent's drafts), so the agent can find gaps
+        and refine before the user reviews — the in-conversation analogue of the
+        background coverage run (which audits only *active* MDL post-activation).
+        Per-turn capped + memoized: identical working sets re-audit free and do not
+        count against the cap. Creates no provenance and persists nothing.
+        """
+
+        if self._model_client is None:
+            return {"note": "Coverage is unavailable (no model client)."}
+        documents = self._coverage_documents()
+        if not documents:
+            return {
+                "note": "No documents to audit; upload a BI doc to run coverage.",
+                "score": 1.0,
+            }
+        # Memo key over the working content + the doc corpus shape — a re-audit of
+        # an unchanged set is free and does not consume the per-turn budget.
+        memo_key = _coverage_memo_key(self._working, documents)
+        cached = self._coverage_memo.get(memo_key)
+        if cached is not None:
+            return cached
+        if self._coverage_audits_done >= self._coverage_self_audit_limit:
+            return {
+                "note": (
+                    "Coverage self-audit limit reached for this turn; apply your "
+                    "changes and the background audit will run on activation."
+                )
+            }
+        self._coverage_audits_done += 1
+        files = [
+            SimpleNamespace(content=content, status="active")
+            for content in self._working.values()
+        ]
+        report = run_directory_coverage(
+            self._model_client,
+            documents=documents,
+            files=files,
+            instructions=self._instructions,
+            embedder=self._embedder,
+        )
+        result = {
+            "score": report.score,
+            "total": report.total,
+            "covered": report.covered,
+            "partial": report.partial,
+            "missing": report.missing,
+            "findings": [
+                {
+                    "kind": finding.claim.kind,
+                    "subject": finding.claim.subject,
+                    "statement": finding.claim.statement,
+                    "status": finding.status,
+                    "suggestion": finding.suggestion,
+                    "document": finding.document_filename,
+                }
+                for finding in report.findings
+                if finding.status != "covered"
+            ],
+            "warnings": report.warnings,
+        }
+        self._coverage_memo[memo_key] = result
+        return result
+
     # -- changeset rendering ----------------------------------------------
 
     def validate_working(self) -> MdlValidationResult:
@@ -448,6 +1097,7 @@ class MdlToolset:
                             strict_models=True,
                         ),
                         summary=self._summaries.get(path, f"Create {path}"),
+                        source_document_id=self._file_grounding.get(path),
                     )
                 )
             elif _normalize(original.content) != _normalize(content):
@@ -464,6 +1114,7 @@ class MdlToolset:
                             strict_models=True,
                         ),
                         summary=self._summaries.get(path, f"Update {path}"),
+                        source_document_id=self._file_grounding.get(path),
                     )
                 )
         for path, original in sorted(self._originals.items()):
@@ -482,6 +1133,7 @@ class MdlToolset:
             manifest_validation=self.validate_working(),
             message=message,
             referenced_document_ids=list(self._referenced_document_ids),
+            tool_calls=list(self._tool_calls),
         )
 
     # -- helpers ----------------------------------------------------------
@@ -492,6 +1144,89 @@ class MdlToolset:
         if not isinstance(path, str) or not path.strip():
             raise ValueError("Tool call requires a 'path' string.")
         return path
+
+
+def _safe_model_name(table: str) -> str:
+    """Identifier-safe model name from a physical table name."""
+
+    lowered = table.strip().lower()
+    cleaned = "".join(char if char.isalnum() else "_" for char in lowered)
+    name = "_".join(part for part in cleaned.split("_") if part)
+    return name or "model"
+
+
+#: Mutating tool name → its semantic provenance verb. Read-only tools are absent
+#: (not recorded in the ledger). Extend additively as the toolset grows.
+_MUTATING_ACTIONS: dict[str, ToolActionKind] = {
+    "write_mdl_file": "write",
+    "delete_mdl_file": "delete",
+    "propose_onboard_table": "onboard",
+    "propose_onboard_tables": "onboard",
+    "propose_relationships": "relate",
+}
+
+
+def _collect(rows: object, *keys: str) -> dict[str, list[str]]:
+    """Collect string values per key across a list of ``{key: value}`` dicts."""
+
+    out: dict[str, list[str]] = {key: [] for key in keys}
+    if isinstance(rows, list):
+        for row in rows:
+            if isinstance(row, dict):
+                for key in keys:
+                    value = row.get(key)
+                    if isinstance(value, str):
+                        out[key].append(value)
+    return out
+
+
+def _summarize_mutation(
+    name: str, args: dict[str, Any], result: dict[str, Any]
+) -> tuple[list[str], dict[str, object], str | None]:
+    """Derive (paths, sensitivity-aware arg shape, human note) for one mutation.
+
+    Reads affected paths from the tool *result* (authoritative once applied) and
+    captures only argument *shapes* — names/counts, never the raw MDL JSON the
+    file content already carries.
+    """
+
+    if not isinstance(result, dict):
+        return [], {}, None
+    if name in ("write_mdl_file", "delete_mdl_file"):
+        path = result.get("path")
+        paths = [path] if isinstance(path, str) else []
+        return paths, {"path": path} if paths else {}, None
+    if name == "propose_onboard_table":
+        path = result.get("path")
+        paths = [path] if isinstance(path, str) else []
+        table = result.get("onboarded_table") or args.get("table")
+        summary = {"tables": [table]} if isinstance(table, str) else {}
+        return paths, summary, table if isinstance(table, str) else None
+    if name == "propose_onboard_tables":
+        collected = _collect(result.get("onboarded"), "path", "table")
+        names = collected["table"]
+        summary = {"tables": names, "table_count": len(names)} if names else {}
+        detail = f"{len(names)} table(s)" if names else None
+        return collected["path"], summary, detail
+    if name == "propose_relationships":
+        collected = _collect(result.get("staged"), "path", "name")
+        names = collected["name"]
+        summary = (
+            {"relationships": names, "relationship_count": len(names)} if names else {}
+        )
+        detail = f"{len(names)} relationship(s)" if names else None
+        return collected["path"], summary, detail
+    return [], {}, None
+
+
+def _coverage_memo_key(
+    working: dict[str, str], documents: list[CoverageDocument]
+) -> str:
+    """Stable key over the working MDL + the document corpus shape (per-turn memo)."""
+
+    mdl = sorted(f"{path}:{_normalize(content)}" for path, content in working.items())
+    docs = sorted(f"{doc.document_id}:{len(doc.text)}" for doc in documents)
+    return json.dumps([mdl, docs], separators=(",", ":"))
 
 
 def _normalize(content: str) -> str:

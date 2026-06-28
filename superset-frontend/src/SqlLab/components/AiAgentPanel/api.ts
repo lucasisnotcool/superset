@@ -486,6 +486,8 @@ export type MdlFileSourceType =
 export interface SemanticProject {
   id: string;
   name: string;
+  /** URL/identity-safe handle, unique within (database, catalog). */
+  slug?: string;
   description?: string | null;
   owner_id: string;
   database_uri_fingerprint: string;
@@ -505,6 +507,10 @@ export interface SemanticProject {
   created_at: string;
   updated_at: string;
   deleted_at?: string | null;
+  /** Latest complete coverage score (0–1) for the project's active MDL, supplied
+   * by the list/get routes for the browser badge. `null`/absent when coverage has
+   * never completed. */
+  coverage_score?: number | null;
 }
 
 export interface SemanticProjectResolveRequest {
@@ -516,6 +522,8 @@ export interface SemanticProjectResolveRequest {
   /** Optional additional schemas to scope the project to (primary stays
    * `schema_name`). Back-compat: callers may send only `schema_name`. */
   schema_names?: string[];
+  /** User-chosen project name (MDL Lab "New project"); server derives one if blank. */
+  name?: string | null;
   supplied_uri?: string | null;
   create_if_missing?: boolean;
 }
@@ -1076,6 +1084,54 @@ export const listSemanticProjects = (
   );
 };
 
+/** Fetch one semantic project by id (governed by DB access). */
+export const getSemanticProject = (projectId: string) =>
+  requestJson<SemanticProject>(`/agent/semantic-layer/projects/${projectId}`, {
+    method: 'GET',
+  });
+
+/** Create a new named semantic project (MDL Lab "New project"). */
+export const createSemanticProject = (payload: SemanticProjectResolveRequest) =>
+  requestJson<SemanticProject>('/agent/semantic-layer/projects', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+
+/** Rename a semantic project (re-derives a unique slug server-side). */
+export const renameSemanticProject = (projectId: string, name: string) =>
+  requestJson<SemanticProject>(`/agent/semantic-layer/projects/${projectId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ name }),
+  });
+
+/**
+ * Duplicate a project's MDL structure into a new project (fresh history).
+ * With `includeDocuments`, also copies the BI documents + chunks and re-embeds
+ * them under the clone's vector scope (DP6 opt-in); off by default.
+ */
+export const duplicateSemanticProject = (
+  projectId: string,
+  name?: string | null,
+  includeDocuments = false,
+) =>
+  requestJson<SemanticProject>(
+    `/agent/semantic-layer/projects/${projectId}/duplicate`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        name: name ?? null,
+        include_documents: includeDocuments,
+      }),
+    },
+  );
+
+/** Archive a semantic project. */
+export const deleteSemanticProject = (projectId: string) =>
+  requestJson<{ deleted: boolean }>(
+    `/agent/semantic-layer/projects/${projectId}`,
+    { method: 'DELETE' },
+  );
+
 export const listMdlFiles = (projectId: string) =>
   requestJson<MdlFile[]>(
     `/agent/semantic-layer/projects/${projectId}/mdl-files`,
@@ -1589,6 +1645,17 @@ export const createDataset = async (params: {
   return response.json.id as number;
 };
 
+export interface RegisteredTable {
+  id: number;
+  tableName: string;
+}
+
+export interface RegisteredTables {
+  tables: RegisteredTable[];
+  /** True when the cap was hit before all pages were read (possible misclassify). */
+  truncated: boolean;
+}
+
 export interface RegisteredTableNames {
   names: string[];
   /** True when the cap was hit before all pages were read (possible misclassify). */
@@ -1600,24 +1667,24 @@ export interface RegisteredTableNames {
 export const REGISTERED_NAME_SCAN_CAP = 5000;
 
 /**
- * Fetch the COMPLETE set of registered dataset names for a schema (id+table_name
+ * Fetch the COMPLETE set of registered datasets for a schema (id + table_name
  * only — `columns` projection keeps the payload tiny), paging at the DAO max of
- * 1000/page until exhausted or the cap is reached. Decoupled from the picker's
- * paginated *display* list so "unregistered" classification is authoritative
- * rather than eventually-consistent (R1): a registered dataset on an unloaded
- * display page is still known here, so it never flashes as "not registered".
+ * 1000/page until exhausted or the cap is reached. This is the authoritative
+ * registered set for a schema: it drives both the onboarding tree's rows and the
+ * "unregistered" classification (R1), so a registered dataset is never missed by
+ * relying on an eventually-consistent display page.
  */
-export const listAllRegisteredTableNames = async (
+export const listAllRegisteredTables = async (
   databaseId: number,
   schema: string,
   cap: number = REGISTERED_NAME_SCAN_CAP,
-): Promise<RegisteredTableNames> => {
+): Promise<RegisteredTables> => {
   const PAGE = 1000; // SQLALCHEMY_DAO_MAX_PAGE_SIZE
-  const names: string[] = [];
+  const tables: RegisteredTable[] = [];
   let page = 0;
   let total = Infinity;
   let truncated = false;
-  while (names.length < total) {
+  while (tables.length < total) {
     const query = rison.encode({
       columns: ['id', 'table_name'],
       filters: [
@@ -1633,17 +1700,37 @@ export const listAllRegisteredTableNames = async (
     const response = await SupersetClient.get({
       endpoint: `/api/v1/dataset/?q=${query}`,
     });
-    const result = (response.json?.result as { table_name: string }[]) ?? [];
-    total = (response.json?.count as number) ?? names.length + result.length;
-    result.forEach(item => names.push(item.table_name));
+    const result =
+      (response.json?.result as { id: number; table_name: string }[]) ?? [];
+    total = (response.json?.count as number) ?? tables.length + result.length;
+    result.forEach(item =>
+      tables.push({ id: item.id, tableName: item.table_name }),
+    );
     if (result.length === 0) break; // defensive: no progress
-    if (names.length >= cap) {
-      truncated = names.length < total;
+    if (tables.length >= cap) {
+      truncated = tables.length < total;
       break;
     }
     page += 1;
   }
-  return { names, truncated };
+  return { tables, truncated };
+};
+
+/**
+ * Names-only view of {@link listAllRegisteredTables}, kept for callers that only
+ * need the registered-name set.
+ */
+export const listAllRegisteredTableNames = async (
+  databaseId: number,
+  schema: string,
+  cap: number = REGISTERED_NAME_SCAN_CAP,
+): Promise<RegisteredTableNames> => {
+  const { tables, truncated } = await listAllRegisteredTables(
+    databaseId,
+    schema,
+    cap,
+  );
+  return { names: tables.map(table => table.tableName), truncated };
 };
 
 /**
@@ -1759,9 +1846,28 @@ export type ProvenanceKind =
   | 'mdl_created'
   | 'mdl_updated'
   | 'mdl_activated'
-  | 'mdl_deleted';
+  | 'mdl_deleted'
+  | 'project_created';
 
 export type ProvenanceActorType = 'user' | 'agent' | 'system';
+
+/** Semantic verb for one MDL-mutating agent tool call (provenance ledger). */
+export type ToolActionKind = 'write' | 'delete' | 'onboard' | 'relate';
+
+/**
+ * One MDL-mutating tool call an agent made during a turn. Folded into an
+ * apply entry's `detail.tool_calls` so the timeline can roll up a per-verb
+ * summary and link a written file to its source document (R-B6).
+ */
+export interface ToolCallRecord {
+  tool: string;
+  action: ToolActionKind;
+  paths: string[];
+  source_document_ids: string[];
+  args_summary: Record<string, unknown>;
+  status: 'ok' | 'error';
+  detail?: string | null;
+}
 
 export interface ProvenanceEntry {
   id: string;
@@ -1770,7 +1876,11 @@ export interface ProvenanceEntry {
   summary: string;
   created_at: string;
   actor?: string | null;
+  /** Author's captured display name (username/email); null for system/old entries. */
+  actor_name?: string | null;
   actor_type?: ProvenanceActorType;
+  /** True when the viewer is the actor (DP10): drives "You" vs the actor's id. */
+  is_self?: boolean;
   /** Number of raw events merged into this entry (>1 for coalesced user runs). */
   edit_count?: number;
   /** Earliest timestamp in a coalesced user run (null when edit_count === 1). */

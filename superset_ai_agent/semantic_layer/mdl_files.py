@@ -21,6 +21,7 @@ import hashlib
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import cast, Protocol
+from uuid import uuid4
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
@@ -131,6 +132,20 @@ class MdlFileStore(Protocol):
     ) -> MdlValidationResult:
         """Validate one MDL JSON file and persist validation output."""
 
+    def duplicate_files(
+        self,
+        source_project_id: str,
+        target_project_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> int:
+        """Copy a project's non-deleted MDL files to another project.
+
+        Preserves each file's path/content/status/validation (so an active clone is
+        immediately queryable); assigns new file ids and stamps the duplicator.
+        Returns the number of files copied.
+        """
+
 
 class InMemoryMdlFileStore:
     """Process-local MDL file store for development and tests."""
@@ -192,6 +207,21 @@ class InMemoryMdlFileStore:
         self._files[file.id] = (owner_id, file)
         return file.model_copy(deep=True)
 
+    def duplicate_files(
+        self,
+        source_project_id: str,
+        target_project_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> int:
+        now = datetime.now(timezone.utc)
+        copied = 0
+        for file in self.list(source_project_id, owner_id=owner_id):
+            clone = _clone_file(file, target_project_id, owner_id, now)
+            self._files[clone.id] = (owner_id, clone)
+            copied += 1
+        return copied
+
     def update(
         self,
         file_id: str,
@@ -224,6 +254,10 @@ class InMemoryMdlFileStore:
             updates["validation"] = validation
         if request.status is not None:
             updates["status"] = request.status
+        if request.source_type is not None:
+            updates["source_type"] = request.source_type
+        if request.source_document_id is not None:
+            updates["source_document_id"] = request.source_document_id
         _assert_activatable(
             request.status,
             request.content if request.content is not None else file.content,
@@ -356,6 +390,24 @@ class SqlAlchemyMdlFileStore:
             session.commit()
             return _file_from_model(model)
 
+    def duplicate_files(
+        self,
+        source_project_id: str,
+        target_project_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> int:
+        files = self.list(source_project_id, owner_id=owner_id)
+        if not files:
+            return 0
+        now = datetime.now(timezone.utc)
+        with self.session_factory() as session:
+            for file in files:
+                clone = _clone_file(file, target_project_id, owner_id, now)
+                session.add(_file_to_model(clone))
+            session.commit()
+        return len(files)
+
     def update(
         self,
         file_id: str,
@@ -392,6 +444,10 @@ class SqlAlchemyMdlFileStore:
                 model.validation = validation.model_dump(mode="json")
             if request.status is not None:
                 model.status = request.status
+            if request.source_type is not None:
+                model.source_type = request.source_type
+            if request.source_document_id is not None:
+                model.source_document_id = request.source_document_id
             _assert_activatable(request.status, model.content)
             model.updated_by = owner_id
             model.updated_at = _utc_now()
@@ -476,6 +532,27 @@ def normalize_mdl_path(path: str) -> str:
     if posix_path.suffix.lower() != ".json":
         raise ValueError("MDL files must use a .json extension.")
     return str(posix_path)
+
+
+def _clone_file(
+    file: MdlFile,
+    target_project_id: str,
+    owner_id: str,
+    now: datetime,
+) -> MdlFile:
+    """Copy an MDL file to another project: new id, re-parented, re-stamped."""
+
+    return file.model_copy(
+        update={
+            "id": str(uuid4()),
+            "project_id": target_project_id,
+            "created_by": owner_id,
+            "updated_by": owner_id,
+            "created_at": now,
+            "updated_at": now,
+            "deleted_at": None,
+        }
+    )
 
 
 def _new_file(

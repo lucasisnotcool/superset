@@ -79,22 +79,66 @@ def _request() -> SemanticProjectResolveRequest:
     )
 
 
-def test_owner_receives_admin_permission() -> None:
+def _partial_service(store: InMemorySemanticProjectStore) -> SemanticAccessService:
+    """A service whose DB context is empty = PARTIAL access (no visible datasets)."""
+
+    def empty_context(scope: ConversationScope) -> AgentContext:
+        return AgentContext(
+            database=DatabaseSummary(id=scope.database_id, name="Sales"),
+            datasets=[],
+        )
+
+    return SemanticAccessService(project_store=store, load_context=empty_context)
+
+
+def test_full_access_grants_write() -> None:
+    # F5/DP2: FULL access (the user can see the database's datasets) → write. There
+    # is no owner/admin tier — access is purely database-derived.
     store = InMemorySemanticProjectStore()
     service = _service(store)
     owner = AgentIdentity(owner_id="owner")
 
     project = service.resolve_project(identity=owner, request=_request())
 
-    assert project.permission == "admin"
-    assert service.require_project_permission(
-        identity=owner,
-        project_id=project.id,
-        permission=SemanticPermission.ADMIN,
-    ).permission == "admin"
+    assert project.permission == "write"
+    assert (
+        service.require_project_permission(
+            identity=owner,
+            project_id=project.id,
+            permission=SemanticPermission.WRITE,
+        ).permission
+        == "write"
+    )
 
 
-def test_db_derived_visibility_grants_read_by_default() -> None:
+def test_partial_access_grants_read_only() -> None:
+    store = InMemorySemanticProjectStore()
+    _service(store).resolve_project(
+        identity=AgentIdentity(owner_id="owner"),
+        request=_request(),
+    )
+    project_id = store.list(owner_id="owner")[0].id
+    analyst = AgentIdentity(owner_id="analyst")
+    service = _partial_service(store)
+
+    project = service.require_project_permission(
+        identity=analyst,
+        project_id=project_id,
+        permission=SemanticPermission.READ,
+    )
+
+    # PARTIAL access (no visible datasets) → read; write is denied.
+    assert project.permission == "read"
+    with pytest.raises(PermissionError):
+        service.require_project_permission(
+            identity=analyst,
+            project_id=project_id,
+            permission=SemanticPermission.WRITE,
+        )
+
+
+def test_full_access_grants_write_to_any_db_user() -> None:
+    # A different user with FULL database access also gets write — no flag needed.
     store = InMemorySemanticProjectStore()
     owner_project = _service(store).resolve_project(
         identity=AgentIdentity(owner_id="owner"),
@@ -102,30 +146,6 @@ def test_db_derived_visibility_grants_read_by_default() -> None:
     )
     analyst = AgentIdentity(owner_id="analyst")
     service = _service(store)
-
-    project = service.require_project_permission(
-        identity=analyst,
-        project_id=owner_project.id,
-        permission=SemanticPermission.READ,
-    )
-
-    assert project.permission == "read"
-    with pytest.raises(PermissionError):
-        service.require_project_permission(
-            identity=analyst,
-            project_id=owner_project.id,
-            permission=SemanticPermission.WRITE,
-        )
-
-
-def test_db_derived_write_requires_explicit_flag_and_full_context() -> None:
-    store = InMemorySemanticProjectStore()
-    owner_project = _service(store).resolve_project(
-        identity=AgentIdentity(owner_id="owner"),
-        request=_request(),
-    )
-    analyst = AgentIdentity(owner_id="analyst")
-    service = _service(store, full_access_grants_write=True)
 
     project = service.require_project_permission(
         identity=analyst,
@@ -154,7 +174,7 @@ def test_list_projects_returns_permission_from_access_service() -> None:
     )
 
     assert len(projects) == 1
-    assert projects[0].permission == "read"
+    assert projects[0].permission == "write"
 
 
 def test_project_resolution_prefers_superset_database_fingerprint() -> None:
@@ -186,7 +206,7 @@ def test_project_resolution_prefers_superset_database_fingerprint() -> None:
 
     assert analyst_project.id == owner_project.id
     assert owner_project.database_uri_fingerprint == "physical-db"
-    assert analyst_project.permission == "read"
+    assert analyst_project.permission == "write"
 
 
 def test_list_projects_uses_superset_database_fingerprint() -> None:

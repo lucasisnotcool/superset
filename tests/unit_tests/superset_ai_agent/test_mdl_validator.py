@@ -745,3 +745,37 @@ def test_cube_dimensions_must_be_a_list() -> None:
         mdl(models=[_DEALS], cubes=[_cube(dimensions={"region": "not-a-list"})])
     )
     assert any(m.code == "cube_invalid_entries" for m in result.messages)
+
+
+def test_schema_index_search_ranks_name_over_columns() -> None:
+    # find_tables backbone: a name hit outranks a column-only hit, and the schema
+    # is carried through for the multi-schema index.
+    index = SchemaIndex(
+        tables={
+            "orders": {"id", "customer_id"},
+            "customers": {"id", "name"},
+        },
+        tables_by_schema={
+            "sales": {"orders": {"id", "customer_id"}},
+            "crm": {"customers": {"id", "name"}},
+        },
+    )
+
+    matches = index.search("orders")
+    assert matches[0][1] == "orders"
+    assert matches[0][0] == "sales"  # schema carried
+
+    # A column-only term ("customer") still surfaces both, orders not first by name.
+    by_column = {table for _schema, table, _score in index.search("customer")}
+    assert "orders" in by_column
+    assert "customers" in by_column
+
+
+def test_schema_index_search_handles_plural_and_empty() -> None:
+    index = SchemaIndex.from_snapshot({"order": ["id"]})
+    # "orders" (plural) still matches the singular table name.
+    assert index.search("orders")[0][1] == "order"
+    # No match -> empty (the honest "not in this database" signal).
+    assert index.search("zzz") == []
+    # Blank query -> empty.
+    assert index.search("   ") == []

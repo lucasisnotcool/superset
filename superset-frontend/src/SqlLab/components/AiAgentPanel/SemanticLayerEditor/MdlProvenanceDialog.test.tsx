@@ -140,6 +140,33 @@ test('renders a coalesced user run as an edited-N-times range', async () => {
   expect(screen.getByTestId('provenance-actor')).toHaveTextContent('You');
 });
 
+test("shows a teammate's captured name (not 'You') for another user's edit", async () => {
+  // DP10/FP2: a non-self user edit renders the captured author name, never "You".
+  fetchMock.get(PROVENANCE, [
+    {
+      id: 'u9',
+      kind: 'mdl_updated',
+      status: 'ok',
+      summary: 'Edited models/orders.json',
+      created_at: '2026-06-26T17:00:00Z',
+      actor: 'superset:7',
+      actor_name: 'alice',
+      actor_type: 'user',
+      is_self: false,
+      detail: { paths: ['models/orders.json'] },
+    },
+  ]);
+
+  render(
+    <MdlProvenanceDialog open projectId="project-1" onClose={jest.fn()} />,
+  );
+
+  await screen.findByTestId('provenance-entry');
+  const actor = screen.getByTestId('provenance-actor');
+  expect(actor).toHaveTextContent('alice');
+  expect(actor).not.toHaveTextContent('You');
+});
+
 test('opens a stored coverage report from a coverage entry', async () => {
   fetchMock.get(PROVENANCE, [
     {
@@ -190,6 +217,168 @@ test('opens a stored coverage report from a coverage entry', async () => {
   ).toBeInTheDocument();
   await userEvent.click(screen.getByTestId('provenance-coverage-back'));
   expect(await screen.findByTestId('provenance-entry')).toBeInTheDocument();
+});
+
+test('rolls up agent tool calls and expands the per-file list with source chips', async () => {
+  fetchMock.get(PROVENANCE, [
+    {
+      id: 'agent1',
+      kind: 'enrichment',
+      status: 'ok',
+      summary: 'Onboard + enrich from spec',
+      created_at: '2026-06-26T05:00:00Z',
+      actor_type: 'agent',
+      detail: {
+        source_type: 'copilot',
+        action_summary: { onboard: 3, write: 1 },
+        documents: [{ id: 'd1', filename: 'spec.md' }],
+        tool_calls: [
+          {
+            tool: 'propose_onboard_tables',
+            action: 'onboard',
+            paths: ['models/a.json', 'models/b.json', 'models/c.json'],
+            source_document_ids: [],
+            args_summary: {},
+            status: 'ok',
+          },
+          {
+            tool: 'write_mdl_file',
+            action: 'write',
+            paths: ['models/a.json'],
+            source_document_ids: ['d1'],
+            args_summary: {},
+            status: 'ok',
+          },
+        ],
+      },
+    },
+  ]);
+
+  render(
+    <MdlProvenanceDialog open projectId="project-1" onClose={jest.fn()} />,
+  );
+
+  const entry = await screen.findByTestId('provenance-entry');
+  // The per-verb rollup line aggregates the ledger summarily.
+  expect(screen.getByTestId('provenance-rollup')).toHaveTextContent(
+    'Onboarded 3 table(s) · Wrote 1 file(s)',
+  );
+  // Three unique files; preview shows the first 3 (a, b, c) with a doc chip on a.
+  let files = screen.getAllByTestId('provenance-file');
+  expect(files).toHaveLength(3);
+  expect(entry).toHaveTextContent('models/a.json ← spec.md');
+  // No "+N more" here (exactly 3 unique paths); add a 4th-file case below.
+  expect(screen.queryByTestId('provenance-files-expand')).toBeNull();
+  files = screen.getAllByTestId('provenance-file');
+  expect(files[0]).toHaveTextContent('models/a.json');
+});
+
+test('truncates a long file list behind a +N more toggle', async () => {
+  fetchMock.get(PROVENANCE, [
+    {
+      id: 'agent2',
+      kind: 'copilot_edit',
+      status: 'ok',
+      summary: 'Wrote many files',
+      created_at: '2026-06-26T05:00:00Z',
+      actor_type: 'agent',
+      detail: {
+        action_summary: { write: 5 },
+        tool_calls: [
+          {
+            tool: 'write_mdl_file',
+            action: 'write',
+            paths: [
+              'models/a.json',
+              'models/b.json',
+              'models/c.json',
+              'models/d.json',
+              'models/e.json',
+            ],
+            source_document_ids: [],
+            args_summary: {},
+            status: 'ok',
+          },
+        ],
+      },
+    },
+  ]);
+
+  render(
+    <MdlProvenanceDialog open projectId="project-1" onClose={jest.fn()} />,
+  );
+
+  await screen.findByTestId('provenance-entry');
+  expect(screen.getAllByTestId('provenance-file')).toHaveLength(3);
+  await userEvent.click(screen.getByTestId('provenance-files-expand'));
+  expect(screen.getAllByTestId('provenance-file')).toHaveLength(5);
+  await userEvent.click(screen.getByTestId('provenance-files-collapse'));
+  expect(screen.getAllByTestId('provenance-file')).toHaveLength(3);
+});
+
+test('legacy agent entry without tool_calls falls back to changeset paths', async () => {
+  fetchMock.get(PROVENANCE, [
+    {
+      id: 'legacy1',
+      kind: 'copilot_edit',
+      status: 'ok',
+      summary: 'Applied 2 changes',
+      created_at: '2026-06-26T05:00:00Z',
+      actor_type: 'agent',
+      detail: { paths: ['models/x.json', 'models/y.json'] },
+    },
+  ]);
+
+  render(
+    <MdlProvenanceDialog open projectId="project-1" onClose={jest.fn()} />,
+  );
+
+  await screen.findByTestId('provenance-entry');
+  // No rollup (no action_summary) but the file list still renders from paths.
+  expect(screen.queryByTestId('provenance-rollup')).toBeNull();
+  expect(screen.getAllByTestId('provenance-file')).toHaveLength(2);
+});
+
+const COVERAGE_STATUS =
+  'http://agent.local/agent/semantic-layer/projects/project-1/coverage/status';
+
+test('shows a coverage running indicator while a run is in flight', async () => {
+  fetchMock.get(PROVENANCE, []);
+  fetchMock.get(COVERAGE_STATUS, {
+    status: 'analysing',
+    running: true,
+    stale: false,
+    score: null,
+    run_id: null,
+  });
+
+  render(
+    <MdlProvenanceDialog open projectId="project-1" onClose={jest.fn()} />,
+  );
+
+  expect(
+    await screen.findByTestId('provenance-coverage-running'),
+  ).toBeInTheDocument();
+});
+
+test('shows no coverage running indicator when idle', async () => {
+  fetchMock.get(PROVENANCE, []);
+  fetchMock.get(COVERAGE_STATUS, {
+    status: 'ready',
+    running: false,
+    stale: false,
+    score: 0.9,
+    run_id: 'r1',
+  });
+
+  render(
+    <MdlProvenanceDialog open projectId="project-1" onClose={jest.fn()} />,
+  );
+
+  await screen.findByText(/No history yet/);
+  expect(
+    screen.queryByTestId('provenance-coverage-running'),
+  ).not.toBeInTheDocument();
 });
 
 test('does not fetch when closed', () => {

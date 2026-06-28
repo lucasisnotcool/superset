@@ -85,10 +85,20 @@ export type toastState = {
 export type UnsavedQueryEditor = Partial<QueryEditor>;
 
 export interface SemanticLayerEditorTab {
-  id: string; // see buildSemanticLayerEditorId in actions/sqlLab.ts
+  id: string; // see buildMdlLabId in actions/sqlLab.ts
   databaseId: number;
   catalogName: string | null;
-  schemaName: string;
+  /**
+   * Vestigial: the legacy per-schema entry is removed — MDL Lab tabs are
+   * browse-first (`buildMdlLabId`) and carry no schema. Retained optional only so
+   * the editor's schema-fallback prop type stays satisfied; always unset now.
+   */
+  schemaName?: string;
+  /**
+   * Deep-link: open this specific project by id on mount (first-class entry).
+   * When set, the editor loads it by id instead of resolving by schema.
+   */
+  projectId?: string;
 }
 
 export interface Table {

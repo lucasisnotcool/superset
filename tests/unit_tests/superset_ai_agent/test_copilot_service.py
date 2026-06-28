@@ -30,6 +30,7 @@ from superset_ai_agent.semantic_layer.copilot.schemas import (
     Changeset,
     ChangesetItem,
     InstructionView,
+    ToolCallRecord,
 )
 from superset_ai_agent.semantic_layer.copilot.service import (
     apply_changeset_items,
@@ -158,6 +159,133 @@ def test_apply_changeset_creates_updates_and_deletes_drafts() -> None:
     assert files["models/customers.json"].source_type == "copilot"
     assert files["models/customers.json"].status == "draft"
     assert "Orders" in files["models/orders.json"].content
+
+
+def test_apply_changeset_persists_source_document_link() -> None:
+    # R-B6: an item carrying a source document is persisted as an enriched file
+    # linked to that document; a plain copilot create keeps source_type="copilot".
+    store = InMemoryMdlFileStore()
+
+    applied = apply_changeset_items(
+        store,
+        project_id="p1",
+        items=[
+            ChangesetItem(
+                op="create",
+                path="models/customers.json",
+                proposed_content=VALID,
+                source_document_id="doc-1",
+            ),
+            ChangesetItem(
+                op="create", path="models/plain.json", proposed_content=VALID
+            ),
+        ],
+        owner_id="local",
+    )
+
+    by_path = {f.path: f for f in applied}
+    enriched = by_path["models/customers.json"]
+    assert enriched.source_type == "enriched_markdown"
+    assert enriched.source_document_id == "doc-1"
+    plain = by_path["models/plain.json"]
+    assert plain.source_type == "copilot"
+    assert plain.source_document_id is None
+
+
+def test_apply_changeset_update_restamps_origin_only_when_doc_grounded() -> None:
+    # A doc-grounded update re-stamps origin → enriched + linked; an un-grounded
+    # agent update must not relabel the file's existing origin.
+    store = InMemoryMdlFileStore()
+    manual = store.create(
+        "p1",
+        MdlFileCreateRequest(
+            path="models/orders.json", content=VALID, source_type="manual"
+        ),
+        owner_id="local",
+    )
+    other = store.create(
+        "p1",
+        MdlFileCreateRequest(
+            path="models/items.json", content=VALID, source_type="manual"
+        ),
+        owner_id="local",
+    )
+    updated = json.loads(VALID)
+    updated["models"][0]["description"] = "x"
+    content = json.dumps(updated)
+
+    apply_changeset_items(
+        store,
+        project_id="p1",
+        items=[
+            ChangesetItem(
+                op="update",
+                path="models/orders.json",
+                file_id=manual.id,
+                proposed_content=content,
+                source_document_id="doc-9",
+            ),
+            ChangesetItem(
+                op="update",
+                path="models/items.json",
+                file_id=other.id,
+                proposed_content=content,
+            ),
+        ],
+        owner_id="local",
+    )
+
+    files = {f.path: f for f in store.list("p1", owner_id="local")}
+    assert files["models/orders.json"].source_type == "enriched_markdown"
+    assert files["models/orders.json"].source_document_id == "doc-9"
+    # Un-grounded agent edit leaves the manual origin untouched.
+    assert files["models/items.json"].source_type == "manual"
+
+
+def test_apply_provenance_payload_folds_tool_calls_and_rollup() -> None:
+    event_type, _message, detail = apply_provenance_payload(
+        items=[
+            ChangesetItem(op="create", path="models/orders.json"),
+            ChangesetItem(op="create", path="models/customers.json"),
+        ],
+        owner_id="u1",
+        actor_name="Ada",
+        conversation_id="c1",
+        summary="Onboard + enrich",
+        documents=[{"id": "d1", "filename": "spec.md"}],
+        tool_calls=[
+            ToolCallRecord(tool="propose_onboard_tables", action="onboard"),
+            ToolCallRecord(tool="propose_onboard_tables", action="onboard"),
+            ToolCallRecord(tool="write_mdl_file", action="write"),
+        ],
+    )
+
+    assert event_type == "document_enriched"
+    assert detail["actor_name"] == "Ada"
+    assert detail["action_summary"] == {"onboard": 2, "write": 1}
+    assert len(detail["tool_calls"]) == 3
+
+
+def test_apply_provenance_payload_caps_tool_calls_but_keeps_full_rollup() -> None:
+    from superset_ai_agent.semantic_layer.copilot.service import TOOL_CALL_DETAIL_CAP
+
+    records = [
+        ToolCallRecord(tool="write_mdl_file", action="write")
+        for _ in range(TOOL_CALL_DETAIL_CAP + 5)
+    ]
+    _event, _message, detail = apply_provenance_payload(
+        items=[ChangesetItem(op="create", path="models/a.json")],
+        owner_id="u1",
+        conversation_id=None,
+        summary=None,
+        documents=[],
+        tool_calls=records,
+    )
+
+    # Rollup counts the full set; the stored member list is capped.
+    assert detail["action_summary"] == {"write": TOOL_CALL_DETAIL_CAP + 5}
+    assert len(detail["tool_calls"]) == TOOL_CALL_DETAIL_CAP
+    assert detail["tool_calls_truncated"] == 5
 
 
 def test_apply_changeset_delete_removes_file() -> None:

@@ -258,26 +258,31 @@ class TabbedSqlEditors extends PureComponent<TabbedSqlEditorsProps> {
     };
 
     const semanticLayerTabs = this.props.semanticLayerEditors.map(
-      (tab: SemanticLayerEditorTab) => ({
-        key: tab.id,
-        label: (
-          <SemanticLayerTabLabel>
-            <Icons.DatabaseOutlined iconSize="s" />
-            <Typography.Text ellipsis={{ tooltip: tab.schemaName }}>
-              {tab.schemaName}
-            </Typography.Text>
-          </SemanticLayerTabLabel>
-        ),
-        children: (
-          <ErrorBoundary>
-            <SemanticLayerEditor
-              databaseId={tab.databaseId}
-              catalogName={tab.catalogName}
-              schemaName={tab.schemaName}
-            />
-          </ErrorBoundary>
-        ),
-      }),
+      (tab: SemanticLayerEditorTab) => {
+        // Browse-first "MDL Lab" tabs carry no schema; label them as the Lab.
+        const tabLabel = tab.schemaName || t('MDL Lab');
+        return {
+          key: tab.id,
+          label: (
+            <SemanticLayerTabLabel>
+              <Icons.DatabaseOutlined iconSize="s" />
+              <Typography.Text ellipsis={{ tooltip: tabLabel }}>
+                {tabLabel}
+              </Typography.Text>
+            </SemanticLayerTabLabel>
+          ),
+          children: (
+            <ErrorBoundary>
+              <SemanticLayerEditor
+                databaseId={tab.databaseId}
+                catalogName={tab.catalogName}
+                schemaName={tab.schemaName ?? ''}
+                projectId={tab.projectId}
+              />
+            </ErrorBoundary>
+          ),
+        };
+      },
     );
 
     const tabItems = [
@@ -299,7 +304,8 @@ class TabbedSqlEditors extends PureComponent<TabbedSqlEditorsProps> {
         onTabClick={this.onTabClicked}
         onEdit={this.handleEdit}
         type={
-          this.props.queryEditors?.length === 0 && semanticLayerTabs.length === 0
+          this.props.queryEditors?.length === 0 &&
+          semanticLayerTabs.length === 0
             ? 'card'
             : 'editable-card'
         }

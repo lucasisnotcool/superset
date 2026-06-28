@@ -30,9 +30,9 @@ import TabbedSqlEditors from 'src/SqlLab/components/TabbedSqlEditors';
 import { extraQueryEditor1, initialState } from 'src/SqlLab/fixtures';
 import { newQueryTabName } from 'src/SqlLab/utils/newQueryTabName';
 import {
-  buildSemanticLayerEditorId,
+  buildMdlLabId,
   closeSemanticLayerEditor,
-  openSemanticLayerEditor,
+  openMdlLab,
 } from 'src/SqlLab/actions/sqlLab';
 import { Store } from 'redux';
 import { AppDispatch, RootState } from 'src/views/store';
@@ -43,8 +43,7 @@ import {
 } from 'src/SqlLab/types';
 
 const getSqlLabState = (store: Store) =>
-  (store.getState() as unknown as { sqlLab: SqlLabRootState['sqlLab'] })
-    .sqlLab;
+  (store.getState() as unknown as { sqlLab: SqlLabRootState['sqlLab'] }).sqlLab;
 
 jest.mock('src/SqlLab/components/SqlEditor', () =>
   // eslint-disable-next-line react/display-name
@@ -198,24 +197,43 @@ test('should have an empty state when query editors is empty', async () => {
   );
 });
 
-test('opening a semantic-layer tab adds it to the tablist and focuses it', async () => {
+test('opening an MDL Lab tab adds it to the tablist and focuses it', async () => {
   const store = createStore(initialState, reducerIndex);
   const dispatch = store.dispatch as AppDispatch;
   setup(store);
 
   act(() => {
-    dispatch(openSemanticLayerEditor(1, 'prod', 'main'));
+    dispatch(openMdlLab(1, 'prod'));
   });
 
-  await screen.findByText('main');
+  await screen.findByText('MDL Lab');
   expect(getSqlLabState(store).activeSemanticLayerEditorId).toEqual(
-    buildSemanticLayerEditorId(1, 'prod', 'main'),
+    buildMdlLabId(1, 'prod'),
   );
   const semanticTabButton = screen
     .getAllByRole('tab')
-    .find(tab => tab.textContent?.includes('main'));
+    .find(tab => tab.textContent?.includes('MDL Lab'));
   expect(semanticTabButton?.closest('.ant-tabs-tab')).toHaveClass(
     'ant-tabs-tab-active',
+  );
+});
+
+test('opening a browse-first MDL Lab tab labels it "MDL Lab" (no schema)', async () => {
+  const store = createStore(initialState, reducerIndex);
+  const dispatch = store.dispatch as AppDispatch;
+  setup(store);
+
+  act(() => {
+    dispatch(openMdlLab(1, 'prod'));
+  });
+
+  await screen.findByText('MDL Lab');
+  expect(getSqlLabState(store).activeSemanticLayerEditorId).toEqual(
+    buildMdlLabId(1, 'prod'),
+  );
+  // The mounted editor receives an empty schema (browse-first).
+  expect(screen.getByTestId('mock-semantic-layer-editor')).toHaveTextContent(
+    'semantic-layer-content-',
   );
 });
 
@@ -226,19 +244,17 @@ test('closing a semantic-layer tab falls back to the previous query tab without 
   const tabHistoryBeforeOpen = getSqlLabState(store).tabHistory;
 
   act(() => {
-    dispatch(openSemanticLayerEditor(1, 'prod', 'main'));
+    dispatch(openMdlLab(1, 'prod'));
   });
-  await screen.findByText('main');
+  await screen.findByText('MDL Lab');
   expect(getSqlLabState(store).tabHistory).toEqual(tabHistoryBeforeOpen);
 
   act(() => {
-    dispatch(
-      closeSemanticLayerEditor(buildSemanticLayerEditorId(1, 'prod', 'main')),
-    );
+    dispatch(closeSemanticLayerEditor(buildMdlLabId(1, 'prod')));
   });
 
   await waitFor(() => {
-    expect(screen.queryByText('main')).not.toBeInTheDocument();
+    expect(screen.queryByText('MDL Lab')).not.toBeInTheDocument();
   });
   expect(getSqlLabState(store).activeSemanticLayerEditorId).toBeNull();
   expect(getSqlLabState(store).tabHistory).toEqual(tabHistoryBeforeOpen);

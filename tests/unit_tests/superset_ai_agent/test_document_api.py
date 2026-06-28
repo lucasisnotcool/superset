@@ -209,6 +209,49 @@ def test_duplicates_finds_exact_pair(tmp_path) -> None:
     assert matches[0]["exact"] is True
 
 
+def test_duplicate_with_include_documents_copies_the_corpus(tmp_path) -> None:
+    # DP6 opt-in: duplicating with include_documents carries the BI documents into
+    # the clone (structure-only duplication leaves the clone empty).
+    client = _client(tmp_path)
+    project = _project(client)
+    _upload(client, project["id"])
+
+    response = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/duplicate",
+        json={"include_documents": True},
+    )
+    assert response.status_code == 200, response.text
+    clone = response.json()
+    assert clone["id"] != project["id"]
+
+    clone_docs = client.get(
+        f"/agent/semantic-layer/projects/{clone['id']}/documents"
+    ).json()
+    assert {d["filename"] for d in clone_docs} == {"glossary.md"}
+    # The copied document is a fresh row (not the source's).
+    source_docs = client.get(
+        f"/agent/semantic-layer/projects/{project['id']}/documents"
+    ).json()
+    assert clone_docs[0]["id"] != source_docs[0]["id"]
+
+
+def test_duplicate_without_include_documents_leaves_clone_empty(tmp_path) -> None:
+    client = _client(tmp_path)
+    project = _project(client)
+    _upload(client, project["id"])
+
+    response = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/duplicate",
+        json={},
+    )
+    assert response.status_code == 200, response.text
+    clone = response.json()
+    clone_docs = client.get(
+        f"/agent/semantic-layer/projects/{clone['id']}/documents"
+    ).json()
+    assert clone_docs == []
+
+
 def test_reindex_is_idempotent(tmp_path) -> None:
     client = _client(tmp_path)
     project = _project(client)

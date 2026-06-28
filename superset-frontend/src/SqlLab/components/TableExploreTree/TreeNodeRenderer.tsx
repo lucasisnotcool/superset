@@ -93,11 +93,6 @@ export interface TreeNodeRendererProps extends NodeRendererProps<TreeNodeData> {
   handleUnpinTable: (tableName: string, schemaName: string) => void;
   handlePinSchema: (schemaName: string) => void;
   handleUnpinSchema: (schemaName: string) => void;
-  handleOpenSemanticLayer: (
-    dbId: number,
-    catalogName: string | null | undefined,
-    schemaName: string,
-  ) => void;
   refreshTableSchema: (id: string) => void;
   sortedTables: Record<string, boolean>;
   toggleSortColumns: (tableId: string) => void;
@@ -118,7 +113,6 @@ const TreeNodeRenderer: React.FC<TreeNodeRendererProps> = ({
   handleUnpinTable,
   handlePinSchema,
   handleUnpinSchema,
-  handleOpenSemanticLayer,
   refreshTableSchema,
   sortedTables,
   toggleSortColumns,
@@ -265,14 +259,6 @@ const TreeNodeRenderer: React.FC<TreeNodeRendererProps> = ({
             </div>
           )}
           <div className="action-hover">
-            <ActionButton
-              label={`semantic-layer-${schema}`}
-              tooltip={t('Open semantic layer')}
-              icon={<Icons.DatabaseOutlined iconSize="m" />}
-              onClick={() =>
-                handleOpenSemanticLayer(Number(_dbId), catalog, schema)
-              }
-            />
             <ActionButton
               label={`refresh-schema-${schema}`}
               tooltip={t('Force refresh table list')}

@@ -93,13 +93,31 @@ export interface CopilotPanelProps {
   readinessStatus: SemanticProjectReadinessStatus;
   /** Human-readable readiness detail (used as the error text when `failed`). */
   readinessDetail?: string | null;
-  /** Start onboarding the schema (the required first step on an empty layer). */
+  /** Onboard the whole schema manually (the deterministic table-picker job). */
   onOnboard: () => void;
+  /** Open the Auto-onboard document picker (the primary empty-state action). */
+  onAutoOnboard?: () => void;
+  /**
+   * Fire a document-grounded onboarding turn from outside the panel (the
+   * Auto-onboard flow). Each new `token` triggers exactly one Copilot turn with
+   * the given message and the documents attached — the kickstart of the
+   * BI-doc-first onboarding conversation.
+   */
+  kickstart?: CopilotKickstart;
   /**
    * Called after attaching persists one or more documents, so the editor can
    * refresh its document list and the new files appear in the workspace tree.
    */
   onDocumentsChanged?: () => void;
+}
+
+export interface CopilotKickstart {
+  /** Monotonic token; a change (not the value) fires one turn. */
+  token: number;
+  /** The templated user message that kickstarts the onboarding conversation. */
+  message: string;
+  /** Documents to attach to (ground) the turn. */
+  documents: SemanticDocument[];
 }
 
 type Decision = 'accepted' | 'rejected';
@@ -127,11 +145,19 @@ const CopilotPanel = ({
   readinessStatus,
   readinessDetail,
   onOnboard,
+  onAutoOnboard,
+  kickstart,
   onDocumentsChanged,
 }: CopilotPanelProps) => {
   const theme = useTheme();
   const { ingest, isIngesting } = useDocumentIngestion(projectId);
   const isReady = readinessStatus === 'ready';
+  // F4: the Copilot is usable pre-onboarding — it can drive onboarding itself
+  // (propose models from a BI doc, human-in-the-loop). The only hard block is an
+  // in-flight onboarding *job* (``indexing``), which would race file writes; empty
+  // and failed projects open straight into a chat that can onboard them.
+  const isBootstrapping = readinessStatus === 'indexing';
+  const needsOnboarding = !isReady && !isBootstrapping;
   const [input, setInput] = useState('');
   // Persisted thread state: the transcript lives on the backend (survives
   // reload + is multi-turn). ``pendingUser`` is the optimistic in-flight bubble.
@@ -366,62 +392,95 @@ const CopilotPanel = ({
   const attachmentBlocksSend =
     pendingAttachments.length > 0 && !attachPollGaveUp;
 
+  // Stream one Copilot turn and reconcile the transcript + proposed changeset.
+  // Shared by the manual Send and the Auto-onboard kickstart so both paths apply
+  // identical optimistic-bubble, reload-from-server, and accept-default logic.
+  const submitTurn = useCallback(
+    async (message: string, attachments: MessageAttachment[]) => {
+      setError(null);
+      resetProposal();
+      setPendingUser(message);
+      setIsRunning(true);
+      setLiveSteps([]);
+      try {
+        const id = await ensureConversation();
+        const result = await streamCopilot(
+          projectId,
+          {
+            message,
+            conversation_id: id,
+            attachments: attachments.length ? attachments : undefined,
+          },
+          step => setLiveSteps(prev => [...prev, step]),
+        );
+        setAttachedDocs([]);
+        setAttachPollGaveUp(false);
+        // The turn (user + assistant + changeset artifact) is now persisted; reload
+        // the thread so the transcript matches the durable record exactly.
+        const conversation = await getCopilotConversation(projectId, id);
+        setMessages(conversation.messages);
+        setPendingUser(null);
+        // Default valid items to accepted (the common "apply all" flow), but
+        // auto-exclude items that failed validation so a known-bad draft is never
+        // applied — and so the per-item Accept becomes a meaningful opt-in for
+        // them rather than a no-op on an already-accepted item (P3).
+        const initial: Record<string, Decision> = {};
+        result.items.forEach(item => {
+          initial[item.path] =
+            item.validation?.valid === false ? 'rejected' : 'accepted';
+        });
+        setDecisions(initial);
+        setChangeset(result);
+        refreshSummaries();
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : String(caught));
+        setPendingUser(null);
+      } finally {
+        setIsRunning(false);
+      }
+    },
+    [ensureConversation, projectId, refreshSummaries, resetProposal],
+  );
+
   const handleSend = useCallback(async () => {
     const message = input.trim();
     if (!message || isRunning || attachmentBlocksSend) return;
-    setError(null);
-    resetProposal();
     setInput('');
-    setPendingUser(message);
-    setIsRunning(true);
-    setLiveSteps([]);
-    try {
-      const id = await ensureConversation();
-      const attachments = attachmentsForSend();
-      const result = await streamCopilot(
-        projectId,
-        {
-          message,
-          conversation_id: id,
-          attachments: attachments.length ? attachments : undefined,
-        },
-        step => setLiveSteps(prev => [...prev, step]),
-      );
-      setAttachedDocs([]);
+    await submitTurn(message, attachmentsForSend());
+  }, [attachmentsForSend, attachmentBlocksSend, input, isRunning, submitTurn]);
+
+  // Auto-onboard kickstart: attach the chosen documents and send the templated
+  // message as one turn. Builds the attachment payload directly from the passed
+  // documents (not the async `attachedDocs` state) so there is no setState race;
+  // the chips still render because we stage the same docs for display.
+  const runKickstart = useCallback(
+    async (message: string, docs: SemanticDocument[]) => {
+      if (!canWrite || isRunning) return;
+      setInput('');
+      setAttachedDocs(docs);
       setAttachPollGaveUp(false);
-      // The turn (user + assistant + changeset artifact) is now persisted; reload
-      // the thread so the transcript matches the durable record exactly.
-      const conversation = await getCopilotConversation(projectId, id);
-      setMessages(conversation.messages);
-      setPendingUser(null);
-      // Default valid items to accepted (the common "apply all" flow), but
-      // auto-exclude items that failed validation so a known-bad draft is never
-      // applied — and so the per-item Accept becomes a meaningful opt-in for
-      // them rather than a no-op on an already-accepted item (P3).
-      const initial: Record<string, Decision> = {};
-      result.items.forEach(item => {
-        initial[item.path] =
-          item.validation?.valid === false ? 'rejected' : 'accepted';
+      const attachments: MessageAttachment[] = docs.map(doc => {
+        const text = doc.extracted_text ?? '';
+        return {
+          filename: doc.filename,
+          content_type: doc.content_type,
+          text: text.slice(0, MAX_ATTACHMENT_CHARS),
+          truncated: text.length > MAX_ATTACHMENT_CHARS,
+        };
       });
-      setDecisions(initial);
-      setChangeset(result);
-      refreshSummaries();
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-      setPendingUser(null);
-    } finally {
-      setIsRunning(false);
-    }
-  }, [
-    attachmentsForSend,
-    attachmentBlocksSend,
-    ensureConversation,
-    input,
-    isRunning,
-    projectId,
-    refreshSummaries,
-    resetProposal,
-  ]);
+      await submitTurn(message, attachments);
+    },
+    [canWrite, isRunning, submitTurn],
+  );
+
+  // Fire the kickstart exactly once per new token (the guard prevents a re-render
+  // — e.g. isRunning toggling — from re-sending the same onboarding turn).
+  const lastKickstartToken = useRef<number | null>(null);
+  useEffect(() => {
+    if (!kickstart || kickstart.token === lastKickstartToken.current) return;
+    lastKickstartToken.current = kickstart.token;
+    runKickstart(kickstart.message, kickstart.documents);
+  }, [kickstart, runKickstart]);
 
   const acceptedItems = useMemo(
     () =>
@@ -641,20 +700,22 @@ const CopilotPanel = ({
       data-test="copilot-panel"
     >
       <Flex
-        justify="space-between"
-        align="center"
+        vertical
+        gap={theme.sizeUnit}
         css={css`
           padding: ${theme.sizeUnit * 2}px;
           border-bottom: 1px solid ${theme.colorBorderSecondary};
         `}
       >
+        {/* Title sits above the actions and the actions wrap, so a narrow rail
+            never squeezes "MDL Copilot" into one character per line. */}
         <Typography.Text strong>{t('MDL Copilot')}</Typography.Text>
         {/* Coverage + Inspector operate on an active semantic layer, so they are
             hidden until the layer is ready (decision: UI-hide, no backend gate).
             Thread actions (new / history / rename / delete) mirror the AI SQL
             chat for cross-agent parity. */}
-        {isReady ? (
-          <Flex gap={theme.sizeUnit}>
+        {!isBootstrapping ? (
+          <Flex gap={theme.sizeUnit} wrap="wrap">
             <Button
               buttonStyle="link"
               buttonSize="small"
@@ -715,7 +776,7 @@ const CopilotPanel = ({
         ) : null}
       </Flex>
 
-      {isReady && isHistoryOpen ? (
+      {!isBootstrapping && isHistoryOpen ? (
         <Flex
           vertical
           gap={theme.sizeUnit}
@@ -763,7 +824,7 @@ const CopilotPanel = ({
         </Flex>
       ) : null}
 
-      {!isReady ? (
+      {isBootstrapping ? (
         <Flex
           vertical
           align="center"
@@ -777,71 +838,76 @@ const CopilotPanel = ({
           `}
           data-test="copilot-not-ready"
         >
-          {readinessStatus === 'indexing' ? (
-            <>
-              <Icons.LoadingOutlined
-                iconSize="xl"
-                aria-label={t('Onboarding in progress')}
-              />
-              <Typography.Text type="secondary">
-                {t(
-                  'Onboarding — building the base semantic layer from your ' +
-                    'registered datasets. This is a one-time setup step, separate ' +
-                    'from the Copilot chat. The Copilot opens automatically when ' +
-                    'it’s ready.',
-                )}
-              </Typography.Text>
-            </>
-          ) : readinessStatus === 'failed' ? (
-            <>
-              <Typography.Text type="danger">
-                {t(
-                  'Onboarding didn’t finish: %s',
-                  readinessDetail || t('unknown error'),
-                )}
-              </Typography.Text>
-              <Typography.Text type="secondary">
-                {t(
-                  'Check that this schema has registered datasets you can ' +
-                    'access, then try again.',
-                )}
-              </Typography.Text>
-              <Button
-                buttonStyle="primary"
-                buttonSize="small"
-                disabled={!canWrite}
-                onClick={onOnboard}
-                data-test="copilot-onboard"
-              >
-                {t('Retry onboarding')}
-              </Button>
-            </>
-          ) : (
-            <>
-              <Typography.Text type="secondary">
-                {t(
-                  'The MDL Copilot turns on after onboarding. Onboarding reads ' +
-                    'the tables you’ve registered as datasets in this schema and ' +
-                    'builds the base semantic layer — the required first step. ' +
-                    'Only registered tables can be onboarded; you can pick which ' +
-                    'ones (and register more) in the next step. Nothing else runs ' +
-                    'until it’s ready.',
-                )}
-              </Typography.Text>
-              <Button
-                buttonStyle="primary"
-                buttonSize="small"
-                disabled={!canWrite}
-                onClick={onOnboard}
-                data-test="copilot-onboard"
-              >
-                {t('Onboard this schema')}
-              </Button>
-            </>
-          )}
+          <Icons.LoadingOutlined
+            iconSize="xl"
+            aria-label={t('Onboarding in progress')}
+          />
+          <Typography.Text type="secondary">
+            {t(
+              'Onboarding is running — building the base semantic layer from your ' +
+                'registered datasets. The Copilot opens automatically when it ' +
+                'finishes.',
+            )}
+          </Typography.Text>
         </Flex>
       ) : (
         <>
+          {/* F4: empty/failed projects open straight into the chat. A slim banner
+              keeps the one-click whole-schema onboarding affordance, while the chat
+              itself can onboard specific tables (incl. across schemas) from a doc. */}
+          {needsOnboarding ? (
+            <Flex
+              vertical
+              gap={theme.sizeUnit}
+              css={css`
+                margin: ${theme.sizeUnit * 2}px;
+                padding: ${theme.sizeUnit * 2}px;
+                border: 1px solid ${theme.colorBorderSecondary};
+                border-radius: ${theme.borderRadius}px;
+              `}
+              data-test="copilot-onboard-banner"
+            >
+              <Typography.Text
+                type={readinessStatus === 'failed' ? 'danger' : 'secondary'}
+              >
+                {readinessStatus === 'failed'
+                  ? t(
+                      'Onboarding didn’t finish: %s',
+                      readinessDetail || t('unknown error'),
+                    )
+                  : t(
+                      'This project has no active models yet. Auto-onboard from a ' +
+                        'business document — the Copilot reads it, maps the tables ' +
+                        'it describes, and proposes a changeset to review — or ' +
+                        'onboard the whole schema manually.',
+                    )}
+              </Typography.Text>
+              <Flex gap={theme.sizeUnit * 2}>
+                {onAutoOnboard ? (
+                  <Button
+                    buttonStyle="primary"
+                    buttonSize="small"
+                    disabled={!canWrite}
+                    onClick={onAutoOnboard}
+                    data-test="copilot-auto-onboard"
+                  >
+                    {t('Auto-onboard')}
+                  </Button>
+                ) : null}
+                <Button
+                  buttonStyle={onAutoOnboard ? 'secondary' : 'primary'}
+                  buttonSize="small"
+                  disabled={!canWrite}
+                  onClick={onOnboard}
+                  data-test="copilot-onboard"
+                >
+                  {readinessStatus === 'failed'
+                    ? t('Retry onboarding')
+                    : t('Onboard manually')}
+                </Button>
+              </Flex>
+            </Flex>
+          ) : null}
           <Flex
             vertical
             gap={theme.sizeUnit * 2}

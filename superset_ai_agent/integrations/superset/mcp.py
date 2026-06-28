@@ -307,10 +307,14 @@ class SupersetMcpClient:
                 _normalize_dataset(_as_dict(self.get_dataset_raw(dataset_id)))
                 for dataset_id in dataset_ids
             ]
+            # An explicit id selection is authoritative: bound it to the requested
+            # database, but do NOT narrow by a single schema_name — that would
+            # silently drop datasets in the project's other schemas (cross-schema
+            # onboarding). The database bound prevents cross-database leakage.
             return [
                 dataset
                 for dataset in datasets
-                if schema_name is None or dataset.schema_name == schema_name
+                if dataset.database_id in {0, database_id}
             ]
         payload = _as_dict(
             self.list_datasets_raw(

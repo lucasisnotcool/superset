@@ -17,9 +17,11 @@
 
 from __future__ import annotations
 
+from uuid import uuid4
+
 from superset_ai_agent.conversations.schemas import ConversationScope
 from superset_ai_agent.conversations.store import DEFAULT_OWNER_ID
-from superset_ai_agent.semantic_layer.document_chunks import DocumentChunk
+from superset_ai_agent.semantic_layer.document_chunks import chunk_id, DocumentChunk
 from superset_ai_agent.semantic_layer.schemas import (
     SemanticDocument,
     SemanticLayerEvent,
@@ -69,10 +71,13 @@ class InMemorySemanticLayerStore:
         *,
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> list[SemanticDocument]:
+        # Project-scoped (F5/§5.7) — parity with the SQLAlchemy store: every
+        # DB-authorized user sees the project's full doc set, not only their own.
+        del owner_id
         return [
             document.model_copy(deep=True)
-            for stored_owner_id, document in self._documents.values()
-            if stored_owner_id == owner_id and document.project_id == project_id
+            for _stored_owner_id, document in self._documents.values()
+            if document.project_id == project_id
         ]
 
     def find_document_by_checksum(
@@ -82,12 +87,12 @@ class InMemorySemanticLayerStore:
         *,
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> SemanticDocument | None:
+        # Project-scoped dedup (DP11) — identical bytes from any user dedup.
+        del owner_id
         matches = [
             document
-            for stored_owner_id, document in self._documents.values()
-            if stored_owner_id == owner_id
-            and document.project_id == project_id
-            and document.checksum == checksum
+            for _stored_owner_id, document in self._documents.values()
+            if document.project_id == project_id and document.checksum == checksum
         ]
         if not matches:
             return None
@@ -165,12 +170,65 @@ class InMemorySemanticLayerStore:
         *,
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> list[DocumentChunk]:
+        # Project-scoped RAG corpus (§5.7.1) — across all uploaders, parity with
+        # the SQLAlchemy store.
+        del owner_id
         result: list[DocumentChunk] = []
-        for document_id, chunks in self._chunks.get(owner_id, {}).items():
-            if self._chunk_projects.get(document_id) != project_id:
-                continue
-            result.extend(chunk.model_copy(deep=True) for chunk in chunks)
+        for owner_chunks in self._chunks.values():
+            for document_id, chunks in owner_chunks.items():
+                if self._chunk_projects.get(document_id) != project_id:
+                    continue
+                result.extend(chunk.model_copy(deep=True) for chunk in chunks)
         return sorted(result, key=lambda chunk: (chunk.document_id, chunk.chunk_index))
+
+    def duplicate_documents(
+        self,
+        source_project_id: str,
+        target_project_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> list[DocumentChunk]:
+        """Copy a project's documents + chunks into another project (DP6).
+
+        Parity with the SQLAlchemy store: project-scoped reads (every uploader's
+        docs), each document re-parented under a fresh id with deterministic new
+        chunk ids; returns the new chunks for the caller to re-embed.
+        """
+
+        chunks_by_doc: dict[str, list[DocumentChunk]] = {}
+        for chunk in self.list_project_chunks(source_project_id):
+            chunks_by_doc.setdefault(chunk.document_id, []).append(chunk)
+        new_chunks: list[DocumentChunk] = []
+        for document in self.list_project_documents(source_project_id):
+            new_document = document.model_copy(
+                update={
+                    "id": str(uuid4()),
+                    "project_id": target_project_id,
+                    "deduplicated": False,
+                }
+            )
+            self.save_document(new_document, owner_id=owner_id)
+            rebuilt = [
+                chunk.model_copy(
+                    update={
+                        "id": chunk_id(new_document.id, chunk.chunk_index),
+                        "document_id": new_document.id,
+                    }
+                )
+                for chunk in sorted(
+                    chunks_by_doc.get(document.id, []),
+                    key=lambda c: c.chunk_index,
+                )
+            ]
+            if rebuilt:
+                self.save_chunks(
+                    new_document.id,
+                    rebuilt,
+                    owner_id=owner_id,
+                    project_id=target_project_id,
+                )
+            new_chunks.extend(rebuilt)
+        return new_chunks
 
     def get_state(
         self,
@@ -248,10 +306,13 @@ class InMemorySemanticLayerStore:
         *,
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> list[SemanticLayerEvent]:
+        # Project-scoped provenance (§5.6.1) — across all actors, parity with the
+        # SQLAlchemy store.
+        del owner_id
         return [
             event.model_copy(deep=True)
-            for stored_owner_id, event in self._events
-            if stored_owner_id == owner_id and event.project_id == project_id
+            for _stored_owner_id, event in self._events
+            if event.project_id == project_id
         ]
 
     def delete_project_events(
@@ -261,13 +322,12 @@ class InMemorySemanticLayerStore:
         owner_id: str = DEFAULT_OWNER_ID,
         types: frozenset[str] | None = None,
     ) -> int:
+        del owner_id
         kept: list[tuple[str, SemanticLayerEvent]] = []
         deleted = 0
         for stored_owner_id, event in self._events:
-            matches = (
-                stored_owner_id == owner_id
-                and event.project_id == project_id
-                and (types is None or event.type in types)
+            matches = event.project_id == project_id and (
+                types is None or event.type in types
             )
             if matches:
                 deleted += 1

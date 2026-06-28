@@ -110,6 +110,7 @@ from superset_ai_agent.semantic_layer.copilot.schemas import (
     CoverageRun,
     InstructionView,
     MessageAttachment,
+    ToolCallRecord,
     WorkspaceNode,
 )
 from superset_ai_agent.semantic_layer.copilot.service import (
@@ -220,7 +221,9 @@ from superset_ai_agent.semantic_layer.schemas import (
     SemanticLayerEventType,
     SemanticLayerState,
     SemanticProject,
+    SemanticProjectDuplicateRequest,
     SemanticProjectReadiness,
+    SemanticProjectRenameRequest,
     SemanticProjectResolveRequest,
     WrenMaterializationResult,
 )
@@ -956,12 +959,24 @@ def create_app(  # noqa: C901
             schema_name=schema_name,
         )
         try:
-            return build_semantic_access_service(fastapi_request).list_projects(
+            projects = build_semantic_access_service(fastapi_request).list_projects(
                 identity=identity,
                 scope=scope,
             )
         except SupersetAuthError as ex:
             raise HTTPException(status_code=ex.status_code, detail=str(ex)) from ex
+        # Enrich each row with its latest coverage score for the browser badge.
+        # Best-effort: a coverage-store hiccup must never break the project list.
+        for project in projects:
+            try:
+                run = active_coverage_run_store.latest_complete(project.id)
+                if run is not None:
+                    project.coverage_score = run.score
+            except Exception:  # pylint: disable=broad-except
+                logger.debug(
+                    "coverage score lookup failed for project %s", project.id
+                )
+        return projects
 
     @api.get(
         "/agent/semantic-layer/projects/{project_id}",
@@ -987,16 +1002,148 @@ def create_app(  # noqa: C901
         fastapi_request: Request,
         identity: AgentIdentity = identity_dependency,
     ) -> dict[str, bool]:
-        """Archive a semantic project."""
+        """Archive a semantic project (requires write access to its database)."""
 
         authorize_semantic_project(
             fastapi_request,
             project_id,
             owner_id=identity.owner_id,
-            permission="admin",
+            permission="write",
         )
         active_semantic_project_store.delete(project_id, owner_id=identity.owner_id)
         return {"deleted": True}
+
+    @api.patch(
+        "/agent/semantic-layer/projects/{project_id}",
+        response_model=SemanticProject,
+    )
+    def rename_semantic_project(
+        project_id: str,
+        request: SemanticProjectRenameRequest,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> SemanticProject:
+        """Rename a semantic project (requires write access to its database)."""
+
+        name = request.name.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="A project name is required.")
+        authorize_semantic_project(
+            fastapi_request,
+            project_id,
+            owner_id=identity.owner_id,
+            permission="write",
+        )
+        return active_semantic_project_store.rename(
+            project_id, name, owner_id=identity.owner_id
+        )
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/duplicate",
+        response_model=SemanticProject,
+    )
+    def duplicate_semantic_project(
+        project_id: str,
+        request: SemanticProjectDuplicateRequest,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> SemanticProject:
+        """Duplicate a project's MDL structure into a new project (fresh history).
+
+        Copies the project identity, schema set, and MDL files; documents, coverage,
+        and provenance are NOT carried (DP6/DP8). A single ``mdl_project_created``
+        provenance entry records the clone's ``duplicated_from`` lineage.
+        """
+
+        # Read access on the source is sufficient — duplication is creative, not
+        # destructive (it never mutates the source).
+        source = authorize_semantic_project(
+            fastapi_request,
+            project_id,
+            owner_id=identity.owner_id,
+            permission="read",
+        )
+        clone = active_semantic_project_store.clone(
+            project_id,
+            new_name=(request.name or None),
+            owner_id=identity.owner_id,
+        )
+        # The clone (project+memberships) and the file copy live in separate stores,
+        # so they cannot share one transaction. If the file copy fails, compensate by
+        # archiving the just-created clone — never leave an orphan empty project.
+        try:
+            active_mdl_file_store.duplicate_files(
+                project_id, clone.id, owner_id=identity.owner_id
+            )
+        except Exception as ex:  # pylint: disable=broad-except
+            try:
+                active_semantic_project_store.delete(
+                    clone.id, owner_id=identity.owner_id
+                )
+            except Exception:  # pylint: disable=broad-except
+                logger.warning(
+                    "Failed to roll back an incomplete project duplicate %s.",
+                    clone.id,
+                    exc_info=True,
+                )
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to duplicate the project's MDL files.",
+            ) from ex
+        if request.include_documents:
+            # DP6 opt-in: copy the BI documents + chunks and re-embed them under the
+            # clone's vector scope. Best-effort — the structural clone has already
+            # succeeded, and vectors are an accelerator (recall degrades to keyword),
+            # so a copy/embed failure must not fail the duplication. Large corpora
+            # embed synchronously here; an async job is the follow-on for scale.
+            try:
+                copied_chunks = active_semantic_layer_store.duplicate_documents(
+                    project_id, clone.id, owner_id=identity.owner_id
+                )
+                if copied_chunks:
+                    active_document_index.index(
+                        copied_chunks,
+                        scope_key=document_scope_key(clone.id),
+                    )
+            except Exception:  # pylint: disable=broad-except
+                logger.warning(
+                    "Failed to copy documents into project duplicate %s.",
+                    clone.id,
+                    exc_info=True,
+                )
+        _emit_project_created_provenance(
+            clone=clone, source=source, owner_id=identity.owner_id
+        )
+        return clone
+
+    @api.post(
+        "/agent/semantic-layer/projects",
+        response_model=SemanticProject,
+    )
+    def create_semantic_project(
+        request: SemanticProjectResolveRequest,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> SemanticProject:
+        """Create a new named semantic project (the MDL Lab "New project" path)."""
+
+        if not request.schema_name:
+            raise HTTPException(status_code=400, detail="schema_name is required.")
+        service = build_semantic_access_service(fastapi_request)
+        # Prove DB access to the requested schema(s) before creating.
+        service.require_schema_set_permission(
+            identity=identity,
+            database_id=request.database_id,
+            catalog_name=request.catalog_name,
+            schema_names=request.resolved_schema_names(),
+            permission=SemanticPermission.WRITE,
+        )
+        try:
+            return active_semantic_project_store.create(
+                service.enrich_request(request), owner_id=identity.owner_id
+            )
+        except SupersetAuthError as ex:
+            raise HTTPException(status_code=ex.status_code, detail=str(ex)) from ex
 
     @api.get(
         "/agent/semantic-layer/projects/{project_id}/mdl-files",
@@ -1025,11 +1172,16 @@ def create_app(  # noqa: C901
         file: MdlFile,
         message: str,
         status_from: str | None = None,
+        actor_name: str | None = None,
     ) -> None:
         """Append an MDL-CRUD provenance event (best-effort; never blocks the write).
 
         Provenance is an audit aid, not part of the write contract — a failure to
         record must not fail the file operation (mirrors the Copilot step-sink).
+
+        ``actor_name`` (the author's username/email, DP10) is captured at write time
+        so a shared project's timeline can name *who* made a hand edit without a
+        cross-user lookup the agent service cannot perform.
         """
 
         try:
@@ -1039,6 +1191,8 @@ def create_app(  # noqa: C901
                 "file_id": file.id,
                 "source_type": file.source_type,
             }
+            if actor_name:
+                detail["actor_name"] = actor_name
             if file.source_document_id:
                 detail["document_id"] = file.source_document_id
             if status_from is not None:
@@ -1057,10 +1211,39 @@ def create_app(  # noqa: C901
         except Exception:  # pylint: disable=broad-except
             logger.warning("Failed to record MDL provenance event.", exc_info=True)
 
+    def _emit_project_created_provenance(
+        *,
+        clone: SemanticProject,
+        source: SemanticProject,
+        owner_id: str,
+    ) -> None:
+        """Stamp a duplicated project's origin entry (best-effort; DP8 lineage)."""
+
+        try:
+            _append_semantic_event(
+                store=active_semantic_layer_store,
+                owner_id=owner_id,
+                event_type="mdl_project_created",
+                scope=_scope_from_project(clone),
+                document_id=None,
+                message=f'Duplicated from "{source.name}"',
+                project_id=clone.id,
+                detail={
+                    "actor": owner_id,
+                    "duplicated_from": source.id,
+                    "source_name": source.name,
+                },
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.warning(
+                "Failed to record project-created provenance.", exc_info=True
+            )
+
     def _emit_agent_apply_provenance(
         *,
         project: SemanticProject,
         owner_id: str,
+        actor_name: str | None = None,
         items: list[ChangesetItem],
         conversation_id: str | None,
     ) -> None:
@@ -1075,6 +1258,7 @@ def create_app(  # noqa: C901
         try:
             summary: str | None = None
             documents: list[dict[str, str | None]] = []
+            tool_calls: list[ToolCallRecord] = []
             if conversation_id:
                 conversation = active_conversation_store.get(
                     conversation_id, owner_id=owner_id
@@ -1082,6 +1266,7 @@ def create_app(  # noqa: C901
                 changeset = changeset_from_conversation(conversation)
                 if changeset is not None:
                     summary = changeset.message
+                    tool_calls = changeset.tool_calls
                     for document_id in changeset.referenced_document_ids:
                         filename: str | None = None
                         try:
@@ -1098,9 +1283,11 @@ def create_app(  # noqa: C901
             event_type, message, detail = apply_provenance_payload(
                 items=items,
                 owner_id=owner_id,
+                actor_name=actor_name,
                 conversation_id=conversation_id,
                 summary=summary,
                 documents=documents,
+                tool_calls=tool_calls,
             )
             _append_semantic_event(
                 store=active_semantic_layer_store,
@@ -1314,6 +1501,7 @@ def create_app(  # noqa: C901
                 event_type="mdl_created",
                 file=created,
                 message=f"Created {created.path}",
+                actor_name=identity.username or identity.email,
             )
             return created
         except MdlFileExistsError as ex:
@@ -1371,14 +1559,31 @@ def create_app(  # noqa: C901
             # for providers that do not implement full-schema introspection.
             fetch_full = getattr(request_context_provider, "get_full_schema", None)
             fetch = fetch_full or request_context_provider.get_context
-            context = fetch(
-                AgentQueryRequest(
-                    question="semantic layer validation",
-                    database_id=project.default_database_id,
-                    catalog_name=project.catalog_name,
-                    schema_name=project.schema_name,
+
+            def _fetch(schema_name: str) -> Any:
+                return fetch(
+                    AgentQueryRequest(
+                        question="semantic layer validation",
+                        database_id=project.default_database_id,
+                        catalog_name=project.catalog_name,
+                        schema_name=schema_name,
+                    )
                 )
-            )
+
+            # Union every member schema so the index knows the project's FULL scope
+            # (mirrors ``_onboarding_context``). Without this, a multi-schema project
+            # validates/generates against only its primary schema — so the R1
+            # invariant wrongly rejects, and the Copilot is blind to, tables in the
+            # project's secondary schemas even though their access is proven.
+            context = _fetch(project.schema_name)
+            seen = {dataset.id for dataset in context.datasets}
+            for schema_name in project.schema_names:
+                if schema_name == project.schema_name:
+                    continue
+                for dataset in _fetch(schema_name).datasets:
+                    if dataset.id not in seen:
+                        seen.add(dataset.id)
+                        context.datasets.append(dataset)
         except Exception:  # pylint: disable=broad-except
             snapshot = active_schema_snapshot_store.get(project.id)
             if snapshot is None:
@@ -1546,6 +1751,7 @@ def create_app(  # noqa: C901
                     file=updated,
                     message=f"Activated {updated.path}",
                     status_from=existing.status,
+                    actor_name=identity.username or identity.email,
                 )
             else:
                 _emit_mdl_provenance(
@@ -1554,6 +1760,7 @@ def create_app(  # noqa: C901
                     event_type="mdl_updated",
                     file=updated,
                     message=f"Edited {updated.path}",
+                    actor_name=identity.username or identity.email,
                 )
             # The active MDL directory changed (activation, or an edit to a live
             # file) → (re)run directory coverage on the latest version.
@@ -1598,6 +1805,7 @@ def create_app(  # noqa: C901
                 event_type="mdl_deleted",
                 file=existing,
                 message=f"Deleted {existing.path}",
+                actor_name=identity.username or identity.email,
             )
             # Deleting a live file changes the active directory → re-audit coverage.
             if existing.status == "active":
@@ -1703,11 +1911,13 @@ def create_app(  # noqa: C901
         )
 
     def _require_project_ready(project: SemanticProject, owner_id: str) -> None:
+        # F4: the Copilot is available even on an empty project, so it can *drive*
+        # onboarding (propose models from a BI doc, human-in-the-loop). Readiness is
+        # advisory, not a gate — the only remaining hard block is an in-flight
+        # onboarding *job* (``indexing``): editing the MDL directory while the job is
+        # still writing files would race it. ``empty``/``ready``/``failed`` all pass.
         readiness = _project_readiness(project, owner_id)
-        if not readiness.ready:
-            # 409 Conflict: the request is valid but the project is not in a state
-            # that can accept Copilot edits yet. The structured detail lets the UI
-            # show a spinner (indexing) vs an onboarding prompt (empty/failed).
+        if readiness.status == "indexing":
             raise HTTPException(
                 status_code=409,
                 detail={
@@ -2333,7 +2543,9 @@ def create_app(  # noqa: C901
                         instructions=instructions,
                         history=history,
                         model=request.model,
-                        max_steps=request.max_steps or app_config.wren_copilot_max_steps,
+                        max_steps=(
+                            request.max_steps or app_config.wren_copilot_max_steps
+                        ),
                         deep_validate=app_config.wren_modeling_deep_validation,
                         autopilot=app_config.wren_copilot_autopilot_enabled,
                         on_step=on_step,
@@ -2423,6 +2635,7 @@ def create_app(  # noqa: C901
         _emit_agent_apply_provenance(
             project=project,
             owner_id=identity.owner_id,
+            actor_name=identity.username or identity.email,
             items=request.items,
             conversation_id=request.conversation_id,
         )
@@ -2539,7 +2752,7 @@ def create_app(  # noqa: C901
             fetch_full = getattr(request_context_provider, "get_full_schema", None)
             fetch = fetch_full or request_context_provider.get_context
 
-            def _fetch(schema_name: str) -> Any:
+            def _fetch(schema_name: str | None) -> Any:
                 return fetch(
                     AgentQueryRequest(
                         question="semantic layer onboarding",
@@ -2551,9 +2764,14 @@ def create_app(  # noqa: C901
                 )
 
             if dataset_ids:
-                # Explicit selection is id-driven; a single fetch covers whatever
-                # schemas the chosen datasets span.
-                context = _fetch(project.schema_name)
+                # An explicit selection is keyed by GLOBALLY-UNIQUE dataset ids, so
+                # fetch by ids ALONE (``schema_name=None``). Passing a single schema
+                # here makes the provider intersect schema AND ids and silently drop
+                # the datasets that live in the project's *other* schemas — so a
+                # cross-schema selection would onboard only the primary schema. The
+                # boundary guard then enforces the project's proven schema set.
+                context = _fetch(None)
+                _enforce_onboarding_schema_boundary(context, project, dataset_ids)
             else:
                 # Whole-project introspection: union every member schema so onboarding
                 # seeds base models across the project's full schema set. Each model's
@@ -2576,13 +2794,16 @@ def create_app(  # noqa: C901
         context: Any,
         owner_id: str,
         dataset_ids: list[int] | None = None,
+        actor_name: str | None = None,
     ) -> SemanticJob:
         """Create + submit the onboarding job.
 
         Onboarding auto-activates valid base models; this also re-indexes retrieval
         so the freshly active layer is searchable immediately (E6 deploy→reindex).
         ``dataset_ids`` (the selected subset, or ``None`` for the whole schema) is
-        recorded on the provenance entry (Feature B).
+        recorded on the provenance entry (Feature B). ``actor_name`` (the
+        onboarder's display name) is stamped so a shared project attributes the
+        onboarding to a person, not a bare id (DP10).
         """
 
         mode = "selected" if dataset_ids is not None else "all"
@@ -2591,6 +2812,7 @@ def create_app(  # noqa: C901
         _append_semantic_event(
             store=active_semantic_layer_store,
             owner_id=owner_id,
+            actor_name=actor_name,
             event_type="onboarding_started",
             scope=scope,
             document_id=None,
@@ -2617,11 +2839,13 @@ def create_app(  # noqa: C901
                 _append_semantic_event(
                     store=active_semantic_layer_store,
                     owner_id=owner_id,
+                    actor_name=actor_name,
                     event_type="onboarding_failed",
                     scope=scope,
                     document_id=None,
                     message=f"Onboarding failed: {ex}",
                     project_id=project.id,
+                    detail={"actor": owner_id, "mode": mode},
                 )
                 return
             # Auto-activation populated the layer; refresh the retrieval index so the
@@ -2636,6 +2860,7 @@ def create_app(  # noqa: C901
             _append_semantic_event(
                 store=active_semantic_layer_store,
                 owner_id=owner_id,
+                actor_name=actor_name,
                 event_type="onboarding_completed",
                 scope=scope,
                 document_id=None,
@@ -2691,7 +2916,11 @@ def create_app(  # noqa: C901
             project, fastapi_request, request or OnboardingRequest()
         )
         return _start_onboarding_job(
-            project, context, identity.owner_id, dataset_ids=dataset_ids
+            project,
+            context,
+            identity.owner_id,
+            dataset_ids=dataset_ids,
+            actor_name=identity.username or identity.email,
         )
 
     @api.post(
@@ -3530,9 +3759,16 @@ def create_app(  # noqa: C901
             for entry in (provenance_from_event(event) for event in events)
             if entry is not None
         ]
+        # DP10: stamp self-vs-teammate attribution here, where the requesting
+        # identity is known. The frontend renders "You" only when ``is_self``.
+        entries = [
+            entry.model_copy(update={"is_self": entry.actor == identity.owner_id})
+            for entry in entries
+        ]
         entries.sort(key=lambda entry: entry.created_at, reverse=True)
         # Collapse contiguous user-edit runs *before* capping so the cap bounds
-        # displayed rows, not raw events.
+        # displayed rows, not raw events. (Coalescing now only merges same-actor
+        # runs, so a shared project keeps distinct users' edits separate.)
         entries = coalesce_user_runs(entries)
         return entries[:PROVENANCE_HISTORY_CAP]
 
@@ -3736,6 +3972,44 @@ def _wren_materialization_base(config: AgentConfig) -> Path:
     return Path(config.agent_storage_dir) / "wren"
 
 
+def _enforce_onboarding_schema_boundary(
+    context: Any, project: SemanticProject, dataset_ids: list[int]
+) -> None:
+    """Keep only selected datasets within the project's schema set, and reconcile.
+
+    An explicit ``include`` selection is fetched id-first (cross-schema). This is
+    the project-boundary guard (F5/R1): never onboard a dataset whose schema is
+    outside the project's proven set, even if a crafted request supplied its id —
+    defense-in-depth, since R1 also rejects at activation. A shortfall between the
+    requested ids and the resolved in-scope datasets is logged so a silent drop
+    (an id that did not load or fell out of scope) surfaces rather than masking.
+    """
+
+    allowed = {schema.lower() for schema in project.schema_names}
+    in_scope = [
+        dataset
+        for dataset in context.datasets
+        if (dataset.schema_name or project.schema_name or "").lower() in allowed
+    ]
+    dropped = len(context.datasets) - len(in_scope)
+    if dropped:
+        logger.warning(
+            "Onboarding dropped %s selected dataset(s) outside the project's "
+            "schema set %s.",
+            dropped,
+            sorted(allowed),
+        )
+    context.datasets = in_scope
+    requested = len(set(dataset_ids))
+    if len(in_scope) < requested:
+        logger.warning(
+            "Onboarding resolved %s of %s requested dataset id(s) for project %s.",
+            len(in_scope),
+            requested,
+            project.id,
+        )
+
+
 def _parse_dataset_ids(dataset_ids: str | None) -> list[int]:
     if not dataset_ids:
         return []
@@ -3752,7 +4026,13 @@ def _append_semantic_event(
     message: str,
     project_id: str | None = None,
     detail: dict[str, Any] | None = None,
+    actor_name: str | None = None,
 ) -> None:
+    # ``actor_name`` (the author's display name, DP10) is captured into the event
+    # detail at write time so a shared project's timeline can name *who* acted
+    # without a cross-user lookup the read path cannot perform.
+    if actor_name:
+        detail = {**(detail or {}), "actor_name": actor_name}
     state = store.get_state(scope, owner_id=owner_id)
     store.append_event(
         SemanticLayerEvent(

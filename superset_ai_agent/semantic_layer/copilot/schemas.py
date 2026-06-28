@@ -32,7 +32,10 @@ from uuid import uuid4
 from pydantic import BaseModel, Field
 
 from superset_ai_agent.schemas import AgentStep
-from superset_ai_agent.semantic_layer.schemas import MdlValidationResult
+from superset_ai_agent.semantic_layer.schemas import (
+    MdlFileSourceType,
+    MdlValidationResult,
+)
 
 
 def _new_id() -> str:
@@ -46,6 +49,37 @@ def _utc_now() -> datetime:
 ATTACHMENT_MAX_CHARS = 200_000
 
 ChangesetOp = Literal["create", "update", "delete"]
+
+#: Semantic verb for an MDL-mutating tool call, named at dispatch time (not
+#: reverse-engineered from a diff). An unmapped/future tool defaults to ``write``
+#: and still surfaces its raw ``tool`` name — extend additively, no migration.
+ToolActionKind = Literal["write", "delete", "onboard", "relate"]
+
+
+class ToolCallRecord(BaseModel):
+    """One MDL-mutating tool call an agent made during a turn (provenance ledger).
+
+    Mirrors an OpenTelemetry ``execute_tool`` span: the tool's name, the semantic
+    verb, the files it touched, the documents that grounded it, and a
+    *sensitivity-aware* argument **shape** (names/counts only — never raw MDL
+    JSON, which is already the file content). Read-only tools are not recorded.
+    The ledger annotates the apply event's coarse diff with per-call intent so the
+    timeline can say "onboarded 3 tables · wrote 4 files" and stay extensible as
+    the toolset grows.
+    """
+
+    tool: str
+    action: ToolActionKind = "write"
+    #: Files this call touched (best-effort; the applied-file set stays the
+    #: authoritative path source at projection time, see the spec's DP6/R1).
+    paths: list[str] = Field(default_factory=list)
+    #: Document ids that grounded this call (R-B6 per-file enrichment signal).
+    source_document_ids: list[str] = Field(default_factory=list)
+    #: Argument *shape* — table names, counts, join types. No values/content.
+    args_summary: dict[str, object] = Field(default_factory=dict)
+    status: Literal["ok", "error"] = "ok"
+    #: Short human note — onboarded table names, a rejection reason, etc.
+    detail: str | None = None
 
 WorkspaceNodeKind = Literal[
     "folder",
@@ -74,6 +108,15 @@ class ChangesetItem(BaseModel):
     validation: MdlValidationResult | None = None
     #: Short human label, e.g. "Add revenue metric to orders".
     summary: str = ""
+    #: R-B6: the source document this file was derived from, when the generating
+    #: tool call was grounded on exactly one document. ``None`` when grounded on
+    #: many/none (the changeset-level ``referenced_document_ids`` still carries the
+    #: set). Persisted onto the file row's ``source_document_id`` on apply.
+    source_document_id: str | None = None
+    #: Origin marker persisted onto the file row. ``None`` → the apply path picks
+    #: the default ("enriched_markdown" when ``source_document_id`` is set, else
+    #: "copilot").
+    source_type: MdlFileSourceType | None = None
 
 
 class Changeset(BaseModel):
@@ -95,6 +138,11 @@ class Changeset(BaseModel):
     #: are ephemeral (no document id), so only the filename is recorded; like
     #: ``referenced_document_ids`` they mark the apply as an enrichment pass.
     referenced_attachments: list[str] = Field(default_factory=list)
+    #: Per-tool-call provenance ledger for this turn's MDL-mutating tool calls.
+    #: Folded into the apply event's ``detail.tool_calls`` so the timeline can
+    #: present a per-verb rollup ("onboarded 3 · wrote 4") and a per-file source
+    #: link. Empty for hand edits / legacy turns (UI falls back to ``paths``/``ops``).
+    tool_calls: list[ToolCallRecord] = Field(default_factory=list)
 
 
 class WorkspaceNode(BaseModel):

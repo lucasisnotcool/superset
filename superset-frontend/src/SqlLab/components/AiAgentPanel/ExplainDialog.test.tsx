@@ -116,6 +116,58 @@ test('surfaces typed detail: the semantic->native rewrite toggles', async () => 
   expect(screen.getByText('embedding')).toBeInTheDocument();
 });
 
+// A single plan_semantic_sql step carrying only the supplied rewrite fields, so
+// the SqlRewrite fallback branches can be exercised in isolation.
+const rewriteStep = (
+  detail: Partial<{ semantic_sql: string | null; native_sql: string | null }>,
+): AgentStep[] => [
+  {
+    kind: 'plan_semantic_sql',
+    status: 'ok',
+    summary: 'Rewrote semantic SQL to native SQL.',
+    started_at: '2026-06-24T12:00:01Z',
+    duration_ms: 10,
+    attempt_index: 0,
+    detail: {
+      kind: 'plan_semantic_sql',
+      engine: 'wren',
+      rewritten: true,
+      semantic_sql: null,
+      native_sql: null,
+      referenced_tables: [],
+      warnings: [],
+      ...detail,
+    },
+  },
+];
+
+test('rewrite with only the native form shows it without a toggle', () => {
+  render(
+    <ExplainDialog
+      open
+      onClose={noop}
+      steps={rewriteStep({ native_sql: 'SELECT a FROM sales.orders' })}
+    />,
+  );
+  expect(screen.getByText('Native SQL')).toBeInTheDocument();
+  expect(screen.getByText('SELECT a FROM sales.orders')).toBeInTheDocument();
+  // No toggle is offered when there is nothing to toggle between.
+  expect(screen.queryByText('Semantic (authored)')).not.toBeInTheDocument();
+});
+
+test('rewrite with only the semantic form falls back to the authored block', () => {
+  render(
+    <ExplainDialog
+      open
+      onClose={noop}
+      steps={rewriteStep({ semantic_sql: 'SELECT a FROM orders' })}
+    />,
+  );
+  expect(screen.getByText('Semantic SQL')).toBeInTheDocument();
+  expect(screen.getByText('SELECT a FROM orders')).toBeInTheDocument();
+  expect(screen.queryByText('Native (executed)')).not.toBeInTheDocument();
+});
+
 test('groups retries into labeled attempts', () => {
   render(<ExplainDialog open onClose={noop} steps={steps} />);
   expect(screen.getByText('Attempt 1')).toBeInTheDocument();

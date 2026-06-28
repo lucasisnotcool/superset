@@ -96,7 +96,9 @@ class ToolCallingModel:
         return ModelResult(content="Created the moves model.")
 
 
-def _client(tmp_path, *, model_client=None, enabled=True, **config) -> TestClient:
+def _client(
+    tmp_path, *, model_client=None, enabled=True, coverage_run_store=None, **config
+) -> TestClient:
     app = create_app(
         config=AgentConfig(
             identity_provider="static",
@@ -117,6 +119,7 @@ def _client(tmp_path, *, model_client=None, enabled=True, **config) -> TestClien
         document_storage=LocalDocumentStorage(str(tmp_path)),
         context_provider=_ContextProvider(),
         job_runner=InlineJobRunner(),
+        coverage_run_store=coverage_run_store,
     )
     return TestClient(app)
 
@@ -498,20 +501,21 @@ def test_readiness_reports_empty_then_ready(tmp_path) -> None:
     assert ready["active_model_count"] == 1
 
 
-def test_copilot_run_blocked_until_ready(tmp_path) -> None:
+def test_copilot_runs_on_empty_project(tmp_path) -> None:
+    # F4: the Copilot is available pre-onboarding so it can *drive* onboarding
+    # (propose base models from a BI doc, human-in-the-loop). An empty project no
+    # longer blocks the turn; readiness is advisory, not a gate.
     client = _client(tmp_path)
     project = _resolve(client)
     pid = project["id"]
 
-    # No onboarded models yet → the editing turn is gated with 409.
     run = client.post(
         f"/agent/semantic-layer/projects/{pid}/copilot",
         json={"message": "model the moves table"},
     )
-    assert run.status_code == 409, run.text
-    assert run.json()["detail"]["status"] == "empty"
+    assert run.status_code == 200, run.text
 
-    # Once a base model is active, the same request is accepted.
+    # And it still works once a base model is active.
     _seed_active_model(client, pid)
     ok = client.post(
         f"/agent/semantic-layer/projects/{pid}/copilot",
@@ -520,7 +524,7 @@ def test_copilot_run_blocked_until_ready(tmp_path) -> None:
     assert ok.status_code == 200, ok.text
 
 
-def test_copilot_stream_blocked_until_ready(tmp_path) -> None:
+def test_copilot_stream_runs_on_empty_project(tmp_path) -> None:
     client = _client(tmp_path)
     project = _resolve(client)
     pid = project["id"]
@@ -529,8 +533,62 @@ def test_copilot_stream_blocked_until_ready(tmp_path) -> None:
         f"/agent/semantic-layer/projects/{pid}/copilot/stream",
         json={"message": "model the moves table"},
     )
-    assert response.status_code == 409, response.text
-    assert response.json()["detail"]["status"] == "empty"
+    assert response.status_code == 200, response.text
+
+
+class _NoOpJobRunner:
+    """A runner that never executes the job, so an onboarding job stays running."""
+
+    def submit(self, fn) -> None:  # noqa: ANN001 - test stub
+        return None
+
+
+def test_copilot_blocked_while_onboarding_is_indexing(tmp_path) -> None:
+    # F4 keeps exactly one hard gate: an in-flight onboarding *job* (``indexing``)
+    # blocks Copilot edits so they don't race the file writes. (empty/ready/failed
+    # all pass — proven by the tests above.)
+    from superset_ai_agent.app import create_app  # local import: custom runner
+    from superset_ai_agent.config import AgentConfig
+    from superset_ai_agent.conversations.memory import InMemoryConversationStore
+    from superset_ai_agent.semantic_layer.memory import InMemorySemanticLayerStore
+
+    app = create_app(
+        config=AgentConfig(
+            identity_provider="static",
+            superset_auth_mode="service_account",
+            conversation_store="memory",
+            semantic_layer_store="memory",
+            wren_engine="passthrough",
+            wren_core_validation_enabled=False,
+            wren_copilot_enabled=True,
+            agent_storage_dir=str(tmp_path),
+        ),
+        model_client=ToolCallingModel(),
+        text_to_sql_graph=object(),
+        conversation_graph=object(),
+        conversation_store=InMemoryConversationStore(),
+        semantic_layer_store=InMemorySemanticLayerStore(),
+        document_storage=LocalDocumentStorage(str(tmp_path)),
+        context_provider=_ContextProvider(),
+        job_runner=_NoOpJobRunner(),
+    )
+    client = TestClient(app)
+    project = _resolve(client)
+    pid = project["id"]
+
+    started = client.post(f"/agent/semantic-layer/projects/{pid}/onboard")
+    assert started.status_code == 202, started.text
+    readiness = client.get(
+        f"/agent/semantic-layer/projects/{pid}/readiness"
+    ).json()
+    assert readiness["status"] == "indexing", readiness
+
+    run = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot",
+        json={"message": "model the moves table"},
+    )
+    assert run.status_code == 409, run.text
+    assert run.json()["detail"]["status"] == "indexing"
 
 
 # -- reset: delete-only, never auto re-onboards ----------------------------------
@@ -568,12 +626,13 @@ def test_reset_deletes_all_mdl_and_does_not_reonboard(tmp_path) -> None:
     assert readiness["status"] == "empty"
     assert readiness["ready"] is False
 
-    # A Copilot turn is gated again after reset (the contract still holds).
-    blocked = client.post(
+    # F4: a Copilot turn is still allowed on the reset (empty) project — onboarding
+    # is a Copilot-driven action now, not a precondition for chatting.
+    allowed = client.post(
         f"/agent/semantic-layer/projects/{pid}/copilot",
         json={"message": "model the moves table"},
     )
-    assert blocked.status_code == 409, blocked.text
+    assert allowed.status_code == 200, allowed.text
 
 
 def test_reset_on_empty_project_is_a_noop(tmp_path) -> None:
@@ -1009,3 +1068,38 @@ def test_copilot_apply_without_conversation_id_does_not_touch_threads(
         client.get(f"/agent/semantic-layer/projects/{pid}/copilot/conversations").json()
         == []
     )
+
+
+def test_project_list_carries_latest_coverage_score_for_the_browser_badge(
+    tmp_path,
+) -> None:
+    # The MDL Lab browser shows a per-project coverage % from the list endpoint
+    # (DP-A: one batch read, not an N+1 status fetch per row).
+    from superset_ai_agent.semantic_layer.copilot.schemas import CoverageReport
+    from superset_ai_agent.semantic_layer.coverage_store import (
+        InMemoryCoverageRunStore,
+    )
+
+    coverage_store = InMemoryCoverageRunStore()
+    client = _client(tmp_path, coverage_run_store=coverage_store)
+    project = _resolve(client)
+    pid = project["id"]
+
+    listing_url = "/agent/semantic-layer/projects?database_id=1&schema_name=pipeline"
+
+    # No coverage yet → the field is present but null.
+    before = client.get(listing_url).json()
+    assert before
+    assert before[0]["coverage_score"] is None
+
+    # A completed run surfaces its score on the list row.
+    run = coverage_store.create(
+        project_id=pid, owner_id="local", mdl_checksum="m", docs_checksum="d"
+    )
+    coverage_store.complete(
+        run.id,
+        CoverageReport(document_filename="spec.md", total=4, covered=3, missing=1),
+        score=0.75,
+    )
+    after = client.get(listing_url).json()
+    assert after[0]["coverage_score"] == 0.75

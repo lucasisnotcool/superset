@@ -140,6 +140,19 @@ class SemanticLayerStore(Protocol):
     ) -> list[DocumentChunk]:
         """List every chunk in a project (cross-document duplicate scans)."""
 
+    def duplicate_documents(
+        self,
+        source_project_id: str,
+        target_project_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> list[DocumentChunk]:
+        """Copy a project's documents + chunks into another project (DP6).
+
+        Returns the new chunks (fresh ids, re-parented) so the caller can re-embed
+        them under the target's vector scope.
+        """
+
     def get_state(
         self,
         scope: ConversationScope,

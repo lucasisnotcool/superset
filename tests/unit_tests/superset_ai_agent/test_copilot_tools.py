@@ -66,9 +66,16 @@ def test_specs_expose_the_tool_surface() -> None:
         "delete_mdl_file",
         "validate_project",
         "get_physical_schema",
+        "propose_onboard_table",
+        "propose_onboard_tables",
+        "propose_relationships",
+        # read-only discovery
+        "find_tables",
         # read-only document grounding tools
         "list_documents",
         "search_documents",
+        "read_document",
+        "run_coverage",
         "find_duplicate_documents",
     }
 
@@ -90,6 +97,193 @@ def test_write_new_file_produces_create_changeset_item() -> None:
     assert item.current_content is None
     assert item.summary == "add orders"
     assert changeset.manifest_validation is not None
+
+
+def test_propose_onboard_table_generates_a_valid_base_model() -> None:
+    # F4 convenience tool: one call onboards a physical table as a base model,
+    # grounded in the (typed) schema index so it passes validation immediately.
+    schema = SchemaIndex.from_snapshot(
+        {"orders": ["id", "amount"]},
+        {"orders": {"id": "INTEGER", "amount": "DECIMAL"}},
+    )
+    toolset = MdlToolset([], schema_index=schema)
+
+    result = toolset.dispatch("propose_onboard_table", {"table": "orders"})
+    assert "error" not in result, result
+    assert result["onboarded_table"] == "orders"
+    assert result["validation"]["valid"] is True
+
+    changeset = toolset.build_changeset()
+    assert len(changeset.items) == 1
+    assert changeset.items[0].op == "create"
+    assert changeset.items[0].path == "models/orders.json"
+    body = json.loads(changeset.items[0].proposed_content or "{}")
+    model = body["models"][0]
+    assert model["tableReference"]["table"] == "orders"
+    assert {c["name"] for c in model["columns"]} == {"id", "amount"}
+    assert all(c.get("type") for c in model["columns"])  # types carried
+
+
+def test_propose_onboard_table_rejects_a_table_outside_the_schema_set() -> None:
+    # R1: the tool never invents a table absent from the project's accessible schemas.
+    toolset = MdlToolset([], schema_index=SCHEMA)
+    result = toolset.dispatch("propose_onboard_table", {"table": "ghosts"})
+    assert "error" in result
+    assert "not in the project" in result["error"]
+
+
+def _multi_schema_index() -> SchemaIndex:
+    """A live-shape index spanning two schemas (orders↔customers join-ready)."""
+
+    return SchemaIndex(
+        tables={
+            "orders": {"id", "amount", "customer_id"},
+            "customers": {"id", "name"},
+        },
+        column_types={
+            "orders": {"id": "BIGINT", "amount": "DECIMAL", "customer_id": "BIGINT"},
+            "customers": {"id": "BIGINT", "name": "VARCHAR"},
+        },
+        tables_by_schema={
+            "sales": {"orders": {"id", "amount", "customer_id"}},
+            "crm": {"customers": {"id", "name"}},
+        },
+    )
+
+
+def test_propose_onboard_tables_onboards_each_across_schemas() -> None:
+    # FP1: the cross-schema BI-doc flow — one call onboards several named tables,
+    # each as its own staged base model. Tables span two schemas.
+    toolset = MdlToolset([], schema_index=_multi_schema_index())
+
+    result = toolset.dispatch(
+        "propose_onboard_tables",
+        {
+            "tables": [
+                {"table": "orders", "schema": "sales"},
+                {"table": "customers", "schema": "crm"},
+            ]
+        },
+    )
+    assert result["rejected"] == [], result
+    assert {row["table"] for row in result["onboarded"]} == {"orders", "customers"}
+
+    changeset = toolset.build_changeset()
+    assert {item.path for item in changeset.items} == {
+        "models/orders.json",
+        "models/customers.json",
+    }
+
+
+def test_propose_onboard_tables_rejects_unknown_tables_per_item() -> None:
+    # R1/R-G2: a bad name is rejected per-item and never invented; valid tables in
+    # the same batch still onboard (partial success).
+    toolset = MdlToolset([], schema_index=SCHEMA)
+
+    result = toolset.dispatch(
+        "propose_onboard_tables",
+        {"tables": [{"table": "orders"}, {"table": "ghosts"}]},
+    )
+    assert {row["table"] for row in result["onboarded"]} == {"orders"}
+    assert len(result["rejected"]) == 1
+    assert result["rejected"][0]["table"] == "ghosts"
+    assert "not in the project" in result["rejected"][0]["error"]
+
+
+def _onboarded_pair() -> MdlToolset:
+    """A toolset with two onboarded models ready to be related."""
+
+    toolset = MdlToolset([], schema_index=_multi_schema_index())
+    toolset.dispatch(
+        "propose_onboard_tables",
+        {
+            "tables": [
+                {"table": "orders", "schema": "sales"},
+                {"table": "customers", "schema": "crm"},
+            ]
+        },
+    )
+    return toolset
+
+
+def test_propose_relationships_stages_a_valid_join() -> None:
+    # FP1: the "+ relationships" half of the worked example — wire two onboarded
+    # models into a cross-schema join as a reviewable changeset.
+    toolset = _onboarded_pair()
+
+    result = toolset.dispatch(
+        "propose_relationships",
+        {
+            "relationships": [
+                {
+                    "models": ["orders", "customers"],
+                    "joinType": "many_to_one",
+                    "condition": "orders.customer_id = customers.id",
+                }
+            ]
+        },
+    )
+    assert result["rejected"] == [], result
+    assert len(result["staged"]) == 1
+
+    changeset = toolset.build_changeset()
+    rel_item = next(
+        item for item in changeset.items if item.path.startswith("relationships/")
+    )
+    body = json.loads(rel_item.proposed_content or "{}")
+    relationship = body["relationships"][0]
+    assert relationship["models"] == ["orders", "customers"]
+    assert relationship["joinType"] == "MANY_TO_ONE"
+    assert relationship["condition"] == "orders.customer_id = customers.id"
+
+
+def test_propose_relationships_rejects_unknown_model() -> None:
+    # A relationship can only join models that were onboarded through the access
+    # proof; an undefined endpoint is rejected (the R1 invariant holds upstream).
+    toolset = _onboarded_pair()
+
+    result = toolset.dispatch(
+        "propose_relationships",
+        {
+            "relationships": [
+                {
+                    "models": ["orders", "ghosts"],
+                    "joinType": "many_to_one",
+                    "condition": "orders.x = ghosts.y",
+                }
+            ]
+        },
+    )
+    assert result["staged"] == []
+    assert "Unknown model" in result["rejected"][0]["error"]
+
+
+def test_propose_relationships_rejects_bad_join_type_and_missing_condition() -> None:
+    toolset = _onboarded_pair()
+
+    bad_join = toolset.dispatch(
+        "propose_relationships",
+        {
+            "relationships": [
+                {
+                    "models": ["orders", "customers"],
+                    "joinType": "SIDEWAYS",
+                    "condition": "orders.customer_id = customers.id",
+                }
+            ]
+        },
+    )
+    assert "Invalid joinType" in bad_join["rejected"][0]["error"]
+
+    no_condition = toolset.dispatch(
+        "propose_relationships",
+        {
+            "relationships": [
+                {"models": ["orders", "customers"], "joinType": "many_to_one"}
+            ]
+        },
+    )
+    assert "condition" in no_condition["rejected"][0]["error"]
 
 
 def test_update_existing_file_produces_update_item() -> None:
@@ -153,6 +347,57 @@ def test_get_physical_schema_returns_real_tables() -> None:
     result = toolset.dispatch("get_physical_schema", {})
 
     assert result["tables"] == {"orders": ["amount", "id"]}
+
+
+def test_find_tables_ranks_matches_and_returns_columns() -> None:
+    # Targeted discovery: a doc entity ("customer orders") should surface the
+    # orders table with its columns — not the whole schema.
+    toolset = MdlToolset([], schema_index=_multi_schema_index())
+
+    result = toolset.dispatch("find_tables", {"query": "customer orders"})
+
+    tables = result["tables"]
+    assert tables, result
+    top = tables[0]
+    assert top["table"] == "orders"
+    assert top["schema"] == "sales"
+    assert {col["name"] for col in top["columns"]} == {"id", "amount", "customer_id"}
+    assert all(col.get("type") for col in top["columns"])  # types carried through
+
+
+def test_find_tables_respects_schema_filter_and_limit() -> None:
+    toolset = MdlToolset([], schema_index=_multi_schema_index())
+
+    scoped = toolset.dispatch("find_tables", {"query": "id", "schema": "crm"})
+    assert {t["table"] for t in scoped["tables"]} == {"customers"}
+
+    capped = toolset.dispatch("find_tables", {"query": "id", "limit": 1})
+    assert len(capped["tables"]) == 1
+
+
+def test_find_tables_empty_on_no_match_never_invents() -> None:
+    # The honest "no table in this database matches" signal (R9): an empty list,
+    # never a fabricated table.
+    toolset = MdlToolset([], schema_index=SCHEMA)
+
+    result = toolset.dispatch("find_tables", {"query": "spaceships"})
+
+    assert result["tables"] == []
+
+
+def test_find_tables_requires_a_query() -> None:
+    toolset = MdlToolset([], schema_index=SCHEMA)
+    assert "error" in toolset.dispatch("find_tables", {})
+
+
+def test_find_tables_and_read_document_are_not_in_the_ledger() -> None:
+    # Read-only tools must not produce ToolCallRecords (provenance is for mutations).
+    toolset = MdlToolset([], schema_index=SCHEMA)
+
+    toolset.dispatch("find_tables", {"query": "orders"})
+    toolset.dispatch("read_document", {"document_id": "missing"})
+
+    assert toolset.build_changeset().tool_calls == []
 
 
 def test_read_and_list_reflect_working_set() -> None:
@@ -290,3 +535,83 @@ def test_write_without_prior_file_does_not_invent_properties() -> None:
         toolset.dispatch("read_mdl_file", {"path": "models/orders.json"})["content"]
     )
     assert "properties" not in stored["models"][0]
+
+
+# -- Tool-call provenance ledger (per-call capture, R-B6 grounding) -----------
+
+
+def test_mutating_tool_calls_are_recorded_in_the_ledger() -> None:
+    toolset = MdlToolset([], schema_index=SCHEMA)
+
+    toolset.dispatch(
+        "write_mdl_file", {"path": "models/orders.json", "content": ORDERS}
+    )
+
+    changeset = toolset.build_changeset()
+    assert len(changeset.tool_calls) == 1
+    record = changeset.tool_calls[0]
+    assert record.tool == "write_mdl_file"
+    assert record.action == "write"
+    assert record.paths == ["models/orders.json"]
+    assert record.status == "ok"
+
+
+def test_read_only_tool_calls_are_not_recorded() -> None:
+    toolset = MdlToolset([_file("models/orders.json", ORDERS)], schema_index=SCHEMA)
+
+    toolset.dispatch("list_mdl_files", {})
+    toolset.dispatch("read_mdl_file", {"path": "models/orders.json"})
+    toolset.dispatch("validate_project", {})
+
+    assert toolset.build_changeset().tool_calls == []
+
+
+def test_onboard_tables_records_an_onboard_verb_with_shapes() -> None:
+    toolset = MdlToolset([], schema_index=SCHEMA)
+
+    toolset.dispatch("propose_onboard_tables", {"tables": [{"table": "orders"}]})
+
+    record = toolset.build_changeset().tool_calls[0]
+    assert record.action == "onboard"
+    assert record.args_summary["tables"] == ["orders"]
+    assert record.args_summary["table_count"] == 1
+    assert record.paths == ["models/orders.json"]
+
+
+def test_failed_mutation_is_recorded_with_error_status() -> None:
+    toolset = MdlToolset([], schema_index=SCHEMA)
+
+    # A table not in the accessible schema is rejected by the onboard core.
+    toolset.dispatch("propose_onboard_table", {"table": "nope"})
+
+    record = toolset.build_changeset().tool_calls[0]
+    assert record.action == "onboard"
+    assert record.status == "error"
+    assert record.detail is not None
+    assert "accessible schemas" in record.detail
+
+
+def test_relationships_record_a_relate_verb() -> None:
+    two = SchemaIndex.from_snapshot({"orders": ["id"], "customers": ["id"]})
+    toolset = MdlToolset([], schema_index=two)
+    toolset.dispatch(
+        "propose_onboard_tables",
+        {"tables": [{"table": "orders"}, {"table": "customers"}]},
+    )
+
+    toolset.dispatch(
+        "propose_relationships",
+        {
+            "relationships": [
+                {
+                    "models": ["orders", "customers"],
+                    "joinType": "MANY_TO_ONE",
+                    "condition": "orders.id = customers.id",
+                }
+            ]
+        },
+    )
+
+    relate = [r for r in toolset.build_changeset().tool_calls if r.action == "relate"]
+    assert len(relate) == 1
+    assert relate[0].args_summary["relationship_count"] == 1

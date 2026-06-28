@@ -42,11 +42,7 @@ import {
 } from '@superset-ui/core/components';
 import type { SqlLabRootState } from 'src/SqlLab/types';
 import useQueryEditor from 'src/SqlLab/hooks/useQueryEditor';
-import {
-  addTable,
-  removeTables,
-  openSemanticLayerEditor,
-} from 'src/SqlLab/actions/sqlLab';
+import { addTable, removeTables, openMdlLab } from 'src/SqlLab/actions/sqlLab';
 import {
   getItem,
   setItem,
@@ -278,16 +274,14 @@ const TableExploreTree: React.FC<Props> = ({ queryEditorId }) => {
     });
   }, []);
 
-  const handleOpenSemanticLayer = useCallback(
-    (
-      schemaDbId: number,
-      catalogName: string | null | undefined,
-      schemaName: string,
-    ) => {
-      dispatch(openSemanticLayerEditor(schemaDbId, catalogName, schemaName));
-    },
-    [dispatch],
-  );
+  // First-class MDL Lab entry: browse all of this database's semantic projects
+  // (no schema preselected). The per-schema action above deep-links into one
+  // schema's project; this opens the database-wide project browser.
+  const handleOpenMdlLab = useCallback(() => {
+    if (dbId) {
+      dispatch(openMdlLab(dbId, catalog));
+    }
+  }, [dispatch, dbId, catalog]);
 
   const sortedTreeData = useMemo(() => {
     if (pinnedSchemas.size === 0) return treeData;
@@ -421,7 +415,6 @@ const TableExploreTree: React.FC<Props> = ({ queryEditorId }) => {
         handleUnpinTable={handleUnpinTable}
         handlePinSchema={handlePinSchema}
         handleUnpinSchema={handleUnpinSchema}
-        handleOpenSemanticLayer={handleOpenSemanticLayer}
         refreshTableSchema={refreshTableSchema}
         sortedTables={sortedTables}
         toggleSortColumns={toggleSortColumns}
@@ -437,7 +430,6 @@ const TableExploreTree: React.FC<Props> = ({ queryEditorId }) => {
       handleUnpinTable,
       handlePinSchema,
       handleUnpinSchema,
-      handleOpenSemanticLayer,
       refreshTableSchema,
       sortedTables,
       toggleSortColumns,
@@ -459,6 +451,15 @@ const TableExploreTree: React.FC<Props> = ({ queryEditorId }) => {
           viewId={ViewLocations.sqllab.leftSidebar}
           defaultPrimaryActions={
             <>
+              <Button
+                color="primary"
+                variant="text"
+                icon={<Icons.DatabaseOutlined />}
+                onClick={handleOpenMdlLab}
+                disabled={!dbId}
+                tooltip={t('Open MDL Lab (browse this database’s projects)')}
+                data-test="open-mdl-lab"
+              />
               <Button
                 color="primary"
                 variant="text"

@@ -73,6 +73,27 @@ writing files yet.
    empty, there is nothing to onboard — say so and stop rather than emitting an
    empty layer.
 
+## Doc-driven onboarding — map a BI doc to the tables it needs
+
+When the user attaches a BI document (the **Auto-onboard** entry), do not dump the
+whole schema. Work from the document:
+
+1. **Read the doc, not just a snippet.** Use `read_document` to read the full
+   extracted text of each attached document — `search_documents` returns only the
+   top passages and can miss the section that lists the entities, joins, and
+   metric definitions. Enumerate every table/entity, relationship, and metric the
+   doc describes.
+2. **Map each named entity to a real table.** Use `find_tables(query)` with the
+   entity's name (e.g. "customer orders") to get the matching physical tables —
+   only the top candidates with their columns, never the whole catalog. If
+   `find_tables` returns nothing for an entity, **say so** ("the document mentions
+   `X` but no matching table exists in this database"); do not invent it.
+3. **Onboard the mapped tables** with `propose_onboard_tables` (cross-schema in one
+   call), then wire the joins the doc describes with `propose_relationships`.
+
+Reserve `get_physical_schema` for *grounding/validation* of a specific table you
+have already identified — not for discovery (it returns the entire schema).
+
 ## Step 1 — Seed structure from the catalog (deterministic, not invented)
 
 Base structure is generated **deterministically** from the permission-filtered
@@ -138,6 +159,16 @@ being silently dropped.
 After activation the layer is indexed for retrieval and the readiness gate flips
 to `ready` — that is what unblocks the Copilot and the query agent. There is no
 manual reindex step for the agent to run.
+
+## Step 5 — Self-review against the documents (doc-driven runs)
+
+When you onboarded from a BI document, **review your own work before handing off**.
+Call `run_coverage` to audit the staged MDL against the project's documents: it
+returns a score plus the specific claims that are still `missing` or `partial`.
+For each gap, add what's missing (a description, synonym, calculated column,
+relationship, or metric the document specifies) with `write_mdl_file`, then call
+`run_coverage` again to confirm the gap closed. The tool is capped per turn, so
+make each pass count; the authoritative background audit still runs on activation.
 
 ## Scaffold / workspace layout
 

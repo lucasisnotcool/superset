@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import cast
+from uuid import uuid4
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -30,7 +31,7 @@ from superset_ai_agent.persistence.models import (
     AiAgentEvent,
     AiAgentSemanticDocument,
 )
-from superset_ai_agent.semantic_layer.document_chunks import DocumentChunk
+from superset_ai_agent.semantic_layer.document_chunks import chunk_id, DocumentChunk
 from superset_ai_agent.semantic_layer.schemas import (
     SemanticDocument,
     SemanticDocumentStatus,
@@ -94,20 +95,73 @@ class SqlAlchemySemanticLayerStore:
         *,
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> list[SemanticDocument]:
+        # Project-scoped (F5/§5.7): every DB-authorized user sees the project's full
+        # BI-doc set, not only their own uploads. ``project_id`` is DB-bound, so this
+        # never widens beyond the database boundary. ``owner_id`` kept for signature
+        # compat (the write paths still stamp it); not a read filter.
+        del owner_id
         with self.session_factory() as session:
             models = (
                 session.execute(
                     select(AiAgentSemanticDocument)
-                    .where(
-                        AiAgentSemanticDocument.owner_id == owner_id,
-                        AiAgentSemanticDocument.project_id == project_id,
-                    )
+                    .where(AiAgentSemanticDocument.project_id == project_id)
                     .order_by(AiAgentSemanticDocument.created_at.desc())
                 )
                 .scalars()
                 .all()
             )
             return [_document_from_model(model) for model in models]
+
+    def duplicate_documents(
+        self,
+        source_project_id: str,
+        target_project_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> list[DocumentChunk]:
+        """Copy a project's documents + chunks into another project (DP6 include-docs).
+
+        Reads are project-scoped (every uploader's docs come along, matching the
+        shared-project model); each document is re-parented under a fresh id and its
+        chunks re-derived with deterministic ids for the new document. Vectors are
+        NOT touched here — they are keyed by project scope, so the caller re-embeds
+        the returned chunks under the target's scope key in one pass.
+        """
+
+        chunks_by_doc: dict[str, list[DocumentChunk]] = {}
+        for chunk in self.list_project_chunks(source_project_id):
+            chunks_by_doc.setdefault(chunk.document_id, []).append(chunk)
+        new_chunks: list[DocumentChunk] = []
+        for document in self.list_project_documents(source_project_id):
+            new_document = document.model_copy(
+                update={
+                    "id": str(uuid4()),
+                    "project_id": target_project_id,
+                    "deduplicated": False,
+                }
+            )
+            self.save_document(new_document, owner_id=owner_id)
+            rebuilt = [
+                chunk.model_copy(
+                    update={
+                        "id": chunk_id(new_document.id, chunk.chunk_index),
+                        "document_id": new_document.id,
+                    }
+                )
+                for chunk in sorted(
+                    chunks_by_doc.get(document.id, []),
+                    key=lambda c: c.chunk_index,
+                )
+            ]
+            if rebuilt:
+                self.save_chunks(
+                    new_document.id,
+                    rebuilt,
+                    owner_id=owner_id,
+                    project_id=target_project_id,
+                )
+            new_chunks.extend(rebuilt)
+        return new_chunks
 
     def find_document_by_checksum(
         self,
@@ -116,12 +170,14 @@ class SqlAlchemySemanticLayerStore:
         *,
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> SemanticDocument | None:
+        # Project-scoped dedup (DP11): identical bytes from any user dedup to the one
+        # project document; the first uploader's row (its ``created_by``) is reused.
+        del owner_id
         with self.session_factory() as session:
             model = (
                 session.execute(
                     select(AiAgentSemanticDocument)
                     .where(
-                        AiAgentSemanticDocument.owner_id == owner_id,
                         AiAgentSemanticDocument.project_id == project_id,
                         AiAgentSemanticDocument.checksum == checksum,
                     )
@@ -272,14 +328,15 @@ class SqlAlchemySemanticLayerStore:
         *,
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> list[DocumentChunk]:
+        # Project-scoped RAG corpus (§5.7.1): the Copilot retrieves over every
+        # project chunk regardless of uploader. Vectors are already keyed
+        # ``doc:{project_id}``, so this aligns the candidate set to the vector scope.
+        del owner_id
         with self.session_factory() as session:
             models = (
                 session.execute(
                     select(AiAgentDocumentChunk)
-                    .where(
-                        AiAgentDocumentChunk.owner_id == owner_id,
-                        AiAgentDocumentChunk.project_id == project_id,
-                    )
+                    .where(AiAgentDocumentChunk.project_id == project_id)
                     .order_by(
                         AiAgentDocumentChunk.document_id.asc(),
                         AiAgentDocumentChunk.chunk_index.asc(),
@@ -384,14 +441,15 @@ class SqlAlchemySemanticLayerStore:
         *,
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> list[SemanticLayerEvent]:
+        # Project-scoped provenance (§5.6.1): the timeline is the project's whole
+        # history; every DB-authorized user sees the same entries (each event keeps
+        # its own ``owner_id`` actor for attribution). ``project_id`` is DB-bound.
+        del owner_id
         with self.session_factory() as session:
             models = (
                 session.execute(
                     select(AiAgentEvent)
-                    .where(
-                        AiAgentEvent.owner_id == owner_id,
-                        AiAgentEvent.project_id == project_id,
-                    )
+                    .where(AiAgentEvent.project_id == project_id)
                     .order_by(AiAgentEvent.created_at.asc())
                 )
                 .scalars()
@@ -408,9 +466,10 @@ class SqlAlchemySemanticLayerStore:
         owner_id: str = DEFAULT_OWNER_ID,
         types: frozenset[str] | None = None,
     ) -> int:
+        # Reset clears the project's provenance for all actors (project-scoped).
+        del owner_id
         with self.session_factory() as session:
             statement = delete(AiAgentEvent).where(
-                AiAgentEvent.owner_id == owner_id,
                 AiAgentEvent.project_id == project_id,
             )
             if types is not None:

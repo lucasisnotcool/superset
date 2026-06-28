@@ -428,6 +428,18 @@ per-event `attempt_index` ([conversation_graph.py:556](conversation_graph.py)).
   dots, durations, one box per step. **`AgentStepDetail.tsx`** — a `switch` on
   `detail.kind` rendering only the fields each shape carries, defaulting to
   `null` for an unknown shape.
+- **`plan_semantic_sql` renders both rewrite forms behind a toggle.** The step
+  carries two forms of the same query — `semantic_sql` (authored, against bare
+  model names) and `native_sql` (executed, with schema-qualified tables). When
+  both are present, `SqlRewrite`
+  ([AgentStepDetail.tsx](../superset-frontend/src/SqlLab/components/AiAgentPanel/AgentStepDetail.tsx),
+  `SqlRewrite`) shows a `Native (executed)` / `Semantic (authored)` segmented
+  toggle that **defaults to native** — execution truth, and the only form that
+  disambiguates which physical schema each table resolved to under a multi-schema
+  project. When only one form is present it falls back to a single labeled block
+  (`Native SQL` or `Semantic SQL`) with no toggle, so older traces that carry only
+  one form render unchanged. Before this, the renderer showed `semantic_sql` only;
+  the schema-qualified SQL that actually ran was not visible in the timeline.
 - **Triggers** in
   [index.tsx](../superset-frontend/src/SqlLab/components/AiAgentPanel/index.tsx):
   an "Explain" button per assistant artifact
@@ -454,11 +466,15 @@ per-event `attempt_index` ([conversation_graph.py:556](conversation_graph.py)).
   and fails if any name is missing from `KNOWN_AGENT_STEP_KINDS` — plus
   turn-level + per-artifact timeline assertions added to the existing graph
   tests.
-- **Frontend:** `jest src/SqlLab/components/AiAgentPanel` → **53 passed (9
-  suites)**, including
+- **Frontend:**
   [ExplainDialog.test.tsx](../superset-frontend/src/SqlLab/components/AiAgentPanel/ExplainDialog.test.tsx)
-  (7 tests) and an end-to-end Explain-flow assertion in `index.test.tsx`.
-  `tsc --noEmit` → **0 errors**; `prettier --check` → clean.
+  → **17 passed**, including `surfaces typed detail: the semantic->native rewrite
+  toggles` (default-native, toggle-reveals-semantic) and two `SqlRewrite`
+  single-form fallback cases (native-only, semantic-only). The end-to-end
+  Explain-flow assertion in `index.test.tsx` checks the dialog renders the
+  schema-qualified `SELECT name FROM main.birth_names`. Both files were red on
+  `master` before this change — the tests encoded the toggle the renderer never
+  implemented. `tsc --noEmit` → **0 errors**; `prettier --check` → clean.
 - **App boot:** `create_app(config=AgentConfig())` builds **45 routes** without
   error.
 - **`ruff check`** → clean on all changed Python files.

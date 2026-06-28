@@ -19,16 +19,28 @@
 
 from __future__ import annotations
 
+from superset_ai_agent.auth import sign_identity_payload
 from tests.unit_tests.superset_ai_agent.test_semantic_layer_api import (
     _client,
     _resolve_project,
     _seed_base_model,
 )
 
+_SECRET = "test-secret"  # noqa: S105 - HMAC secret for the test identity signer
+_HEADER = "X-Superset-Ai-Agent-Identity"
 
-def _provenance(client, project_id: str) -> list[dict]:
+
+def _signed_headers(owner_id: str, username: str) -> dict[str, str]:
+    token = sign_identity_payload(
+        {"owner_id": owner_id, "username": username}, secret=_SECRET
+    )
+    return {_HEADER: token}
+
+
+def _provenance(client, project_id: str, headers: dict | None = None) -> list[dict]:
     response = client.get(
-        f"/agent/semantic-layer/projects/{project_id}/provenance"
+        f"/agent/semantic-layer/projects/{project_id}/provenance",
+        headers=headers,
     )
     assert response.status_code == 200, response.text
     return response.json()
@@ -142,6 +154,43 @@ def test_onboarding_entry_carries_selection_detail(tmp_path) -> None:
     assert completed["detail"]["mode"] == "selected"
     assert completed["detail"]["dataset_ids"] == [42]
     assert "model_count" in completed["detail"]
+
+
+def test_onboarding_attributes_actor_name_across_users(tmp_path) -> None:
+    # P2/DP10: a shared project's onboarding entry names *who* onboarded. Alice
+    # onboards; Bob (same DB access) reads the timeline and sees Alice's name with
+    # is_self=False, while Alice sees the same entry as her own (is_self=True).
+    client, _ = _client(
+        tmp_path,
+        identity_provider="signed_header",
+        signed_identity_secret=_SECRET,
+    )
+    alice = _signed_headers("user-alice", "Alice")
+    bob = _signed_headers("user-bob", "Bob")
+
+    project = client.post(
+        "/agent/semantic-layer/projects/resolve",
+        json={"database_id": 1, "database_label": "Sales", "schema_name": "pipeline"},
+        headers=alice,
+    ).json()
+    pid = project["id"]
+
+    onboard = client.post(
+        f"/agent/semantic-layer/projects/{pid}/onboard", headers=alice
+    )
+    assert onboard.status_code == 202, onboard.text
+
+    completed = next(
+        e for e in _provenance(client, pid, headers=bob) if e["kind"] == "onboarding"
+    )
+    assert completed["detail"]["actor_name"] == "Alice"
+    assert completed["actor_name"] == "Alice"
+    assert completed["is_self"] is False
+
+    completed_self = next(
+        e for e in _provenance(client, pid, headers=alice) if e["kind"] == "onboarding"
+    )
+    assert completed_self["is_self"] is True
 
 
 def test_reset_purges_provenance(tmp_path) -> None:
