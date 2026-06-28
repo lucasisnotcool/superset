@@ -246,6 +246,32 @@ class AiAgentSemanticProject(Base):
     deleted_at = Column(DateTime(timezone=True), nullable=True)
 
 
+class AiAgentSemanticProjectSchema(Base):
+    """One schema a semantic project is scoped to (multi-schema membership).
+
+    Normalized membership set for a project. The project's ``schema_name`` column is
+    retained as the *primary* schema (the wren-core logical namespace); this table is
+    authoritative for the *full* set a project may reference via per-model
+    ``tableReference.schema``. A row per (project, schema); ``position`` preserves the
+    authored order with the primary at 0.
+    """
+
+    __tablename__ = "ai_agent_semantic_project_schemas"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "schema_name",
+            name="uq_ai_agent_semantic_project_schema",
+        ),
+    )
+
+    id = Column(String(36), primary_key=True)
+    project_id = Column(String(36), index=True, nullable=False)
+    schema_name = Column(String(255), nullable=False)
+    position = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+
 class AiAgentSemanticProjectGrant(Base):
     """Explicit semantic project grant."""
 

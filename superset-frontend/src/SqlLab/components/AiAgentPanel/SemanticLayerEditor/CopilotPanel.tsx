@@ -52,15 +52,19 @@ import {
   deleteCopilotConversation,
   getCopilotConversation,
   getCopilotInspector,
+  getSemanticDocument,
   listCopilotConversations,
   MessageAttachment,
+  SemanticDocument,
   SemanticProjectReadinessStatus,
   streamCopilot,
   updateCopilotConversationTitle,
 } from '../api';
-import { SemanticDocument } from '../api';
 import useDocumentIngestion from '../useDocumentIngestion';
-import { getDocumentStatusMeta } from './documentStatus';
+import {
+  getDocumentStatusMeta,
+  isPendingDocumentStatus,
+} from './documentStatus';
 import CopilotInspectorDialog from './CopilotInspectorDialog';
 import CoverageDialog from './CoverageDialog';
 
@@ -102,6 +106,14 @@ type Decision = 'accepted' | 'rejected';
 
 const MAX_ATTACHMENT_CHARS = 200_000;
 
+// Live attach-status poll: a document over the async-extraction threshold uploads
+// as `extracting` and finishes on a background thread, so the staged chip is
+// polled to its terminal status. Extraction is far faster than onboarding (which
+// polls 2s × 450 ≈ 15min), so a shorter interval and a ~3min cap suffice; on cap
+// the Send gate stops blocking even if the doc is still extracting.
+const ATTACH_POLL_INTERVAL_MS = 1500;
+const ATTACH_POLL_MAX_ATTEMPTS = 120;
+
 const opLabel = (op: ChangesetItem['op']) => {
   if (op === 'create') return t('Create');
   if (op === 'delete') return t('Delete');
@@ -134,6 +146,10 @@ const CopilotPanel = ({
   // persisted documents (not raw text) so a chip can show live status and the
   // send payload is derived from the authoritative extraction.
   const [attachedDocs, setAttachedDocs] = useState<SemanticDocument[]>([]);
+  // True once the status poll exhausts its attempt budget while a doc is still
+  // extracting. It stops the Send gate from blocking forever on a hung/slow
+  // extraction; reset whenever the attachment set changes (a new attach re-arms).
+  const [attachPollGaveUp, setAttachPollGaveUp] = useState(false);
   // The LIVE, actionable changeset for the just-completed turn. Past changesets
   // re-render read-only from message artifacts on resume (no stale Apply).
   const [changeset, setChangeset] = useState<Changeset | null>(null);
@@ -213,6 +229,7 @@ const CopilotPanel = ({
     setPendingUser(null);
     setInput('');
     setAttachedDocs([]);
+    setAttachPollGaveUp(false);
     setError(null);
     resetProposal();
     setIsHistoryOpen(false);
@@ -257,12 +274,72 @@ const CopilotPanel = ({
           .filter(doc => !seen.has(doc.id));
         return [...prev, ...additions];
       });
+      // A fresh attachment re-arms the poll's give-up budget (so a previous
+      // exhausted poll doesn't leave the new doc's Send gate disengaged).
+      setAttachPollGaveUp(false);
       // The new documents now live in the workspace; let the editor refresh so
       // they appear in the file browser tree.
       onDocumentsChanged?.();
     },
     [ingest, onDocumentsChanged],
   );
+
+  // Live-update staged attachments that are still extracting (large files extract
+  // on a background thread). Polls each pending doc to its terminal status so the
+  // chip reflects progress (R1) and `attachmentsForSend` grounds the turn on the
+  // finished text (R3). Bounded + cancel-safe, mirroring the onboarding poller.
+  useEffect(() => {
+    const pending = attachedDocs.filter(doc =>
+      isPendingDocumentStatus(doc.status),
+    );
+    if (!pending.length) return undefined;
+    let cancelled = false;
+    let attemptsLeft = ATTACH_POLL_MAX_ATTEMPTS;
+    let timer: ReturnType<typeof setTimeout>;
+
+    const poll = async () => {
+      const fresh = await Promise.all(
+        pending.map(doc => getSemanticDocument(doc.id).catch(() => null)),
+      );
+      if (cancelled) return;
+      // Patch only changed rows so an unchanged poll keeps the array identity
+      // stable and does not re-arm this effect (avoids a tight reschedule loop).
+      setAttachedDocs(prev => {
+        let changed = false;
+        const next = prev.map(doc => {
+          const updated = fresh.find(item => item?.id === doc.id);
+          if (
+            updated &&
+            (updated.status !== doc.status ||
+              updated.extracted_text !== doc.extracted_text)
+          ) {
+            changed = true;
+            return updated;
+          }
+          return doc;
+        });
+        return changed ? next : prev;
+      });
+      attemptsLeft -= 1;
+      const stillPending = fresh.some(
+        item => item && isPendingDocumentStatus(item.status),
+      );
+      if (!stillPending) return;
+      if (attemptsLeft <= 0) {
+        // Give up the Send gate but keep the (still-pending) status visible; the
+        // turn may proceed ungrounded for this doc and RAG catches up later.
+        setAttachPollGaveUp(true);
+        return;
+      }
+      timer = setTimeout(poll, ATTACH_POLL_INTERVAL_MS);
+    };
+
+    timer = setTimeout(poll, ATTACH_POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [attachedDocs]);
 
   // Build the inline grounding payload from the persisted documents' extracted
   // text (server-side extraction handles PDF/DOCX/etc.), bounded per attachment.
@@ -280,9 +357,18 @@ const CopilotPanel = ({
     [attachedDocs],
   );
 
+  // Attachments still extracting: a turn waits for them so their text can ground
+  // the chat — unless the poll already gave up (then proceed; RAG catches up).
+  const pendingAttachments = useMemo(
+    () => attachedDocs.filter(doc => isPendingDocumentStatus(doc.status)),
+    [attachedDocs],
+  );
+  const attachmentBlocksSend =
+    pendingAttachments.length > 0 && !attachPollGaveUp;
+
   const handleSend = useCallback(async () => {
     const message = input.trim();
-    if (!message || isRunning) return;
+    if (!message || isRunning || attachmentBlocksSend) return;
     setError(null);
     resetProposal();
     setInput('');
@@ -302,6 +388,7 @@ const CopilotPanel = ({
         step => setLiveSteps(prev => [...prev, step]),
       );
       setAttachedDocs([]);
+      setAttachPollGaveUp(false);
       // The turn (user + assistant + changeset artifact) is now persisted; reload
       // the thread so the transcript matches the durable record exactly.
       const conversation = await getCopilotConversation(projectId, id);
@@ -327,6 +414,7 @@ const CopilotPanel = ({
     }
   }, [
     attachmentsForSend,
+    attachmentBlocksSend,
     ensureConversation,
     input,
     isRunning,
@@ -897,6 +985,17 @@ const CopilotPanel = ({
               >
                 {attachedDocs.map(doc => {
                   const meta = getDocumentStatusMeta(doc.status);
+                  const pending = isPendingDocumentStatus(doc.status);
+                  // Once the poll has given up, a still-pending doc shows a distinct
+                  // "background" cue rather than a misleading perpetual "Extracting…"
+                  // (the gate has re-enabled Send by this point). Otherwise show the
+                  // live status label while in flight or when it needs attention.
+                  const statusLabel =
+                    pending && attachPollGaveUp
+                      ? t('Still processing in the background')
+                      : pending || meta.attention
+                        ? meta.label
+                        : null;
                   return (
                     <Tag
                       key={doc.id}
@@ -908,15 +1007,23 @@ const CopilotPanel = ({
                       }
                     >
                       {doc.filename}
-                      {/* Surface a status hint only when it needs attention
-                          (e.g. still extracting, needs OCR, or errored); a ready
-                          document shows just its name. The workspace tree is the
-                          live status surface — this is a snapshot at attach time. */}
-                      {meta.attention ? ` · ${meta.label}` : ''}
+                      {statusLabel ? ` · ${statusLabel}` : ''}
                     </Tag>
                   );
                 })}
               </Flex>
+            ) : null}
+            {attachPollGaveUp && pendingAttachments.length > 0 ? (
+              <Typography.Text
+                type="secondary"
+                data-test="copilot-attach-giveup-note"
+              >
+                {t(
+                  'Still extracting %s in the background — you can send now; ' +
+                    'it’ll be available to later turns.',
+                  pendingAttachments.map(doc => doc.filename).join(', '),
+                )}
+              </Typography.Text>
             ) : null}
             <Input.TextArea
               value={input}
@@ -967,16 +1074,32 @@ const CopilotPanel = ({
                   {t('Attach')}
                 </Button>
               </Tooltip>
-              <Button
-                buttonStyle="primary"
-                buttonSize="small"
-                disabled={!canWrite || isRunning || !input.trim()}
-                loading={isRunning}
-                onClick={handleSend}
-                data-test="copilot-send"
+              <Tooltip
+                title={
+                  attachmentBlocksSend
+                    ? t(
+                        'Waiting for %s to finish extracting…',
+                        pendingAttachments.map(doc => doc.filename).join(', '),
+                      )
+                    : ''
+                }
               >
-                {t('Send')}
-              </Button>
+                <Button
+                  buttonStyle="primary"
+                  buttonSize="small"
+                  disabled={
+                    !canWrite ||
+                    isRunning ||
+                    !input.trim() ||
+                    attachmentBlocksSend
+                  }
+                  loading={isRunning}
+                  onClick={handleSend}
+                  data-test="copilot-send"
+                >
+                  {t('Send')}
+                </Button>
+              </Tooltip>
             </Flex>
           </Flex>
         </>

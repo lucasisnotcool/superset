@@ -24,6 +24,7 @@ import useDocumentIngestion from './useDocumentIngestion';
 const mockUpload = jest.fn();
 const mockSuccessToast = jest.fn();
 const mockDangerToast = jest.fn();
+const mockInfoToast = jest.fn();
 
 jest.mock('./api', () => ({
   ...jest.requireActual('./api'),
@@ -38,6 +39,10 @@ jest.mock('src/components/MessageToasts/actions', () => ({
   },
   addDangerToast: (...args: unknown[]) => {
     mockDangerToast(...args);
+    return { type: 'ADD_TOAST', payload: {} };
+  },
+  addInfoToast: (...args: unknown[]) => {
+    mockInfoToast(...args);
     return { type: 'ADD_TOAST', payload: {} };
   },
 }));
@@ -126,4 +131,100 @@ test('is a no-op without a project id', async () => {
 
   expect(ingested).toEqual([]);
   expect(mockUpload).not.toHaveBeenCalled();
+});
+
+// jsdom's File does not implement `.text()`/`.size` reliably, so stub them; the
+// production code uses the real browser File API.
+const makeFile = (
+  name: string,
+  content: string,
+  {
+    type = 'application/json',
+    size = content.length,
+  }: { type?: string; size?: number } = {},
+): File => {
+  const f = new File([content], name, { type });
+  Object.defineProperty(f, 'text', { value: () => Promise.resolve(content) });
+  Object.defineProperty(f, 'size', { value: size });
+  return f;
+};
+
+const mdlJsonFile = (name = 'model.json') =>
+  makeFile(name, JSON.stringify({ models: [{ name: 'orders' }] }));
+
+test('shows a one-time notice for an MDL-shaped JSON file (dropped MDL import)', async () => {
+  mockUpload.mockResolvedValue(
+    doc({ filename: 'model.json', content_type: 'application/json' }),
+  );
+  const { result } = setup();
+
+  await act(async () => {
+    await result.current.ingest([mdlJsonFile()]);
+  });
+
+  expect(mockInfoToast).toHaveBeenCalledTimes(1);
+  expect(mockInfoToast).toHaveBeenCalledWith(
+    expect.stringContaining('looks like an MDL file'),
+  );
+});
+
+test('fires the MDL notice once even for multiple MDL-shaped JSON files', async () => {
+  mockUpload
+    .mockResolvedValueOnce(
+      doc({ id: 'a', filename: 'a.json', content_type: 'application/json' }),
+    )
+    .mockResolvedValueOnce(
+      doc({ id: 'b', filename: 'b.json', content_type: 'application/json' }),
+    );
+  const { result } = setup();
+
+  await act(async () => {
+    await result.current.ingest([mdlJsonFile('a.json'), mdlJsonFile('b.json')]);
+  });
+
+  expect(mockInfoToast).toHaveBeenCalledTimes(1);
+});
+
+test('does NOT show the MDL notice for a JSON data file (no MDL keys)', async () => {
+  mockUpload.mockResolvedValue(
+    doc({ filename: 'data.json', content_type: 'application/json' }),
+  );
+  const { result } = setup();
+
+  await act(async () => {
+    await result.current.ingest([
+      makeFile('data.json', JSON.stringify({ rows: [1, 2, 3] })),
+    ]);
+  });
+
+  expect(mockInfoToast).not.toHaveBeenCalled();
+});
+
+test('does NOT show the MDL notice for an oversized JSON file (treated as data)', async () => {
+  mockUpload.mockResolvedValue(
+    doc({ filename: 'big.json', content_type: 'application/json' }),
+  );
+  const { result } = setup();
+
+  // MDL-shaped content but reported > 1 MB: skipped by the size cap (no parse).
+  await act(async () => {
+    await result.current.ingest([
+      makeFile('big.json', JSON.stringify({ models: [{ name: 'x' }] }), {
+        size: 2_000_000,
+      }),
+    ]);
+  });
+
+  expect(mockInfoToast).not.toHaveBeenCalled();
+});
+
+test('does not show the JSON notice for non-JSON files', async () => {
+  mockUpload.mockResolvedValue(doc());
+  const { result } = setup();
+
+  await act(async () => {
+    await result.current.ingest([file()]);
+  });
+
+  expect(mockInfoToast).not.toHaveBeenCalled();
 });

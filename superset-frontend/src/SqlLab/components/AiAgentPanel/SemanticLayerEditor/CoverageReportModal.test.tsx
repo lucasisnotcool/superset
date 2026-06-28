@@ -64,6 +64,24 @@ test('renders the score, counts, and per-claim findings', () => {
   expect(screen.getAllByTestId('coverage-finding')).toHaveLength(2);
 });
 
+test('shows the source document tag for directory-level findings', () => {
+  const directoryReport = {
+    ...report,
+    findings: [
+      { ...report.findings[0], document_filename: 'orders.md' },
+      { ...report.findings[1], document_filename: 'glossary.md' },
+    ],
+  };
+  render(
+    <CoverageReportModal open report={directoryReport} onClose={jest.fn()} />,
+  );
+
+  const sources = screen.getAllByTestId('coverage-finding-source');
+  expect(sources).toHaveLength(2);
+  expect(sources[0]).toHaveTextContent('orders.md');
+  expect(sources[1]).toHaveTextContent('glossary.md');
+});
+
 test('shows a loading state while auditing', () => {
   render(
     <CoverageReportModal open report={null} loading onClose={jest.fn()} />,

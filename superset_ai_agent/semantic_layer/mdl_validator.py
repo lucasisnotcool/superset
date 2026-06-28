@@ -55,18 +55,24 @@ class SchemaIndex:
 
     tables: dict[str, set[str]] = field(default_factory=dict)
     column_types: dict[str, dict[str, str]] = field(default_factory=dict)
+    #: schema (lowercased) → table (lowercased) → column names. Populated from the
+    #: live ``from_agent_context`` path only; empty on the names-only snapshot path,
+    #: so schema-aware checks degrade closed (to the bare-table behaviour) there.
+    tables_by_schema: dict[str, dict[str, set[str]]] = field(default_factory=dict)
 
     @classmethod
     def from_agent_context(cls, context: AgentContext) -> "SchemaIndex":
         tables: dict[str, set[str]] = {}
         column_types: dict[str, dict[str, str]] = {}
+        tables_by_schema: dict[str, dict[str, set[str]]] = {}
         for dataset in context.datasets:
             if not dataset.table_name:
                 continue
             table = dataset.table_name.lower()
-            tables[table] = {
+            columns = {
                 column.name.lower() for column in dataset.columns if column.name
             }
+            tables[table] = columns
             types = {
                 column.name.lower(): column.type
                 for column in dataset.columns
@@ -74,7 +80,14 @@ class SchemaIndex:
             }
             if types:
                 column_types[table] = types
-        return cls(tables=tables, column_types=column_types)
+            schema = (dataset.schema_name or "").lower()
+            if schema:
+                tables_by_schema.setdefault(schema, {})[table] = columns
+        return cls(
+            tables=tables,
+            column_types=column_types,
+            tables_by_schema=tables_by_schema,
+        )
 
     @classmethod
     def from_snapshot(
@@ -113,10 +126,26 @@ class SchemaIndex:
     def has_types(self) -> bool:
         return any(self.column_types.values())
 
-    def has_table(self, table: str) -> bool:
+    @property
+    def schemas(self) -> set[str]:
+        """Physical schemas this index knows about (empty on the snapshot path)."""
+
+        return set(self.tables_by_schema)
+
+    def has_schema(self, schema: str) -> bool:
+        return schema.lower() in self.tables_by_schema
+
+    def has_table(self, table: str, schema: str | None = None) -> bool:
+        if schema and self.tables_by_schema:
+            return table.lower() in self.tables_by_schema.get(schema.lower(), {})
         return table.lower() in self.tables
 
-    def has_column(self, table: str, column: str) -> bool:
+    def has_column(
+        self, table: str, column: str, schema: str | None = None
+    ) -> bool:
+        if schema and self.tables_by_schema:
+            scoped = self.tables_by_schema.get(schema.lower(), {})
+            return column.lower() in scoped.get(table.lower(), set())
         return column.lower() in self.tables.get(table.lower(), set())
 
     def column_type(self, table: str, column: str) -> str | None:
@@ -341,6 +370,7 @@ def _validate_models(
         seen_names.add(name)
 
         table = _table_name(model)
+        schema = _table_schema(model)
         model_columns = model.get("columns")
         has_columns = isinstance(model_columns, list) and bool(model_columns)
         if strict_models and table is None and not has_columns:
@@ -373,18 +403,37 @@ def _validate_models(
                     code="model_without_mapping",
                 )
             )
-        elif schema_index is not None and not schema_index.has_table(table):
+        elif (
+            schema is not None
+            and schema_index is not None
+            and schema_index.schemas
+            and not schema_index.has_schema(schema)
+        ):
+            # R1: a model may only physically reference a schema in the project's
+            # proven set. ``schema_index.schemas`` is non-empty only on the live
+            # path, so this degrades closed on the names-only snapshot.
             messages.append(
                 MdlValidationMessage(
                     message=(
-                        f"Model {name} references table '{table}' that does not "
+                        f"Model {name} references schema '{schema}' that is not "
+                        "part of the project's schema set."
+                    ),
+                    code="schema_not_in_project",
+                )
+            )
+        elif schema_index is not None and not schema_index.has_table(table, schema):
+            messages.append(
+                MdlValidationMessage(
+                    message=(
+                        f"Model {name} references table "
+                        f"'{_qualified_table(schema, table)}' that does not "
                         "exist in the schema."
                     ),
                     code="unknown_table",
                 )
             )
 
-        _validate_columns(name, model, table, schema_index, messages)
+        _validate_columns(name, model, table, schema, schema_index, messages)
     return seen_names
 
 
@@ -392,6 +441,7 @@ def _validate_columns(
     model_name: str,
     model: dict[str, Any],
     table: str | None,
+    schema: str | None,
     schema_index: SchemaIndex | None,
     messages: list[MdlValidationMessage],
 ) -> None:
@@ -407,7 +457,9 @@ def _validate_columns(
         return
     seen_columns: set[str] = set()
     table_known = (
-        schema_index is not None and table is not None and schema_index.has_table(table)
+        schema_index is not None
+        and table is not None
+        and schema_index.has_table(table, schema)
     )
     for column in columns:
         if not isinstance(column, dict):
@@ -436,6 +488,7 @@ def _validate_columns(
             column=column,
             column_name=column_name,
             table=table,
+            schema=schema,
             table_known=table_known,
             schema_index=schema_index,
             messages=messages,
@@ -448,6 +501,7 @@ def _validate_column_semantics(
     column: dict[str, Any],
     column_name: str,
     table: str | None,
+    schema: str | None,
     table_known: bool,
     schema_index: SchemaIndex | None,
     messages: list[MdlValidationMessage],
@@ -483,7 +537,7 @@ def _validate_column_semantics(
         return
     if (
         not is_calculated
-        and not schema_index.has_column(table, column_name)  # type: ignore[union-attr]
+        and not schema_index.has_column(table, column_name, schema)  # type: ignore[union-attr]
     ):
         messages.append(
             MdlValidationMessage(
@@ -883,6 +937,21 @@ def _table_name(model: dict[str, Any]) -> str | None:
         # SQL-backed models are not mapped to a single physical table.
         return None
     return None
+
+
+def _table_schema(model: dict[str, Any]) -> str | None:
+    """Physical schema a model's ``tableReference`` points at, if declared."""
+
+    reference = model.get("tableReference")
+    if isinstance(reference, dict):
+        schema = reference.get("schema")
+        if isinstance(schema, str) and schema:
+            return schema
+    return None
+
+
+def _qualified_table(schema: str | None, table: str) -> str:
+    return f"{schema}.{table}" if schema else table
 
 
 def _dedup_models_keep_last(

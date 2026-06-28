@@ -200,38 +200,80 @@ useEffect(() => {
 
 > Top-to-bottom. `[ ]` todo · `[x]` done.
 
-### Phase 0 — Verify anchors (no code)
-- [ ] Re-grep T1–T7 anchors; confirm `getSemanticDocument` + onboarding poller
-      shapes unchanged. **Blocker:** none. **Unblocks:** P1.
+### Phase 0 — Verify anchors (no code) ✅ DONE
+- [x] Re-grep T1–T7 anchors; confirmed `getSemanticDocument` + onboarding poller
+      shapes unchanged.
 
-### Phase 1 — Status helper
-> **Blocker:** P0. **Independent.** **Unblocks:** P2, P3.
-- [ ] T1 add `isPendingDocumentStatus` + unit test (R6).
+### Phase 1 — Status helper ✅ DONE
+- [x] T1 `isPendingDocumentStatus` in `documentStatus.tsx` + `documentStatus.test.ts`
+      (3 tests). Green.
 
-### Phase 2 — Live chip + grounding poll (#2, #3)
-> **Blocker:** P1 (uses the helper). **Depends on** `getSemanticDocument` (exists).
-- [ ] T2 imports.
-- [ ] T3 poll effect (reconcile by id, bounded, cancel-safe) (R1/R3/R5).
-- [ ] T5 chip shows pending label.
-- [ ] T4 Send gate + `attachPollGaveUp` + tooltip (R2).
-- [ ] `CopilotPanel.test` cases (§9). **Unblocks:** nothing downstream.
+### Phase 2 — Live chip + grounding poll (#2, #3) ✅ DONE
+- [x] T2 imports (`getSemanticDocument`, `isPendingDocumentStatus`).
+- [x] T3 poll effect — reconcile by id, change-guarded (stable identity when
+      unchanged), bounded (1500 ms × 120), cancel-safe (R1/R3/R5).
+- [x] T5 chip shows the live status label while pending.
+- [x] T4 Send gate (`attachmentBlocksSend`) + `attachPollGaveUp` give-up + tooltip
+      naming the pending file(s); `handleSend` also guards (Enter bypasses
+      `disabled`). Reset on attach / send / new-chat.
+- [x] `CopilotPanel.test` — 4 new cases (poll→extracted+ungate, loop-guard,
+      give-up re-enable, fresh-text-on-send). Suite **20 passed**.
 
-### Phase 3 — MDL-JSON notice (#4)
-> **Blocker:** P1 only nominally; **independent of P2** (different file). Can run in parallel.
-- [ ] T6 one-time JSON info toast in the hook (R4).
-- [ ] T7 `README.md` + release-copy note (R4).
-- [ ] `useDocumentIngestion.test` case (§9).
+### Phase 3 — MDL-JSON notice (#4) ✅ DONE
+- [x] T6 one-time JSON info toast in `useDocumentIngestion` (once per ingest, not
+      per file).
+- [x] T7 `README.md` "Document Ingestion (MDL Copilot)" section + removed-capability
+      note (release copy).
+- [x] `useDocumentIngestion.test` — 3 new cases (JSON notice once / once-for-many /
+      none-for-non-JSON). Suite **7 passed**.
 
-### Phase 4 — Verify & polish
-> **Blocker:** P1–P3.
-- [ ] `AiAgentPanel` Jest green (excluding the 2 pre-existing failures noted in the
-      prior plan §12 #7); `tsc --noEmit` clean on touched files; `prettier` clean
-      (`oxlint`/`eslint` in CI).
-- [ ] Manual QA (needs live agent + embedder): attach a >1 MB PDF → chip shows
-      *Extracting…*, Send disabled, chip flips to *Extracted* and Send enables, the
-      turn is grounded; attach a `.json` → info toast, lands as a `raw/` document.
-- [ ] Update [`plan_unified_attach_ingestion_spec.md` §12](plan_unified_attach_ingestion_spec.md)
-      marking gaps #2/#3/#4 closed, and the `document-rag-suite` memory.
+### Phase 4 — Verify & polish ✅ DONE
+- [x] Touched suites green (documentStatus 3, useDocumentIngestion 7, CopilotPanel
+      20, editor index 12 = **42**); `tsc --noEmit` clean on touched files;
+      `prettier` clean. (`oxlint`/`eslint` in CI — no local config.) The 2
+      pre-existing `AiAgentPanel` failures (prior plan §12 #7) are untouched.
+- [ ] **Manual QA — NOT run** (needs live agent + embedder): attach a >1 MB PDF →
+      chip *Extracting…*, Send disabled → flips to *Extracted*, Send enables,
+      turn grounded; attach `.json` → info toast, lands in `raw/`. **See §11 gaps.**
+- [x] Updated [`plan_unified_attach_ingestion_spec.md` §12](plan_unified_attach_ingestion_spec.md)
+      (gaps #2/#3/#4 marked closed) + the `document-rag-suite` memory.
+
+---
+
+## 11. As-built notes — residual risks & UX expectation gaps
+
+Implemented and test-green (42 touched-suite tests). Honest gaps between code and
+user expectation:
+
+1. **✅ CLOSED — workspace tree is now live.** An editor-level document-status poll
+   ([`plan_attach_tree_gate_json_followups.md`](plan_attach_tree_gate_json_followups.md)
+   G1/T1) advances the tree badge for **both** ingress paths without a manual
+   refresh.
+2. **DEFERRED (G2) — Send-gate vs. multi-attach timing.** Kept all-or-nothing by
+   decision; revisit per that plan's D2 (trades guaranteed first-turn grounding for
+   responsiveness).
+3. **✅ CLOSED — give-up cue.** The chip now shows *Still processing in the
+   background* (not a perpetual *Extracting…*) and a note explains Send is usable
+   while extraction continues (G3/T4/T5). The ~3-min window itself is unchanged
+   (tune `ATTACH_POLL_MAX_ATTEMPTS` if needed).
+4. **Poll cost.** One `getSemanticDocument` per pending doc per 1500 ms per open
+   Copilot. Bounded and tiny, but a deployment that attaches many large docs at
+   once multiplies the GETs. No batched "get-many" endpoint exists; per-doc is fine
+   at expected scale.
+5. **Effect re-arm on each status change.** The poll effect depends on
+   `attachedDocs`; a real status change re-runs it and resets `attemptsLeft`. So the
+   cap is "max attempts *without progress*," not a hard wall-clock — correct for
+   hang-detection, but worth knowing when reading the give-up test.
+6. **✅ CLOSED — JSON notice precision.** Now sniffs MDL shape (size-capped parse +
+   top-level key check); a legitimate `.json` data file gets **no** notice (G4/T6).
+7. **Manual/visual QA not performed** — no live agent + embedder in this session;
+   the async-extraction → live-chip → grounded-send loop is covered by unit tests
+   with fake timers + mocked `getSemanticDocument`, not by eye. The real backend's
+   `extracting → extracted` transition timing is assumed, not observed.
+8. **Enter-to-send is guarded in `handleSend`** (the TextArea `onPressEnter` calls
+   it), so the gate holds even though the disabled prop only covers the button —
+   verified by the gate tests via the button, **not** via a literal Enter keypress.
+   A dedicated Enter-key test would close that small coverage seam.
 
 ---
 

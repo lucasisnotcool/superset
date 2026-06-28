@@ -86,3 +86,47 @@ test('flags a stale score after the MDL changes', async () => {
     'stale',
   );
 });
+
+test('refetches status when a coverage_completed SSE event arrives', async () => {
+  const listeners: Record<string, Array<() => void>> = {};
+  const OriginalEventSource = globalThis.EventSource;
+  class MockEventSource {
+    addEventListener(type: string, handler: () => void) {
+      (listeners[type] ??= []).push(handler);
+    }
+
+    removeEventListener() {}
+
+    close() {}
+  }
+  // @ts-ignore - test double
+  globalThis.EventSource = MockEventSource;
+
+  // First status: analysing; after the event, a completed score.
+  fetchMock.get(STATUS, {
+    status: 'analysing',
+    running: true,
+    stale: false,
+    score: null,
+    run_id: null,
+  });
+
+  render(<CoverageBadge projectId="p1" />);
+  expect(await screen.findByTestId('coverage-badge')).toHaveTextContent(
+    'analysing',
+  );
+
+  fetchMock.removeRoutes().clearHistory();
+  fetchMock.get(STATUS, {
+    status: 'ready',
+    running: false,
+    stale: false,
+    score: 0.9,
+    run_id: 'r2',
+  });
+  // Simulate the server pushing a completed run.
+  listeners.coverage_completed?.forEach(handler => handler());
+
+  expect(await screen.findByText(/90%/)).toBeInTheDocument();
+  globalThis.EventSource = OriginalEventSource;
+});

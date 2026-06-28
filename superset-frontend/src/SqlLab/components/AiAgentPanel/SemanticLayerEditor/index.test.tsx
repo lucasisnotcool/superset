@@ -440,6 +440,47 @@ test('Upload document ingests files through the shared pipeline (no dialog)', as
   expect(mockIngest).toHaveBeenCalledWith([expect.any(File)]);
 });
 
+test('workspace tree advances a document status live (no manual refresh)', async () => {
+  mockBaseRoutes([mdlFile('a', 'models/a.json')]);
+  const docFixture = (status: string) => ({
+    id: 'doc-1',
+    project_id: 'project-1',
+    filename: 'report.pdf',
+    content_type: 'application/pdf',
+    size_bytes: 2_000_000,
+    status,
+    scope: { database_id: 1, dataset_ids: [] },
+    checksum: 'c',
+    storage_uri: 'mem://x',
+    warnings: [],
+    created_at: '',
+    updated_at: '',
+  });
+  // First fetch (initial load) is still extracting; the background poll re-fetches
+  // and finds it extracted — the tree must reflect that without a manual refresh.
+  let calls = 0;
+  fetchMock.get('glob:*/agent/semantic-layer/documents?*', () => {
+    calls += 1;
+    return [docFixture(calls <= 1 ? 'extracting' : 'extracted')];
+  });
+
+  render(
+    <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="main" />,
+    { useRedux: true },
+  );
+
+  // Initially the tree shows the document with an Extracting… badge.
+  expect(await screen.findByText('report.pdf')).toBeInTheDocument();
+  expect(screen.getByText(/Extracting/)).toBeInTheDocument();
+
+  // The poll (2s interval) re-fetches and the badge clears — live, no refresh.
+  await waitFor(
+    () => expect(screen.queryByText(/Extracting/)).not.toBeInTheDocument(),
+    { timeout: 6000 },
+  );
+  expect(calls).toBeGreaterThan(1);
+});
+
 test('Reset confirms, deletes all MDL, and does NOT re-onboard', async () => {
   mockBaseRoutes([mdlFile('a', 'models/a.json')]);
   mockReset();

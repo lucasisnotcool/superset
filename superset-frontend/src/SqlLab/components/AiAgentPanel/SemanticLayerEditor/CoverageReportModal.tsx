@@ -26,6 +26,7 @@ import {
   Tag,
   Typography,
 } from '@superset-ui/core/components';
+import { Icons } from '@superset-ui/core/components/Icons';
 import { CoverageReport, CoverageStatus } from '../api';
 
 export interface CoverageReportModalProps {
@@ -108,6 +109,14 @@ export const CoverageReportBody = ({
                   <Typography.Text strong>
                     {finding.claim.subject}
                   </Typography.Text>
+                  {finding.document_filename ? (
+                    <Tag
+                      icon={<Icons.FileTextOutlined />}
+                      data-test="coverage-finding-source"
+                    >
+                      {finding.document_filename}
+                    </Tag>
+                  ) : null}
                 </Flex>
                 <Typography.Text>{finding.claim.statement}</Typography.Text>
                 {finding.matched ? (

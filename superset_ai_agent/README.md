@@ -430,6 +430,21 @@ Execute a reviewed SQL artifact:
 Invoke-RestMethod -Uri http://localhost:8097/agent/conversations/<conversation-id>/execute-sql -Method Post -ContentType "application/json" -Body '{"sql":"select * from birth_names limit 10","scope":{"database_id":1,"schema_name":null,"dataset_ids":[16]},"execution_mode":"manual"}'
 ```
 
+## Document Ingestion (MDL Copilot)
+
+Document upload is unified into a single pipeline. Both the Copilot **Attach**
+control and the **Upload document** button persist the file as a workspace
+document (content-hash deduplicated), extract its text, and vectorize it for
+retrieval; Attach additionally inlines the extracted text to ground the current
+chat turn. Large files (over `WREN_DOCUMENT_ASYNC_THRESHOLD_BYTES`) extract on a
+background thread — the attach chip polls the document to its terminal status and
+the Send button waits for extraction so the turn is grounded.
+
+> **Removed:** the UI path that imported a `.json` file *as an MDL model*. A
+> `.json` upload is now stored as a **document** (like any other file). Author MDL
+> models in the model editor or by asking the Copilot. The UI surfaces a one-time
+> notice when JSON is ingested.
+
 ## POC Limitations
 
 - The `local` Superset adapter is for development and imports Superset in the

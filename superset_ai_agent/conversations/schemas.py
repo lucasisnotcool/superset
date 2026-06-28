@@ -47,16 +47,46 @@ def _new_id() -> str:
     return str(uuid4())
 
 
+def normalize_schema_names(
+    primary: str | None,
+    extras: list[str] | None,
+) -> list[str]:
+    """Return an ordered, de-duplicated schema set with ``primary`` first.
+
+    The single source of truth for "what schemas does this scope/project cover".
+    ``primary`` (the scalar ``schema_name``) is always element 0 when present, so
+    every existing reader of ``schema_name`` keeps seeing the primary schema while
+    ``schema_names`` carries the full multi-schema set.
+    """
+
+    ordered: list[str] = []
+    for name in [primary, *(extras or [])]:
+        if name and name not in ordered:
+            ordered.append(name)
+    return ordered
+
+
 class ConversationScope(BaseModel):
     """Superset context attached to a conversation turn."""
 
     database_id: int
     catalog_name: str | None = None
+    #: Primary schema (back-compat scalar). For a multi-schema scope this is the
+    #: first element of ``schema_names``.
     schema_name: str | None = None
+    #: Full schema set for a multi-schema semantic project. ``None``/empty means the
+    #: scope is single-schema (use ``schema_name``). Prefer ``effective_schema_names``.
+    schema_names: list[str] | None = None
     dataset_ids: list[int] = Field(default_factory=list)
     query_editor_id: str | None = None
     current_sql: str | None = None
     selected_text: str | None = None
+
+    @property
+    def effective_schema_names(self) -> list[str]:
+        """Ordered schema set, primary first; ``[]`` when no schema is set."""
+
+        return normalize_schema_names(self.schema_name, self.schema_names)
 
 
 class ConversationArtifact(BaseModel):

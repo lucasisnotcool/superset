@@ -21,9 +21,12 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
-from superset_ai_agent.conversations.schemas import ConversationScope
+from superset_ai_agent.conversations.schemas import (
+    ConversationScope,
+    normalize_schema_names,
+)
 
 # Active values are "uploaded"/"extracted"/"error". "needs_review"/"approved"/
 # "indexed" are legacy (the removed document-review/overlay flow) and are retained
@@ -129,6 +132,8 @@ class SemanticLayerState(BaseModel):
     database_id: int
     catalog_name: str | None = None
     schema_name: str | None = None
+    #: Full schema set when the project spans multiple schemas (primary first).
+    schema_names: list[str] | None = None
     dataset_ids: list[int] = Field(default_factory=list)
     document_count: int
     last_error: str | None = None
@@ -174,7 +179,13 @@ MdlContentType = Literal["application/json"]
 
 
 class SemanticProject(BaseModel):
-    """Schema-scoped Wren semantic project."""
+    """Wren semantic project spanning one or more schemas of a database.
+
+    ``schema_name`` is the **primary** schema (the wren-core logical namespace and
+    the back-compat scalar). ``schema_names`` is the full, ordered set the project
+    covers, with the primary first; a model may reference a physical table in any
+    member schema via its ``tableReference.schema``.
+    """
 
     id: str = Field(default_factory=_new_id)
     name: str
@@ -185,6 +196,7 @@ class SemanticProject(BaseModel):
     database_label: str | None = None
     catalog_name: str | None = None
     schema_name: str
+    schema_names: list[str] = Field(default_factory=list)
     schema_display_name: str | None = None
     default_database_id: int | None = None
     visibility: SemanticProjectVisibility = "db_access"
@@ -195,18 +207,43 @@ class SemanticProject(BaseModel):
     updated_at: datetime = Field(default_factory=_utc_now)
     deleted_at: datetime | None = None
 
+    @model_validator(mode="after")
+    def _sync_schema_set(self) -> "SemanticProject":
+        """Keep ``schema_name`` (primary) and ``schema_names`` (full set) consistent.
+
+        The primary is always element 0 of the set; the set is de-duplicated and
+        order-preserving. A project constructed with only ``schema_name`` gets a
+        one-element set, so single-schema projects are unchanged.
+        """
+
+        names = normalize_schema_names(self.schema_name, self.schema_names)
+        if names:
+            if self.schema_names != names:
+                self.schema_names = names
+            if self.schema_name != names[0]:
+                self.schema_name = names[0]
+        return self
+
 
 class SemanticProjectResolveRequest(BaseModel):
-    """Resolve or create the schema project for a database/catalog/schema."""
+    """Resolve or create the semantic project for a database/catalog/schema(s)."""
 
     database_id: int
     database_label: str | None = None
     database_backend: str | None = None
     catalog_name: str | None = None
     schema_name: str
+    #: Optional additional schemas to scope the project to (primary stays
+    #: ``schema_name``). Back-compat: callers may send only ``schema_name``.
+    schema_names: list[str] | None = None
     supplied_uri: str | None = None
     database_uri_fingerprint: str | None = None
     create_if_missing: bool = True
+
+    def resolved_schema_names(self) -> list[str]:
+        """Ordered, de-duplicated requested schema set with the primary first."""
+
+        return normalize_schema_names(self.schema_name, self.schema_names)
 
 
 class MdlValidationMessage(BaseModel):

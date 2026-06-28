@@ -296,6 +296,8 @@ export interface ConversationScope {
   database_id: number;
   catalog_name?: string | null;
   schema_name?: string | null;
+  /** Full schema set for a multi-schema semantic project (primary first). */
+  schema_names?: string[] | null;
   dataset_ids: number[];
   query_editor_id?: string | null;
   current_sql?: string | null;
@@ -386,6 +388,7 @@ export interface SemanticLayerState {
   database_id: number;
   catalog_name?: string | null;
   schema_name?: string | null;
+  schema_names?: string[] | null;
   dataset_ids: number[];
   document_count: number;
   last_error?: string | null;
@@ -490,6 +493,9 @@ export interface SemanticProject {
   database_label?: string | null;
   catalog_name?: string | null;
   schema_name: string;
+  /** Full schema set the project covers (primary first). Defaults to
+   * `[schema_name]` for single-schema projects. */
+  schema_names?: string[];
   schema_display_name?: string | null;
   default_database_id?: number | null;
   visibility: SemanticProjectVisibility;
@@ -507,6 +513,9 @@ export interface SemanticProjectResolveRequest {
   database_backend?: string | null;
   catalog_name?: string | null;
   schema_name: string;
+  /** Optional additional schemas to scope the project to (primary stays
+   * `schema_name`). Back-compat: callers may send only `schema_name`. */
+  schema_names?: string[];
   supplied_uri?: string | null;
   create_if_missing?: boolean;
 }
@@ -1280,6 +1289,9 @@ export interface CoverageFinding {
   matched?: string;
   rationale?: string;
   suggestion?: string;
+  /** Source document this claim came from (directory coverage only). */
+  document_id?: string | null;
+  document_filename?: string;
 }
 
 export interface OverreachFinding {

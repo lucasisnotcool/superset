@@ -81,8 +81,10 @@ import CopilotPanel from './CopilotPanel';
 import OnboardingTablePicker from './OnboardingTablePicker';
 import MdlProvenanceDialog from './MdlProvenanceDialog';
 import CoverageBadge from './CoverageBadge';
+import SchemaSetControl from './SchemaSetControl';
 import DocumentDetailPane from './DocumentDetailPane';
 import WorkspaceTree, { treeFromFiles } from './WorkspaceTree';
+import { isPendingDocumentStatus } from './documentStatus';
 
 // Lazy-loaded so the graph code + ECharts land in a separate async chunk fetched
 // only when the Graph tab is opened — zero cost otherwise (wren_graph_view.md D1).
@@ -240,26 +242,56 @@ const defaultMdl = `{
 const ONBOARDING_POLL_INTERVAL_MS = 2000;
 const ONBOARDING_POLL_MAX_ATTEMPTS = 450; // ~15 minutes at the interval above
 
+// While any uploaded document is still extracting (large files extract on a
+// background thread), poll the document list so the workspace tree shows live
+// status instead of a stale snapshot. Bounded like onboarding (~4 min) so a stuck
+// extraction doesn't poll forever.
+const DOCUMENT_POLL_INTERVAL_MS = 2000;
+const DOCUMENT_POLL_MAX_ATTEMPTS = 120;
+
+/** Stable status signature so an unchanged poll doesn't churn the tree. */
+const documentStatusSignature = (documents: SemanticDocument[]): string =>
+  documents
+    .map(document => `${document.id}:${document.status}`)
+    .sort()
+    .join('|');
+
 export interface SemanticLayerEditorProps {
   databaseId: number;
   catalogName: string | null;
   schemaName: string;
+  /** Additional schemas to seed the project's set with (primary stays
+   * `schemaName`). Optional; the editor also lets a user add schemas in-place. */
+  schemaNames?: string[];
 }
 
 export default function SemanticLayerEditor({
   databaseId,
   catalogName,
   schemaName,
+  schemaNames,
 }: SemanticLayerEditorProps) {
   const dispatch = useDispatch();
+  // Ordered, de-duplicated requested schema set with the primary (`schemaName`)
+  // first. Mirrors the backend `normalize_schema_names` contract.
+  const requestedSchemaNames = useMemo(() => {
+    const ordered: string[] = [];
+    [schemaName, ...(schemaNames ?? [])].forEach(name => {
+      if (name && !ordered.includes(name)) {
+        ordered.push(name);
+      }
+    });
+    return ordered;
+  }, [schemaName, schemaNames]);
   const scope: ConversationScope = useMemo(
     () => ({
       database_id: databaseId,
       catalog_name: catalogName,
       schema_name: schemaName,
+      schema_names: requestedSchemaNames,
       dataset_ids: [],
     }),
-    [databaseId, catalogName, schemaName],
+    [databaseId, catalogName, schemaName, requestedSchemaNames],
   );
 
   const [project, setProject] = useState<SemanticProject | null>(null);
@@ -368,6 +400,7 @@ export default function SemanticLayerEditor({
       database_id: scope.database_id,
       catalog_name: scope.catalog_name ?? null,
       schema_name: scope.schema_name,
+      schema_names: scope.schema_names ?? undefined,
       create_if_missing: true,
     });
     const [nextFiles, nextState, nextDocuments, nextReadiness] =
@@ -419,6 +452,40 @@ export default function SemanticLayerEditor({
       );
     });
   }, [refresh, dispatch]);
+
+  // Widen the project to cover another schema. Re-resolves with the expanded set
+  // (the backend proves access to the new schema before associating it), then
+  // refreshes so the schema chip appears and the new schema's tables become
+  // onboardable. Models pointing at a schema outside the set are rejected by
+  // validation (R1), so this is the only sanctioned way to grow coverage.
+  const addSchema = useCallback(
+    async (schema: string) => {
+      if (!project || project.schema_names?.includes(schema)) {
+        return;
+      }
+      try {
+        await resolveSemanticProject({
+          database_id: scope.database_id,
+          catalog_name: scope.catalog_name ?? null,
+          schema_name: project.schema_name,
+          schema_names: [
+            ...(project.schema_names ?? [project.schema_name]),
+            schema,
+          ],
+          create_if_missing: false,
+        });
+        await refresh();
+        dispatch(addSuccessToast(t('Added schema "%(schema)s".', { schema })));
+      } catch (ex) {
+        dispatch(
+          addDangerToast(
+            ex instanceof Error ? ex.message : t('Unable to add schema'),
+          ),
+        );
+      }
+    },
+    [project, scope, refresh, dispatch],
+  );
 
   // Upload document(s) through the shared ingestion pipeline, then refresh so the
   // new files appear in the workspace tree. No chat involvement — this is the
@@ -694,6 +761,56 @@ export default function SemanticLayerEditor({
     };
   }, [pollJobId, project, dispatch, announceOnboardingComplete, refresh]);
 
+  // Live workspace tree: while any document is still extracting, re-fetch the
+  // document list so its status badge advances to terminal without a manual
+  // refresh — for files added via the Upload button OR Copilot Attach (both land
+  // in `documents`). Bounded + cancel-safe; change-guarded so an unchanged poll
+  // keeps the array identity stable (no tree churn, no effect re-arm).
+  useEffect(() => {
+    if (
+      !scope.schema_name ||
+      !documents.some(d => isPendingDocumentStatus(d.status))
+    ) {
+      return undefined;
+    }
+    let cancelled = false;
+    let attemptsLeft = DOCUMENT_POLL_MAX_ATTEMPTS;
+    let timer: ReturnType<typeof setTimeout>;
+
+    const poll = async () => {
+      let next: SemanticDocument[] | null = null;
+      try {
+        next = await listSemanticDocuments(scope);
+      } catch {
+        next = null; // transient; keep polling within budget
+      }
+      if (cancelled) {
+        return;
+      }
+      if (next) {
+        const fetched = next;
+        setDocuments(prev =>
+          documentStatusSignature(prev) === documentStatusSignature(fetched)
+            ? prev
+            : fetched,
+        );
+      }
+      attemptsLeft -= 1;
+      const stillPending =
+        next?.some(d => isPendingDocumentStatus(d.status)) ?? true;
+      if (!stillPending || attemptsLeft <= 0) {
+        return;
+      }
+      timer = setTimeout(poll, DOCUMENT_POLL_INTERVAL_MS);
+    };
+
+    timer = setTimeout(poll, DOCUMENT_POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [documents, scope]);
+
   // Destructive "start over": delete all MDL so the project returns to the empty
   // (un-onboarded) state. Does NOT re-onboard — the rail re-gates the Copilot
   // behind an explicit Onboard. Gated behind a confirmation dialog. Documents
@@ -794,9 +911,27 @@ export default function SemanticLayerEditor({
                   data-test="open-provenance"
                 />
               </Tooltip>
-              <CoverageBadge projectId={project?.id} refreshSignal={mdlFiles} />
+              <CoverageBadge
+                projectId={project?.id}
+                // Only the active set drives coverage; key on it so draft edits
+                // don't trigger redundant status refetches (SSE handles the rest).
+                refreshSignal={mdlFiles
+                  .filter(file => file.status === 'active')
+                  .map(file => `${file.id}:${file.checksum}`)
+                  .join(',')}
+              />
             </Flex>
             <SemanticLayerStateBadge state={state} />
+            {project && (
+              <SchemaSetControl
+                schemaNames={project.schema_names ?? [project.schema_name]}
+                primarySchema={project.schema_name}
+                databaseId={databaseId}
+                catalogName={catalogName}
+                canEdit={canWrite}
+                onAddSchema={addSchema}
+              />
+            )}
           </Flex>
         </Flex>
         <Button

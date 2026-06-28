@@ -16,12 +16,15 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { t } from '@apache-superset/core/translation';
 import { Tag, Tooltip } from '@superset-ui/core/components';
 import { CoverageStatusInfo, getCoverageStatus, refreshCoverage } from '../api';
+import { COVERAGE_EVENT_TYPES, useProjectEvents } from './useProjectEvents';
 
-const POLL_MS = 4000;
+// Low-frequency safety net: SSE drives live updates, this only covers missed
+// events / SSE-buffering proxies. Far cheaper than the old 4s analysing-poll.
+const FALLBACK_POLL_MS = 30000;
 
 const TAG_COLOR: Record<CoverageStatusInfo['status'], string> = {
   analysing: 'processing',
@@ -53,28 +56,30 @@ export interface CoverageBadgeProps {
  */
 const CoverageBadge = ({ projectId, refreshSignal }: CoverageBadgeProps) => {
   const [info, setInfo] = useState<CoverageStatusInfo | null>(null);
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const poll = useCallback(async () => {
     if (!projectId) return;
     try {
-      const next = await getCoverageStatus(projectId);
-      setInfo(next);
-      if (next.status === 'analysing') {
-        timer.current = setTimeout(poll, POLL_MS);
-      }
+      setInfo(await getCoverageStatus(projectId));
     } catch {
       // Best-effort badge — a transient status failure is not surfaced.
     }
   }, [projectId]);
 
+  // Live updates: refetch when the project emits a coverage/active-set event.
+  useProjectEvents(projectId, COVERAGE_EVENT_TYPES, poll, Boolean(projectId));
+
+  // Initial load + on an explicit refresh signal (e.g. MDL directory changed).
   useEffect(() => {
-    if (timer.current) clearTimeout(timer.current);
     poll();
-    return () => {
-      if (timer.current) clearTimeout(timer.current);
-    };
   }, [poll, refreshSignal]);
+
+  // Safety-net poll for missed SSE events / buffering proxies.
+  useEffect(() => {
+    if (!projectId) return undefined;
+    const id = setInterval(poll, FALLBACK_POLL_MS);
+    return () => clearInterval(id);
+  }, [projectId, poll]);
 
   const onReRun = useCallback(async () => {
     if (!projectId) return;

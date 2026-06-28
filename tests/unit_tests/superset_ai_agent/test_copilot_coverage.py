@@ -435,6 +435,12 @@ def test_run_directory_coverage_unions_claims_across_documents() -> None:
     assert report.covered == 1
     assert report.missing == 1
     assert report.score == 0.5
+    # G2: each finding is tagged back to its source document (by claim order).
+    by_doc = {f.document_filename: f for f in report.findings}
+    assert by_doc["a.md"].status == "covered"
+    assert by_doc["a.md"].document_id == "d1"
+    assert by_doc["b.md"].status == "missing"
+    assert by_doc["b.md"].document_id == "d2"
 
 
 def test_run_directory_coverage_no_documents_is_a_noop() -> None:

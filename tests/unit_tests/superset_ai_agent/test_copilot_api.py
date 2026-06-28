@@ -443,7 +443,11 @@ def test_directory_coverage_is_idempotent_for_same_version(tmp_path) -> None:
     pid = project["id"]
     client.post(
         f"/agent/semantic-layer/projects/{pid}/documents/text",
-        json={"filename": "g.md", "text": "id = order id.", "content_type": "text/markdown"},
+        json={
+            "filename": "g.md",
+            "text": "id = order id.",
+            "content_type": "text/markdown",
+        },
     )
     _seed_active_model(client, pid)
 
@@ -936,6 +940,51 @@ def test_copilot_apply_emits_agent_provenance(tmp_path) -> None:
     assert entry["detail"]["source_type"] == "copilot"
     assert entry["detail"]["ops"]["create"] == 1
     assert entry["detail"]["conversation_id"] == cid
+
+
+def test_copilot_apply_with_attachment_records_enrichment(tmp_path) -> None:
+    # G1: an apply whose turn carried an inline attachment is recorded as an
+    # enrichment pass (not a generic agent edit), with the attachment filename.
+    client = _client(tmp_path)
+    project = _resolve(client)
+    pid = project["id"]
+    _seed_active_model(client, pid)
+    cid = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot/conversations"
+    ).json()["id"]
+
+    client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot",
+        json={
+            "message": "model the moves table",
+            "conversation_id": cid,
+            "attachments": [
+                {
+                    "filename": "spec.md",
+                    "content_type": "text/markdown",
+                    "text": "moves has an id column",
+                }
+            ],
+        },
+    )
+    run = client.get(
+        f"/agent/semantic-layer/projects/{pid}/copilot/conversations/{cid}"
+    ).json()
+    items = run["messages"][-1]["artifacts"][0]["payload"]["items"]
+    apply = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot/apply",
+        json={"items": items, "conversation_id": cid},
+    )
+    assert apply.status_code == 200, apply.text
+
+    provenance = client.get(
+        f"/agent/semantic-layer/projects/{pid}/provenance"
+    ).json()
+    enrichments = [e for e in provenance if e["kind"] == "enrichment"]
+    assert len(enrichments) == 1
+    assert enrichments[0]["detail"]["documents"] == [
+        {"id": None, "filename": "spec.md"}
+    ]
 
 
 def test_copilot_apply_without_conversation_id_does_not_touch_threads(

@@ -95,6 +95,15 @@ export const getDocumentStatusMeta = (status: string): DocumentStatusMeta => {
   }
 };
 
+/**
+ * Whether a document is still in flight (text extraction not yet finished), as
+ * opposed to a terminal state (`extracted`/`needs_ocr`/`error` + legacy terminal
+ * states). Drives the live attach-status poll and the Send gate: a turn should
+ * wait for a pending attachment so its extracted text can ground the chat.
+ */
+export const isPendingDocumentStatus = (status: string): boolean =>
+  status === 'uploaded' || status === 'extracting';
+
 export interface DocumentStatusTagProps {
   status: string;
   /** When the status is `error`, the backend message is shown on hover. */

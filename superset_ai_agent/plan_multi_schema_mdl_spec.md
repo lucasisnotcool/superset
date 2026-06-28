@@ -198,6 +198,22 @@ Introduce an explicit **schema set** owned by the project. Two viable shapes —
 
 ---
 
+## 7a. Implementation status (as built)
+
+**Shipped & tested (backend + core frontend):**
+- **Model layer** — `normalize_schema_names` + `schema_names` on `SemanticProject` / `SemanticProjectResolveRequest` / `ConversationScope` / `SemanticLayerState`; `schema_name` retained as the primary (back-compat). `scope_hash` is byte-identical for single-schema scopes, distinct+order-independent for multi (R5). *(`test_multi_schema_models.py`)*
+- **DB** — `ai_agent_semantic_project_schemas` association table + migration `0010` with primary-schema backfill (expand step, reversible). *(`test_multi_schema_migration.py`)*
+- **Stores** — both in-memory and SQLAlchemy: resolve matches by primary then membership (reopening on a secondary schema finds the same project), reconciles the set additively, persists/loads memberships, lists by membership. *(`test_multi_schema_projects.py`)*
+- **Access (R1)** — `require_schema_set_permission` proves every schema in the set and returns the union context; `resolve_project` / project re-open prove the full set. *(`test_multi_schema_access.py`)*
+- **Validation (R1 + D4)** — `SchemaIndex` is schema-qualified (degrades closed on the names-only snapshot); models referencing an out-of-set schema error (`schema_not_in_project`); unknown-table messages are schema-qualified; column checks respect schema on table-name collisions. *(`test_multi_schema_validation.py`)*
+- **Onboarding (D4)** — base-model generation disambiguates colliding logical names by schema (tableReference stays exact); the onboard endpoint unions every member schema for whole-project introspection. *(`test_multi_schema_onboarding.py`)*
+- **Materializer** — `dataSource.properties.schema_names` + `semanticProject.schemas` exposed; root schema stays the primary (logical namespace).
+- **Frontend** — `schema_names` on the API types; the editor seeds resolve with the set and renders header **schema chips** + an **Add-schema** control (proves access server-side, then offers onboarding). *(`SchemaSetControl.test.tsx`)*
+
+**Deferred (with rationale):**
+- **Multi-schema onboarding *picker* + physical schema *graph overlay*** — the per-schema table-selection picker and the physical-table graph overlay still center on the primary schema. Both require integration-heavy refactors of single-schema data hooks (`useSchemaGraphData`, the picker's `schema eq` dataset fetch) with their own integration-test surface. **Functionally covered**: the whole-project "Onboard" path already introspects the union of all member schemas, so a newly-added schema's tables *are* onboardable; only the granular per-schema selection UI is pending. **Gap to flag to users:** after adding a schema, use "Onboard" (whole-project) rather than expecting the table picker to list the new schema's tables.
+- **Phase 4 contract swap (unique-index replacement, D2b named projects) + scalar-echo retirement (D7)** — **not required for multi-schema**: the existing `(fingerprint, catalog, schema_name, deleted_at)` unique constraint still holds (it pins the *primary* schema; additional schemas live in the membership table), so resolve never creates duplicates. The swap is only needed to unlock *multiple named projects per database* (a separate future capability) and carries migration risk against persistent `ai_agent.db` volumes — correctly deferred to a dedicated change. Retiring the scalar `schema_name` (D7) must wait out a deprecation window.
+
 ## 8. Phasing (independently shippable)
 
 1. **Phase 0 — Decouple root namespace (no scope change).** Make wren-core root `schema` a fixed logical namespace (D5); confirm existing single-schema projects unaffected. Pure refactor, no migration. De-risks the engine assumption before touching scope.

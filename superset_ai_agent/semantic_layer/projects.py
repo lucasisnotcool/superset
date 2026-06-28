@@ -19,12 +19,16 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Protocol
+from uuid import uuid4
 
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from superset_ai_agent.conversations.store import DEFAULT_OWNER_ID
-from superset_ai_agent.persistence.models import AiAgentSemanticProject
+from superset_ai_agent.persistence.models import (
+    AiAgentSemanticProject,
+    AiAgentSemanticProjectSchema,
+)
 from superset_ai_agent.semantic_layer.schemas import (
     SemanticProject,
     SemanticProjectResolveRequest,
@@ -100,15 +104,29 @@ class InMemorySemanticProjectStore:
     ) -> SemanticProject:
         fingerprint = _request_fingerprint(request)
         catalog_key = _catalog_key(request.catalog_name)
-        for project in self._projects.values():
-            if (
-                project.database_uri_fingerprint == fingerprint
-                and _catalog_key(project.catalog_name) == catalog_key
-                and project.schema_name == request.schema_name
-                and project.deleted_at is None
-                and project.status == "active"
-            ):
-                return _with_permission(project, owner_id)
+        requested = request.resolved_schema_names()
+        candidates = [
+            project
+            for project in self._projects.values()
+            if project.database_uri_fingerprint == fingerprint
+            and _catalog_key(project.catalog_name) == catalog_key
+            and project.deleted_at is None
+            and project.status == "active"
+        ]
+        # Prefer a project where the requested schema is the primary, then any
+        # project whose membership set already covers it (so reopening on a
+        # non-primary schema finds the same project rather than fragmenting).
+        match = next(
+            (p for p in candidates if p.schema_name == request.schema_name), None
+        ) or next(
+            (p for p in candidates if request.schema_name in p.schema_names), None
+        )
+        if match is not None:
+            merged = _merge_schema_names(match.schema_names, requested)
+            if merged != match.schema_names:
+                match = match.model_copy(update={"schema_names": merged})
+                self._projects[match.id] = match
+            return _with_permission(match, owner_id)
         if not request.create_if_missing:
             raise SemanticProjectNotFoundError(request.schema_name)
         project = _project_from_request(
@@ -143,7 +161,7 @@ class InMemorySemanticProjectStore:
                 catalog_name is None
                 or _catalog_key(project.catalog_name) == _catalog_key(catalog_name)
             )
-            and (schema_name is None or project.schema_name == schema_name)
+            and (schema_name is None or schema_name in project.schema_names)
         ]
         return sorted(projects, key=lambda item: item.updated_at, reverse=True)
 
@@ -208,23 +226,53 @@ class SqlAlchemySemanticProjectStore:
     ) -> SemanticProject:
         fingerprint = _request_fingerprint(request)
         catalog_key = _catalog_key(request.catalog_name)
+        requested = request.resolved_schema_names()
         with self.session_factory() as session:
+            scope = (
+                AiAgentSemanticProject.database_uri_fingerprint == fingerprint,
+                AiAgentSemanticProject.catalog_name == catalog_key,
+                AiAgentSemanticProject.deleted_at.is_(None),
+                AiAgentSemanticProject.status == "active",
+            )
+            # Prefer a project whose primary schema matches; fall back to one whose
+            # membership set already covers the requested schema.
             model = (
                 session.execute(
                     select(AiAgentSemanticProject).where(
-                        AiAgentSemanticProject.database_uri_fingerprint
-                        == fingerprint,
-                        AiAgentSemanticProject.catalog_name == catalog_key,
+                        *scope,
                         AiAgentSemanticProject.schema_name == request.schema_name,
-                        AiAgentSemanticProject.deleted_at.is_(None),
-                        AiAgentSemanticProject.status == "active",
                     )
                 )
                 .scalars()
                 .one_or_none()
             )
+            if model is None:
+                membership = select(AiAgentSemanticProjectSchema.project_id).where(
+                    AiAgentSemanticProjectSchema.schema_name == request.schema_name
+                )
+                model = (
+                    session.execute(
+                        select(AiAgentSemanticProject)
+                        .where(*scope, AiAgentSemanticProject.id.in_(membership))
+                        .order_by(AiAgentSemanticProject.updated_at.desc())
+                    )
+                    .scalars()
+                    .first()
+                )
             if model is not None:
-                return _with_permission(_project_from_model(model), owner_id)
+                project = _project_from_model(
+                    model,
+                    schema_names=_load_schema_names(
+                        session, model.id, model.schema_name
+                    ),
+                )
+                merged = _merge_schema_names(project.schema_names, requested)
+                if merged != project.schema_names:
+                    project = project.model_copy(update={"schema_names": merged})
+                    _sync_membership_rows(session, project)
+                    model.updated_at = _utc_now()
+                    session.commit()
+                return _with_permission(project, owner_id)
             if not request.create_if_missing:
                 raise SemanticProjectNotFoundError(request.schema_name)
             project = _project_from_request(
@@ -233,6 +281,7 @@ class SqlAlchemySemanticProjectStore:
                 database_uri_fingerprint=fingerprint,
             )
             session.add(_project_to_model(project))
+            _sync_membership_rows(session, project)
             session.commit()
             return project
 
@@ -268,14 +317,30 @@ class SqlAlchemySemanticProjectStore:
                     AiAgentSemanticProject.catalog_name == _catalog_key(catalog_name)
                 )
             if schema_name is not None:
-                query = query.where(AiAgentSemanticProject.schema_name == schema_name)
+                membership = select(AiAgentSemanticProjectSchema.project_id).where(
+                    AiAgentSemanticProjectSchema.schema_name == schema_name
+                )
+                query = query.where(
+                    or_(
+                        AiAgentSemanticProject.schema_name == schema_name,
+                        AiAgentSemanticProject.id.in_(membership),
+                    )
+                )
             models = (
                 session.execute(query.order_by(AiAgentSemanticProject.updated_at.desc()))
                 .scalars()
                 .all()
             )
             return [
-                _with_permission(_project_from_model(model), owner_id)
+                _with_permission(
+                    _project_from_model(
+                        model,
+                        schema_names=_load_schema_names(
+                            session, model.id, model.schema_name
+                        ),
+                    ),
+                    owner_id,
+                )
                 for model in models
             ]
 
@@ -289,7 +354,10 @@ class SqlAlchemySemanticProjectStore:
             model = session.get(AiAgentSemanticProject, project_id)
             if model is None:
                 raise SemanticProjectNotFoundError(project_id)
-            project = _project_from_model(model)
+            project = _project_from_model(
+                model,
+                schema_names=_load_schema_names(session, model.id, model.schema_name),
+            )
             if (
                 project.deleted_at is not None
                 or project.status != "active"
@@ -363,6 +431,7 @@ def _project_from_request(
         database_label=request.database_label,
         catalog_name=request.catalog_name,
         schema_name=request.schema_name,
+        schema_names=request.resolved_schema_names(),
         schema_display_name=request.schema_name,
         default_database_id=request.database_id,
     )
@@ -390,7 +459,11 @@ def _project_to_model(project: SemanticProject) -> AiAgentSemanticProject:
     )
 
 
-def _project_from_model(model: AiAgentSemanticProject) -> SemanticProject:
+def _project_from_model(
+    model: AiAgentSemanticProject,
+    *,
+    schema_names: list[str] | None = None,
+) -> SemanticProject:
     return SemanticProject(
         id=model.id,
         name=model.name,
@@ -401,6 +474,7 @@ def _project_from_model(model: AiAgentSemanticProject) -> SemanticProject:
         database_label=model.database_label,
         catalog_name=model.catalog_name or None,
         schema_name=model.schema_name,
+        schema_names=schema_names or [model.schema_name],
         schema_display_name=model.schema_display_name,
         default_database_id=model.default_database_id,
         visibility=model.visibility,
@@ -410,6 +484,71 @@ def _project_from_model(model: AiAgentSemanticProject) -> SemanticProject:
         updated_at=model.updated_at,
         deleted_at=model.deleted_at,
     )
+
+
+def _merge_schema_names(existing: list[str], requested: list[str]) -> list[str]:
+    """Append any requested schemas not already in ``existing`` (primary unchanged)."""
+
+    merged = list(existing)
+    for name in requested:
+        if name and name not in merged:
+            merged.append(name)
+    return merged
+
+
+def _load_schema_names(
+    session: Session, project_id: str, primary: str
+) -> list[str]:
+    """Load a project's ordered schema set, falling back to its primary schema.
+
+    The fallback keeps projects readable before the backfill migration has run
+    (or in test databases created straight from metadata without memberships).
+    """
+
+    rows = (
+        session.execute(
+            select(AiAgentSemanticProjectSchema)
+            .where(AiAgentSemanticProjectSchema.project_id == project_id)
+            .order_by(AiAgentSemanticProjectSchema.position)
+        )
+        .scalars()
+        .all()
+    )
+    names = [row.schema_name for row in rows if row.schema_name]
+    return names or [primary]
+
+
+def _sync_membership_rows(session: Session, project: SemanticProject) -> None:
+    """Insert membership rows for any new schemas; keep ``position`` aligned.
+
+    Additive only — removing a schema from a project is an explicit operation
+    (D3), never a side effect of resolve, so no rows are deleted here.
+    """
+
+    existing = {
+        row.schema_name: row
+        for row in session.execute(
+            select(AiAgentSemanticProjectSchema).where(
+                AiAgentSemanticProjectSchema.project_id == project.id
+            )
+        )
+        .scalars()
+        .all()
+    }
+    for position, schema in enumerate(project.schema_names):
+        row = existing.get(schema)
+        if row is None:
+            session.add(
+                AiAgentSemanticProjectSchema(
+                    id=str(uuid4()),
+                    project_id=project.id,
+                    schema_name=schema,
+                    position=position,
+                    created_at=_utc_now(),
+                )
+            )
+        elif row.position != position:
+            row.position = position
 
 
 def _is_visible(project: SemanticProject, owner_id: str) -> bool:

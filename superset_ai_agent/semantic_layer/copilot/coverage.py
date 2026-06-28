@@ -711,6 +711,9 @@ def run_directory_coverage(
         )
 
     all_claims: list[CoverageClaim] = []
+    # Source document aligned by index with ``all_claims`` (so each finding can be
+    # tagged back to the document its claim came from).
+    sources: list[CoverageDocument] = []
     warnings: list[str] = []
     for document in documents:
         _raise_if_cancelled(should_cancel)
@@ -721,6 +724,7 @@ def run_directory_coverage(
             warnings.append(f"Claim extraction failed for {document.filename}.")
             continue
         all_claims.extend(claims)
+        sources.extend([document] * len(claims))
 
     if not all_claims:
         warnings.append("No modelable claims were found across the documents.")
@@ -735,6 +739,13 @@ def run_directory_coverage(
         embedder=embedder,
         votes=votes,
     )
+    # Tag each finding with its source document. Guarded on equal length: every
+    # judge path (incl. the degrade-to-all-missing seam) returns one finding per
+    # claim in order, but if that ever changes we skip tagging rather than mis-map.
+    if len(findings) == len(sources):
+        for finding, source in zip(findings, sources, strict=False):
+            finding.document_id = source.document_id
+            finding.document_filename = source.filename
     if not facts:
         warnings.append(
             "The project has no MDL semantics yet; everything is missing."

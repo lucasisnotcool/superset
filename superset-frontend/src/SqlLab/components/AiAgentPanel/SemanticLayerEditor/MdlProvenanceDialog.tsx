@@ -38,6 +38,7 @@ import {
 } from '../api';
 import { CopyButton } from '../AgentStepDetail';
 import { CoverageReportBody } from './CoverageReportModal';
+import { COVERAGE_EVENT_TYPES, useProjectEvents } from './useProjectEvents';
 
 // Reuses the AI Explain dialog's visual language (vertical, status-dotted
 // timeline) — provenance is a linear time series rather than SQL attempts.
@@ -229,10 +230,19 @@ const MdlProvenanceDialog = ({
     }
   }, [open, load]);
 
-  const showingReport =
+  // Live-refresh the timeline while the dialog is open (a closed dialog holds no
+  // connection). Skip while a coverage report is being viewed so the drill-in
+  // is not yanked out from under the user.
+  const viewingReport =
     report !== null || reportLoading || reportError !== null;
+  useProjectEvents(
+    projectId,
+    COVERAGE_EVENT_TYPES,
+    load,
+    open && !viewingReport,
+  );
 
-  if (showingReport) {
+  if (viewingReport) {
     return (
       <Modal
         show={open}

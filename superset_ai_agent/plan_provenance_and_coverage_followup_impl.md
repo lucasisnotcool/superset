@@ -209,3 +209,82 @@ unchanged. Harmless but chatty.
 ## Industry-pattern sources (rationale)
 - SSE + low-frequency fallback poll for live status (avoid pure polling) — server-sent events guidance: https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events
 - Provenance/lineage "which source did this come from" tagging — OpenLineage facets model: https://openlineage.io/docs/spec/facets/
+
+---
+
+## Implementation status (Phase 3 delivered 2026-06-28)
+
+All gaps G1–G6 are implemented and tested. Re-anchored against the tree *after*
+the multi-schema feature landed (commit `d83567ab0d` + working-tree multi-schema
+work); all G1–G6 anchors held.
+
+**Test results**
+- Backend `tests/unit_tests/superset_ai_agent/`: **867 passed, 11 skipped**.
+- My frontend suites (MdlProvenanceDialog, CoverageBadge, CoverageReportModal,
+  useProjectEvents): **17 passed**.
+- ruff (enforced) + prettier clean on changed files; changed logic files mypy-clean.
+
+**Pre-existing failures (NOT from this work):** `ExplainDialog.test.tsx` and
+`AiAgentPanel/index.test.tsx` (2 tests) fail on schema-qualified SQL rendering
+(`SELECT … FROM sales.orders`). Confirmed identical failures with my `api.ts` +
+`SemanticLayerEditor/index.tsx` changes stashed — they are collateral from the
+other agent's multi-schema feature changing table-reference rendering in the
+**SQL-agent** suites, unrelated to provenance/coverage. Flag to that work's owner.
+
+### What shipped, by gap
+
+- **G1.** `Changeset.referenced_attachments` (`copilot/schemas.py`), stamped after
+  `run_copilot` in both the turn (`app.py` ~2259) and stream (~2376) handlers;
+  `_emit_agent_apply_provenance` folds attachments into `detail.documents` as
+  `{id: None, filename}` and they now count toward the enrichment classification
+  (`service.py::apply_provenance_payload`).
+- **G2.** `CoverageFinding.document_id`/`document_filename`; `run_directory_coverage`
+  carries a per-claim `sources` list and tags findings (length-guarded against
+  judge degrade paths); UI renders a source-document tag per finding
+  (`CoverageReportModal.tsx`).
+- **G3.** New shared `useProjectEvents` hook (named-SSE-frame aware) + `COVERAGE_EVENT_TYPES`;
+  `CoverageBadge` and the open `MdlProvenanceDialog` subscribe and refetch live;
+  badge polling cut from 4s-while-analysing to a 30s safety net.
+- **G4.** Badge `refreshSignal` keyed on the **active** file set (id+checksum), not
+  all `mdlFiles`.
+- **G5.** Accepted non-goals confirmed in code (stage-granular cancel, union overreach).
+- **G6.** Resolved the "ESLint broken" note: the project lints with **oxlint**
+  (`npm run lint` → `oxlint --config oxlint.json`); there is no ESLint config.
+
+### Decision deltas from the plan
+
+- **D-FU-1 adjusted:** attachments are stamped onto the changeset at the *turn*
+  handler (where `request.attachments` lives), not mined from `Changeset.steps` —
+  the steps never carried attachment metadata. Same outcome, cleaner source.
+- **D-FU-3 implemented as designed:** SSE primary + 30s fallback poll.
+
+## Remaining risks & expectation/UI gaps (next session)
+
+1. **oxlint not runnable locally.** Its native binary (`oxlint.darwin-universal.node`)
+   is not installed in this checkout, so the lint gate could not be executed here.
+   Prettier + Jest are clean and the code matches existing patterns; CI will lint.
+   *Action:* reinstall oxlint platform binary (`npm i` / optional-dep) to verify.
+2. **Attachment attribution is filename-only.** Attachments have no document id, so
+   an enrichment chip from an attachment shows the filename with no link/preview
+   (vs. a real document chip which carries an id). Expected — attachments are
+   ephemeral; no further action unless attachments become first-class documents.
+3. **Per-document tagging needs the judge to preserve order.** Findings are tagged
+   by zip-with-sources, guarded on equal length; if a future judge path reorders
+   or drops findings, tagging silently skips (counts stay correct, source tags
+   vanish) rather than mis-attributing. Acceptable, but note for judge changes.
+4. **Directory report groups by tag, not layout.** Findings show a source-document
+   tag but are not visually grouped/collapsible by document. For a project with
+   many documents the flat list is long. Follow-up: optional group-by-document
+   accordion in `CoverageReportBody`.
+5. **SSE connection per surface.** The badge (always, while a project is open) and
+   the provenance dialog (while open) each hold one EventSource. Shared via the
+   `useProjectEvents` hook but not de-duplicated into a single per-project
+   connection. Fine at current scale; revisit if more surfaces subscribe.
+6. **Dialog live-refresh is paused during a coverage drill-in** (by design, so the
+   open report isn't yanked away). A run completing while the user reads a report
+   won't update the timeline until they navigate back — acceptable.
+7. **Multi-schema interaction unverified for coverage.** The other agent added
+   multi-schema projects after the coverage feature; `_active_mdl_checksum` /
+   `_coverage_documents` operate on the active file set regardless of schema, so
+   they should be correct, but no test exercises coverage on a multi-schema
+   project. Follow-up: add one multi-schema directory-coverage test.

@@ -55,6 +55,10 @@ def materialize_wren_project(
     mdl_dir = project_path / "mdl"
     mdl_dir.mkdir(parents=True, exist_ok=True)
 
+    # The root schema is the wren-core *logical* namespace (the project's primary
+    # schema); per-model ``tableReference.schema`` is the physical source of truth,
+    # so a project's models may span every schema in ``schema_names``. ``schema_name``
+    # is kept for back-compat readers alongside the full ``schema_names`` set.
     merged: dict[str, Any] = {
         "catalog": project.catalog_name or "default",
         "dataSource": {
@@ -64,6 +68,7 @@ def materialize_wren_project(
                 "superset_database_id": project.default_database_id,
                 "semantic_project_id": project.id,
                 "schema_name": project.schema_name,
+                "schema_names": project.schema_names,
             },
         },
         "models": [],
@@ -71,6 +76,7 @@ def materialize_wren_project(
             "id": project.id,
             "name": project.name,
             "schema": project.schema_name,
+            "schemas": project.schema_names,
             "catalog": project.catalog_name,
         },
     }
@@ -112,6 +118,7 @@ def materialize_wren_project(
                 "superset_database_id": project.default_database_id,
                 "semantic_project_id": project.id,
                 "schema_name": project.schema_name,
+                "schema_names": project.schema_names,
             },
         },
     )

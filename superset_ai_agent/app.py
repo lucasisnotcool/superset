@@ -1092,6 +1092,9 @@ def create_app(  # noqa: C901
                         except Exception:  # pylint: disable=broad-except
                             filename = None
                         documents.append({"id": document_id, "filename": filename})
+                    # Inline attachments have no document id — record filename only.
+                    for attachment in changeset.referenced_attachments:
+                        documents.append({"id": None, "filename": attachment})
             event_type, message, detail = apply_provenance_payload(
                 items=items,
                 owner_id=owner_id,
@@ -2256,6 +2259,9 @@ def create_app(  # noqa: C901
             # then surface the 502 to the client.
             commit(f"The Copilot turn failed: {ex}")
             raise HTTPException(status_code=502, detail=str(ex)) from ex
+        changeset.referenced_attachments = [
+            attachment.filename for attachment in request.attachments
+        ]
         commit(changeset.message or "", changeset)
         return changeset
 
@@ -2370,6 +2376,9 @@ def create_app(  # noqa: C901
                 yield _conversation_sse({"type": "error", "detail": holder["error"]})
             else:
                 changeset = holder["changeset"]
+                changeset.referenced_attachments = [
+                    attachment.filename for attachment in request.attachments
+                ]
                 commit(changeset.message or "", changeset)
                 yield _conversation_sse(
                     {
@@ -2529,15 +2538,35 @@ def create_app(  # noqa: C901
             # fetch (context/superset_metadata.py), so a selection seeds only those.
             fetch_full = getattr(request_context_provider, "get_full_schema", None)
             fetch = fetch_full or request_context_provider.get_context
-            context = fetch(
-                AgentQueryRequest(
-                    question="semantic layer onboarding",
-                    database_id=project.default_database_id,
-                    catalog_name=project.catalog_name,
-                    schema_name=project.schema_name,
-                    dataset_ids=dataset_ids or [],
+
+            def _fetch(schema_name: str) -> Any:
+                return fetch(
+                    AgentQueryRequest(
+                        question="semantic layer onboarding",
+                        database_id=project.default_database_id,
+                        catalog_name=project.catalog_name,
+                        schema_name=schema_name,
+                        dataset_ids=dataset_ids or [],
+                    )
                 )
-            )
+
+            if dataset_ids:
+                # Explicit selection is id-driven; a single fetch covers whatever
+                # schemas the chosen datasets span.
+                context = _fetch(project.schema_name)
+            else:
+                # Whole-project introspection: union every member schema so onboarding
+                # seeds base models across the project's full schema set. Each model's
+                # tableReference still carries its own (schema, table).
+                context = _fetch(project.schema_name)
+                seen = {dataset.id for dataset in context.datasets}
+                for schema_name in project.schema_names:
+                    if schema_name == project.schema_name:
+                        continue
+                    for dataset in _fetch(schema_name).datasets:
+                        if dataset.id not in seen:
+                            seen.add(dataset.id)
+                            context.datasets.append(dataset)
             return context, dataset_ids
         except SupersetAuthError as ex:
             raise HTTPException(status_code=ex.status_code, detail=str(ex)) from ex

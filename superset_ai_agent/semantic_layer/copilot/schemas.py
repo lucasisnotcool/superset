@@ -91,6 +91,10 @@ class Changeset(BaseModel):
     #: while producing this changeset — the enrichment-provenance signal (a
     #: non-empty list means this apply is recorded as an enrichment pass).
     referenced_document_ids: list[str] = Field(default_factory=list)
+    #: Filenames of inline message attachments the turn was grounded on. Attachments
+    #: are ephemeral (no document id), so only the filename is recorded; like
+    #: ``referenced_document_ids`` they mark the apply as an enrichment pass.
+    referenced_attachments: list[str] = Field(default_factory=list)
 
 
 class WorkspaceNode(BaseModel):
@@ -210,6 +214,10 @@ class CoverageFinding(BaseModel):
     rationale: str = ""
     #: How to close the gap (feeds the copilot remediation loop).
     suggestion: str = ""
+    #: Source document this claim came from (directory coverage only; ``None`` for
+    #: a single-document audit, where the report's ``document_*`` fields suffice).
+    document_id: str | None = None
+    document_filename: str = ""
 
 
 class OverreachFinding(BaseModel):

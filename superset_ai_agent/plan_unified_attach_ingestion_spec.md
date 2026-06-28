@@ -338,22 +338,16 @@ follow-up or a product decision.
    surface only after the round-trip, as a danger toast from the server's 400.
    Acceptable (server is authoritative) but the `accept` filter is the only
    pre-hint. *Gap:* a `.pages` or `.zip` slips past `accept` only to 400.
-2. **Status chip is a snapshot, not live.** A large file attached as
-   `extracting` shows "· Extracting…" at attach time and does **not** auto-update
-   in the composer (the **tree** is the live surface and does refresh). If the
-   user sends immediately, inline grounding uses whatever `extracted_text` exists
-   (possibly empty for a still-extracting large file) — RAG catches up next turn.
-   *Expectation gap:* a user may expect the chip to flip to "ready" in place.
-3. **Inline grounding races large-file extraction.** For files over the 1 MB
-   async threshold, `extracted_text` may be empty on the upload response, so the
-   *first* turn after attaching a big PDF may not be grounded inline (RAG still
-   indexes it for later turns). Small files (the common case) extract inline and
-   are grounded immediately. *Mitigation option (future):* disable Send until the
-   attached docs report `extracted`, or poll the doc status in the composer.
-4. **Dropped UI MDL-JSON import (D1-A).** Attaching/uploading a `.json` now makes
-   a `raw/` document, **not** an MDL model. Intended, but a user who previously
-   imported hand-authored MDL JSON via the dialog will not find that path. Needs
-   release-note/UX copy. (MDL authoring remains via the editor + Copilot.)
+2. **✅ CLOSED — Status chip is now live.** A composer poll
+   ([`plan_attach_grounding_ux_followups.md`](plan_attach_grounding_ux_followups.md))
+   reconciles each pending attachment to its terminal status, so the chip flips in
+   place. (The *tree* live-update remains deferred — see that plan §11 #1.)
+3. **✅ CLOSED — large-file grounding race.** Send is gated while any attachment is
+   `extracting`; the poll repopulates `extracted_text`, so the turn grounds on the
+   finished text. Give-up clause prevents a permanent block. (Follow-up plan P2.)
+4. **✅ CLOSED — Dropped UI MDL-JSON import (D1-A).** A one-time info toast fires on
+   JSON ingest and the agent `README.md` documents the removal. (Follow-up plan P3.)
+   The capability is still gone by design (MDL authoring via editor + Copilot).
 5. **Per-project dedup means cross-project re-upload re-embeds.** By design (D3),
    but a user moving the same file across schemas pays embedding twice.
 6. **`needs_ocr` / `error` documents still attach.** They appear in the tree and

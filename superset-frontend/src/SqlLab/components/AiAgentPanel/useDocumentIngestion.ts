@@ -21,9 +21,51 @@ import { useDispatch } from 'react-redux';
 import { t } from '@apache-superset/core/translation';
 import {
   addDangerToast,
+  addInfoToast,
   addSuccessToast,
 } from 'src/components/MessageToasts/actions';
 import { SemanticDocument, uploadProjectSourceDocument } from './api';
+
+// Top-level keys that mark a JSON document as a (Wren) MDL model rather than
+// arbitrary data. Used to scope the "stored as a document, not a model" notice to
+// files a user might actually have meant to import as MDL.
+const MDL_TOP_LEVEL_KEYS = [
+  'models',
+  'relationships',
+  'views',
+  'dataSource',
+  'enumDefinitions',
+  'metrics',
+];
+
+// Don't parse large JSON just to classify it — a multi-MB `.json` is data, not a
+// hand-authored MDL model. Bounds the client-side parse cost.
+const MDL_SNIFF_MAX_BYTES = 1_000_000;
+
+/**
+ * Best-effort check that a JSON file looks like an MDL model (vs. a data file), by
+ * size-capped parse + top-level key sniff. Non-JSON, oversized, or unparseable
+ * files return false. Drives the one-time "JSON is stored as a document" notice so
+ * it does not fire for legitimate JSON data uploads.
+ */
+const isLikelyMdlJson = async (file: File): Promise<boolean> => {
+  const isJson =
+    file.type.includes('json') || file.name.toLowerCase().endsWith('.json');
+  if (!isJson || file.size >= MDL_SNIFF_MAX_BYTES) {
+    return false;
+  }
+  try {
+    const parsed = JSON.parse(await file.text());
+    return (
+      typeof parsed === 'object' &&
+      parsed !== null &&
+      MDL_TOP_LEVEL_KEYS.some(key => key in parsed)
+    );
+  } catch {
+    // Unparseable / not an object → treat as a plain document, no notice.
+    return false;
+  }
+};
 
 export interface DocumentIngestionResult {
   /** The persisted document — either freshly created or the reused duplicate. */
@@ -65,6 +107,9 @@ export default function useDocumentIngestion(
         return [];
       }
       setIsIngesting(true);
+      // Set when any ingested file looks like an MDL model (drives a single notice
+      // that the UI no longer imports MDL JSON as a model — see below).
+      let sawMdlJson = false;
       try {
         const settled = await Promise.all(
           files.map(async file => {
@@ -88,6 +133,9 @@ export default function useDocumentIngestion(
                   addSuccessToast(t('Uploaded “%s”.', document.filename)),
                 );
               }
+              if (await isLikelyMdlJson(file)) {
+                sawMdlJson = true;
+              }
               return { document, deduplicated };
             } catch (caught) {
               dispatch(
@@ -103,9 +151,25 @@ export default function useDocumentIngestion(
             }
           }),
         );
-        return settled.filter(
+        const results = settled.filter(
           (result): result is DocumentIngestionResult => result !== null,
         );
+        // The UI MDL-JSON import path was removed: an MDL-shaped `.json` upload is
+        // now stored as a document, not authored as an MDL model. Surface that once
+        // per ingest action — and only for files that actually look like MDL, so a
+        // legitimate JSON data upload stays silent.
+        if (sawMdlJson) {
+          dispatch(
+            addInfoToast(
+              t(
+                'This looks like an MDL file. It was stored as a document — to ' +
+                  'use it as a model, build it in the model editor or ask the ' +
+                  'Copilot.',
+              ),
+            ),
+          );
+        }
+        return results;
       } finally {
         setIsIngesting(false);
       }

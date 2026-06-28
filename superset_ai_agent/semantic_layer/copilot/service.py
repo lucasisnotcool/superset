@@ -250,10 +250,11 @@ def apply_provenance_payload(
 ) -> tuple[str, str, dict[str, object]]:
     """Build the (event_type, message, detail) for an agent-apply provenance event.
 
-    Classifies the apply as an ``enrichment`` pass when the agent retrieved
-    document passages (``documents`` non-empty), else a generic ``copilot_edit``.
-    ``ops``/``paths`` derive from the accepted items; ``documents`` are resolved
-    id+filename pairs the caller looked up from the document store.
+    Classifies the apply as an ``enrichment`` pass when the agent was grounded on
+    documents — retrieved passages or inline attachments (``documents`` non-empty)
+    — else a generic ``copilot_edit``. ``ops``/``paths`` derive from the accepted
+    items; ``documents`` are ``{id, filename}`` pairs (id is ``None`` for inline
+    attachments, which have no persisted document).
     """
 
     ops = {"create": 0, "update": 0, "delete": 0}

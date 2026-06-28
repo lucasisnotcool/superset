@@ -17,6 +17,8 @@
  * under the License.
  */
 import {
+  act,
+  fireEvent,
   render,
   screen,
   userEvent,
@@ -32,6 +34,14 @@ const mockIngest = jest.fn();
 jest.mock('../useDocumentIngestion', () => ({
   __esModule: true,
   default: () => ({ ingest: mockIngest, isIngesting: false }),
+}));
+
+// Override only the single-document getter the attach-status poll calls; the rest
+// of `../api` (streaming, conversations) stays real and rides the fetch mock.
+const mockGetSemanticDocument = jest.fn();
+jest.mock('../api', () => ({
+  ...jest.requireActual('../api'),
+  getSemanticDocument: (...args: unknown[]) => mockGetSemanticDocument(...args),
 }));
 
 const ingestedDoc = (
@@ -208,6 +218,11 @@ beforeEach(() => {
   process.env.SUPERSET_AI_AGENT_URL = 'http://agent.local/';
   localStorage.clear();
   mockIngest.mockReset();
+  mockGetSemanticDocument.mockReset();
+});
+
+afterEach(() => {
+  jest.useRealTimers();
 });
 
 afterEach(() => {
@@ -545,6 +560,173 @@ test('attaching inlines the extracted text into the next turn', async () => {
         truncated: false,
       }),
     ]);
+  });
+});
+
+// --- Live attach-status poll (gaps #2/#3) -----------------------------------
+// These use fake timers + fireEvent for deterministic control of the 1500ms poll.
+
+const attachViaInput = async (name = 'spec.pdf', type = 'application/pdf') => {
+  await act(async () => {
+    fireEvent.change(screen.getByTestId('copilot-attach-input'), {
+      target: { files: [new File(['x'], name, { type })] },
+    });
+  });
+};
+
+const typeMessage = (value: string) =>
+  act(() => {
+    fireEvent.change(screen.getByTestId('copilot-input'), {
+      target: { value },
+    });
+  });
+
+test('a still-extracting attachment polls to extracted and ungated Send (R1/R2)', async () => {
+  jest.useFakeTimers();
+  installFetch();
+  mockIngest.mockResolvedValue([
+    {
+      document: ingestedDoc({ status: 'extracting', extracted_text: null }),
+      deduplicated: false,
+    },
+  ]);
+  mockGetSemanticDocument.mockResolvedValue(
+    ingestedDoc({ status: 'extracted', extracted_text: 'DONE' }),
+  );
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+    />,
+  );
+
+  await attachViaInput();
+  await typeMessage('go');
+
+  // Pending: chip shows the live status and Send is gated.
+  expect(screen.getByText(/spec\.pdf · Extracting/)).toBeInTheDocument();
+  expect(screen.getByTestId('copilot-send')).toBeDisabled();
+
+  // One poll tick reconciles the doc to its terminal status.
+  await act(async () => {
+    await jest.advanceTimersByTimeAsync(1500);
+  });
+
+  expect(mockGetSemanticDocument).toHaveBeenCalledWith('doc-1');
+  expect(screen.queryByText(/Extracting/)).not.toBeInTheDocument();
+  expect(screen.getByTestId('copilot-send')).not.toBeDisabled();
+});
+
+test('a settled (extracted) attachment is never polled (loop guard)', async () => {
+  jest.useFakeTimers();
+  installFetch();
+  mockIngest.mockResolvedValue([
+    { document: ingestedDoc({ status: 'extracted' }), deduplicated: false },
+  ]);
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+    />,
+  );
+
+  await attachViaInput();
+  await act(async () => {
+    await jest.advanceTimersByTimeAsync(5000);
+  });
+
+  expect(mockGetSemanticDocument).not.toHaveBeenCalled();
+  // A ready attachment never gates Send (needs a message though).
+  await typeMessage('go');
+  expect(screen.getByTestId('copilot-send')).not.toBeDisabled();
+});
+
+test('Send re-enables after the poll budget is exhausted while still extracting (R2 give-up)', async () => {
+  jest.useFakeTimers();
+  installFetch();
+  mockIngest.mockResolvedValue([
+    {
+      document: ingestedDoc({ status: 'extracting', extracted_text: null }),
+      deduplicated: false,
+    },
+  ]);
+  // Never reaches a terminal status → the poll must give up and ungate Send.
+  mockGetSemanticDocument.mockResolvedValue(
+    ingestedDoc({ status: 'extracting', extracted_text: null }),
+  );
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+    />,
+  );
+
+  await attachViaInput();
+  await typeMessage('go');
+  expect(screen.getByTestId('copilot-send')).toBeDisabled();
+
+  // Advance through the whole attempt budget (120 ticks @ 1500ms + margin).
+  await act(async () => {
+    await jest.advanceTimersByTimeAsync(1500 * 121);
+  });
+
+  // The gate has given up so the turn can proceed (R2)...
+  expect(screen.getByTestId('copilot-send')).not.toBeDisabled();
+  // ...and the give-up cue replaces the misleading perpetual "Extracting…" (G3):
+  // the chip now reads "Still processing in the background" and a note explains
+  // the file is still extracting and will be available to later turns.
+  expect(screen.queryByText(/· Extracting/)).not.toBeInTheDocument();
+  expect(
+    screen.getByText(/spec\.pdf · Still processing in the background/),
+  ).toBeInTheDocument();
+  expect(screen.getByTestId('copilot-attach-giveup-note')).toBeInTheDocument();
+});
+
+test('after async extraction completes, Send inlines the fresh text (R3)', async () => {
+  jest.useFakeTimers();
+  const fetchFn = installFetch();
+  mockIngest.mockResolvedValue([
+    {
+      document: ingestedDoc({ status: 'extracting', extracted_text: null }),
+      deduplicated: false,
+    },
+  ]);
+  mockGetSemanticDocument.mockResolvedValue(
+    ingestedDoc({ status: 'extracted', extracted_text: 'FINAL TEXT' }),
+  );
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+    />,
+  );
+
+  await attachViaInput();
+  await typeMessage('summarize');
+  await act(async () => {
+    await jest.advanceTimersByTimeAsync(1500);
+  });
+  expect(screen.getByTestId('copilot-send')).not.toBeDisabled();
+
+  // Send under real timers so the streaming read + thread reload settle normally.
+  jest.useRealTimers();
+  fireEvent.click(screen.getByTestId('copilot-send'));
+
+  await waitFor(() => {
+    const streamCall = fetchFn.mock.calls.find(([url]) =>
+      String(url).includes('/copilot/stream'),
+    );
+    expect(streamCall).toBeDefined();
+    const body = JSON.parse(String((streamCall![1] as RequestInit).body));
+    expect(body.attachments[0].text).toBe('FINAL TEXT');
   });
 });
 

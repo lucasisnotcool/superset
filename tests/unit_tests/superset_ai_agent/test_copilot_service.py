@@ -319,6 +319,20 @@ def test_apply_provenance_payload_generic_edit_without_docs() -> None:
     assert detail["documents"] == []
 
 
+def test_apply_provenance_payload_attachment_only_counts_as_enrichment() -> None:
+    # An inline attachment (id=None) is a valid enrichment signal on its own (G1).
+    event_type, _message, detail = apply_provenance_payload(
+        items=[ChangesetItem(op="update", path="models/orders.json", file_id="f1")],
+        owner_id="u1",
+        conversation_id="c1",
+        summary=None,
+        documents=[{"id": None, "filename": "spec.md"}],
+    )
+
+    assert event_type == "document_enriched"
+    assert detail["documents"] == [{"id": None, "filename": "spec.md"}]
+
+
 def test_build_inspector_reflects_active_mode() -> None:
     # The inspector preview must show the same mode banner the loop will send, so
     # operators can see whether auto-pilot is live (P1).

@@ -195,7 +195,13 @@ class SemanticLayerStore(Protocol):
 
 
 def scope_hash(scope: ConversationScope) -> str:
-    """Return a stable hash for a Superset semantic-layer scope."""
+    """Return a stable hash for a Superset semantic-layer scope.
+
+    For a single-schema scope the payload is byte-identical to the historical shape
+    (``schema_name`` only), so existing NL→SQL memory and instruction recall keyed by
+    this hash are preserved. A multi-schema scope adds a sorted ``schema_names`` key,
+    giving it a distinct, order-independent identity (R5).
+    """
 
     payload = {
         "database_id": scope.database_id,
@@ -203,6 +209,9 @@ def scope_hash(scope: ConversationScope) -> str:
         "schema_name": scope.schema_name,
         "dataset_ids": sorted(scope.dataset_ids),
     }
+    schemas = scope.effective_schema_names
+    if len(schemas) > 1:
+        payload["schema_names"] = sorted(schemas)
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -235,5 +244,6 @@ def scope_matches(left: ConversationScope, right: ConversationScope) -> bool:
         left.database_id == right.database_id
         and left.catalog_name == right.catalog_name
         and left.schema_name == right.schema_name
+        and sorted(left.effective_schema_names) == sorted(right.effective_schema_names)
         and sorted(left.dataset_ids) == sorted(right.dataset_ids)
     )

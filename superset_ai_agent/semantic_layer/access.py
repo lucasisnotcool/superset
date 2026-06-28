@@ -27,7 +27,10 @@ from pydantic import BaseModel, Field
 from superset_ai_agent.auth import AgentIdentity
 from superset_ai_agent.config import SemanticAccessMode
 from superset_ai_agent.conversations.schemas import ConversationScope
-from superset_ai_agent.integrations.superset.client import AgentContext, DatabaseIdentity
+from superset_ai_agent.integrations.superset.client import (
+    AgentContext,
+    DatabaseIdentity,
+)
 from superset_ai_agent.semantic_layer.projects import SemanticProjectStore
 from superset_ai_agent.semantic_layer.schemas import (
     SemanticProject,
@@ -103,10 +106,72 @@ class SemanticAccessService:
         scope: ConversationScope,
         permission: SemanticPermission = SemanticPermission.READ,
     ) -> AgentContext:
-        """Prove the identity can use semantic assets for a Superset scope."""
+        """Prove the identity can use semantic assets for a Superset scope.
 
+        For a multi-schema scope this proves access to **every** schema in the set
+        and returns the union context, so a schema the identity cannot reach never
+        contributes datasets (and, upstream, never enters a project's set — R1).
+        """
+
+        schema_names = scope.effective_schema_names
+        if len(schema_names) > 1:
+            return self.require_schema_set_permission(
+                identity=identity,
+                database_id=scope.database_id,
+                catalog_name=scope.catalog_name,
+                schema_names=schema_names,
+                dataset_ids=scope.dataset_ids,
+                permission=permission,
+            )
         _ = identity, permission
         return self.load_context(scope)
+
+    def require_schema_set_permission(
+        self,
+        *,
+        identity: AgentIdentity,
+        database_id: int,
+        catalog_name: str | None,
+        schema_names: list[str],
+        dataset_ids: list[int] | None = None,
+        permission: SemanticPermission = SemanticPermission.READ,
+    ) -> AgentContext:
+        """Prove access to each schema in the set; return the union context.
+
+        Each schema is proven independently (one Superset context load per schema);
+        the merged ``datasets`` give onboarding and validation every physical table
+        the project may legitimately reference. A schema that cannot be proven
+        contributes nothing, which is what keeps an unauthorized schema out of the
+        project's set (R1).
+        """
+
+        if not schema_names:
+            return self.load_context(
+                ConversationScope(
+                    database_id=database_id,
+                    catalog_name=catalog_name,
+                    dataset_ids=list(dataset_ids or []),
+                )
+            )
+        database = None
+        merged: list = []
+        seen: set = set()
+        for schema_name in schema_names:
+            context = self.load_context(
+                ConversationScope(
+                    database_id=database_id,
+                    catalog_name=catalog_name,
+                    schema_name=schema_name,
+                    dataset_ids=list(dataset_ids or []),
+                )
+            )
+            if database is None:
+                database = context.database
+            for dataset in context.datasets:
+                if dataset.id not in seen:
+                    seen.add(dataset.id)
+                    merged.append(dataset)
+        return AgentContext(database=database, datasets=merged)
 
     def resolve_project(
         self,
@@ -117,14 +182,11 @@ class SemanticAccessService:
     ) -> SemanticProject:
         """Resolve or create a schema project after proving Superset scope access."""
 
-        self.require_scope_permission(
+        self.require_schema_set_permission(
             identity=identity,
-            scope=ConversationScope(
-                database_id=request.database_id,
-                catalog_name=request.catalog_name,
-                schema_name=request.schema_name,
-                dataset_ids=[],
-            ),
+            database_id=request.database_id,
+            catalog_name=request.catalog_name,
+            schema_names=request.resolved_schema_names(),
             permission=permission,
         )
         resolved_request = self._request_with_database_identity(request)
@@ -202,14 +264,11 @@ class SemanticAccessService:
     ) -> SemanticProject:
         context = None
         if project.default_database_id is not None:
-            context = self.require_scope_permission(
+            context = self.require_schema_set_permission(
                 identity=identity,
-                scope=ConversationScope(
-                    database_id=project.default_database_id,
-                    catalog_name=project.catalog_name,
-                    schema_name=project.schema_name,
-                    dataset_ids=[],
-                ),
+                database_id=project.default_database_id,
+                catalog_name=project.catalog_name,
+                schema_names=project.schema_names,
                 permission=permission,
             )
         resolved = self._project_with_permission(

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json  # noqa: TID251 - standalone agent JSON contract
+from collections import Counter
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -451,10 +452,28 @@ def deterministic_base_model_proposals(
 ) -> list[MdlEnrichmentProposal]:
     """Build review-draft base MDL proposals from permission-filtered datasets."""
 
+    datasets = list(superset_context.datasets)
+    base_names = [
+        str(
+            model_from_dataset(dataset).get("name")
+            or _safe_mdl_name(dataset.table_name)
+        )
+        for dataset in datasets
+    ]
+    # D4: the same logical model name introspected from two physical schemas would
+    # collapse under the manifest's last-wins dedupe (one table lost). Disambiguate
+    # the *logical* name by schema only when it actually collides; the model's
+    # ``tableReference`` still points at the exact (schema, table), so resolution is
+    # unaffected and single-schema names stay clean.
+    name_counts = Counter(base_names)
     proposals: list[MdlEnrichmentProposal] = []
-    for dataset in superset_context.datasets:
+    for dataset, base_name in zip(datasets, base_names, strict=True):
         model = model_from_dataset(dataset)
-        model_name = str(model.get("name") or _safe_mdl_name(dataset.table_name))
+        if name_counts[base_name] > 1 and dataset.schema_name:
+            model_name = _safe_mdl_name(f"{dataset.schema_name}_{base_name}")
+            model["name"] = model_name
+        else:
+            model_name = base_name
         proposed_content = json.dumps({"models": [model]}, indent=2)
         proposals.append(
             MdlEnrichmentProposal(
