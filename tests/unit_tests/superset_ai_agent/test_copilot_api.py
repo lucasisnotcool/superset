@@ -672,6 +672,115 @@ def test_recovery_dismissal_is_durable_and_keeps_suggestions(tmp_path) -> None:
     assert after["suggestion_count"] >= 1
 
 
+class AlwaysProposesModel:
+    """Coverage with a gap; every recovery turn writes one model then finalizes.
+
+    Detects a fresh turn by the absence of tool-result messages, so it proposes an
+    edit on each independent recovery run (used to exercise the back-fill path).
+    """
+
+    def is_reachable(self) -> bool:
+        return True
+
+    def list_models(self) -> list[ModelInfo]:
+        return [ModelInfo(name="test-model")]
+
+    def chat(self, messages: list[ChatMessage], **kwargs: Any) -> ModelResult:
+        schema = kwargs.get("format_schema")
+        if schema is not None:
+            props = (schema or {}).get("properties", {})
+            if "claims" in props:
+                return ModelResult(
+                    content=json.dumps(
+                        {
+                            "claims": [
+                                {
+                                    "kind": "definition",
+                                    "subject": "id",
+                                    "statement": "id is the order id",
+                                }
+                            ]
+                        }
+                    )
+                )
+            return ModelResult(
+                content=json.dumps(
+                    {"findings": [{"claim_id": "c0", "status": "missing"}]}
+                )
+            )
+        # Copilot turn: propose once (no tool result yet), else finalize.
+        if not any(message.role == "tool" for message in messages):
+            return ModelResult(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="r",
+                        name="write_mdl_file",
+                        arguments={
+                            "path": "models/recovery.json",
+                            "content": RECOVERY_MDL,
+                        },
+                    )
+                ],
+            )
+        return ModelResult(content="Proposed documenting the order id.")
+
+
+def test_recovery_backfills_an_unrecovered_run(tmp_path) -> None:
+    # A coverage run that completed WITHOUT recovery (e.g. audited before the
+    # recovery feature existed) carries recovery_status "none". The next coverage
+    # trigger / manual refresh on that unchanged version must back-fill recovery,
+    # so already-active projects pick up suggestions without a fresh audit.
+    from superset_ai_agent.semantic_layer.copilot.schemas import CoverageReport
+    from superset_ai_agent.semantic_layer.coverage_store import (
+        InMemoryCoverageRunStore,
+    )
+
+    store = InMemoryCoverageRunStore()
+    client = _client(
+        tmp_path,
+        model_client=AlwaysProposesModel(),
+        wren_coverage_recovery_enabled=True,
+        coverage_run_store=store,
+    )
+    project = _resolve(client)
+    pid = project["id"]
+    client.post(
+        f"/agent/semantic-layer/projects/{pid}/documents/text",
+        json={
+            "filename": "g.md",
+            "text": "id = order id.",
+            "content_type": "text/markdown",
+        },
+    )
+    _seed_active_model(client, pid)
+
+    # The auto-run already recovered this version; simulate a pre-recovery run by
+    # adding a newer completed run on the SAME version with recovery_status "none".
+    seed = client.get(f"/agent/semantic-layer/projects/{pid}/coverage/latest").json()
+    legacy = store.create(
+        project_id=seed["project_id"],
+        owner_id=seed["owner_id"],
+        mdl_checksum=seed["mdl_checksum"],
+        docs_checksum=seed["docs_checksum"],
+    )
+    store.claim(legacy.id)
+    store.complete(
+        legacy.id,
+        CoverageReport(total=1, missing=1, score=0.0),
+        score=0.0,
+    )
+    assert store.get(legacy.id).recovery_status == "none"
+
+    # A manual refresh on the unchanged version back-fills recovery for it.
+    refresh = client.post(f"/agent/semantic-layer/projects/{pid}/coverage/refresh")
+    assert refresh.status_code == 200, refresh.text
+
+    recovered = store.get(legacy.id)
+    assert recovered.recovery_status == "ready"
+    assert recovered.recovery_conversation_id is not None
+
+
 def test_recovery_does_not_run_when_flag_disabled(tmp_path) -> None:
     # Default: recovery feature off → coverage runs, no recovery is scheduled.
     client = _client(tmp_path, model_client=CoverageModel())

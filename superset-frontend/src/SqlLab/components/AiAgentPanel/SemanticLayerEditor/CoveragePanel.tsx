@@ -75,12 +75,18 @@ const CoveragePanel = ({
   const stale = status === 'stale';
   const hasReport = status === 'ready' || status === 'stale';
   // Second entrypoint to the recovery suggestions (the banner is the first); both
-  // survive each other's dismissal because the state is server-side.
+  // survive each other's dismissal because the state is server-side. The report
+  // also surfaces the recovery agent's in-flight / failed states here so the user
+  // is not left wondering whether suggestions are coming.
   const recoveryRunId = info?.recovery_run_id ?? null;
+  const recoveryStatus = info?.recovery_status;
   const recoveryReady =
-    info?.recovery_status === 'ready' &&
+    recoveryStatus === 'ready' &&
     info?.recovery_dismissed === false &&
     Boolean(recoveryRunId);
+  const recoveryPreparing =
+    recoveryStatus === 'pending' || recoveryStatus === 'running';
+  const recoveryFailed = recoveryStatus === 'failed';
 
   const loadReport = useCallback(async () => {
     setLoading(true);
@@ -149,6 +155,29 @@ const CoveragePanel = ({
                 {t('Review')}
               </Button>
             }
+          />
+        ) : null}
+        {recoveryPreparing ? (
+          <Alert
+            type="info"
+            showIcon
+            icon={<Icons.LoadingOutlined spin />}
+            message={t('Preparing coverage suggestions…')}
+            description={t(
+              'The recovery agent is drafting edits to close these gaps. This runs in the background — you can keep working.',
+            )}
+            data-test="coverage-recovery-preparing"
+          />
+        ) : null}
+        {recoveryFailed ? (
+          <Alert
+            type="warning"
+            showIcon
+            message={t('Coverage suggestions unavailable')}
+            description={t(
+              'The recovery agent could not generate suggestions for this report. It will try again after the next coverage run.',
+            )}
+            data-test="coverage-recovery-failed"
           />
         ) : null}
       </>

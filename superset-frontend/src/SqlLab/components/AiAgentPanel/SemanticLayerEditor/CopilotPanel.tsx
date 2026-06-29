@@ -59,7 +59,6 @@ import {
 } from './documentStatus';
 import AttachDocumentDialog from './AttachDocumentDialog';
 import CopilotInspectorDialog from './CopilotInspectorDialog';
-import CoverageDialog from './CoverageDialog';
 
 /** Pull the persisted Copilot changeset off an assistant message, if any. */
 const changesetFromMessage = (
@@ -196,7 +195,6 @@ const CopilotPanel = ({
   const [error, setError] = useState<string | null>(null);
   const [inspector, setInspector] = useState<CopilotInspector | null>(null);
   const [inspectorOpen, setInspectorOpen] = useState(false);
-  const [coverageOpen, setCoverageOpen] = useState(false);
   const [liveSteps, setLiveSteps] = useState<AgentStep[]>([]);
   // Drives the Attach dialog (pick existing `raw/` documents and/or upload new
   // ones). Replaces the former bare hidden file input.
@@ -801,15 +799,6 @@ const CopilotPanel = ({
             <Button
               buttonStyle="link"
               buttonSize="small"
-              icon={<Icons.CheckSquareOutlined />}
-              onClick={() => setCoverageOpen(true)}
-              data-test="copilot-coverage-toggle"
-            >
-              {t('Coverage')}
-            </Button>
-            <Button
-              buttonStyle="link"
-              buttonSize="small"
               icon={<Icons.SettingOutlined />}
               onClick={openInspector}
               data-test="copilot-inspector-toggle"
@@ -1219,11 +1208,6 @@ const CopilotPanel = ({
         open={inspectorOpen}
         inspector={inspector}
         onClose={() => setInspectorOpen(false)}
-      />
-      <CoverageDialog
-        projectId={projectId}
-        open={coverageOpen}
-        onClose={() => setCoverageOpen(false)}
       />
       <AttachDocumentDialog
         open={attachOpen}
