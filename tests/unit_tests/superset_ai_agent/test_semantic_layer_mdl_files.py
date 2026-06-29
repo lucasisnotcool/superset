@@ -110,6 +110,42 @@ def test_cannot_activate_structurally_invalid_mdl_file() -> None:
         )
 
 
+def test_relationship_only_file_can_be_activated() -> None:
+    # The Copilot's propose_relationships writes relationships-only files. The
+    # per-file activation gate must not block them as empty_root -- their endpoint
+    # models are resolved by the project-level gate against the merged manifest.
+    store = InMemoryMdlFileStore()
+    file = store.create(
+        "project-1",
+        MdlFileCreateRequest(
+            path="relationships/deals_sites.json",
+            content=json.dumps(
+                {
+                    "relationships": [
+                        {
+                            "name": "deals_sites",
+                            "models": ["deals", "sites"],
+                            "joinType": "MANY_TO_ONE",
+                            "condition": "deals.site_id = sites.site_id",
+                        }
+                    ]
+                }
+            ),
+        ),
+        owner_id="owner",
+    )
+    assert file.validation is not None
+    assert file.validation.valid is True
+    assert not any(m.code == "empty_root" for m in file.validation.messages)
+
+    activated = store.update(
+        file.id,
+        MdlFileUpdateRequest(status="active"),
+        owner_id="owner",
+    )
+    assert activated.status == "active"
+
+
 def test_create_persists_validation_override() -> None:
     store = InMemoryMdlFileStore()
     physical = MdlValidationResult(

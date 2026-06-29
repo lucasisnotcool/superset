@@ -366,9 +366,12 @@ Source:
   ~6 call sites are upgraded.
 - Store gate: `semantic_layer/mdl_files.py::_assert_activatable` +
   `MdlFileValidationError` block `draft→active` for invalid content in both
-  in-memory and SQLAlchemy stores.
+  in-memory and SQLAlchemy stores. A relationships-only file passes this per-file
+  gate (relationships count toward `empty_root`); unresolved endpoints are warnings
+  here and become errors only on the merged manifest.
 - Route gate: `app.py::_enforce_activation` re-validates the merged project
-  manifest (plus physical schema) on activation → `422`.
+  manifest (plus physical schema) on activation → `422`. This is where a
+  relationship's endpoints are resolved strictly and wren-core deep validation runs.
 - Materialization guard: `wren_materializer.py` validates the merged active
   manifest and returns `WrenMaterializationResult.warnings`.
 

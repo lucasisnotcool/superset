@@ -292,6 +292,14 @@ def validate_mdl(
     (almost always a relationship emitted as a model) into an error instead of
     two warnings; the Copilot proposal path sets it so the correction loop catches
     the mistake before activation, while the default stays lenient for drafts.
+
+    A relationships-only document (``{"relationships": [...]}`` with no model/view/
+    metric/cube) is a valid project *fragment*: this mirrors Wren's own layout,
+    which stores relationships in a top-level ``relationships.yml`` separate from
+    models. Its endpoint models resolve when the project files are merged, so the
+    per-file pass reports unresolved endpoints as warnings (``strict_relationships``
+    is left ``False`` here); ``validate_project_manifest`` enforces them strictly on
+    the merged manifest.
     """
 
     parsed, parse_message = _parse_json(content)
@@ -303,13 +311,13 @@ def validate_mdl(
     views = _extract_list(parsed, "views")
     metrics = _extract_list(parsed, "metrics")
     cubes = _extract_list(parsed, "cubes")
-    if not models and not views and not metrics and not cubes:
+    if not models and not views and not metrics and not cubes and not relationships:
         return MdlValidationResult(
             valid=False,
             messages=[
                 MdlValidationMessage(
                     message="MDL must contain at least one model, view, metric, "
-                    "or cube.",
+                    "cube, or relationship.",
                     code="empty_root",
                 )
             ],

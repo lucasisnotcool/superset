@@ -172,9 +172,7 @@ def test_model_with_columns_but_no_mapping_stays_a_warning() -> None:
     # is never swept into the new error, even under strict_models (DP1-narrow).
     result = validate_mdl(
         mdl(
-            models=[
-                {"name": "derived", "columns": [{"name": "x", "type": "VARCHAR"}]}
-            ]
+            models=[{"name": "derived", "columns": [{"name": "x", "type": "VARCHAR"}]}]
         ),
         strict_models=True,
     )
@@ -379,9 +377,7 @@ def test_type_mismatch_skipped_for_calculated_column() -> None:
             }
         ]
     )
-    result = validate_mdl(
-        content, schema_index=_typed_schema_index(amount="BIGINT")
-    )
+    result = validate_mdl(content, schema_index=_typed_schema_index(amount="BIGINT"))
     assert not any(m.code == "column_type_mismatch" for m in result.messages)
 
 
@@ -536,6 +532,128 @@ def test_metric_only_file_is_not_empty_root() -> None:
     assert not any(m.code == "empty_root" for m in result.messages)
 
 
+def test_relationship_only_file_is_not_empty_root() -> None:
+    # Wren stores relationships in a top-level file separate from models, so a
+    # relationships-only fragment must validate per-file (endpoints resolve at
+    # merge). The Copilot's propose_relationships emits exactly this shape.
+    result = validate_mdl(
+        mdl(
+            relationships=[
+                {
+                    "name": "deals_sites",
+                    "models": ["deals", "sites"],
+                    "joinType": "MANY_TO_ONE",
+                    "condition": "deals.site_id = sites.site_id",
+                }
+            ]
+        )
+    )
+    assert result.valid is True
+    assert not any(m.code == "empty_root" for m in result.messages)
+    # Both endpoints are absent from this lone fragment -> warnings, not errors.
+    assert (
+        sum(
+            1
+            for m in result.messages
+            if m.code == "unresolved_relationship" and m.severity == "warning"
+        )
+        == 2
+    )
+
+
+def test_empty_relationships_list_is_empty_root() -> None:
+    # An empty relationships array carries no entity -> still empty_root.
+    result = validate_mdl(mdl(relationships=[]))
+    assert result.valid is False
+    assert any(m.code == "empty_root" for m in result.messages)
+
+
+def test_empty_object_is_empty_root() -> None:
+    result = validate_mdl("{}")
+    assert result.valid is False
+    assert any(m.code == "empty_root" for m in result.messages)
+
+
+def test_relationship_only_invalid_join_type_is_error() -> None:
+    # Relaxing empty_root must not mask a malformed relationship: a bad joinType
+    # is an error even when the file carries nothing but relationships.
+    result = validate_mdl(
+        mdl(
+            relationships=[
+                {
+                    "name": "deals_sites",
+                    "models": ["deals", "sites"],
+                    "joinType": "SIDEWAYS",
+                    "condition": "deals.site_id = sites.site_id",
+                }
+            ]
+        )
+    )
+    assert result.valid is False
+    assert any(m.code == "invalid_join_type" for m in result.messages)
+
+
+def test_relationship_only_bad_arity_is_error() -> None:
+    result = validate_mdl(
+        mdl(
+            relationships=[
+                {
+                    "name": "deals_sites",
+                    "models": ["deals"],
+                    "joinType": "MANY_TO_ONE",
+                    "condition": "deals.site_id = sites.site_id",
+                }
+            ]
+        )
+    )
+    assert result.valid is False
+    assert any(m.code == "relationship_arity" for m in result.messages)
+
+
+def test_relationship_only_file_resolves_in_merged_project() -> None:
+    # The activation invariant: a relationships-only file activates when its
+    # endpoint models are present in the projected (merged) manifest, and is
+    # rejected when they are dangling -- the per-file gate no longer blocks it.
+    rel_only = mdl(
+        relationships=[
+            {
+                "name": "deals_sites",
+                "models": ["deals", "sites"],
+                "joinType": "MANY_TO_ONE",
+                "condition": "deals.site_id = sites.site_id",
+            }
+        ]
+    )
+    deals = mdl(
+        models=[
+            {
+                "name": "deals",
+                "tableReference": {"table": "deals"},
+                "columns": [{"name": "site_id", "type": "v"}],
+            }
+        ]
+    )
+    sites = mdl(
+        models=[
+            {
+                "name": "sites",
+                "tableReference": {"table": "sites"},
+                "columns": [{"name": "site_id", "type": "v"}],
+            }
+        ]
+    )
+
+    merged = validate_project_manifest([rel_only, deals, sites])
+    assert merged.valid is True
+
+    dangling = validate_project_manifest([rel_only])
+    assert dangling.valid is False
+    assert any(
+        m.code == "unresolved_relationship" and m.severity == "error"
+        for m in dangling.messages
+    )
+
+
 def test_metric_without_measure_is_warning() -> None:
     result = validate_mdl(
         mdl(models=[_DEALS], metrics=[{"name": "total_amount", "baseObject": "deals"}])
@@ -676,9 +794,7 @@ def _cube(**extra: Any) -> dict[str, Any]:
     cube = {
         "name": "deal_cube",
         "baseObject": "deals",
-        "measures": [
-            {"name": "total", "type": "DOUBLE", "expression": "SUM(amount)"}
-        ],
+        "measures": [{"name": "total", "type": "DOUBLE", "expression": "SUM(amount)"}],
     }
     cube.update(extra)
     return cube

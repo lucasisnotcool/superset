@@ -1,6 +1,8 @@
 # Plan: Let relationships-only MDL files activate (stop breaking Wren's abstraction)
 
-**Status:** Not started — resumable checklist for future agent sessions.
+**Status:** ✅ Implemented (Phases 1–5). Phase 6 in-app verification optional/manual.
+Core fix landed in `mdl_validator.py`; tests added in `test_mdl_validator.py`,
+`test_semantic_layer_mdl_files.py`, `test_semantic_layer_api.py`; eval fold removed.
 **Owner area:** `superset_ai_agent/semantic_layer` (MDL validation + activation).
 **One-line:** The per-file activation gate rejects relationships-only files via `empty_root`,
 breaking the Copilot apply→activate path. Wren itself stores relationships in their own

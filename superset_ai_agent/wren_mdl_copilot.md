@@ -511,7 +511,7 @@ and may drift — anchor on symbols).
 | Prompts | `prompts/registry.py::get_prompt`; `prompts/wren_enrichment.md`, `prompts/wren_onboarding.md` | File-backed prompt loader. |
 | Skills | `skills/__init__.py::list_skills`, `get_skill`; `skills/*.md` | **Inert today** (nothing dispatches them). Activate for the copilot + inspector. |
 | Authoring contract | `semantic_layer/mdl_authoring.py::AuthoredManifest`, `proposal_response_schema`, `serialize_manifest` | Typed LLM authoring schema (camelCase). |
-| Activation gate | `app.py::_enforce_activation` (~1114); `mdl_files.py::_assert_activatable` (~53) | Manifest-level deep validation before draft→active. |
+| Activation gate | `app.py::_enforce_activation` (~1114); `mdl_files.py::_assert_activatable` (~53) | Manifest-level deep validation before draft→active. A relationships-only file is a valid fragment (counts toward `empty_root`); its endpoints resolve on the merged manifest at the route gate, mirroring Wren's top-level `relationships.yml`. |
 | Persistence models | `persistence/models.py::AiAgentSemanticMdlFile` (~283), `AiAgentInstruction`, `SemanticProject` (`current_version_id` ~209, **dangling — no version table**). |
 | Config flags | `config.py` (`wren_*`, `WREN_*` env) | `wren_modeling_max_correction_retries`, `wren_modeling_deep_validation`, `wren_core_validation_enabled`, etc. |
 

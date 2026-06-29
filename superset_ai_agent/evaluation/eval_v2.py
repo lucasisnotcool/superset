@@ -188,50 +188,6 @@ def _item_mdl(item: dict[str, Any]) -> dict[str, Any]:
         return {}
 
 
-def _is_relationships_only(item: dict[str, Any]) -> bool:
-    mdl = _item_mdl(item)
-    has_model = any(mdl.get(k) for k in ("models", "views", "metrics", "cubes"))
-    return bool(mdl.get("relationships")) and not has_model
-
-
-def consolidate_relationship_items(
-    items: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], int]:
-    """Fold relationships-only changeset files into a model file (activation fix).
-
-    The Copilot's ``propose_relationships`` emits ``relationships/*.json`` files that
-    contain *only* relationships. The activation gate (``mdl_files.py`` →
-    ``validate_mdl``) rejects any file with no model/view/metric/cube (``empty_root``),
-    so a Copilot changeset that proposes relationships **cannot be activated** — a real
-    product bug (HEAD). Because the project *compiler* merges all active files into one
-    manifest, moving the relationships into a model file is **semantically identical**
-    (same merged manifest, same joins) but makes every activated file valid. We fold
-    all relationships-only items into the first model item and drop the separate
-    relationship files. Returns ``(new_items, n_relationships_folded)``; a no-op (with
-    0) when there is nothing to fold or no model item to fold into.
-    """
-    model_items = [it for it in items if _item_mdl(it).get("models")]
-    rel_items = [it for it in items if _is_relationships_only(it)]
-    if not rel_items or not model_items:
-        return items, 0
-
-    folded: list[dict[str, Any]] = []
-    for it in rel_items:
-        folded.extend(_item_mdl(it).get("relationships", []))
-
-    target = model_items[0]
-    target_mdl = _item_mdl(target)
-    target_mdl.setdefault("relationships", []).extend(folded)
-    new_target = {**target, "content": json.dumps(target_mdl, indent=2)}
-
-    out: list[dict[str, Any]] = []
-    for it in items:
-        if _is_relationships_only(it):
-            continue
-        out.append(new_target if it is target else it)
-    return out, len(folded)
-
-
 def models_from_changeset(items: list[dict[str, Any]]) -> set[str]:
     """Model names proposed across a changeset (independent of activation).
 
@@ -507,15 +463,15 @@ class AgentClientV2(ec.AgentClient):
         raw_items = (
             [] if turn.get("error") else (turn.get("changeset") or {}).get("items", [])
         )
-        # Selection metrics come from the RAW changeset so the fold below never hides
-        # what the Copilot actually chose. The fold works around a product bug where
-        # relationships-only files cannot be activated (consolidate_relationship_items).
+        # Selection metrics come from the changeset the Copilot actually produced.
+        # Relationships-only files now activate natively (they are valid project
+        # fragments — empty_root admits them and the bulk-status route validates the
+        # merged manifest), so the changeset is applied and activated as-is.
         proposed_models = sorted(models_from_changeset(raw_items))
-        items, folded = consolidate_relationship_items(raw_items)
         applied = activated = False
         activate_error: str | None = None
-        if items:
-            self.copilot_apply(project_id, items)
+        if raw_items:
+            self.copilot_apply(project_id, raw_items)
             applied = True
             try:
                 self.activate_all(project_id)
@@ -526,7 +482,9 @@ class AgentClientV2(ec.AgentClient):
             **turn,
             "items": len(raw_items),
             "proposed_models": proposed_models,
-            "relationships_folded": folded,
+            # Retained at 0 for result-shape stability (notebooks read this key); the
+            # relationship fold was removed once relationships-only files activate.
+            "relationships_folded": 0,
             "applied": applied,
             "activated": activated,
             "activate_error": activate_error,

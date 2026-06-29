@@ -306,7 +306,7 @@ def test_auto_onboard_uploads_then_builds_with_production_message():
     assert turn_calls[0][1] == v2.AUTO_ONBOARD_MESSAGE
 
 
-# --- relationships-only activation workaround (real product bug) ------------ #
+# --- relationships-only activation (native after empty_root fix) ------------- #
 def _model_item(name, op="update"):
     content = json.dumps({"models": [{"name": name, "columns": []}]})
     return {"op": op, "path": f"models/{name}.json", "content": content}
@@ -315,11 +315,6 @@ def _model_item(name, op="update"):
 def _rel_item(a, b):
     content = json.dumps({"relationships": [{"name": f"{a}_{b}", "models": [a, b]}]})
     return {"op": "create", "path": f"relationships/{a}_{b}.json", "content": content}
-
-
-def test_is_relationships_only_detects_model_less_files():
-    assert v2._is_relationships_only(_rel_item("a", "b")) is True
-    assert v2._is_relationships_only(_model_item("a")) is False
 
 
 def test_models_from_changeset_reads_proposed_model_names():
@@ -331,42 +326,10 @@ def test_models_from_changeset_reads_proposed_model_names():
     assert v2.models_from_changeset(items) == {"seagate_sites", "seagate_work_orders"}
 
 
-def test_consolidate_folds_relationships_into_a_model_file():
-    items = [
-        _model_item("m1"),
-        _model_item("m2"),
-        _rel_item("m1", "m2"),
-        _rel_item("m2", "m3"),
-    ]
-    new_items, folded = v2.consolidate_relationship_items(items)
-    assert folded == 2
-    # No relationships-only files remain.
-    assert all(not v2._is_relationships_only(it) for it in new_items)
-    # The two relationships now live inside a model file (merged manifest unchanged).
-    target = next(
-        it for it in new_items if json.loads(it["content"]).get("relationships")
-    )
-    assert len(json.loads(target["content"])["relationships"]) == 2
-    assert json.loads(target["content"])["models"]  # still has its model
-
-
-def test_consolidate_is_noop_without_relationships():
-    items = [_model_item("m1")]
-    new_items, folded = v2.consolidate_relationship_items(items)
-    assert folded == 0
-    assert new_items == items
-
-
-def test_consolidate_is_noop_without_a_model_to_fold_into():
-    # All relationships, no model file — cannot fold; leave as-is (will fail to
-    # activate, surfacing the bug rather than silently dropping data).
-    items = [_rel_item("a", "b")]
-    new_items, folded = v2.consolidate_relationship_items(items)
-    assert folded == 0
-    assert new_items == items
-
-
-def test_copilot_build_folds_relationships_and_reports_count():
+def test_copilot_build_applies_relationship_files_natively():
+    # Relationships-only files are valid project fragments, so the build applies the
+    # whole changeset as-is (no fold) and lets bulk-status validate/activate the
+    # merged manifest. The result reports 0 relationships folded.
     turn = {
         "changeset": {"items": [_model_item("m1"), _rel_item("m1", "m2")]},
         "error": None,
@@ -375,11 +338,11 @@ def test_copilot_build_folds_relationships_and_reports_count():
     client = _FakeV2(turn)
     out = client.copilot_build("p", "msg")
     assert out["items"] == 2  # raw changeset size
-    assert out["relationships_folded"] == 1
+    assert out["relationships_folded"] == 0
     assert out["proposed_models"] == ["m1"]
-    # the applied set dropped the relationships-only file (folded in)
+    # Every changeset item is applied unchanged, including the relationship file.
     applied_calls = [c for c in client.calls if c[0] == "apply"]
-    assert applied_calls[0][1] == 1  # only the (now relationship-bearing) model file
+    assert applied_calls[0][1] == 2
 
 
 def test_copilot_enrich_pass_adds_coverage_and_models():

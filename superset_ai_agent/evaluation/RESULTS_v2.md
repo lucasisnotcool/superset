@@ -30,10 +30,11 @@ experiments **E8 / E11 / E12** and surfaced a product bug. Companion spec:
 >   higher coverage (**0.909 vs 0.42–0.73**) on a smaller MDL. (E11)
 > - **Enrich once.** Extra Copilot enrichment passes are useless-to-harmful — coverage
 >   flat at 0.909, graded **8→5→5**. Confirms E6 on the product's real flow. (E12)
-> - **🔴 Product bug:** Copilot-proposed *relationships* (relationships-only files)
->   **cannot be activated** (per-file `empty_root` gate) — blocks the Copilot
->   apply→activate path for any real schema. Harness works around it; needs a product
->   fix. (E8)
+> - **✅ Fixed (was 🔴):** Copilot-proposed *relationships* (relationships-only files)
+>   used to fail activation (per-file `empty_root` gate). They are now valid project
+>   fragments — `empty_root` admits a relationships-only file and the `bulk-status`
+>   route validates the merged manifest — matching Wren's own `relationships.yml`
+>   layout. The harness fold (`consolidate_relationship_items`) was removed. (E8)
 
 ## Run metadata (fill in at run time — this is what makes results comparable)
 
@@ -229,20 +230,20 @@ on activation** — confirmed live: a 10-item enrichment changeset = 4 model upd
 **6 relationships-only files**, and `bulk-status` rejected the whole atomic activation
 with *"MDL must contain at least one model, view, metric, or cube."*
 
-- **Impact:** the Copilot apply→activate path is **broken for any real schema** (joins
-  are essential), not just this fixture. This is on **HEAD** (not version skew — the
-  rebuilt agent has `bulk-status`).
-- **Why it's a per-file gate bug:** the relationships are *valid in the merged project
-  manifest* (their endpoint models exist); only the per-file `empty_root` check fails.
-  **Suggested product fix:** exempt relationships-only files from the per-file
-  `empty_root` gate (they are validated against the projected manifest anyway), or have
-  `propose_relationships` co-locate relationships into a model file.
-- **Harness workaround (semantically faithful):** `eval_v2.consolidate_relationship_items`
-  folds the relationships into a model file before applying. The project *compiler*
-  merges all active files into one manifest, so the merged result — and every query —
-  is **identical**; only file organization changes. This unblocks grading; selection
-  metrics are still read from the **raw** changeset so the fold never hides what the
-  Copilot chose. (Also retained: the earlier `activate_all` 405→per-file fallback.)
+- **Impact (historical):** the Copilot apply→activate path was **broken for any real
+  schema** (joins are essential), not just this fixture.
+- **Why it was a per-file gate bug:** the relationships are *valid in the merged project
+  manifest* (their endpoint models exist); only the per-file `empty_root` check failed.
+- **✅ Product fix (shipped):** `validate_mdl` now counts `relationships` toward the
+  `empty_root` non-empty check (`mdl_validator.py`), so a relationships-only file is a
+  valid project *fragment* — exactly how Wren stores relationships (a top-level
+  `relationships.yml`, separate from models). Per-file unresolved endpoints stay warnings;
+  `validate_project_manifest` (the `bulk-status` gate) resolves them strictly on the
+  merged manifest and runs wren-core deep validation when enabled, preserving the
+  round-trip guarantee. The harness fold `consolidate_relationship_items` was **removed**;
+  the changeset is applied as-is and `activate_all` (atomic `bulk-status`, with the
+  405→per-file fallback retained) activates it natively. Selection metrics are still read
+  from the raw changeset.
 
 ## E9 — Distractor discrimination
 

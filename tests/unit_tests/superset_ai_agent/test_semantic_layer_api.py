@@ -241,19 +241,13 @@ def test_semantic_layer_document_upload_state_and_events(tmp_path) -> None:
     assert context_provider.requests[0].database_id == 1
 
     # The removed review/index routes return 404/405.
-    assert (
-        client.patch(
-            f"/agent/semantic-layer/documents/{document['id']}/review",
-            json={"approved_update_ids": [], "notes": "x"},
-        ).status_code
-        in {404, 405}
-    )
-    assert (
-        client.post(
-            "/agent/semantic-layer/index/rebuild", json={"scope": scope}
-        ).status_code
-        in {404, 405}
-    )
+    assert client.patch(
+        f"/agent/semantic-layer/documents/{document['id']}/review",
+        json={"approved_update_ids": [], "notes": "x"},
+    ).status_code in {404, 405}
+    assert client.post(
+        "/agent/semantic-layer/index/rebuild", json={"scope": scope}
+    ).status_code in {404, 405}
 
     state = client.get(
         "/agent/semantic-layer/state?database_id=1&dataset_ids=42",
@@ -380,9 +374,7 @@ def test_onboard_auto_activates_models_deterministic_fallback(tmp_path) -> None:
     client, _ = _client(tmp_path)
     project = _resolve_project(client)
 
-    response = client.post(
-        f"/agent/semantic-layer/projects/{project['id']}/onboard"
-    )
+    response = client.post(f"/agent/semantic-layer/projects/{project['id']}/onboard")
 
     assert response.status_code == 202
     job = response.json()
@@ -463,13 +455,13 @@ def test_reset_deletes_all_mdl_and_does_not_reonboard(tmp_path) -> None:
     project = _resolve_project(client)
     # A hand-authored extra file + an enrichment-style file that reset must remove.
     _seed_base_model(client, project["id"], model="legacy", table="legacy")
-    enrich_file = client.post(
+    client.post(
         f"/agent/semantic-layer/projects/{project['id']}/mdl-files",
         json={
             "path": "seagate/semantics.mdl.json",
             "content": json.dumps({"models": [{"name": "moves"}]}),
         },
-    ).json()
+    )
 
     reset = client.post(f"/agent/semantic-layer/projects/{project['id']}/reset")
 
@@ -512,9 +504,7 @@ def test_onboard_uses_llm_when_available(tmp_path) -> None:
     client, _ = _client(tmp_path, model_client=ChatModelClient(payload))
     project = _resolve_project(client)
 
-    response = client.post(
-        f"/agent/semantic-layer/projects/{project['id']}/onboard"
-    )
+    response = client.post(f"/agent/semantic-layer/projects/{project['id']}/onboard")
 
     assert response.status_code == 202
     result = response.json()["result"]
@@ -549,9 +539,7 @@ def test_onboard_seeding_ignores_invented_columns(tmp_path) -> None:
     client, _ = _client(tmp_path, model_client=ChatModelClient(payload))
     project = _resolve_project(client)
 
-    response = client.post(
-        f"/agent/semantic-layer/projects/{project['id']}/onboard"
-    )
+    response = client.post(f"/agent/semantic-layer/projects/{project['id']}/onboard")
 
     assert response.status_code == 202
     result = response.json()["result"]
@@ -706,6 +694,92 @@ def test_activation_dedups_re_emitted_model_across_files(tmp_path) -> None:
         json={"status": "active"},
     )
     assert activate_second.status_code == 200
+
+
+def _make_model(client, project_id: str, name: str) -> str:
+    # Both endpoints map to the exposed "moves" table with no columns, so they
+    # pass physical validation; distinct model names give the relationship two
+    # resolvable endpoints.
+    created = client.post(
+        f"/agent/semantic-layer/projects/{project_id}/mdl-files",
+        json={
+            "path": f"models/{name}.json",
+            "content": json.dumps(
+                {"models": [{"name": name, "tableReference": {"table": "moves"}}]}
+            ),
+        },
+    )
+    assert created.status_code == 200, created.text
+    return created.json()["id"]
+
+
+def _make_relationship_file(client, project_id: str, endpoints: list[str]) -> str:
+    created = client.post(
+        f"/agent/semantic-layer/projects/{project_id}/mdl-files",
+        json={
+            "path": "relationships/rel.json",
+            "content": json.dumps(
+                {
+                    "relationships": [
+                        {
+                            "name": "_".join(endpoints),
+                            "models": endpoints,
+                            "joinType": "MANY_TO_ONE",
+                            "condition": f"{endpoints[0]}.id = {endpoints[1]}.id",
+                        }
+                    ]
+                }
+            ),
+        },
+    )
+    assert created.status_code == 200, created.text
+    return created.json()["id"]
+
+
+def test_bulk_activate_models_and_relationship_file(tmp_path) -> None:
+    # The Copilot apply->activate path: a relationships-only file activates
+    # alongside its endpoint models in one atomic bulk operation. The per-file
+    # empty_root gate no longer blocks the relationship fragment.
+    client, _ = _client(tmp_path)
+    project = _resolve_project(client)
+    pid = project["id"]
+
+    deals = _make_model(client, pid, "deals")
+    sites = _make_model(client, pid, "sites")
+    rel = _make_relationship_file(client, pid, ["deals", "sites"])
+
+    response = client.post(
+        f"/agent/semantic-layer/projects/{pid}/mdl-files/bulk-status",
+        json={"status": "active", "file_ids": [deals, sites, rel]},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["changed_count"] == 3
+    by_id = {f["id"]: f for f in body["files"]}
+    assert by_id[rel]["status"] == "active"
+    assert by_id[rel]["validation"]["valid"] is True
+
+
+def test_bulk_activate_dangling_relationship_is_422(tmp_path) -> None:
+    # A relationships-only file whose endpoints are not present in the projected
+    # active manifest is still rejected -- by the project-level gate, not the
+    # per-file gate (no safety regression).
+    client, _ = _client(tmp_path)
+    project = _resolve_project(client)
+    pid = project["id"]
+
+    rel = _make_relationship_file(client, pid, ["ghost_a", "ghost_b"])
+
+    response = client.post(
+        f"/agent/semantic-layer/projects/{pid}/mdl-files/bulk-status",
+        json={"status": "active", "file_ids": [rel]},
+    )
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert detail["validation"]["valid"] is False
+    assert any(
+        m["code"] == "unresolved_relationship" for m in detail["validation"]["messages"]
+    )
 
 
 def test_create_persists_physical_validation(tmp_path) -> None:
@@ -955,9 +1029,7 @@ def test_instructions_crud_roundtrip(tmp_path) -> None:
     assert listed.status_code == 200
     assert [item["id"] for item in listed.json()] == [instruction_id]
 
-    deleted = client.delete(
-        f"/agent/semantic-layer/instructions/{instruction_id}"
-    )
+    deleted = client.delete(f"/agent/semantic-layer/instructions/{instruction_id}")
     assert deleted.status_code == 200
     assert deleted.json() == {"deleted": True}
 
@@ -1004,8 +1076,10 @@ def test_instruction_create_rejects_empty(tmp_path) -> None:
     client, _ = _client(tmp_path)
     response = client.post(
         "/agent/semantic-layer/instructions",
-        json={"scope": {"database_id": 1, "schema_name": "pipeline"},
-              "instruction": "   "},
+        json={
+            "scope": {"database_id": 1, "schema_name": "pipeline"},
+            "instruction": "   ",
+        },
     )
     assert response.status_code == 400
 
