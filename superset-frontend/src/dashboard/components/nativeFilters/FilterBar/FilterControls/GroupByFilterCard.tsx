@@ -17,6 +17,7 @@
  * under the License.
  */
 import { FC, useCallback, useEffect, useMemo, useState } from 'react';
+import rison from 'rison';
 import { t } from '@apache-superset/core/translation';
 import {
   DataMask,
@@ -25,8 +26,6 @@ import {
   useTruncation,
   ChartCustomization,
   NativeFilterTarget,
-  Filters,
-  NativeFilterType,
 } from '@superset-ui/core';
 import {
   styled,
@@ -52,7 +51,6 @@ import { TooltipWithTruncation } from 'src/dashboard/components/nativeFilters/Fi
 import { addDangerToast } from 'src/components/MessageToasts/actions';
 import { cachedSupersetGet } from 'src/utils/cachedSupersetGet';
 import { dispatchChartCustomizationHoverAction } from './utils';
-import { mergeExtraFormData } from '../../utils';
 import {
   datasetLabel as getDatasetLabel,
   datasetLabelLower,
@@ -223,6 +221,22 @@ export const createLabelSortComparator =
     const labelComparator = propertyComparator('label');
     return sortAscending ? labelComparator(a, b) : labelComparator(b, a);
   };
+
+// A customization target's datasetId may be a raw id, a string, or an option
+// object ({ value }). Normalize to the primitive id (or null) so the column
+// fetch can key on it and skip work when there's nothing to load.
+export const resolveDatasetId = (dataset: unknown): string | number | null => {
+  if (dataset == null) {
+    return null;
+  }
+  if (typeof dataset === 'number' || typeof dataset === 'string') {
+    return dataset;
+  }
+  if (typeof dataset === 'object' && 'value' in dataset) {
+    return (dataset as { value: string | number }).value;
+  }
+  return null;
+};
 
 const GroupByFilterCardContent: FC<{
   customizationItem: ChartCustomization;
@@ -420,54 +434,33 @@ const GroupByFilterCard: FC<GroupByFilterCardProps> = ({
     ],
   );
 
-  const filters = useSelector<RootState, Filters>(
-    state => state.nativeFilters.filters,
-  );
-
-  const dependencies = useMemo(() => {
-    let deps = {};
-
-    Object.entries(filters).forEach(([filterId, filter]) => {
-      if (
-        filter.type === NativeFilterType.Divider ||
-        !effectiveDataMask[filterId]?.filterState?.value
-      ) {
-        return;
-      }
-
-      const filterState = effectiveDataMask[filterId];
-      deps = mergeExtraFormData(deps, filterState?.extraFormData);
-    });
-
-    return deps;
-  }, [effectiveDataMask, filters]);
+  // Resolve the dataset id from whatever shape the customization target carries
+  // (raw id, string, or an option object). Memoized so the column fetch below
+  // keys on a primitive and re-runs only when the dataset actually changes — not
+  // on every dashboard filter value change (the old effect depended on a
+  // `dependencies` object rebuilt from the dataMask, which churned constantly).
+  const datasetId = useMemo(() => resolveDatasetId(dataset), [dataset]);
 
   useEffect(() => {
+    if (!datasetId) {
+      return;
+    }
+
     const fetchColumnOptions = async () => {
-      const datasetSource = dataset;
-
-      if (!datasetSource) {
-        return;
-      }
-
-      const datasetId =
-        typeof datasetSource === 'number'
-          ? datasetSource
-          : typeof datasetSource === 'string'
-            ? datasetSource
-            : typeof datasetSource === 'object' &&
-                datasetSource !== null &&
-                'value' in datasetSource
-              ? (datasetSource as { value: string | number }).value
-              : null;
-
-      if (!datasetId) {
-        return;
-      }
-
       setLoading(true);
       try {
-        const endpoint = `/api/v1/dataset/${datasetId}`;
+        // Project to only the fields this card consumes (dataset name + the
+        // filterable columns) instead of pulling the dataset's full
+        // columns+metrics payload.
+        const query = rison.encode({
+          columns: [
+            'table_name',
+            'columns.column_name',
+            'columns.verbose_name',
+            'columns.filterable',
+          ],
+        });
+        const endpoint = `/api/v1/dataset/${datasetId}?q=${query}`;
         const { json } = await cachedSupersetGet({ endpoint });
 
         if (json?.result) {
@@ -501,7 +494,7 @@ const GroupByFilterCard: FC<GroupByFilterCardProps> = ({
     };
 
     fetchColumnOptions();
-  }, [dataset, dependencies, dispatch]);
+  }, [datasetId, dispatch]);
 
   const displayTitle = columnDisplayName;
 

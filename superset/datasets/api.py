@@ -17,13 +17,14 @@
 # pylint: disable=too-many-lines
 from __future__ import annotations
 
+import hashlib
 import logging
 from datetime import datetime
 from io import BytesIO
 from typing import Any, Callable
 from zipfile import is_zipfile, ZipFile
 
-from flask import request, Response, send_file
+from flask import current_app, request, Response, send_file
 from flask_appbuilder.api import expose, protect, rison as parse_rison, safe
 from flask_appbuilder.api.schemas import get_item_schema
 from flask_appbuilder.const import API_RESULT_RES_KEY, API_SELECT_COLUMNS_RIS_KEY
@@ -31,6 +32,7 @@ from flask_appbuilder.models.sqla.interface import SQLAInterface
 from flask_babel import ngettext
 from jinja2.exceptions import TemplateSyntaxError
 from marshmallow import ValidationError
+from sqlalchemy.orm import joinedload, selectinload, subqueryload
 from sqlalchemy.orm.exc import MultipleResultsFound
 
 from superset import event_logger, is_feature_enabled, security_manager
@@ -1206,6 +1208,35 @@ class DatasetRestApi(BaseSupersetModelRestApi):
         except CommandException as ex:
             return self.response(ex.status, message=ex.message)
 
+    @staticmethod
+    def _detail_etag(table: SqlaTable) -> str:
+        """Strong ETag for a dataset detail (`GET /<id_or_uuid>`) response.
+
+        Folds in the dataset's *and* its columns'/metrics' ``changed_on`` (so a
+        column or metric edit invalidates the tag even when it doesn't bump the
+        parent row), the build version (so a serialization-shape change across
+        deploys never 304-matches a stale client), and the raw query string plus
+        the ``DATASET_FOLDERS`` flag (both change the serialized body). The
+        columns/metrics are already eager-loaded by ``get``, so reading their
+        ``changed_on`` adds no queries.
+        """
+        timestamps = [table.changed_on]
+        timestamps.extend(column.changed_on for column in table.columns)
+        timestamps.extend(metric.changed_on for metric in table.metrics)
+        last_modified = max(
+            (timestamp for timestamp in timestamps if timestamp is not None),
+            default=None,
+        )
+        parts = [
+            str(table.id),
+            str(last_modified),
+            str(current_app.config.get("VERSION_STRING", "")),
+            str(current_app.config.get("VERSION_SHA", "")),
+            request.query_string.decode("utf-8", "ignore"),
+            str(is_feature_enabled("DATASET_FOLDERS")),
+        ]
+        return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+
     @expose("/<id_or_uuid>", methods=("GET",))
     @protect()
     @safe
@@ -1263,9 +1294,34 @@ class DatasetRestApi(BaseSupersetModelRestApi):
             500:
               $ref: '#/components/responses/500'
         """
-        table = DatasetDAO.find_by_id_or_uuid(id_or_uuid)
+        # Eager-load the relationships the detail schema serializes so a wide
+        # dataset doesn't fan out into per-relationship lazy loads (mirrors the
+        # MCP read path). Loader options are applied after the DAO base_filter,
+        # so visibility scoping is unchanged.
+        table = DatasetDAO.find_by_id_or_uuid(
+            id_or_uuid,
+            options=[
+                subqueryload(SqlaTable.columns),
+                subqueryload(SqlaTable.metrics),
+                selectinload(SqlaTable.owners),
+                joinedload(SqlaTable.database),
+            ],
+        )
         if not table:
             return self.response_404()
+
+        # Conditional GET: on an ETag match return 304 and skip the expensive
+        # full columns+metrics serialization below. The visibility check above
+        # still runs every request, and no body is cached server-side, so this
+        # never serves a dataset past the base_filter gate (the body stays in
+        # each client's private cache).
+        etag = self._detail_etag(table)
+        if request.if_none_match.contains(etag):
+            not_modified = Response(status=304)
+            not_modified.set_etag(etag)
+            not_modified.cache_control.private = True
+            not_modified.cache_control.max_age = 0
+            return not_modified
 
         response: dict[str, Any] = {}
         args = kwargs.get("rison", {})
@@ -1302,7 +1358,15 @@ class DatasetRestApi(BaseSupersetModelRestApi):
             except SupersetTemplateException as ex:
                 return self.response(ex.status, message=str(ex))
 
-        return self.response(200, **response)
+        result = self.response(200, **response)
+        # Strong validator + revalidate-every-time: clients keep the body but
+        # must re-check (If-None-Match), letting the 304 branch above skip
+        # serialization on the next identical request. Private: never shared
+        # across principals by an intermediary cache.
+        result.set_etag(etag)
+        result.cache_control.private = True
+        result.cache_control.max_age = 0
+        return result
 
     @expose("/<int:pk>/drill_info/", methods=("GET",))
     @protect()

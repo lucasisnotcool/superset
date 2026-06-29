@@ -1798,19 +1798,53 @@ export const listAllRegisteredTableNames = async (
   return { names: tables.map(table => table.tableName), truncated };
 };
 
+// The Dataset `can_write` grant is session-stable (it only changes if the user's
+// roles change, which requires a re-login), so memoize it: the onboarding picker
+// re-checks it on every open, and without this each open hit `/dataset/_info`.
+// Only successes are cached — a transient failure stays uncached so a later open
+// can retry (and the caller degrades permissively meanwhile).
+let datasetWritePermissionCache: boolean | null = null;
+let datasetWritePermissionInFlight: Promise<boolean> | null = null;
+
+/** Reset the dataset-write-permission memo (test hook). */
+export const resetDatasetWritePermissionCache = () => {
+  datasetWritePermissionCache = null;
+  datasetWritePermissionInFlight = null;
+};
+
 /**
  * Whether the current user may create datasets. Reads the FAB `_info` endpoint's
  * `permissions` array (the same signal Superset's Dataset list uses to show its
  * "Create Dataset" button). Used to gate inline registration on the *real*
- * Dataset `can_write` rather than a project-write proxy.
+ * Dataset `can_write` rather than a project-write proxy. Memoized per session
+ * (see note above).
  */
-export const getDatasetWritePermission = async (): Promise<boolean> => {
+export const getDatasetWritePermission = (): Promise<boolean> => {
+  if (datasetWritePermissionCache !== null) {
+    return Promise.resolve(datasetWritePermissionCache);
+  }
+  if (datasetWritePermissionInFlight) {
+    return datasetWritePermissionInFlight;
+  }
   const query = rison.encode({ keys: ['permissions'] });
-  const response = await SupersetClient.get({
+  datasetWritePermissionInFlight = SupersetClient.get({
     endpoint: `/api/v1/dataset/_info?q=${query}`,
-  });
-  const permissions = (response.json?.permissions as string[]) ?? [];
-  return permissions.includes('can_write');
+  })
+    .then(response => {
+      const permissions = (response.json?.permissions as string[]) ?? [];
+      const canWrite = permissions.includes('can_write');
+      datasetWritePermissionCache = canWrite;
+      datasetWritePermissionInFlight = null;
+      return canWrite;
+    })
+    .catch(error => {
+      // Don't cache failures — let a later call retry. Re-throw so the caller's
+      // own catch keeps deciding how to degrade (the picker treats it as
+      // permitted; the create POST still enforces server-side).
+      datasetWritePermissionInFlight = null;
+      throw error;
+    });
+  return datasetWritePermissionInFlight;
 };
 
 /**

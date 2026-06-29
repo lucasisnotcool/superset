@@ -17,7 +17,16 @@
  * under the License.
  */
 import { LabeledValue } from '@superset-ui/core/components';
-import { createLabelSortComparator } from './GroupByFilterCard';
+import { render, waitFor } from 'spec/helpers/testing-library';
+import { cachedSupersetGet } from 'src/utils/cachedSupersetGet';
+import GroupByFilterCard, {
+  createLabelSortComparator,
+  resolveDatasetId,
+} from './GroupByFilterCard';
+
+jest.mock('src/utils/cachedSupersetGet', () => ({
+  cachedSupersetGet: jest.fn(),
+}));
 
 const apple: LabeledValue = { value: 'a', label: 'Apple' };
 const banana: LabeledValue = { value: 'b', label: 'Banana' };
@@ -38,4 +47,47 @@ test('preserves source order when sortAscending is unset', () => {
   const compare = createLabelSortComparator(undefined);
   expect(compare(apple, banana)).toBe(0);
   expect(compare(banana, apple)).toBe(0);
+});
+
+test('resolveDatasetId normalizes id / string / option-object / nullish', () => {
+  expect(resolveDatasetId(7)).toBe(7);
+  expect(resolveDatasetId('7')).toBe('7');
+  expect(resolveDatasetId({ value: 7, label: 't' })).toBe(7);
+  expect(resolveDatasetId(undefined)).toBeNull();
+  expect(resolveDatasetId(null)).toBeNull();
+  expect(resolveDatasetId({})).toBeNull();
+});
+
+test('fetches dataset columns with a projected query, not the full payload', async () => {
+  (cachedSupersetGet as jest.Mock).mockResolvedValue({
+    json: { result: { table_name: 'orders', columns: [] } },
+  });
+
+  const customizationItem = {
+    id: 'cust-1',
+    name: 'Group by',
+    targets: [{ datasetId: 7, column: { name: 'col' } }],
+    controlValues: {},
+  } as any;
+
+  render(
+    <GroupByFilterCard
+      customizationItem={customizationItem}
+      dataMaskSelected={{}}
+    />,
+    { useRedux: true },
+  );
+
+  await waitFor(() => expect(cachedSupersetGet).toHaveBeenCalledTimes(1));
+  const endpoint = (cachedSupersetGet as jest.Mock).mock.calls[0][0]
+    .endpoint as string;
+  // Detail-by-id WITH a rison projection (the heavy un-projected form is gone).
+  expect(endpoint).toContain('/api/v1/dataset/7?q=');
+  const decoded = decodeURIComponent(endpoint);
+  expect(decoded).toContain('table_name');
+  expect(decoded).toContain('columns.column_name');
+  expect(decoded).toContain('columns.verbose_name');
+  expect(decoded).toContain('columns.filterable');
+  // Must NOT request metrics or other heavy nested collections.
+  expect(decoded).not.toContain('metrics');
 });

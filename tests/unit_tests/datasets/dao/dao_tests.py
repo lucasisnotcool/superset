@@ -97,3 +97,34 @@ def test_datasource_find_by_ids_skip_base_filter_not_found(
     )
 
     assert len(result) == 0
+
+
+def test_find_by_id_or_uuid_applies_eager_options(
+    session_with_data: Session,
+) -> None:
+    """
+    The optional ``options`` (SQLAlchemy loader options) are applied without
+    altering which row is returned; passing ``None`` (the default) is a no-op.
+    Backs the dataset detail eager-load (Track A1).
+    """
+    from sqlalchemy.orm import joinedload, subqueryload
+
+    from superset.connectors.sqla.models import SqlaTable
+    from superset.daos.dataset import DatasetDAO
+
+    eager = DatasetDAO.find_by_id_or_uuid(
+        "1",
+        skip_base_filter=True,
+        options=[
+            subqueryload(SqlaTable.columns),
+            joinedload(SqlaTable.database),
+        ],
+    )
+    assert eager
+    assert eager.id == 1
+    assert isinstance(eager, SqlaTable)
+
+    # Default (no options) returns the same row — additive, behavior unchanged.
+    default = DatasetDAO.find_by_id_or_uuid("1", skip_base_filter=True)
+    assert default is not None
+    assert default.id == eager.id

@@ -52,6 +52,7 @@ import {
   getAgentHealth,
   getAgentHealthCached,
   resetAgentHealthCache,
+  resetDatasetWritePermissionCache,
   getConversation,
   listMdlFiles,
   listConversations,
@@ -71,6 +72,8 @@ const originalAgentUrl = process.env.SUPERSET_AI_AGENT_URL;
 
 beforeEach(() => {
   process.env.SUPERSET_AI_AGENT_URL = 'http://agent.local/';
+  // Module-level memo persists across tests; reset so each starts clean.
+  resetDatasetWritePermissionCache();
 });
 
 afterEach(() => {
@@ -936,6 +939,48 @@ test('getDatasetWritePermission is false when can_write is absent', async () => 
   } as any);
 
   expect(await getDatasetWritePermission()).toBe(false);
+  get.mockRestore();
+});
+
+test('getDatasetWritePermission memoizes a success across calls (one request)', async () => {
+  const get = jest.spyOn(SupersetClient, 'get').mockResolvedValue({
+    json: { permissions: ['can_write'] },
+  } as any);
+
+  // Repeated opens of the picker call this on each open; only the first should
+  // hit the network.
+  expect(await getDatasetWritePermission()).toBe(true);
+  expect(await getDatasetWritePermission()).toBe(true);
+  expect(await getDatasetWritePermission()).toBe(true);
+  expect(get).toHaveBeenCalledTimes(1);
+  get.mockRestore();
+});
+
+test('getDatasetWritePermission dedupes concurrent calls into one request', async () => {
+  const get = jest.spyOn(SupersetClient, 'get').mockResolvedValue({
+    json: { permissions: ['can_write'] },
+  } as any);
+
+  const [a, b] = await Promise.all([
+    getDatasetWritePermission(),
+    getDatasetWritePermission(),
+  ]);
+  expect(a).toBe(true);
+  expect(b).toBe(true);
+  expect(get).toHaveBeenCalledTimes(1);
+  get.mockRestore();
+});
+
+test('getDatasetWritePermission does not cache failures (later call retries)', async () => {
+  const get = jest
+    .spyOn(SupersetClient, 'get')
+    .mockRejectedValueOnce(new Error('network'))
+    .mockResolvedValueOnce({ json: { permissions: ['can_write'] } } as any);
+
+  await expect(getDatasetWritePermission()).rejects.toThrow('network');
+  // Failure wasn't cached, so a retry hits the network again and resolves.
+  expect(await getDatasetWritePermission()).toBe(true);
+  expect(get).toHaveBeenCalledTimes(2);
   get.mockRestore();
 });
 

@@ -23,6 +23,7 @@ import {
   userEvent,
   waitFor,
 } from 'spec/helpers/testing-library';
+import { resetDatasetWritePermissionCache } from '../api';
 import OnboardingTablePicker from './OnboardingTablePicker';
 
 const datasetsPage = (
@@ -79,6 +80,9 @@ const mockSupersetGet = (
   });
 
 beforeEach(() => {
+  // The dataset-write-permission memo is module-level; reset it so a cached
+  // grant from one test doesn't leak into the next (e.g. the can_write tests).
+  resetDatasetWritePermissionCache();
   mockSupersetGet();
 });
 
@@ -522,12 +526,34 @@ test('unregistered tables are read-only without real dataset can_write', async (
   ).toBeInTheDocument();
 });
 
-test('returning to the tab (window focus) refetches the schemas', async () => {
+test('an ordinary window focus does NOT refetch the schemas', async () => {
+  // A plain alt-tab back to the app must not re-list every schema's datasets;
+  // only a real return from the Add-Dataset flow should (see next test).
   const spy = jest.spyOn(SupersetClient, 'get');
   renderPicker();
   await screen.findByText('orders');
   const before = spy.mock.calls.length;
 
+  window.dispatchEvent(new Event('focus'));
+
+  // Give any (unwanted) refetch a chance to fire, then assert none did.
+  await new Promise(resolve => setTimeout(resolve, 50));
+  expect(spy.mock.calls.length).toBe(before);
+});
+
+test('returning from the Add-Dataset tab (focus after Register click) refetches', async () => {
+  jest.restoreAllMocks();
+  resetDatasetWritePermissionCache();
+  const spy = mockSupersetGet({ public: { datasets: [], physical: [] } });
+  renderPicker();
+
+  // Empty state surfaces the "Register tables as datasets" link.
+  const link = await screen.findByTestId('picker-register-link-empty');
+  const before = spy.mock.calls.length;
+
+  // Clicking the link arms the return-from-Add-Dataset guard...
+  await userEvent.click(link);
+  // ...so the next window focus reloads the schemas.
   window.dispatchEvent(new Event('focus'));
 
   await waitFor(() => expect(spy.mock.calls.length).toBeGreaterThan(before));

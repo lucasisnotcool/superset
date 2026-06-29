@@ -203,9 +203,16 @@ class BaseDAO(CoreBaseDAO[T], Generic[T]):
         skip_base_filter: bool = False,
         *,
         skip_visibility_filter: bool = False,
+        options: Sequence[Any] | None = None,
     ) -> T | None:
         """
-        Find a model by id or uuid, if defined applies `base_filter`
+        Find a model by id or uuid, if defined applies `base_filter`.
+
+        ``options`` are SQLAlchemy loader options (e.g. ``joinedload``,
+        ``subqueryload``) applied *after* the ``base_filter``, so eager-loading
+        relationships never widens the set of rows a principal may see. Defaults
+        to ``None`` (no loader options), keeping behavior unchanged for callers
+        that don't opt in.
         """
         query = db.session.query(cls.model_cls)
         if skip_visibility_filter:
@@ -217,6 +224,8 @@ class BaseDAO(CoreBaseDAO[T], Generic[T]):
             query = cls.base_filter(  # pylint: disable=not-callable
                 cls.id_column_name, data_model
             ).apply(query, None)
+        if options:
+            query = query.options(*options)
         id_column = getattr(cls.model_cls, cls.id_column_name)
         uuid_column = getattr(cls.model_cls, cls.uuid_column_name)
 

@@ -163,3 +163,108 @@ def test_handle_filters_args_returns_request_scoped_filters(
     fresh_filters = api.datamodel.get_filters.return_value
     assert fresh_filters.rest_add_filters.call_count == 2
     assert fresh_filters.get_joined_filters.call_count == 2
+
+
+def _make_dataset(table_name: str = "etag_table") -> Any:
+    """Persist a minimal dataset (with one column) and return it."""
+    from superset.connectors.sqla.models import SqlaTable, TableColumn
+    from superset.models.core import Database
+
+    SqlaTable.metadata.create_all(db.session.get_bind())
+    database = Database(database_name="etag_db", sqlalchemy_uri="sqlite://")
+    dataset = SqlaTable(
+        table_name=table_name,
+        database=database,
+        columns=[TableColumn(column_name="col_a")],
+    )
+    db.session.add(dataset)
+    db.session.flush()
+    return dataset
+
+
+def test_get_dataset_returns_etag_and_304_on_revalidation(
+    session: Session,
+    client: Any,
+    full_api_access: None,
+) -> None:
+    """
+    Dataset detail GET sets a strong ETag, and an ``If-None-Match`` revalidation
+    of the same (unchanged) dataset returns 304 with no body — letting the client
+    skip the full columns/metrics serialization. (Track A2)
+    """
+    dataset = _make_dataset()
+
+    first = client.get(f"/api/v1/dataset/{dataset.id}")
+    assert first.status_code == 200
+    etag = first.headers.get("ETag")
+    assert etag, "detail response must carry an ETag"
+    assert first.headers["Cache-Control"].replace(" ", "").find("private") != -1
+
+    revalidate = client.get(
+        f"/api/v1/dataset/{dataset.id}",
+        headers={"If-None-Match": etag},
+    )
+    assert revalidate.status_code == 304
+    assert revalidate.get_data(as_text=True) == ""
+    assert revalidate.headers.get("ETag") == etag
+
+
+def test_get_dataset_etag_changes_after_column_edit(
+    session: Session,
+    client: Any,
+    full_api_access: None,
+) -> None:
+    """
+    A child (column) change invalidates the ETag even though it need not bump the
+    parent's ``changed_on`` — so the prior tag no longer 304-matches and the
+    client refetches. Guards risk A-R2 (stale schema). (Track A2)
+    """
+    from superset.connectors.sqla.models import TableColumn
+
+    dataset = _make_dataset("etag_child_table")
+
+    first = client.get(f"/api/v1/dataset/{dataset.id}")
+    assert first.status_code == 200
+    etag = first.headers["ETag"]
+
+    # Add a column (a child change). The detail ETag folds in columns'
+    # changed_on, so the stale tag must NOT 304-match anymore.
+    dataset.columns.append(TableColumn(column_name="col_b"))
+    db.session.flush()
+
+    revalidate = client.get(
+        f"/api/v1/dataset/{dataset.id}",
+        headers={"If-None-Match": etag},
+    )
+    assert revalidate.status_code == 200
+    assert revalidate.headers["ETag"] != etag
+
+
+def test_get_dataset_passes_eager_load_options(
+    session: Session,
+    client: Any,
+    full_api_access: None,
+) -> None:
+    """
+    The detail GET resolves the dataset through ``find_by_id_or_uuid`` with eager
+    loader ``options`` (columns, metrics, owners, database) so a wide dataset
+    doesn't fan out into per-relationship lazy loads. (Track A1)
+    """
+    from superset.daos.dataset import DatasetDAO
+
+    dataset = _make_dataset("eager_table")
+
+    real_find = DatasetDAO.find_by_id_or_uuid
+    captured: dict[str, Any] = {}
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return real_find(*args, **kwargs)
+
+    with patch.object(DatasetDAO, "find_by_id_or_uuid", side_effect=spy):
+        response = client.get(f"/api/v1/dataset/{dataset.id}")
+
+    assert response.status_code == 200
+    options = captured.get("options")
+    assert options is not None
+    assert len(options) == 4
