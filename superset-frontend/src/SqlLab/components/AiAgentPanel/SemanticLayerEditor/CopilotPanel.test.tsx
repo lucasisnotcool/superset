@@ -250,6 +250,60 @@ test('header shows the title and the thread actions (stacked, both visible)', as
   expect(screen.getByTestId('copilot-history-toggle')).toBeInTheDocument();
 });
 
+test('shows the bound project name as a badge next to the title', async () => {
+  // The badge makes the Copilot's scope (which MDL Lab project it edits/grounds
+  // on) visible — a redundant confirmation of the projectId it is keyed by.
+  installFetch();
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      projectName="Sales Mart"
+      canWrite
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+    />,
+  );
+
+  expect(screen.getByTestId('copilot-project-badge')).toHaveTextContent(
+    'Sales Mart',
+  );
+});
+
+test('omits the project badge when no project name is provided', async () => {
+  installFetch();
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+    />,
+  );
+
+  expect(screen.queryByTestId('copilot-project-badge')).not.toBeInTheDocument();
+});
+
+test('dismisses the no-active-models onboarding banner with the X button', async () => {
+  installFetch();
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="empty"
+      onOnboard={jest.fn()}
+      onAutoOnboard={jest.fn()}
+    />,
+  );
+
+  expect(
+    await screen.findByTestId('copilot-onboard-banner'),
+  ).toBeInTheDocument();
+  await userEvent.click(screen.getByTestId('copilot-onboard-dismiss'));
+  expect(
+    screen.queryByTestId('copilot-onboard-banner'),
+  ).not.toBeInTheDocument();
+});
+
 test('streams the copilot, shows a diff, and applies accepted changes', async () => {
   const fetchFn = installFetch();
   const onApplied = jest.fn();

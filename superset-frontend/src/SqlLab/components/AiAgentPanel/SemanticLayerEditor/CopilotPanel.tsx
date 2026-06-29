@@ -82,6 +82,13 @@ const activeThreadKey = (projectId: string) =>
 
 export interface CopilotPanelProps {
   projectId: string;
+  /**
+   * Name of the project this Copilot is bound to. Surfaced as a badge next to the
+   * title so the user can always see which MDL Lab project the Copilot is scoped
+   * to — the Copilot's entire grounding (and every API call) is keyed by
+   * `projectId`, so this badge is a visible, redundant confirmation of that scope.
+   */
+  projectName?: string | null;
   canWrite: boolean;
   /** Called after accepted edits are persisted, so the editor can refresh. */
   onApplied?: () => void;
@@ -146,6 +153,7 @@ const opLabel = (op: ChangesetItem['op']) => {
 
 const CopilotPanel = ({
   projectId,
+  projectName,
   canWrite,
   onApplied,
   readinessStatus,
@@ -165,6 +173,10 @@ const CopilotPanel = ({
   // and failed projects open straight into a chat that can onboard them.
   const isBootstrapping = readinessStatus === 'indexing';
   const needsOnboarding = !isReady && !isBootstrapping;
+  // Lets the user dismiss the onboarding banner and just chat (the Copilot can
+  // onboard from the conversation too). Resets per project — the panel is keyed
+  // by project id, so opening another project shows the banner again.
+  const [onboardBannerDismissed, setOnboardBannerDismissed] = useState(false);
   const [input, setInput] = useState('');
   // Persisted thread state: the transcript lives on the backend (survives
   // reload + is multi-turn). ``pendingUser`` is the optimistic in-flight bubble.
@@ -750,8 +762,19 @@ const CopilotPanel = ({
         `}
       >
         {/* Title sits above the actions and the actions wrap, so a narrow rail
-            never squeezes "MDL Copilot" into one character per line. */}
-        <Typography.Text strong>{t('MDL Copilot')}</Typography.Text>
+            never squeezes "MDL Copilot" into one character per line. The project
+            badge makes the Copilot's scope (which MDL Lab project it edits and
+            grounds on) visible at all times. */}
+        <Flex align="center" gap={theme.sizeUnit} wrap="wrap">
+          <Typography.Text strong>{t('MDL Copilot')}</Typography.Text>
+          {projectName ? (
+            <Tooltip title={t('This Copilot is scoped to the open project')}>
+              <Tag color="blue" data-test="copilot-project-badge">
+                {projectName}
+              </Tag>
+            </Tooltip>
+          ) : null}
+        </Flex>
         {/* Coverage + Inspector operate on an active semantic layer, so they are
             hidden until the layer is ready (decision: UI-hide, no backend gate).
             Thread actions (new / history / rename / delete) mirror the AI SQL
@@ -897,7 +920,7 @@ const CopilotPanel = ({
           {/* F4: empty/failed projects open straight into the chat. A slim banner
               keeps the one-click whole-schema onboarding affordance, while the chat
               itself can onboard specific tables (incl. across schemas) from a doc. */}
-          {needsOnboarding ? (
+          {needsOnboarding && !onboardBannerDismissed ? (
             <Flex
               vertical
               gap={theme.sizeUnit}
@@ -947,6 +970,18 @@ const CopilotPanel = ({
                     ? t('Retry onboarding')
                     : t('Onboard manually')}
                 </Button>
+                {/* Dismiss: an outlined (no-fill, grey-border) icon button to
+                    close the banner and just chat. */}
+                <Tooltip title={t('Dismiss')}>
+                  <Button
+                    buttonStyle="tertiary"
+                    buttonSize="small"
+                    icon={<Icons.CloseOutlined />}
+                    onClick={() => setOnboardBannerDismissed(true)}
+                    aria-label={t('Dismiss')}
+                    data-test="copilot-onboard-dismiss"
+                  />
+                </Tooltip>
               </Flex>
             </Flex>
           ) : null}

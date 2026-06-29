@@ -54,6 +54,11 @@ class SchemaItem(BaseModel):
     name: str
     model: str | None = None
     text: str
+    #: For ``kind == "relationship"``: the model names this relationship joins
+    #: (its endpoints). Empty for models/columns. Carried structurally (not just in
+    #: ``text``) so context selection can pull in a join partner whose own items
+    #: ranked out — the cross-schema join-closure (see ``runtime`` / the plan).
+    related_models: list[str] = []
     #: Query-time relevance (set by the ranker on the returned top-k, not at index
     #: time): normalized token overlap for keyword, cosine similarity for embedding.
     #: ``None`` when no question tokens matched or the cold ANN path omits it.
@@ -74,9 +79,7 @@ class Retriever(Protocol):
     def has_index(self, scope_key: str, checksum: str) -> bool:
         """Whether this exact manifest version is already indexed."""
 
-    def index(
-        self, items: list[SchemaItem], *, scope_key: str, checksum: str
-    ) -> None:
+    def index(self, items: list[SchemaItem], *, scope_key: str, checksum: str) -> None:
         """Build/refresh the index for a manifest version (idempotent per checksum)."""
 
     def retrieve(
@@ -176,6 +179,9 @@ def manifest_to_schema_items(manifest: CompiledManifest) -> list[SchemaItem]:
                 kind="relationship",
                 name=rel_name,
                 text=rel_text,
+                related_models=[
+                    str(m) for m in (rel.get("models") or []) if str(m or "")
+                ],
             )
         )
     return items
@@ -186,15 +192,12 @@ def _tokens(text: str) -> set[str]:
     return {token for token in normalized.split() if token}
 
 
-def _keyword_rank(
-    question: str, items: list[SchemaItem], k: int
-) -> list[SchemaItem]:
+def _keyword_rank(question: str, items: list[SchemaItem], k: int) -> list[SchemaItem]:
     q_tokens = _tokens(question)
     if not q_tokens:
         return items[:k]
     overlap = {
-        id(item): len(q_tokens & _tokens(f"{item.name} {item.text}"))
-        for item in items
+        id(item): len(q_tokens & _tokens(f"{item.name} {item.text}")) for item in items
     }
     scored = sorted(items, key=lambda item: overlap[id(item)], reverse=True)
     # Normalize overlap to 0-1 by the query token count so the surfaced score is
@@ -289,9 +292,7 @@ class KeywordRetriever:
         entry = self._index.get(scope_key)
         return entry is not None and entry.checksum == checksum
 
-    def index(
-        self, items: list[SchemaItem], *, scope_key: str, checksum: str
-    ) -> None:
+    def index(self, items: list[SchemaItem], *, scope_key: str, checksum: str) -> None:
         self._index.set(scope_key, _IndexEntry(checksum=checksum, items=items))
 
     def retrieve(
@@ -328,9 +329,7 @@ class EmbeddingRetriever:
         entry = self._index.get(scope_key)
         return entry is not None and entry.checksum == self.effective_checksum(checksum)
 
-    def index(
-        self, items: list[SchemaItem], *, scope_key: str, checksum: str
-    ) -> None:
+    def index(self, items: list[SchemaItem], *, scope_key: str, checksum: str) -> None:
         eff = self.effective_checksum(checksum)
         existing = self._index.get(scope_key)
         if existing is not None and existing.checksum == eff:
@@ -363,8 +362,10 @@ class EmbeddingRetriever:
 
     def effective_name(self, scope_key: str) -> str:
         entry = self._index.get(scope_key)
-        return "embedding" if entry is not None and entry.vectors is not None else (
-            "keyword"
+        return (
+            "embedding"
+            if entry is not None and entry.vectors is not None
+            else ("keyword")
         )
 
     def prime(
@@ -437,9 +438,7 @@ class LanceDbRetriever:
             return True
         return self._table(scope_key, checksum) is not None
 
-    def index(
-        self, items: list[SchemaItem], *, scope_key: str, checksum: str
-    ) -> None:
+    def index(self, items: list[SchemaItem], *, scope_key: str, checksum: str) -> None:
         if self.has_index(scope_key, checksum):
             return
         self._mem.index(items, scope_key=scope_key, checksum=checksum)
@@ -514,9 +513,7 @@ class LanceDbRetriever:
             except Exception as ex:  # pylint: disable=broad-except
                 logger.warning("LanceDB ANN search failed (%s); rehydrating.", ex)
         self._rehydrate(scope_key, checksum)
-        return self._mem.retrieve(
-            question, scope_key=scope_key, checksum=checksum, k=k
-        )
+        return self._mem.retrieve(question, scope_key=scope_key, checksum=checksum, k=k)
 
     def effective_name(self, scope_key: str) -> str:
         entry = self._mem._index.get(scope_key)  # pylint: disable=protected-access
@@ -723,18 +720,61 @@ def retrieve_mdl_context(
         # Stamp the *effective* retriever (keyword on a silent fallback) so the UI
         # badge reflects what actually ran (G8a).
         mode = retriever.effective_name(scope_key)
-        return [
-            {
-                "source": "retriever",
-                "retriever": mode,
-                "kind": item.kind,
-                "name": item.name,
-                "model": item.model,
-                "text": item.text,
-                "score": item.score,
-            }
-            for item in top
-        ]
+        return [_item_to_dict(item, source="retriever", retriever=mode) for item in top]
     except Exception as ex:  # pylint: disable=broad-except - retrieval is best-effort
         logger.warning("Schema retrieval failed; using keyword context only: %s", ex)
+        return []
+
+
+def _item_to_dict(
+    item: SchemaItem, *, source: str, retriever: str | None = None
+) -> dict[str, Any]:
+    """Serialize a ``SchemaItem`` to the context-item dict shape the prompt + the
+    selection/closure steps consume. ``related_models`` is carried so closure can
+    resolve a relationship's join endpoints structurally."""
+
+    payload: dict[str, Any] = {
+        "source": source,
+        "kind": item.kind,
+        "name": item.name,
+        "model": item.model,
+        "text": item.text,
+        "score": item.score,
+        "related_models": item.related_models,
+    }
+    if retriever is not None:
+        payload["retriever"] = retriever
+    return payload
+
+
+def project_schema_items(
+    *,
+    project_id: str | None,
+    owner_id: str,
+    mdl_file_store: MdlFileStore | None,
+) -> list[dict[str, Any]]:
+    """The project's **entire** active MDL chunked into context-item dicts.
+
+    Distinct from :func:`retrieve_mdl_context` (which returns the question-ranked
+    top-k): this is the unranked, complete set used as the **join-closure source**
+    — a join partner that ranked out of the top-k must still be injectable, so
+    closure needs every model/column/relationship, not just the retrieved subset.
+    Degrades closed to ``[]`` (no project/store/active MDL, or on any error) so the
+    SQL path is never disrupted. Tagged ``source="manifest"``.
+    """
+
+    if project_id is None or mdl_file_store is None:
+        return []
+    try:
+        active_files = [
+            file
+            for file in mdl_file_store.list(project_id, owner_id=owner_id)
+            if file.status == "active" and file.deleted_at is None
+        ]
+        if not active_files:
+            return []
+        items = manifest_to_schema_items(compile_manifest(active_files))
+        return [_item_to_dict(item, source="manifest") for item in items]
+    except Exception as ex:  # pylint: disable=broad-except - best-effort closure source
+        logger.warning("Manifest closure-source build failed (non-fatal): %s", ex)
         return []

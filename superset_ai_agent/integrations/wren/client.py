@@ -336,6 +336,14 @@ class FileWrenClient:
             tokens = set(_tokens(text))
             score = len(question_tokens & tokens)
             if name.lower() in dataset_names:
+                # The user is actively browsing this table in the current schema.
+                score += 3
+            elif question_tokens & _model_identity_tokens(model, name):
+                # Schema-neutral parity boost: the question explicitly names this
+                # model's physical table (or the model itself). Available to EVERY
+                # model regardless of the request's single ``schema_name``, so a
+                # cross-schema model the user asks for is not out-ranked purely
+                # because its physical table lives in another schema (Fix B).
                 score += 3
             if score > 0:
                 matches.append((score, name))
@@ -390,6 +398,20 @@ def _models_from_mdl(mdl: dict[str, Any]) -> list[dict[str, Any]]:
 def _model_name(model: dict[str, Any]) -> str:
     value = model.get("name") or model.get("model") or model.get("table")
     return str(value) if value else ""
+
+
+def _model_identity_tokens(model: dict[str, Any], name: str) -> set[str]:
+    """Tokens identifying a model: its name + its physical table (``tableReference``).
+
+    Used for a schema-neutral relevance boost — matching the question against the
+    table a model maps to, independent of which schema that table lives in.
+    """
+
+    tokens = _tokens(name)
+    ref = model.get("tableReference") or model.get("table_reference")
+    if isinstance(ref, dict) and isinstance(ref.get("table"), str):
+        tokens |= _tokens(ref["table"])
+    return tokens
 
 
 def _tokens(text: str) -> set[str]:

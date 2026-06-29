@@ -971,7 +971,7 @@ test('main editor shows a loading state while the project list loads (#4)', asyn
   expect(screen.queryByTestId('mdl-list-loading')).not.toBeInTheDocument();
 });
 
-test('Upload and Reset are full-width block buttons (#2)', async () => {
+test('Activate-all, Upload, and Reset live in one responsive action group (#4)', async () => {
   mockBaseRoutes([mdlFile('a', 'models/a.json')]);
   fetchMock.get(
     'http://agent.local/agent/semantic-layer/projects/project-1',
@@ -996,12 +996,19 @@ test('Upload and Reset are full-width block buttons (#2)', async () => {
   );
 
   await screen.findByTestId('mdl-workspace');
+  // The three library actions are siblings in the responsive group, which
+  // (via a container query) stacks them full-width or lays them in one row by
+  // the column width — replacing the previous mismatched/offset buttons.
+  const actions = screen.getByTestId('mdl-browser-actions');
   expect(
-    screen.getByTestId('semantic-upload-document').closest('button'),
-  ).toHaveClass('ant-btn-block');
-  expect(screen.getByRole('button', { name: /Reset/i })).toHaveClass(
-    'ant-btn-block',
-  );
+    within(actions).getByTestId('semantic-upload-document'),
+  ).toBeInTheDocument();
+  expect(
+    within(actions).getByRole('button', { name: /Reset/i }),
+  ).toBeInTheDocument();
+  expect(
+    within(actions).getByRole('button', { name: /(Activate|Deactivate) all/i }),
+  ).toBeInTheDocument();
 });
 
 test('deleting a project confirms first, then deletes (#3)', async () => {

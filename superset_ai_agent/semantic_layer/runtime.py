@@ -18,10 +18,13 @@
 from __future__ import annotations
 
 import json  # noqa: TID251 - standalone agent context-item dedup key
+import logging
 from collections.abc import Callable
 from typing import Any
 
 from superset_ai_agent.schemas import WrenContextArtifact
+
+logger = logging.getLogger(__name__)
 
 
 def canonical_model_name(item: dict[str, Any]) -> str | None:
@@ -106,6 +109,8 @@ def build_unified_context(
     table_selection_limit: int,
     max_context_items: int,
     model_selector: ModelSelector | None = None,
+    manifest_items: list[dict[str, Any]] | None = None,
+    join_closure_limit: int = 0,
 ) -> WrenContextArtifact:
     """Single post-retrieval context entrypoint (C1.2 / C1.3).
 
@@ -129,6 +134,10 @@ def build_unified_context(
 
     merged = [*retrieved_items, *wren_context.context_items]
     selected = _select_models(merged, table_selection_limit, model_selector)
+    # Cross-schema join-closure: pull in join partners of the selected models so a
+    # relevant join never loses one side (the partner's columns/table). Runs for
+    # BOTH the heuristic and LLM-selector paths since it follows _select_models.
+    selected = apply_join_closure(selected, manifest_items or [], join_closure_limit)
     capped = cap_context_items(selected, max_context_items)
     update: dict[str, Any] = {"context_items": capped}
     if retrieved_items:
@@ -137,6 +146,84 @@ def build_unified_context(
             1 for item in capped if item.get("source") == "retriever"
         )
     return wren_context.model_copy(update=update)
+
+
+def relationship_partners(
+    selected_names: set[str], manifest_items: list[dict[str, Any]]
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Join partners of the selected models, one hop, in first-seen order.
+
+    Scans the manifest's relationship items (``kind == "relationship"``, endpoints
+    in ``related_models``); a relationship that crosses the selected/unselected
+    boundary contributes its unselected endpoint(s) as partners and is returned as
+    a *connecting* relationship (so its join condition reaches the prompt). Pure;
+    applies no budget — the caller caps.
+    """
+
+    partners: list[str] = []
+    connecting: list[dict[str, Any]] = []
+    for item in manifest_items:
+        if item.get("kind") != "relationship":
+            continue
+        ends = [str(name) for name in (item.get("related_models") or []) if name]
+        in_sel = [name for name in ends if name in selected_names]
+        out_sel = [name for name in ends if name not in selected_names]
+        if not in_sel or not out_sel:
+            continue  # fully-in (already covered) or fully-out (irrelevant) join
+        connecting.append(item)
+        for name in out_sel:
+            if name not in partners:
+                partners.append(name)
+    return partners, connecting
+
+
+def apply_join_closure(
+    selected: list[dict[str, Any]],
+    manifest_items: list[dict[str, Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Append join-partner items (model + columns + connecting relationship) for
+    partners reachable from the selected models in one hop.
+
+    No-op (returns ``selected`` unchanged) when ``limit <= 0``, there are no
+    manifest items, or no relationship crosses the selection boundary — so
+    single-schema / small projects are unaffected. Partners are capped at
+    ``limit`` (logged on truncation — no silent cap). Injected items are tagged
+    ``source="closure"`` so :func:`cap_context_items` protects them on overflow.
+    """
+
+    if limit <= 0 or not manifest_items:
+        return selected
+    selected_names = set(candidate_model_names(selected))
+    if not selected_names:
+        return selected
+    partners, connecting = relationship_partners(selected_names, manifest_items)
+    if not partners:
+        return selected
+    if len(partners) > limit:
+        logger.info(
+            "Join-closure truncated: %d partner models found, keeping %d "
+            "(wren_join_closure_limit). Dropped: %s",
+            len(partners),
+            limit,
+            partners[limit:],
+        )
+        partners = partners[:limit]
+    kept = set(partners)
+    items_by_model: dict[str, list[dict[str, Any]]] = {}
+    for item in manifest_items:
+        name = canonical_model_name(item)
+        if name in kept:
+            items_by_model.setdefault(name, []).append(item)
+    injected: list[dict[str, Any]] = []
+    for partner in partners:
+        injected.extend(items_by_model.get(partner, []))
+    for rel in connecting:
+        ends = {str(name) for name in (rel.get("related_models") or []) if name}
+        if ends & kept:
+            injected.append(rel)
+    tagged = [{**item, "source": "closure"} for item in injected]
+    return [*selected, *tagged]
 
 
 def _select_models(
@@ -177,6 +264,10 @@ def cap_context_items(
         deduped.append(item)
     if max_items <= 0 or len(deduped) <= max_items:
         return deduped
-    ranked = [item for item in deduped if item.get("source") == "retriever"]
-    other = [item for item in deduped if item.get("source") != "retriever"]
+    # Keep the relevance-ranked retriever chunks first, then join-closure items
+    # (both sides of a relevant join must survive overflow), then the rest.
+    priority = {"retriever": 0, "closure": 1}
+    ranked = [item for item in deduped if item.get("source") in priority]
+    ranked.sort(key=lambda item: priority.get(str(item.get("source") or ""), 9))
+    other = [item for item in deduped if item.get("source") not in priority]
     return (ranked + other)[:max_items]

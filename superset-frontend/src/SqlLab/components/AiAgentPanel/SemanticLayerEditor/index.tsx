@@ -256,6 +256,33 @@ const ScrollList = styled.div`
   `}
 `;
 
+// The library actions (Activate-all / Upload / Reset) form a responsive group.
+// A container query on the browser COLUMN width (not the viewport) drives it, so
+// it reacts to the Splitter: a single equal-width row when the column is wide
+// enough to fit all three, otherwise stacked full-width.
+const ActionBar = styled.div`
+  container-type: inline-size;
+`;
+
+const ActionBarRow = styled.div`
+  ${({ theme }) => css`
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: ${theme.sizeUnit}px;
+
+    /* Each action fills its column whether stacked or in a row — including the
+       Upload button when antd wraps a disabled tooltip child in a span. */
+    button {
+      width: 100%;
+    }
+
+    /* ~3 equal-width labelled buttons + gaps; below this they stack full-width. */
+    @container (min-width: 460px) {
+      grid-template-columns: repeat(3, 1fr);
+    }
+  `}
+`;
+
 const STATUS_TOGGLE_HELP = t(
   'Toggle on to activate this MDL file so it is included in the semantic ' +
     'layer; toggle off to keep it as a draft.',
@@ -1523,88 +1550,86 @@ export default function SemanticLayerEditor({
                                 }}
                               />
                             </ScrollList>
-                            <Button
-                              block
-                              buttonStyle="tertiary"
-                              loading={pendingAction === 'bulk'}
-                              disabled={
-                                !project ||
-                                !canWrite ||
-                                isLoading ||
-                                mdlFiles.length === 0
-                              }
-                              onClick={() => setAllStatuses(!allActive)}
-                              icon={
-                                allActive ? (
-                                  <Icons.MinusCircleOutlined iconSize="m" />
-                                ) : (
-                                  <Icons.CheckCircleOutlined iconSize="m" />
-                                )
-                              }
-                            >
-                              {allActive
-                                ? t('Deactivate all')
-                                : t('Activate all')}
-                            </Button>
-                            {/* One action per row, each full-width — matching the
-                                block "Activate/Deactivate all" above, so a button
-                                that is alone on its row fills it rather than
-                                hugging the left edge. */}
-                            <Flex vertical gap="small">
-                              <input
-                                ref={uploadInputRef}
-                                type="file"
-                                multiple
-                                accept=".json,.md,.markdown,.txt,.csv,.html,.pdf,.docx,.xlsx,.pptx"
-                                css={css`
-                                  display: none;
-                                `}
-                                onChange={handleUpload}
-                                data-test="semantic-upload-input"
-                              />
-                              <Tooltip
-                                title={t(
-                                  'Upload a document (PDF, Word, Excel, PowerPoint, CSV, ' +
-                                    'HTML, Markdown, JSON). It is added to the workspace ' +
-                                    'and vectorized for the Copilot and viewer.',
-                                )}
-                              >
+                            {/* Activate-all / Upload / Reset: one equal-width row
+                                when the column is wide enough, else stacked
+                                full-width (container query in ActionBarRow). */}
+                            <ActionBar>
+                              <ActionBarRow data-test="mdl-browser-actions">
                                 <Button
-                                  block
                                   buttonStyle="tertiary"
+                                  loading={pendingAction === 'bulk'}
                                   disabled={
                                     !project ||
                                     !canWrite ||
                                     isLoading ||
-                                    isIngesting
+                                    mdlFiles.length === 0
                                   }
-                                  loading={isIngesting}
-                                  onClick={() =>
-                                    uploadInputRef.current?.click()
+                                  onClick={() => setAllStatuses(!allActive)}
+                                  icon={
+                                    allActive ? (
+                                      <Icons.MinusCircleOutlined iconSize="m" />
+                                    ) : (
+                                      <Icons.CheckCircleOutlined iconSize="m" />
+                                    )
                                   }
-                                  icon={<Icons.UploadOutlined iconSize="m" />}
-                                  data-test="semantic-upload-document"
                                 >
-                                  {t('Upload document')}
+                                  {allActive
+                                    ? t('Deactivate all')
+                                    : t('Activate all')}
                                 </Button>
-                              </Tooltip>
-                              <Button
-                                block
-                                buttonStyle="tertiary"
-                                loading={isResetting}
-                                disabled={
-                                  !project ||
-                                  !canWrite ||
-                                  isLoading ||
-                                  onboardingInFlight ||
-                                  isResetting
-                                }
-                                onClick={() => setShowResetConfirm(true)}
-                                icon={<Icons.ReloadOutlined iconSize="m" />}
-                              >
-                                {isResetting ? t('Resetting…') : t('Reset')}
-                              </Button>
-                            </Flex>
+                                <input
+                                  ref={uploadInputRef}
+                                  type="file"
+                                  multiple
+                                  accept=".json,.md,.markdown,.txt,.csv,.html,.pdf,.docx,.xlsx,.pptx"
+                                  css={css`
+                                    display: none;
+                                  `}
+                                  onChange={handleUpload}
+                                  data-test="semantic-upload-input"
+                                />
+                                <Tooltip
+                                  title={t(
+                                    'Upload a document (PDF, Word, Excel, PowerPoint, CSV, ' +
+                                      'HTML, Markdown, JSON). It is added to the workspace ' +
+                                      'and vectorized for the Copilot and viewer.',
+                                  )}
+                                >
+                                  <Button
+                                    buttonStyle="tertiary"
+                                    disabled={
+                                      !project ||
+                                      !canWrite ||
+                                      isLoading ||
+                                      isIngesting
+                                    }
+                                    loading={isIngesting}
+                                    onClick={() =>
+                                      uploadInputRef.current?.click()
+                                    }
+                                    icon={<Icons.UploadOutlined iconSize="m" />}
+                                    data-test="semantic-upload-document"
+                                  >
+                                    {t('Upload document')}
+                                  </Button>
+                                </Tooltip>
+                                <Button
+                                  buttonStyle="tertiary"
+                                  loading={isResetting}
+                                  disabled={
+                                    !project ||
+                                    !canWrite ||
+                                    isLoading ||
+                                    onboardingInFlight ||
+                                    isResetting
+                                  }
+                                  onClick={() => setShowResetConfirm(true)}
+                                  icon={<Icons.ReloadOutlined iconSize="m" />}
+                                >
+                                  {isResetting ? t('Resetting…') : t('Reset')}
+                                </Button>
+                              </ActionBarRow>
+                            </ActionBar>
                           </BrowserPane>
                         </Splitter.Panel>
                         <Splitter.Panel className="semantic-editor-center-panel">
@@ -1750,6 +1775,7 @@ export default function SemanticLayerEditor({
                                 // into the newly opened one.
                                 key={project.id}
                                 projectId={project.id}
+                                projectName={project.name}
                                 canWrite={canWrite}
                                 onApplied={refresh}
                                 readinessStatus={railStatus}

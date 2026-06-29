@@ -1012,7 +1012,53 @@ const stateWithSchema = () => ({
   },
 });
 
-test('surfaces the resolved semantic project name when one project covers the schema', async () => {
+const stateWithoutSchema = () => ({
+  ...initialState,
+  sqlLab: {
+    ...initialState.sqlLab,
+    queryEditors: initialState.sqlLab.queryEditors.map(queryEditor => ({
+      ...queryEditor,
+      schema: null,
+    })),
+  },
+});
+
+test('lists all database projects in the picker when no schema is selected', async () => {
+  // With no schema selected the list endpoint is called WITHOUT a schema_name,
+  // so the dropdown still shows every project for the database (the user can see
+  // and pick one; it grounds once a schema is chosen).
+  fetchMock.get('begin:http://agent.local/agent/semantic-layer/projects?', [
+    makeSemanticProject('project-a', 'Sales'),
+    makeSemanticProject('project-b', 'Marketing'),
+  ]);
+  fetchMock.get(
+    'begin:http://agent.local/agent/semantic-layer/projects/project-a/state',
+    {
+      project_id: 'project-a',
+      database_id: 1,
+      schema_name: 'main',
+      dataset_ids: [],
+      document_count: 1,
+      last_error: null,
+    },
+  );
+
+  const store = createStore(stateWithoutSchema(), reducerIndex);
+  render(<AiAgentPanel />, { store });
+
+  // The picker appears with the database's projects even without a schema.
+  await screen.findByTestId('semantic-project-select');
+  expect(screen.getByText('Sales')).toBeInTheDocument();
+
+  // The list call carried no schema_name → it is database-wide.
+  const calls = fetchMock.callHistory.calls(
+    'begin:http://agent.local/agent/semantic-layer/projects?',
+  );
+  expect(calls.length).toBeGreaterThan(0);
+  expect(String(calls[0].url)).not.toContain('schema_name');
+});
+
+test('shows the project picker as the always-visible entrypoint even for a single covering project', async () => {
   fetchMock.get('begin:http://agent.local/agent/semantic-layer/projects?', [
     makeSemanticProject('project-1', 'Sales'),
   ]);
@@ -1031,11 +1077,13 @@ test('surfaces the resolved semantic project name when one project covers the sc
   const store = createStore(stateWithSchema(), reducerIndex);
   render(<AiAgentPanel />, { store });
 
-  // A single covering project is shown by name (transparency) with no picker.
-  expect(await screen.findByText('Semantic layer: Sales')).toBeInTheDocument();
-  expect(
-    screen.queryByTestId('semantic-project-select'),
-  ).not.toBeInTheDocument();
+  // The picker is the entrypoint even with one project, pre-selected to it, so
+  // the user can always see and change which project grounds the SQL agent …
+  const picker = await screen.findByTestId('semantic-project-select');
+  expect(picker).toBeInTheDocument();
+  expect(screen.getByText('Sales')).toBeInTheDocument();
+  // … and the state badge shows the document count alongside the picker.
+  expect(await screen.findByText('3 document(s)')).toBeInTheDocument();
 });
 
 test('lets the user pick among multiple semantic projects and sends the choice', async () => {
@@ -1146,6 +1194,152 @@ test('lets the user pick among multiple semantic projects and sends the choice',
   expect(JSON.parse(String(messageCall.options.body)).scope.project_id).toBe(
     'project-b',
   );
+});
+
+test('re-syncs the picker when the backend grounds on a different project (silent-fallback fix)', async () => {
+  fetchMock.get('begin:http://agent.local/agent/semantic-layer/projects?', [
+    makeSemanticProject('project-a', 'Sales'),
+    makeSemanticProject('project-b', 'Marketing'),
+  ]);
+  fetchMock.get(
+    'begin:http://agent.local/agent/semantic-layer/projects/project-a/state',
+    {
+      project_id: 'project-a',
+      database_id: 1,
+      schema_name: 'main',
+      dataset_ids: [],
+      document_count: 1,
+      last_error: null,
+    },
+  );
+  fetchMock.get(
+    'begin:http://agent.local/agent/semantic-layer/projects/project-b/state',
+    {
+      project_id: 'project-b',
+      database_id: 1,
+      schema_name: 'main',
+      dataset_ids: [],
+      document_count: 2,
+      last_error: null,
+    },
+  );
+
+  const conversation = {
+    id: 'conversation-1',
+    title: 'New chat',
+    owner_id: 'local',
+    kind: 'sql',
+    project_id: null,
+    scope: { database_id: 1, schema_name: 'main', dataset_ids: [] },
+    messages: [],
+    created_at: '2026-06-19T00:00:00Z',
+    updated_at: '2026-06-19T00:00:00Z',
+  };
+  // The backend fell back: the pinned project-a did not cover the schema, so it
+  // grounded on project-b and pinned the conversation to it.
+  const turned = {
+    ...conversation,
+    project_id: 'project-b',
+    messages: [
+      {
+        id: 'm1',
+        role: 'user',
+        content: 'hi',
+        created_at: '2026-06-19T00:00:00Z',
+        artifacts: [],
+      },
+      {
+        id: 'm2',
+        role: 'assistant',
+        content: 'ok',
+        created_at: '2026-06-19T00:00:00Z',
+        artifacts: [],
+      },
+    ],
+  };
+  fetchMock.post('http://agent.local/agent/conversations', conversation);
+  fetchMock.post(
+    'http://agent.local/agent/conversations/conversation-1/messages/stream',
+    404,
+  );
+  fetchMock.post(
+    'http://agent.local/agent/conversations/conversation-1/messages',
+    {
+      status: 'ok',
+      conversation_id: 'conversation-1',
+      message: turned.messages[1],
+      artifacts: [],
+      trace: [],
+      conversation: turned,
+    },
+  );
+
+  const store = createStore(stateWithSchema(), reducerIndex);
+  render(<AiAgentPanel />, { store });
+
+  // Default selection is the most-recent (first) project, "Sales".
+  await screen.findByTestId('semantic-project-select');
+  expect(screen.getByText('Sales')).toBeInTheDocument();
+
+  await userEvent.type(
+    screen.getByPlaceholderText('Ask about this database'),
+    'hi',
+  );
+  await userEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+  // After the turn, the picker reflects the project the backend ACTUALLY used,
+  // so it never silently misrepresents the grounding.
+  expect(await screen.findByText('Marketing')).toBeInTheDocument();
+});
+
+test('re-probes the project list when the picker opens so newly created projects appear', async () => {
+  // The list grows between the initial mount fetch and opening the dropdown
+  // (e.g. a project created in the MDL Lab meanwhile).
+  let calls = 0;
+  fetchMock.get(
+    'begin:http://agent.local/agent/semantic-layer/projects?',
+    () => {
+      calls += 1;
+      return calls === 1
+        ? [makeSemanticProject('project-a', 'Sales')]
+        : [
+            makeSemanticProject('project-a', 'Sales'),
+            makeSemanticProject('project-b', 'Marketing'),
+          ];
+    },
+  );
+  fetchMock.get(
+    'begin:http://agent.local/agent/semantic-layer/projects/project-a/state',
+    {
+      project_id: 'project-a',
+      database_id: 1,
+      schema_name: 'main',
+      dataset_ids: [],
+      document_count: 1,
+      last_error: null,
+    },
+  );
+  fetchMock.get(
+    'begin:http://agent.local/agent/semantic-layer/projects/project-b/state',
+    {
+      project_id: 'project-b',
+      database_id: 1,
+      schema_name: 'main',
+      dataset_ids: [],
+      document_count: 2,
+      last_error: null,
+    },
+  );
+
+  const store = createStore(stateWithSchema(), reducerIndex);
+  render(<AiAgentPanel />, { store });
+
+  const picker = await screen.findByTestId('semantic-project-select');
+  // Open the dropdown → re-probe → the newly created project is now an option.
+  await userEvent.click(
+    picker.querySelector('.ant-select-selector') as Element,
+  );
+  expect(await screen.findByText('Marketing')).toBeInTheDocument();
 });
 
 test('switching the semantic layer mid-conversation starts a fresh chat', async () => {

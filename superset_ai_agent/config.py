@@ -257,6 +257,14 @@ class AgentConfig:
     # model call to the retrieval node; degrades closed to wren_table_selection_limit
     # on any failure/empty result. Default false (opt-in: latency/cost).
     wren_llm_table_selection: bool = False
+    # Cross-schema join-closure: after table-selection, pull in up to this many
+    # join *partner* models (one hop) that are connected to a selected model by an
+    # MDL relationship but were not themselves selected — so the prompt always has
+    # BOTH sides of a relevant join (columns + table), not a dangling relationship.
+    # Closure partners are EXEMPT from ``wren_table_selection_limit`` (else closure
+    # would just re-truncate); the absolute ``wren_max_context_items`` cap still
+    # applies. 0 = off (legacy behavior; a low-ranked partner stays pruned).
+    wren_join_closure_limit: int = 5
     wren_memory_store: WrenMemoryStoreMode = "none"
     wren_memory_learning_enabled: bool = True
     wren_memory_recall_k: int = 3
@@ -767,6 +775,12 @@ class AgentConfig:
             wren_llm_table_selection=_env_bool(
                 "WREN_LLM_TABLE_SELECTION",
                 cls.wren_llm_table_selection,
+            ),
+            wren_join_closure_limit=int(
+                os.getenv(
+                    "WREN_JOIN_CLOSURE_LIMIT",
+                    str(cls.wren_join_closure_limit),
+                )
             ),
             wren_memory_store=cast(
                 WrenMemoryStoreMode,

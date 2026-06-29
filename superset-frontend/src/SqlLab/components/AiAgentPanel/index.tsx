@@ -20,6 +20,7 @@ import {
   ChangeEvent,
   KeyboardEvent,
   type ReactNode,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -48,6 +49,7 @@ import {
   addDangerToast,
   addInfoToast,
   addSuccessToast,
+  addWarningToast,
 } from 'src/components/MessageToasts/actions';
 import copyTextToClipboard from 'src/utils/copy';
 import {
@@ -154,6 +156,13 @@ const Chip = styled.span`
     text-overflow: ellipsis;
     white-space: nowrap;
   `}
+`;
+
+// Keeps the always-visible MDL project picker compact in the context-chip row
+// (the Superset Select has no `size` prop, so width is constrained here).
+const ProjectSelectWrap = styled.div`
+  min-width: 140px;
+  max-width: 220px;
 `;
 
 const HistoryPanel = styled.div`
@@ -759,49 +768,56 @@ const AiAgentPanel = () => {
     };
   }, []);
 
-  useEffect(() => {
-    if (!currentScope?.schema_name) {
+  // Probe for the project candidates without creating one. Using the listing
+  // endpoint (200 + possibly-empty array) instead of resolve avoids a spurious
+  // 404 in the console when no project exists yet. When a schema is selected we
+  // pass it so the list is schema-scoped (the grounding candidates); when NO
+  // schema is selected we omit it, so the dropdown shows ALL of the database's
+  // projects — the user can still see/pick one (it grounds once a schema is set).
+  // The list is ordered most-recent first, so [0] mirrors the backend's heuristic
+  // default — keep it the default selection, but preserve the user's pin when it
+  // is still present. Depends only on the database/catalog/schema primitives (NOT
+  // the selected project), so re-selecting never re-fetches.
+  const refreshSemanticProjects = useCallback(async () => {
+    if (typeof databaseId !== 'number') {
       setSemanticProjects([]);
       setSelectedProjectId(null);
-      return undefined;
+      return;
     }
-    let isMounted = true;
-    // Probe for the schema-scoped project candidates without creating one. Using
-    // the listing endpoint (200 + possibly-empty array) instead of resolve avoids
-    // a spurious 404 in the console when no project exists yet for the schema. The
-    // list is ordered most-recent first, so [0] mirrors the backend's heuristic
-    // default — keep it the default selection, but preserve the user's pin when it
-    // still covers the (unchanged) schema.
-    listSemanticProjects(
-      currentScope.database_id,
-      currentScope.catalog_name ?? null,
-      currentScope.schema_name,
-    )
-      .then(projects => {
-        if (!isMounted) {
-          return;
-        }
-        setSemanticProjects(projects);
-        setSelectedProjectId(prev =>
-          prev && projects.some(project => project.id === prev)
-            ? prev
-            : (projects[0]?.id ?? null),
-        );
-      })
-      .catch(() => {
-        if (isMounted) {
-          setSemanticProjects([]);
-          setSelectedProjectId(null);
-        }
-      });
-    return () => {
-      isMounted = false;
+    try {
+      const projects = await listSemanticProjects(
+        databaseId,
+        queryEditor?.catalog || null,
+        // null when no schema → backend returns every project for the database.
+        queryEditor?.schema || null,
+      );
+      setSemanticProjects(projects);
+      setSelectedProjectId(prev =>
+        prev && projects.some(project => project.id === prev)
+          ? prev
+          : (projects[0]?.id ?? null),
+      );
+    } catch {
+      setSemanticProjects([]);
+      setSelectedProjectId(null);
+    }
+  }, [databaseId, queryEditor?.catalog, queryEditor?.schema]);
+
+  useEffect(() => {
+    refreshSemanticProjects();
+  }, [refreshSemanticProjects]);
+
+  // A project created elsewhere (e.g. in the MDL Lab) won't be in our cached list
+  // until we re-probe. Re-fetch when the window regains focus (covers creating a
+  // project in another tab) so the freshly created project appears as an option;
+  // the picker also re-probes when its dropdown opens (see `onOpenChange`).
+  useEffect(() => {
+    const onFocus = () => {
+      refreshSemanticProjects();
     };
-  }, [
-    currentScope?.database_id,
-    currentScope?.catalog_name,
-    currentScope?.schema_name,
-  ]);
+    window.addEventListener('focus', onFocus);
+    return () => window.removeEventListener('focus', onFocus);
+  }, [refreshSemanticProjects]);
 
   // Fetch the document/coverage state for whichever project is selected so the
   // badge reflects the project actually grounding the turn.
@@ -975,7 +991,36 @@ const AiAgentPanel = () => {
         controller.signal,
       );
       setConversation(result.conversation);
-      setDatasetIds(result.conversation.scope.dataset_ids);
+      // Surface a server-side grounding fallback. The backend honors the pinned
+      // project_id only when it covers the schema; otherwise it grounds on a
+      // different covering project and pins the conversation to THAT one. Re-sync
+      // the picker to what was actually used (so it never misrepresents the
+      // grounding) and, when an explicit pin was overridden, tell the user — the
+      // cross-schema F2 drift the pin alone cannot catch.
+      const groundedProjectId = result.conversation.project_id ?? null;
+      if (groundedProjectId && groundedProjectId !== selectedProjectId) {
+        const overrodePin = selectedProjectId !== null;
+        setSelectedProjectId(groundedProjectId);
+        if (overrodePin) {
+          const groundedName =
+            semanticProjects.find(p => p.id === groundedProjectId)?.name ??
+            null;
+          dispatch(
+            addWarningToast(
+              groundedName
+                ? t(
+                    'The selected semantic project did not cover this schema; ' +
+                      'grounded on “%s” instead.',
+                    groundedName,
+                  )
+                : t(
+                    'The selected semantic project did not cover this schema; ' +
+                      'grounded on a different project instead.',
+                  ),
+            ),
+          );
+        }
+      }
       await refreshConversationSummaries();
       if (result.status === 'error') {
         dispatch(addDangerToast(t('The agent could not complete the turn.')));
@@ -1274,27 +1319,44 @@ const AiAgentPanel = () => {
           {queryEditor?.schema && <Chip>{queryEditor.schema}</Chip>}
           {queryEditor?.catalog && <Chip>{queryEditor.catalog}</Chip>}
           {queryEditor?.selectedText && <Chip>{t('Selection')}</Chip>}
-          {semanticProjects.length > 1 ? (
-            <Select
-              ariaLabel={t('Semantic layer project')}
-              options={semanticProjects.map(project => ({
-                value: project.id,
-                label: project.name,
-              }))}
-              value={selectedProjectId ?? undefined}
-              onChange={value => onSelectProject(value as string)}
-              showSearch={false}
-              size="small"
-              data-test="semantic-project-select"
-            />
+          {/* The MDL project picker is the always-visible entrypoint whenever the
+              active schema is covered by at least one semantic project — even a
+              single one — so the user can always see and change which project
+              grounds the SQL agent. The state badge sits beside it (document
+              count / readiness) since the dropdown already carries the name. When
+              no project covers the schema there is nothing to pick, so only the
+              badge shows. */}
+          {semanticProjects.length > 0 ? (
+            <Flex align="center" gap={4}>
+              <ProjectSelectWrap>
+                <Select
+                  ariaLabel={t('Semantic layer project')}
+                  options={semanticProjects.map(project => ({
+                    value: project.id,
+                    label: project.name,
+                  }))}
+                  value={selectedProjectId ?? undefined}
+                  onChange={value => onSelectProject(value as string)}
+                  onOpenChange={open => {
+                    // Re-probe on open so a project created since the last fetch
+                    // (e.g. in the MDL Lab) shows up in the options immediately.
+                    if (open) {
+                      refreshSemanticProjects();
+                    }
+                  }}
+                  showSearch={false}
+                  data-test="semantic-project-select"
+                />
+              </ProjectSelectWrap>
+              <SemanticLayerStateBadge
+                state={semanticLayerState}
+                projectName={null}
+              />
+            </Flex>
           ) : (
             <SemanticLayerStateBadge
               state={semanticLayerState}
-              projectName={
-                semanticProjects.find(
-                  project => project.id === selectedProjectId,
-                )?.name ?? null
-              }
+              projectName={null}
             />
           )}
         </ContextChips>

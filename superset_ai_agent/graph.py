@@ -71,6 +71,7 @@ from superset_ai_agent.semantic_layer.runtime import (
 )
 from superset_ai_agent.semantic_layer.schema_retriever import (
     create_retriever,
+    project_schema_items,
     retrieve_mdl_context,
     Retriever,
 )
@@ -370,9 +371,7 @@ class TextToSqlGraph:
         request = state["request"]
         context = self.context_provider.get_context(request)
         retrieval = getattr(self.context_provider, "last_retrieval", None)
-        retrieval_artifact = (
-            retrieval.retrieval if retrieval is not None else None
-        )
+        retrieval_artifact = retrieval.retrieval if retrieval is not None else None
         details = {
             "dataset_count": len(context.datasets),
             "database_name": context.database.name,
@@ -467,24 +466,35 @@ class TextToSqlGraph:
                     "warnings": warnings,
                 }
             )
+        owner_id = state.get("owner_id", DEFAULT_OWNER_ID)
         retrieved_items = retrieve_mdl_context(
             config=self.config,
             retriever=self.retriever,
             question=request.question,
             project_id=project_id,
-            owner_id=state.get("owner_id", DEFAULT_OWNER_ID),
+            owner_id=owner_id,
+            mdl_file_store=self.mdl_file_store,
+        )
+        # Join-closure source: the project's FULL active MDL (unranked), so a join
+        # partner that ranked out of the retriever top-k can still be injected.
+        manifest_items = project_schema_items(
+            project_id=project_id,
+            owner_id=owner_id,
             mdl_file_store=self.mdl_file_store,
         )
         # R2/C1: one post-retrieval entrypoint — unify fetch_context + retriever
-        # chunks, run table-selection over the *unified* set (C1.1), then dedup +
-        # bound across all sources (R-RET-E). C1.3: an opt-in LLM selector picks the
-        # relevant model subset, degrading closed to the heuristic.
+        # chunks, run table-selection over the *unified* set (C1.1), apply
+        # cross-schema join-closure, then dedup + bound across all sources
+        # (R-RET-E). C1.3: an opt-in LLM selector picks the relevant model subset,
+        # degrading closed to the heuristic.
         wren_context = build_unified_context(
             wren_context=wren_context,
             retrieved_items=retrieved_items,
             table_selection_limit=self.config.wren_table_selection_limit,
             max_context_items=self.config.wren_max_context_items,
             model_selector=self._model_selector(request.question),
+            manifest_items=manifest_items,
+            join_closure_limit=self.config.wren_join_closure_limit,
         )
         retrieval_artifact = state.get("wren_retrieval")
         if retrieval_artifact is not None and project_id is not None:
