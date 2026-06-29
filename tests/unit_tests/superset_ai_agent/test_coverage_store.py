@@ -207,3 +207,42 @@ def test_terminal_transition_clears_progress(store) -> None:
     store.complete(run.id, CoverageReport(score=0.8), score=0.8)
     # A completed run carries no live progress (it no longer applies).
     assert store.get(run.id).progress is None
+
+
+def test_set_recovery_status_and_conversation(store) -> None:
+    run = store.create(
+        project_id="p1", owner_id="u1", mdl_checksum="c1", docs_checksum="d1"
+    )
+    store.claim(run.id)
+    store.complete(run.id, CoverageReport(score=0.5), score=0.5)
+    # Defaults: no recovery yet.
+    fresh = store.get(run.id)
+    assert fresh.recovery_status == "none"
+    assert fresh.recovery_conversation_id is None
+    assert fresh.recovery_dismissed_at is None
+
+    store.set_recovery(run.id, status="running")
+    assert store.get(run.id).recovery_status == "running"
+    # Completing the run did not clobber recovery; setting ready links the thread.
+    store.set_recovery(run.id, status="ready", conversation_id="conv-1")
+    persisted = store.get(run.id)
+    assert persisted.recovery_status == "ready"
+    assert persisted.recovery_conversation_id == "conv-1"
+    # The completed report is preserved across recovery updates.
+    assert persisted.report is not None and persisted.score == 0.5
+
+
+def test_dismiss_recovery_is_durable_and_status_preserving(store) -> None:
+    run = store.create(
+        project_id="p1", owner_id="u1", mdl_checksum="c1", docs_checksum="d1"
+    )
+    store.claim(run.id)
+    store.complete(run.id, CoverageReport(score=0.5), score=0.5)
+    store.set_recovery(run.id, status="ready", conversation_id="conv-1")
+
+    store.dismiss_recovery(run.id)
+    persisted = store.get(run.id)
+    assert persisted.recovery_dismissed_at is not None
+    # Dismissal hides the notification but keeps the suggestions reachable.
+    assert persisted.recovery_status == "ready"
+    assert persisted.recovery_conversation_id == "conv-1"

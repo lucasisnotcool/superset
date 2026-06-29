@@ -43,12 +43,13 @@ that improve recall, validate before finishing. Only the mechanics change.
 
 | Need | Tool | Notes |
 |------|------|-------|
-| See real tables/columns/types | `get_physical_schema` | The authority. Never reference anything absent from it. |
+| See real tables/columns/types | `get_physical_schema` | The authority. Never reference anything absent from it. Multi-schema projects return `{schemas: {schema: {table: {columns, types}}}}` — use the schema each table is under. |
 | List existing MDL files | `list_mdl_files` | Path + status (new / unchanged / modified). |
 | Read a file's full JSON | `read_mdl_file` | Read before you edit. |
 | Refine an existing file | `patch_mdl_file` | **Preferred for edits.** Emit only the changed entities/columns, keyed by name; omitted entities/columns and their `properties` are preserved by the merge. |
 | Create / restructure a file | `write_mdl_file` | Full-content overwrite — for a NEW file or moving/removing an entity. Returns structural + physical validation. |
-| Delete a file | `delete_mdl_file` | |
+| Remove an entity | `remove_mdl_entity` | Drop a named model/relationship/metric/**calculated** column without re-emitting the file (physical columns can't be removed). Empties → file deleted. |
+| Delete a file | `delete_mdl_file` | Whole-file by path. |
 | Validate the whole project | `validate_project` | Structural + physical + (when available) engine deep-validate. Run before finishing. |
 | Ground edits in operator docs | `search_documents` / `list_documents` / `find_duplicate_documents` | Glossaries, metric formulas, synonyms. |
 
@@ -65,7 +66,8 @@ scratch when you mean to extend it.
 
 ## Phase 1 — Ground in the physical schema (physical authority)
 
-Call `get_physical_schema` first, every time, before writing a model. It returns:
+Call `get_physical_schema` first, every time, before writing a model. For a
+single-schema project it returns `{tables, column_types}`:
 
 ```json
 {
@@ -74,6 +76,22 @@ Call `get_physical_schema` first, every time, before writing a model. It returns
   "column_types": { "orders": { "order_id": "INTEGER", "total_amount": "DECIMAL(10,2)" } }
 }
 ```
+
+For a **multi-schema** project it returns the same data keyed by schema, so you
+can author the right `tableReference.schema` and same-named tables don't collide:
+
+```json
+{
+  "schemas": {
+    "sales":   { "orders":    { "columns": ["order_id", "customer_id"], "types": { "order_id": "INTEGER" } } },
+    "billing": { "invoices":  { "columns": ["invoice_id", "order_id"] } }
+  }
+}
+```
+
+A relationship may join models in **different** schemas (e.g. `sales.orders` ↔
+`billing.invoices`); the join condition uses model/column names — the engine
+translates to the dialect's schema-qualified SQL.
 
 Rules — these are **code-enforced** by validation; an MDL that breaks them cannot
 activate:

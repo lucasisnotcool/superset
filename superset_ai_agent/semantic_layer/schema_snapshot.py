@@ -44,6 +44,9 @@ class SchemaSnapshot(BaseModel):
     catalog_name: str | None = None
     schema_name: str | None = None
     tables: dict[str, list[str]] = Field(default_factory=dict)
+    #: Schema-qualified twin of ``tables`` (schema → table → columns). Empty for a
+    #: single-schema snapshot; restores schema-aware outage validation when set (F3).
+    tables_by_schema: dict[str, dict[str, list[str]]] = Field(default_factory=dict)
     captured_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -89,6 +92,7 @@ class SqlAlchemySchemaSnapshotStore:
             model.catalog_name = snapshot.catalog_name
             model.schema_name = snapshot.schema_name
             model.tables = snapshot.tables
+            model.tables_by_schema = snapshot.tables_by_schema or None
             model.captured_at = snapshot.captured_at
             session.commit()
             return _from_model(model)
@@ -122,5 +126,6 @@ def _from_model(model: AiAgentSchemaSnapshot) -> SchemaSnapshot:
         catalog_name=model.catalog_name,
         schema_name=model.schema_name,
         tables=dict(model.tables or {}),
+        tables_by_schema=dict(model.tables_by_schema or {}),
         captured_at=model.captured_at,
     )

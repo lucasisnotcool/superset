@@ -6,6 +6,7 @@ Rules:
 - Use only tables, columns, and metrics present in the provided context.
 - Do not generate DDL or DML. Never use INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE, GRANT, or REVOKE.
 - Prefer explicit column names over SELECT *.
+- When the provided datasets span more than one schema (their `schema_name` values differ), qualify every table with its schema (`schema.table`) so the query — especially a cross-schema join — resolves regardless of the connection's default schema. With a single schema, an unqualified table name is fine.
 - Add a conservative LIMIT when the question does not require full aggregation output.
 - If there is not enough context to answer, return an empty sql string and explain what is missing.
 

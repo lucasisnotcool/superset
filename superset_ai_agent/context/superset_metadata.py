@@ -17,14 +17,22 @@
 
 from __future__ import annotations
 
+import logging
+
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.context.base import ContextProvider
-from superset_ai_agent.integrations.superset.client import AgentContext, SupersetClient
+from superset_ai_agent.integrations.superset.client import (
+    AgentContext,
+    DatasetMetadata,
+    SupersetClient,
+)
 from superset_ai_agent.schemas import AgentQueryRequest
 from superset_ai_agent.semantic_layer.retrieval import (
     retrieve_schema_context,
     RetrievedContext,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class SupersetMetadataContextProvider(ContextProvider):
@@ -50,22 +58,17 @@ class SupersetMetadataContextProvider(ContextProvider):
                 dataset_ids=request.dataset_ids,
             )
 
+        # Only the database shell is needed here — ``datasets`` is replaced by the
+        # candidate scan below, so fetching them in the base context too would pay
+        # the per-dataset N+1 a second time for nothing.
         base_context = self.superset_client.get_agent_context(
             database_id=request.database_id,
             catalog_name=request.catalog_name,
             schema_name=request.schema_name,
             dataset_ids=[],
+            include_datasets=False,
         )
-        candidate_datasets = self.superset_client.list_datasets(
-            database_id=request.database_id,
-            catalog_name=request.catalog_name,
-            schema_name=request.schema_name,
-            limit=max(
-                self.config.wren_schema_table_scan_limit,
-                self.config.wren_schema_table_candidate_limit,
-                self.config.max_context_datasets,
-            ),
-        )
+        candidate_datasets = self._candidate_datasets(request)
         if not candidate_datasets:
             return base_context
         retrieved = retrieve_schema_context(
@@ -75,6 +78,63 @@ class SupersetMetadataContextProvider(ContextProvider):
         )
         self.last_retrieval = retrieved
         return retrieved.context
+
+    def _candidate_datasets(self, request: AgentQueryRequest) -> list[DatasetMetadata]:
+        """Datasets to rank for the question.
+
+        Single-schema (the common case): scan the one schema, unchanged. For a
+        **multi-schema project** (``effective_schema_names`` > 1), union every
+        member schema's datasets so the agent can rank — and join — across the
+        project's full scope, mirroring the modeling-time union
+        (``_onboarding_context``/``_schema_index_for_project``). The union is
+        bounded by ``wren_schema_total_candidate_limit`` (caps the N+1 scan);
+        ranking then selects the most relevant from the union.
+        """
+
+        per_schema_limit = max(
+            self.config.wren_schema_table_scan_limit,
+            self.config.wren_schema_table_candidate_limit,
+            self.config.max_context_datasets,
+        )
+        schemas = request.effective_schema_names
+        if len(schemas) <= 1:
+            return self.superset_client.list_datasets(
+                database_id=request.database_id,
+                catalog_name=request.catalog_name,
+                schema_name=request.schema_name,
+                limit=per_schema_limit,
+            )
+        total_cap = self.config.wren_schema_total_candidate_limit
+        seen: set[int] = set()
+        candidates: list[DatasetMetadata] = []
+        truncated = False
+        for schema in schemas:
+            if total_cap > 0 and len(candidates) >= total_cap:
+                truncated = True
+                break
+            for dataset in self.superset_client.list_datasets(
+                database_id=request.database_id,
+                catalog_name=request.catalog_name,
+                schema_name=schema,
+                limit=per_schema_limit,
+            ):
+                if dataset.id in seen:
+                    continue
+                seen.add(dataset.id)
+                candidates.append(dataset)
+            if total_cap > 0 and len(candidates) >= total_cap:
+                truncated = True
+                candidates = candidates[:total_cap]
+                break
+        if truncated:
+            logger.info(
+                "Cross-schema candidate union truncated at %d "
+                "(wren_schema_total_candidate_limit) over %d schemas %s",
+                total_cap,
+                len(schemas),
+                schemas,
+            )
+        return candidates
 
     def get_full_schema(self, request: AgentQueryRequest) -> AgentContext:
         """Return the **complete** in-scope schema, with no question ranking (CR3).
@@ -93,11 +153,15 @@ class SupersetMetadataContextProvider(ContextProvider):
                 schema_name=request.schema_name,
                 dataset_ids=request.dataset_ids,
             )
+        # Only the database shell is needed here — ``datasets`` is replaced by the
+        # candidate scan below, so fetching them in the base context too would pay
+        # the per-dataset N+1 a second time for nothing.
         base_context = self.superset_client.get_agent_context(
             database_id=request.database_id,
             catalog_name=request.catalog_name,
             schema_name=request.schema_name,
             dataset_ids=[],
+            include_datasets=False,
         )
         candidate_datasets = self.superset_client.list_datasets(
             database_id=request.database_id,

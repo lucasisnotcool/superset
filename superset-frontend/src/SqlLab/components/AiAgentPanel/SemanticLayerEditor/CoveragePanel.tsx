@@ -31,6 +31,7 @@ import { Icons } from '@superset-ui/core/components/Icons';
 import { CoverageReport, CoverageStatusInfo, getLatestCoverage } from '../api';
 import { CoverageReportBody } from './CoverageReportModal';
 import CoverageProgress from './CoverageProgress';
+import RecoverySuggestionsDialog from './RecoverySuggestionsDialog';
 
 export interface CoveragePanelProps {
   projectId: string;
@@ -67,11 +68,19 @@ const CoveragePanel = ({
   const [computedAt, setComputedAt] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [suggestionsOpen, setSuggestionsOpen] = useState(false);
 
   const status = info?.status;
   const running = status === 'analysing';
   const stale = status === 'stale';
   const hasReport = status === 'ready' || status === 'stale';
+  // Second entrypoint to the recovery suggestions (the banner is the first); both
+  // survive each other's dismissal because the state is server-side.
+  const recoveryRunId = info?.recovery_run_id ?? null;
+  const recoveryReady =
+    info?.recovery_status === 'ready' &&
+    info?.recovery_dismissed === false &&
+    Boolean(recoveryRunId);
 
   const loadReport = useCallback(async () => {
     setLoading(true);
@@ -104,8 +113,10 @@ const CoveragePanel = ({
   if (running) {
     body = <CoverageProgress progress={info?.progress} />;
   } else if (hasReport) {
-    body = (
-      <Flex vertical gap={theme.sizeUnit * 2}>
+    // The freshness alerts and "Computed …" stamp belong with the score/badges
+    // in the pinned summary, so they stay in view while the claims scroll.
+    const summaryExtra = (
+      <>
         {stale ? (
           <Alert
             type="warning"
@@ -120,8 +131,35 @@ const CoveragePanel = ({
             {t('Computed %s', formatTimestamp(computedAt))}
           </Typography.Text>
         ) : null}
-        <CoverageReportBody report={report} loading={loading} error={error} />
-      </Flex>
+        {recoveryReady ? (
+          <Alert
+            type="info"
+            showIcon
+            message={t('Coverage suggestions ready')}
+            description={t(
+              'The recovery agent proposed edits to close these gaps.',
+            )}
+            action={
+              <Button
+                buttonSize="small"
+                buttonStyle="primary"
+                onClick={() => setSuggestionsOpen(true)}
+                data-test="coverage-review-suggestions"
+              >
+                {t('Review')}
+              </Button>
+            }
+          />
+        ) : null}
+      </>
+    );
+    body = (
+      <CoverageReportBody
+        report={report}
+        loading={loading}
+        error={error}
+        summaryExtra={summaryExtra}
+      />
     );
   } else {
     // status === 'none' (or unknown): no run exists yet.
@@ -140,6 +178,7 @@ const CoveragePanel = ({
       title={t('Coverage')}
       show={open}
       onHide={onClose}
+      centered
       footer={
         <Flex justify="end" gap={theme.sizeUnit * 2}>
           <Button onClick={onClose} data-test="coverage-panel-close">
@@ -163,6 +202,12 @@ const CoveragePanel = ({
       data-test="coverage-panel"
     >
       {body}
+      <RecoverySuggestionsDialog
+        projectId={projectId}
+        runId={recoveryRunId}
+        open={suggestionsOpen}
+        onClose={() => setSuggestionsOpen(false)}
+      />
     </Modal>
   );
 };

@@ -169,6 +169,7 @@ class LlmWrenClient:
         document: SemanticDocument,
         schema: dict[str, list[str]] | None = None,
         schema_types: dict[str, dict[str, str]] | None = None,
+        schema_by_schema: dict[str, dict[str, dict[str, object]]] | None = None,
         instructions: list[str] | None = None,
     ) -> MdlEnrichmentProposal:
         base_mdl = self._effective_mdl_json(project)
@@ -204,13 +205,27 @@ class LlmWrenClient:
         # when catalog types are available (live path), also carry them so the model
         # types a brand-new column correctly, and the loop's SchemaIndex can reject a
         # cross-family type mismatch.
+        # F4: a multi-schema project also carries a SCHEMA-QUALIFIED view (each table
+        # under its schema), so the model authors a correct ``tableReference.schema``
+        # and the correction loop's index validates per-schema (no same-name collision
+        # across schemas). Single-schema enrichment is unaffected.
+        tables_by_schema, types_by_schema = _split_schema_view(schema_by_schema)
         schema_index = (
-            SchemaIndex.from_snapshot(schema, schema_types) if schema else None
+            SchemaIndex.from_snapshot(
+                schema,
+                schema_types,
+                tables_by_schema=tables_by_schema,
+                types_by_schema=types_by_schema,
+            )
+            if schema
+            else None
         )
         if schema:
             base_payload["physical_schema"] = schema
             if schema_types:
                 base_payload["physical_schema_types"] = schema_types
+            if schema_by_schema:
+                base_payload["physical_schema_by_schema"] = schema_by_schema
         # Operator guidance (Wren `instructions`) steers the enrichment.
         if instructions:
             base_payload["instructions"] = instructions
@@ -608,6 +623,38 @@ class LlmWrenClient:
                 (getattr(result, "content", "") or "")[:200],
             )
             return None
+
+
+def _split_schema_view(
+    view: dict[str, dict[str, dict[str, object]]] | None,
+) -> tuple[
+    dict[str, dict[str, list[str]]] | None,
+    dict[str, dict[str, dict[str, str]]] | None,
+]:
+    """Split a schema-qualified view into ``(tables_by_schema, types_by_schema)``.
+
+    The copilot/onboarding surface a ``{schema: {table: {columns, types?}}}`` view;
+    ``SchemaIndex.from_snapshot`` wants the two maps separately. Returns
+    ``(None, None)`` for an empty view (single-schema enrichment).
+    """
+
+    if not view:
+        return None, None
+    tables: dict[str, dict[str, list[str]]] = {}
+    types: dict[str, dict[str, dict[str, str]]] = {}
+    for schema_name, tbls in view.items():
+        tables[schema_name] = {}
+        for table, entry in tbls.items():
+            cols = entry.get("columns") if isinstance(entry, dict) else None
+            tables[schema_name][table] = (
+                [str(col) for col in cols] if isinstance(cols, list) else []
+            )
+            typ = entry.get("types") if isinstance(entry, dict) else None
+            if isinstance(typ, dict) and typ:
+                types.setdefault(schema_name, {})[table] = {
+                    str(key): str(value) for key, value in typ.items()
+                }
+    return tables, (types or None)
 
 
 def _supersedes(candidate: Any, current: Any) -> bool:

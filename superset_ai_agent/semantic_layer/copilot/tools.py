@@ -57,6 +57,7 @@ from superset_ai_agent.semantic_layer.mdl_files import normalize_mdl_path
 from superset_ai_agent.semantic_layer.mdl_merge import (
     merge_manifest_sections,
     MERGE_SECTIONS,
+    remove_manifest_entities,
 )
 from superset_ai_agent.semantic_layer.mdl_schema import JOIN_TYPES
 from superset_ai_agent.semantic_layer.mdl_validator import (
@@ -253,6 +254,44 @@ class MdlToolset:
                 },
             ),
             ToolSpec(
+                name="remove_mdl_entity",
+                description=(
+                    "Remove named entities from an existing MDL file: a model, "
+                    "relationship, metric, view, or a CALCULATED column. Prefer this "
+                    "over rewriting the whole file with write_mdl_file just to drop "
+                    "something. Physical columns cannot be removed (physical "
+                    "authority — they come from the catalog). If a removal empties "
+                    "the file, the file is deleted. Returns validation."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": path_param,
+                        "removals": {
+                            "type": "array",
+                            "description": (
+                                "Entities to remove. Each item is "
+                                "{section, name, column?} where section is one of "
+                                "models|relationships|metrics|views; set 'column' "
+                                "(with section=models, name=<model>) to remove a "
+                                "calculated column."
+                            ),
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "section": {"type": "string"},
+                                    "name": {"type": "string"},
+                                    "column": {"type": "string"},
+                                },
+                                "required": ["section", "name"],
+                            },
+                        },
+                        "summary": {"type": "string"},
+                    },
+                    "required": ["path", "removals"],
+                },
+            ),
+            ToolSpec(
                 name="validate_project",
                 description=(
                     "Validate the whole MDL project (structural + physical + "
@@ -263,8 +302,12 @@ class MdlToolset:
             ToolSpec(
                 name="get_physical_schema",
                 description=(
-                    "Return the real tables/columns available in this schema. Use "
-                    "to ground edits; never reference anything absent here."
+                    "Return the real tables/columns/types available to this project. "
+                    "Use to ground edits; never reference anything absent here. For a "
+                    "single-schema project the result is {tables, column_types}; for a "
+                    "MULTI-SCHEMA project it is {schemas: {schema: {table: {columns, "
+                    "types}}}} — author each model's tableReference with the schema "
+                    "the table is listed under."
                 ),
                 parameters={"type": "object", "properties": {}},
             ),
@@ -498,6 +541,7 @@ class MdlToolset:
             "write_mdl_file": self._write_mdl_file,
             "patch_mdl_file": self._patch_mdl_file,
             "delete_mdl_file": self._delete_mdl_file,
+            "remove_mdl_entity": self._remove_mdl_entity,
             "validate_project": self._validate_project,
             "get_physical_schema": self._get_physical_schema,
             "find_tables": self._find_tables,
@@ -697,15 +741,15 @@ class MdlToolset:
     def _delete_mdl_file(self, args: dict[str, Any]) -> dict[str, Any]:
         path = self._require_path(args)
         if path not in self._working:
-            # Deletion is whole-file by path; there is no per-model delete. A model
-            # lives inside a file's models[]/relationships[], so removing or moving
-            # one means rewriting that file with write_mdl_file (P4).
+            # delete_mdl_file is whole-file by path. To remove one entity inside a
+            # file (a model, relationship, metric, or calculated column) use
+            # remove_mdl_entity; to relocate one, remove it here and write it back
+            # elsewhere with write_mdl_file.
             return {
                 "error": (
-                    f"No MDL file at {path!r} to delete. Deletion removes whole "
-                    "files by path; to remove or relocate a model (for example a "
-                    "join wrongly placed in models[]), rewrite its containing file "
-                    "with write_mdl_file."
+                    f"No MDL file at {path!r} to delete. delete_mdl_file removes "
+                    "whole files by path; to remove a single model/relationship/"
+                    "metric/calculated column, use remove_mdl_entity."
                 )
             }
         del self._working[path]
@@ -713,15 +757,144 @@ class MdlToolset:
             self._summaries[path] = str(args["summary"])
         return {"path": path, "deleted": True}
 
+    def _remove_mdl_entity(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Remove named entities (or a calculated column) from an existing file.
+
+        The inverse of ``patch_mdl_file``: instead of re-emitting the whole file to
+        drop something, name what to remove. Upholds physical authority — a physical
+        (non-``isCalculated``) column is refused, since it comes from the catalog.
+        Each removal is validated and applied to the working copy; a removal that
+        empties the file deletes the file (DC-D4). Invalid/absent targets are
+        reported per-item so a batch with one bad entry still applies the rest.
+        """
+
+        path = normalize_mdl_path(self._require_path(args))
+        if path not in self._working:
+            return {
+                "error": (
+                    f"No MDL file at {path!r} to edit. remove_mdl_entity removes "
+                    "entities from an existing file; there is nothing to remove here."
+                )
+            }
+        removals = args.get("removals")
+        if not isinstance(removals, list) or not removals:
+            return {
+                "error": (
+                    "remove_mdl_entity requires a non-empty 'removals' list of "
+                    "{section, name, column?} objects."
+                )
+            }
+        try:
+            base = json.loads(self._working[path])
+        except (ValueError, TypeError):
+            return {"error": f"Working copy of {path!r} is not valid JSON."}
+        if not isinstance(base, dict):
+            return {"error": f"Working copy of {path!r} is not a JSON object."}
+
+        valid, rejected = self._validate_removals(base, removals)
+        if not valid:
+            return {"removed": [], "rejected": rejected}
+
+        new_base, removed, missing = remove_manifest_entities(base, valid)
+        if _manifest_is_empty(new_base):
+            # The last entity was removed — drop the now-empty file (DC-D4) rather
+            # than stage an empty-root manifest the activation gate would reject.
+            del self._working[path]
+            if args.get("summary"):
+                self._summaries[path] = str(args["summary"])
+            result: dict[str, Any] = {"path": path, "deleted": True, "removed": removed}
+        else:
+            result = self._stage_content(
+                path, json.dumps(new_base, indent=2), args.get("summary")
+            )
+            result["removed"] = removed
+        if missing:
+            result["missing"] = missing
+        if rejected:
+            result["rejected"] = rejected
+        return result
+
+    def _validate_removals(
+        self, base: dict[str, Any], removals: list[Any]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Split a removal batch into (valid, rejected), enforcing physical authority.
+
+        A removal targets a known section and names an entity; a column removal must
+        target a *calculated* column (a physical column comes from the catalog and
+        cannot be removed, DC-D3). Order/shape problems are rejected per-item, never
+        raised, so one bad entry doesn't drop the whole batch.
+        """
+
+        valid: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
+        for removal in removals:
+            if not isinstance(removal, dict):
+                rejected.append({"removal": removal, "error": "Invalid entry."})
+                continue
+            section = removal.get("section")
+            name = removal.get("name")
+            column = removal.get("column")
+            if not isinstance(section, str) or section not in MERGE_SECTIONS:
+                rejected.append(
+                    {
+                        "removal": removal,
+                        "error": f"'section' must be one of {sorted(MERGE_SECTIONS)}.",
+                    }
+                )
+                continue
+            if not isinstance(name, str) or not name.strip():
+                rejected.append({"removal": removal, "error": "A 'name' is required."})
+                continue
+            if column is not None and (
+                not isinstance(column, str) or not column.strip()
+            ):
+                rejected.append(
+                    {"removal": removal, "error": "'column' must be a string."}
+                )
+                continue
+            if column:
+                existing = _find_column(base, name, column)
+                if existing is not None and not existing.get("isCalculated"):
+                    rejected.append(
+                        {
+                            "removal": removal,
+                            "error": (
+                                f"Column '{column}' on '{name}' is a physical column; "
+                                "physical columns come from the catalog and cannot be "
+                                "removed. Only calculated columns (isCalculated) can."
+                            ),
+                        }
+                    )
+                    continue
+            entry: dict[str, Any] = {"section": section, "name": name}
+            if column:
+                entry["column"] = column
+            valid.append(entry)
+        return valid, rejected
+
     def _validate_project(self, _args: dict[str, Any]) -> dict[str, Any]:
         return self.validate_working().model_dump(mode="json")
 
     def _get_physical_schema(self, _args: dict[str, Any]) -> dict[str, Any]:
         if self._schema_index is None:
             return {"tables": {}, "note": "No physical schema available."}
-        result: dict[str, Any] = {"tables": self._schema_index.to_tables()}
-        if self._schema_index.has_types():
-            result["column_types"] = self._schema_index.typed_tables()
+        index = self._schema_index
+        if index.is_multi_schema():
+            # F1: a cross-schema project must surface each table UNDER its schema so
+            # the agent can author a correct tableReference.schema, and same-named
+            # tables across schemas don't collide. The flat `tables` shape drops the
+            # schema and silently hides one of any collision.
+            return {
+                "schemas": index.schema_qualified_view(),
+                "note": (
+                    "This project spans multiple schemas. Each table is listed under "
+                    "its physical schema; set that schema in the model's "
+                    'tableReference ({"schema": ..., "table": ...}).'
+                ),
+            }
+        result: dict[str, Any] = {"tables": index.to_tables()}
+        if index.has_types():
+            result["column_types"] = index.typed_tables()
         return result
 
     def _find_tables(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -749,7 +922,9 @@ class MdlToolset:
             columns: list[dict[str, Any]] = []
             for column in self._schema_index.columns_for(table, match_schema):
                 entry: dict[str, Any] = {"name": column}
-                column_type = self._schema_index.column_type(table, column)
+                column_type = self._schema_index.column_type(
+                    table, column, match_schema
+                )
                 if column_type:
                     entry["type"] = column_type
                 columns.append(entry)
@@ -887,7 +1062,7 @@ class MdlToolset:
         columns_payload: list[dict[str, Any]] = []
         for column in self._schema_index.columns_for(table, schema):
             entry: dict[str, Any] = {"name": column}
-            column_type = self._schema_index.column_type(table, column)
+            column_type = self._schema_index.column_type(table, column, schema)
             if column_type:
                 entry["type"] = column_type
             columns_payload.append(entry)
@@ -1338,6 +1513,28 @@ def _ignored_structural_edits(
     return ignored
 
 
+def _find_column(
+    base: dict[str, Any], model_name: str, column_name: str
+) -> dict[str, Any] | None:
+    """Return the named column dict on the named model, or ``None`` if absent."""
+
+    for model in base.get("models", []) or []:
+        if isinstance(model, dict) and model.get("name") == model_name:
+            for column in model.get("columns", []) or []:
+                if isinstance(column, dict) and column.get("name") == column_name:
+                    return column
+    return None
+
+
+def _manifest_is_empty(manifest: dict[str, Any]) -> bool:
+    """True when a manifest holds no entities in any mergeable section."""
+
+    return not any(
+        isinstance(manifest.get(section), list) and manifest.get(section)
+        for section in MERGE_SECTIONS
+    )
+
+
 def _overlay_entity_names(
     base: dict[str, Any], overlay: dict[str, Any]
 ) -> tuple[set[str], set[str]]:
@@ -1377,6 +1574,7 @@ _MUTATING_ACTIONS: dict[str, ToolActionKind] = {
     "write_mdl_file": "write",
     "patch_mdl_file": "write",
     "delete_mdl_file": "delete",
+    "remove_mdl_entity": "remove",
     "propose_onboard_table": "onboard",
     "propose_onboard_tables": "onboard",
     "propose_relationships": "relate",
@@ -1413,6 +1611,14 @@ def _summarize_mutation(
         path = result.get("path")
         paths = [path] if isinstance(path, str) else []
         return paths, {"path": path} if paths else {}, None
+    if name == "remove_mdl_entity":
+        path = result.get("path")
+        paths = [path] if isinstance(path, str) else []
+        removed = result.get("removed")
+        removed = removed if isinstance(removed, list) else []
+        summary = {"removed": removed, "removed_count": len(removed)} if removed else {}
+        detail = f"{len(removed)} entit(ies)" if removed else None
+        return paths, summary, detail
     if name == "propose_onboard_table":
         path = result.get("path")
         paths = [path] if isinstance(path, str) else []

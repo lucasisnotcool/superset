@@ -340,6 +340,42 @@ test('rolls up agent tool calls and expands the per-file list with source chips'
   expect(files[0]).toHaveTextContent('models/a.json');
 });
 
+test('renders the remove verb in the rollup line', async () => {
+  fetchMock.get(PROVENANCE, [
+    {
+      id: 'agent-remove',
+      kind: 'copilot_edit',
+      status: 'ok',
+      summary: 'Dropped a stale relationship and a calculated column',
+      created_at: '2026-06-26T05:00:00Z',
+      actor_type: 'agent',
+      detail: {
+        source_type: 'copilot',
+        action_summary: { remove: 2 },
+        tool_calls: [
+          {
+            tool: 'remove_mdl_entity',
+            action: 'remove',
+            paths: ['relationships.json'],
+            source_document_ids: [],
+            args_summary: { removed_count: 2 },
+            status: 'ok',
+          },
+        ],
+      },
+    },
+  ]);
+
+  render(
+    <MdlProvenanceDialog open projectId="project-1" onClose={jest.fn()} />,
+  );
+
+  await screen.findByTestId('provenance-entry');
+  expect(screen.getByTestId('provenance-rollup')).toHaveTextContent(
+    'Removed 2 entit(ies)',
+  );
+});
+
 test('truncates a long file list behind a +N more toggle', async () => {
   fetchMock.get(PROVENANCE, [
     {

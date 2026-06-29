@@ -88,6 +88,7 @@ const CoverageDialog = ({ projectId, open, onClose }: CoverageDialogProps) => {
       show={open}
       onHide={onClose}
       footer={null}
+      centered
       data-test="coverage-dialog"
     >
       <Flex vertical gap={theme.sizeUnit * 2}>

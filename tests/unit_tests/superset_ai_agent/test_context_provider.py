@@ -38,6 +38,7 @@ class FakeSupersetClient:
         catalog_name: str | None = None,
         schema_name: str | None = None,
         dataset_ids: list[int] | None = None,
+        include_datasets: bool = True,
     ) -> AgentContext:
         return AgentContext(
             database=DatabaseSummary(id=database_id, name="warehouse"),
@@ -161,3 +162,96 @@ def test_get_full_schema_returns_whole_scope_ignoring_ranking() -> None:
         "pipeline_moves",
     ]
     assert client.list_limits == [50]  # bounded by the scan limit, not the cap
+
+
+class _PerSchemaClient(FakeSupersetClient):
+    """``list_datasets`` returns schema-specific rows so the union is observable."""
+
+    def __init__(self, by_schema: dict[str, list[tuple[int, str]]]) -> None:
+        super().__init__()
+        self._by_schema = by_schema
+        self.scanned_schemas: list[str | None] = []
+
+    def list_datasets(
+        self,
+        *,
+        database_id: int,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        dataset_ids: list[int] | None = None,
+        limit: int = 8,
+    ) -> list[DatasetMetadata]:
+        self.list_limits.append(limit)
+        self.scanned_schemas.append(schema_name)
+        return [
+            DatasetMetadata(
+                id=ident,
+                table_name=name,
+                schema_name=schema_name,
+                database_id=database_id,
+                columns=[],
+                metrics=[],
+            )
+            for ident, name in self._by_schema.get(schema_name or "", [])
+        ]
+
+
+def test_multi_schema_project_unions_candidates_across_schemas() -> None:
+    # A multi-schema project (schema_names set) must rank over the UNION of all
+    # member schemas' datasets, not just the primary — so a secondary-schema table
+    # can reach the prompt and be joined.
+    client = _PerSchemaClient({"public": [(1, "orders")], "crm": [(2, "customers")]})
+    provider = SupersetMetadataContextProvider(
+        client,
+        config=AgentConfig(wren_schema_table_candidate_limit=10),
+    )
+
+    context = provider.get_context(
+        AgentQueryRequest(
+            question="orders by customers",
+            database_id=1,
+            schema_name="public",
+            schema_names=["public", "crm"],
+        )
+    )
+
+    assert client.scanned_schemas == ["public", "crm"]  # both scanned
+    assert sorted(d.table_name for d in context.datasets) == ["customers", "orders"]
+
+
+def test_multi_schema_union_is_bounded_by_total_cap() -> None:
+    # The union scan stops once the total cap is reached (bounds the N+1 scan).
+    client = _PerSchemaClient(
+        {"public": [(1, "orders"), (2, "items")], "crm": [(3, "customers")]}
+    )
+    provider = SupersetMetadataContextProvider(
+        client,
+        config=AgentConfig(
+            wren_schema_total_candidate_limit=1,
+            wren_schema_table_candidate_limit=10,
+        ),
+    )
+
+    provider.get_context(
+        AgentQueryRequest(
+            question="orders",
+            database_id=1,
+            schema_name="public",
+            schema_names=["public", "crm"],
+        )
+    )
+
+    # Cap hit after the first schema → the second schema is never scanned.
+    assert client.scanned_schemas == ["public"]
+
+
+def test_single_schema_request_is_unchanged_no_union() -> None:
+    # Regression guard: a single-schema scope makes exactly one list_datasets call.
+    client = _PerSchemaClient({"sales": [(1, "deals")]})
+    provider = SupersetMetadataContextProvider(client)
+
+    provider.get_context(
+        AgentQueryRequest(question="deals", database_id=1, schema_name="sales")
+    )
+
+    assert client.scanned_schemas == ["sales"]

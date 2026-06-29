@@ -69,6 +69,9 @@ SemanticLayerEventType = Literal[
     # Live, non-provenance coverage progress (Feature C): emitted at stage
     # boundaries to nudge the badge to re-poll; never a provenance timeline entry.
     "coverage_progress",
+    # Non-provenance: the chained recovery agent finished and has gap-closing
+    # suggestions to review. Wakes the notification banner; not a timeline entry.
+    "recovery_suggestions_ready",
     # Project lifecycle: the origin entry stamped on a duplicated project
     # (plan_mdl_lab_spec.md DP8) recording its ``duplicated_from`` lineage.
     "mdl_project_created",

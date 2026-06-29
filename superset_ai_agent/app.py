@@ -79,6 +79,7 @@ from superset_ai_agent.persistence.database import (
     create_session_factory,
     run_migrations,
 )
+from superset_ai_agent.persistence.ttl_cache import TtlCache
 from superset_ai_agent.schemas import (
     AgentQueryRequest,
     AgentQueryResponse,
@@ -1515,6 +1516,132 @@ def create_app(  # noqa: C901
         except Exception:  # pylint: disable=broad-except
             logger.warning("Failed to record coverage provenance.", exc_info=True)
 
+        # Chain the recovery agent when the report has gaps and the feature is on.
+        # Separate job (ack-fast-then-process): coverage labels land immediately;
+        # the recovery Copilot turn streams its suggestions in afterwards.
+        if (
+            app_config.wren_copilot_enabled
+            and app_config.wren_coverage_recovery_enabled
+            and (report.missing + report.partial) > 0
+        ):
+            try:
+                active_coverage_run_store.set_recovery(run_id, status="pending")
+                active_job_runner.submit(
+                    lambda: _run_recovery_job(run_id, project, owner_id)
+                )
+            except Exception:  # pylint: disable=broad-except
+                logger.warning("Failed to schedule coverage recovery.", exc_info=True)
+
+    def _run_recovery_job(  # noqa: C901 - gate/seed/run/persist/emit seams
+        run_id: str, project: SemanticProject, owner_id: str
+    ) -> None:
+        """Chained Copilot turn that proposes edits to close coverage gaps.
+
+        Reads the completed run's report, seeds a ``kind="recovery"`` conversation
+        with the report as a synthetic user message, runs the full Copilot toolset,
+        and persists the resulting changeset as the conversation's artifact (the
+        reviewable suggestion set). Never auto-applies; emits a non-provenance
+        ``recovery_suggestions_ready`` event when there is something to review.
+        """
+
+        if not (
+            app_config.wren_copilot_enabled
+            and app_config.wren_coverage_recovery_enabled
+        ):
+            return
+        try:
+            run = active_coverage_run_store.get(run_id)
+        except CoverageRunNotFoundError:
+            return
+        # Only the latest completed run recovers; a superseded run is skipped, and
+        # an already-recovered run is idempotent (no duplicate suggestions).
+        if run.status != "complete" or run.report is None:
+            return
+        if run.recovery_conversation_id is not None:
+            return
+        if (run.report.missing + run.report.partial) == 0:
+            active_coverage_run_store.set_recovery(run_id, status="empty")
+            return
+
+        active_coverage_run_store.set_recovery(run_id, status="running")
+        try:
+            files = active_mdl_file_store.list(project.id, owner_id=owner_id)
+            instructions = [
+                view.instruction
+                for view in _project_instruction_views(project, owner_id)
+            ]
+            user_message = _build_recovery_message(run.report)
+            conversation = active_conversation_store.create(
+                _scope_from_project(project),
+                owner_id=owner_id,
+                kind="recovery",
+                project_id=project.id,
+            )
+            turn_service = ConversationTurnService(active_conversation_store)
+            turn_service.begin_turn(
+                conversation.id,
+                user_content=user_message,
+                scope=_scope_from_project(project),
+                owner_id=owner_id,
+            )
+            changeset = run_copilot(
+                model_client=active_model_client,
+                files=files,
+                schema_index=_cached_schema_index(project),
+                user_message=user_message,
+                instructions=instructions,
+                history=None,
+                max_steps=app_config.wren_copilot_max_steps,
+                tool_result_max_chars=app_config.wren_copilot_tool_result_max_chars,
+                deep_validate=app_config.wren_modeling_deep_validation,
+                autopilot=app_config.wren_copilot_autopilot_enabled,
+                document_store=active_semantic_layer_store,
+                document_index=active_document_index,
+                project_id=project.id,
+                owner_id=owner_id,
+                retrieve_k=app_config.wren_document_retrieve_k,
+                embedder=active_embedder,
+            )
+            turn_service.commit_turn(
+                conversation.id,
+                assistant_content=changeset.message or "",
+                artifacts=[changeset_to_artifact(changeset)],
+                owner_id=owner_id,
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.warning("Coverage recovery failed.", exc_info=True)
+            try:
+                active_coverage_run_store.set_recovery(run_id, status="failed")
+            except CoverageRunNotFoundError:
+                pass
+            return
+
+        count = len(changeset.items)
+        active_coverage_run_store.set_recovery(
+            run_id,
+            status="ready" if count > 0 else "empty",
+            conversation_id=conversation.id,
+        )
+        if count > 0:
+            try:
+                _append_semantic_event(
+                    store=active_semantic_layer_store,
+                    owner_id=owner_id,
+                    event_type="recovery_suggestions_ready",
+                    scope=_scope_from_project(project),
+                    document_id=None,
+                    message=f"{count} coverage suggestion(s) ready to review",
+                    project_id=project.id,
+                    detail={
+                        "run_id": run_id,
+                        "recovery_conversation_id": conversation.id,
+                        "suggestion_count": count,
+                        "mdl_checksum": run.mdl_checksum,
+                    },
+                )
+            except Exception:  # pylint: disable=broad-except
+                logger.warning("Failed to emit recovery event.", exc_info=True)
+
     @api.post(
         "/agent/semantic-layer/projects/{project_id}/mdl-files",
         response_model=MdlFile,
@@ -1585,7 +1712,26 @@ def create_app(  # noqa: C901
             raise HTTPException(status_code=404, detail="MDL file not found.")
         return file
 
-    def _schema_index_for_project(
+    # Shared across requests (the app factory runs once); keyed per project so an
+    # unauthorized caller never reaches a cached entry (access is checked upstream).
+    _schema_index_cache: TtlCache[tuple[str, tuple[str, ...]], SchemaIndex] = TtlCache(
+        ttl_seconds=app_config.wren_schema_index_cache_ttl_seconds,
+    )
+
+    def _cached_schema_index(project: SemanticProject) -> SchemaIndex | None:
+        """Warm-cache-only physical schema index for background jobs.
+
+        A background job (coverage recovery) has no request, so it cannot build a
+        live schema index. Reuse the cache a recent request warmed; else ``None``
+        so MDL validation degrades to structural-only (the apply route re-validates
+        against a live schema before anything is persisted).
+        """
+
+        return _schema_index_cache.get(
+            (project.id, tuple(sorted(project.schema_names)))
+        )
+
+    def _schema_index_for_project(  # noqa: C901
         project: SemanticProject,
         fastapi_request: Request,
     ) -> SchemaIndex | None:
@@ -1595,10 +1741,22 @@ def create_app(  # noqa: C901
         a Superset outage the last snapshot is used so physical validation keeps
         catching hallucinated columns instead of degrading to structural-only.
         Returns ``None`` only when neither a live fetch nor a snapshot exists.
+
+        A short TTL cache (``wren_schema_index_cache_ttl_seconds``) fronts the live
+        fetch: Copilot/MDL operations (validate-on-edit, deploy preview, copilot
+        turns) call this repeatedly, and each live build is a Superset dataset list
+        + a per-dataset N+1 per project schema. Caching by project id is safe — the
+        caller has already authorized the project for this request, and the index
+        is project-scoped. Keyed on the schema set so a multi-schema change is a
+        miss; only successful live builds are cached (never the outage fallback).
         """
 
         if project.default_database_id is None:
             return None
+        cache_key = (project.id, tuple(sorted(project.schema_names)))
+        cached_index = _schema_index_cache.get(cache_key)
+        if cached_index is not None:
+            return cached_index
         try:
             request_context_provider, _ = build_superset_runtime(fastapi_request)
             # CR3: ground modeling/validation on the *complete* scope schema, not a
@@ -1636,7 +1794,10 @@ def create_app(  # noqa: C901
             snapshot = active_schema_snapshot_store.get(project.id)
             if snapshot is None:
                 return None
-            return SchemaIndex.from_snapshot(snapshot.tables)
+            return SchemaIndex.from_snapshot(
+                snapshot.tables,
+                tables_by_schema=snapshot.tables_by_schema or None,
+            )
         index = SchemaIndex.from_agent_context(context)
         try:
             active_schema_snapshot_store.upsert(
@@ -1646,11 +1807,15 @@ def create_app(  # noqa: C901
                     catalog_name=project.catalog_name,
                     schema_name=project.schema_name,
                     tables=index.to_tables(),
+                    # F3: persist the schema-qualified map too, so a multi-schema
+                    # project's outage fallback stays schema-aware.
+                    tables_by_schema=index.to_tables_by_schema(),
                 )
             )
         except Exception:  # noqa: S110  # pylint: disable=broad-except
             # Snapshotting is best-effort; never block validation on it.
             pass
+        _schema_index_cache.set(cache_key, index)
         return index
 
     def _project_has_models(project_id: str, *, owner_id: str) -> bool:
@@ -2447,6 +2612,17 @@ def create_app(  # noqa: C901
                 if active is not None and active.progress is not None
                 else None
             ),
+            # Recovery agent (latest run): drives the "suggestions ready"
+            # notification. ``recovery_dismissed`` is the durable per-run dismissal.
+            "recovery_status": (
+                latest.recovery_status if latest is not None else "none"
+            ),
+            "recovery_run_id": latest.id if latest is not None else None,
+            "recovery_dismissed": (
+                latest.recovery_dismissed_at is not None
+                if latest is not None
+                else False
+            ),
         }
 
     @api.post(
@@ -2496,6 +2672,90 @@ def create_app(  # noqa: C901
             }
             for checksum, run in runs.items()
         }
+
+    def _require_coverage_run(
+        project_id: str, run_id: str, *, fastapi_request: Request, identity, permission
+    ) -> CoverageRun:
+        authorize_semantic_project(
+            fastapi_request,
+            project_id,
+            owner_id=identity.owner_id,
+            permission=permission,
+        )
+        try:
+            run = active_coverage_run_store.get(run_id)
+        except CoverageRunNotFoundError as ex:
+            raise HTTPException(404, "Coverage run not found.") from ex
+        if run.project_id != project_id:
+            raise HTTPException(404, "Coverage run not found.")
+        return run
+
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}/coverage/runs/{run_id}/recovery",
+    )
+    def get_coverage_recovery(
+        project_id: str,
+        run_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> dict[str, Any]:
+        """Recovery suggestions (a reviewable changeset) for a coverage run.
+
+        Reads the changeset back from the recovery conversation's artifact —
+        server-authoritative, the same source the apply/provenance path trusts.
+        ``stale`` flags that the active MDL moved on since this run was audited.
+        """
+
+        _require_copilot_enabled()
+        run = _require_coverage_run(
+            project_id,
+            run_id,
+            fastapi_request=fastapi_request,
+            identity=identity,
+            permission="read",
+        )
+        changeset = None
+        if run.recovery_conversation_id:
+            try:
+                conversation = active_conversation_store.get(
+                    run.recovery_conversation_id, owner_id=identity.owner_id
+                )
+                changeset = changeset_from_conversation(conversation)
+            except Exception:  # pylint: disable=broad-except
+                changeset = None
+        current_checksum = _active_mdl_checksum(project_id, identity.owner_id)
+        return {
+            "run_id": run.id,
+            "status": run.recovery_status,
+            "conversation_id": run.recovery_conversation_id,
+            "suggestion_count": len(changeset.items) if changeset else 0,
+            "changeset": changeset.model_dump(mode="json") if changeset else None,
+            "dismissed": run.recovery_dismissed_at is not None,
+            "stale": run.mdl_checksum != current_checksum,
+        }
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/coverage/runs/{run_id}"
+        "/recovery/dismiss",
+    )
+    def dismiss_coverage_recovery(
+        project_id: str,
+        run_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> dict[str, bool]:
+        """Durably dismiss the 'recovery suggestions ready' notification (per run)."""
+
+        _require_copilot_enabled()
+        _require_coverage_run(
+            project_id,
+            run_id,
+            fastapi_request=fastapi_request,
+            identity=identity,
+            permission="write",
+        )
+        active_coverage_run_store.dismiss_recovery(run_id)
+        return {"dismissed": True}
 
     # -- Copilot conversations (persistent, multi-turn threads) -----------
     # Parallel to the AI SQL ``/agent/conversations`` surface but project-scoped
@@ -3530,6 +3790,13 @@ def create_app(  # noqa: C901
                 if schema_index is not None and schema_index.has_types()
                 else None
             ),
+            # F4: for a cross-schema project, also pass the schema-qualified view so
+            # the enrichment grounds + validates per-schema (single-schema → None).
+            schema_by_schema=(
+                schema_index.schema_qualified_view()
+                if schema_index is not None and schema_index.is_multi_schema()
+                else None
+            ),
             instructions=instructions,
         )
         # Re-validate the proposal against the live schema (R3) so hallucinated
@@ -4216,6 +4483,45 @@ def _scope_from_query(
     )
 
 
+def _build_recovery_message(report: CoverageReport) -> str:
+    """Serialize a coverage report's gaps into the recovery agent's user message.
+
+    Lists the missing/partial claims (with the judge's remediation hint and source
+    document) and instructs the agent to propose minimal, source-grounded MDL edits
+    that close them — removals allowed when justified. Covered findings are omitted.
+    """
+
+    gaps = [f for f in report.findings if f.status in ("missing", "partial")]
+    lines = [
+        "A coverage audit compared the project's source documents against the "
+        "active MDL and found gaps. Propose the minimal set of MDL edits that "
+        "capture the claims below that the model fails to represent. Only add or "
+        "change semantics the documents support. You may remove or rewrite MDL "
+        "that the documents contradict or that is redundant, but justify every "
+        "removal. Do not invent data. Cite the claim each edit closes.",
+        "",
+        (
+            f"Coverage: {round(report.score * 100)}% "
+            f"({report.covered} covered, {report.partial} partial, "
+            f"{report.missing} missing)."
+        ),
+        "",
+        "Gaps to close:",
+    ]
+    for index, finding in enumerate(gaps, start=1):
+        source = (
+            f" [from {finding.document_filename}]" if finding.document_filename else ""
+        )
+        entry = (
+            f"{index}. ({finding.status}) {finding.claim.subject}: "
+            f"{finding.claim.statement}{source}"
+        )
+        if finding.suggestion:
+            entry += f"\n   Hint: {finding.suggestion}"
+        lines.append(entry)
+    return "\n".join(lines)
+
+
 def _scope_from_project(project: SemanticProject) -> ConversationScope:
     if project.default_database_id is None:
         raise HTTPException(
@@ -4236,6 +4542,7 @@ def _enrichment_proposal(
     wren_client: WrenClient,
     schema: dict[str, list[str]] | None = None,
     schema_types: dict[str, dict[str, str]] | None = None,
+    schema_by_schema: dict[str, dict[str, dict[str, object]]] | None = None,
     instructions: list[str] | None = None,
 ) -> MdlEnrichmentProposal:
     return wren_client.propose_mdl_from_document(
@@ -4243,6 +4550,7 @@ def _enrichment_proposal(
         document=document,
         schema=schema,
         schema_types=schema_types,
+        schema_by_schema=schema_by_schema,
         instructions=instructions,
     )
 

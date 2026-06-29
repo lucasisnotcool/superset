@@ -57,9 +57,7 @@ def _model(name: str, schema: str, table: str, columns: list[str]) -> str:
                 {
                     "name": name,
                     "tableReference": {"schema": schema, "table": table},
-                    "columns": [
-                        {"name": col, "type": "VARCHAR"} for col in columns
-                    ],
+                    "columns": [{"name": col, "type": "VARCHAR"} for col in columns],
                 }
             ]
         }
@@ -127,3 +125,120 @@ def test_column_check_respects_schema_on_table_name_collision() -> None:
     )
     assert not result.valid
     assert any(m.code == "unknown_column" for m in result.messages)
+
+
+def _typed_dataset(table: str, schema: str, columns: dict[str, str]) -> DatasetMetadata:
+    return DatasetMetadata(
+        id=abs(hash((schema, table))) % 100000,
+        table_name=table,
+        schema_name=schema,
+        database_id=1,
+        columns=[
+            ColumnSummary(name=name, type=type_) for name, type_ in columns.items()
+        ],
+        metrics=[],
+    )
+
+
+def test_column_type_resolves_by_schema_on_collision() -> None:
+    # F2: same table+column in two schemas with DIFFERENT types. column_type with a
+    # schema must return that schema's type, not whichever won the flat overwrite.
+    index = SchemaIndex.from_agent_context(
+        AgentContext(
+            database=DatabaseSummary(id=1, name="db"),
+            datasets=[
+                _typed_dataset("orders", "sales", {"amount": "DOUBLE"}),
+                _typed_dataset("orders", "archive", {"amount": "BIGINT"}),
+            ],
+        )
+    )
+    assert index.column_type("orders", "amount", "sales") == "DOUBLE"
+    assert index.column_type("orders", "amount", "archive") == "BIGINT"
+    # Without a schema it falls back to the flat map (single-schema/snapshot behaviour).
+    assert index.column_type("orders", "amount") in {"DOUBLE", "BIGINT"}
+
+
+def test_schema_qualified_view_groups_tables_under_schemas() -> None:
+    # F1: the surfacing view keeps each table under its own schema, with types.
+    index = SchemaIndex.from_agent_context(
+        AgentContext(
+            database=DatabaseSummary(id=1, name="db"),
+            datasets=[
+                _typed_dataset("orders", "sales", {"id": "BIGINT"}),
+                _typed_dataset("orders", "archive", {"id": "BIGINT", "ts": "DATE"}),
+            ],
+        )
+    )
+    assert index.is_multi_schema() is True
+    view = index.schema_qualified_view()
+    assert set(view) == {"sales", "archive"}
+    assert view["sales"]["orders"]["columns"] == ["id"]
+    assert view["archive"]["orders"]["columns"] == ["id", "ts"]
+    assert view["sales"]["orders"]["types"] == {"id": "BIGINT"}
+
+
+def test_single_schema_index_is_not_multi_schema() -> None:
+    index = _index(_dataset("orders", "sales", ["id"]))
+    assert index.is_multi_schema() is False
+
+
+def test_from_snapshot_restores_qualified_maps() -> None:
+    # F3 plumbing: a multi-schema snapshot round-trips the qualified maps so
+    # cross-schema validation survives a Superset outage.
+    index = SchemaIndex.from_snapshot(
+        tables={"orders": ["id"]},
+        tables_by_schema={
+            "sales": {"orders": ["id"]},
+            "archive": {"orders": ["id", "ts"]},
+        },
+        types_by_schema={"sales": {"orders": {"id": "BIGINT"}}},
+    )
+    assert index.is_multi_schema() is True
+    assert index.has_column("orders", "ts", "archive")
+    assert not index.has_column("orders", "ts", "sales")
+    assert index.column_type("orders", "id", "sales") == "BIGINT"
+
+
+def test_type_mismatch_resolves_by_schema_on_collision() -> None:
+    # `code` is VARCHAR in 'sales' but BIGINT in 'archive'. A model under 'archive'
+    # typed VARCHAR must mismatch (archive is BIGINT); the same under 'sales' must
+    # NOT (sales is VARCHAR) — proving the type check resolves per-schema (F2).
+    index = SchemaIndex.from_agent_context(
+        AgentContext(
+            database=DatabaseSummary(id=1, name="db"),
+            datasets=[
+                _typed_dataset("orders", "sales", {"code": "VARCHAR"}),
+                _typed_dataset("orders", "archive", {"code": "BIGINT"}),
+            ],
+        )
+    )
+    archive = json.dumps(
+        {
+            "models": [
+                {
+                    "name": "a",
+                    "tableReference": {"schema": "archive", "table": "orders"},
+                    "columns": [{"name": "code", "type": "VARCHAR"}],
+                }
+            ]
+        }
+    )
+    sales = json.dumps(
+        {
+            "models": [
+                {
+                    "name": "b",
+                    "tableReference": {"schema": "sales", "table": "orders"},
+                    "columns": [{"name": "code", "type": "VARCHAR"}],
+                }
+            ]
+        }
+    )
+    assert any(
+        m.code == "column_type_mismatch"
+        for m in validate_mdl(archive, schema_index=index).messages
+    )
+    assert not any(
+        m.code == "column_type_mismatch"
+        for m in validate_mdl(sales, schema_index=index).messages
+    )

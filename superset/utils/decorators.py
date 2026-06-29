@@ -50,7 +50,8 @@ def statsd_gauge(metric_prefix: str | None = None) -> Callable[..., Any]:
                 return result
             except Exception as ex:
                 if (
-                    hasattr(ex, "status") and ex.status < 500  # pylint: disable=no-member
+                    hasattr(ex, "status")
+                    and ex.status < 500  # pylint: disable=no-member
                 ):
                     app.config["STATS_LOGGER"].gauge(f"{metric_prefix_}.warning", 1)
                 else:
@@ -141,11 +142,17 @@ def logs_context(
 @contextmanager
 def stats_timing(stats_key: str, stats_logger: BaseStatsLogger) -> Iterator[float]:
     """Provide a transactional scope around a series of operations."""
+    from superset.utils import server_timing
+
     start_ts = now_as_float()
     try:
         yield start_ts
     finally:
-        stats_logger.timing(stats_key, now_as_float() - start_ts)
+        elapsed_ms = now_as_float() - start_ts
+        stats_logger.timing(stats_key, elapsed_ms)
+        # Surface the same boundary in the response's Server-Timing header so
+        # frontend/backend attribution sees it (no-op outside a request).
+        server_timing.record_metric(stats_key, elapsed_ms)
 
 
 def arghash(args: Any, kwargs: Any) -> int:

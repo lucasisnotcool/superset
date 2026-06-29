@@ -263,7 +263,66 @@ def test_graph_skips_wren_context_without_schema() -> None:
     assert response.wren_context.available is False
     assert response.wren_context.dry_plan is None
     assert wren_client.mdl_paths == []
-    assert response.trace[1].summary == "Wren context requires a selected schema."
+    assert (
+        response.trace[1].summary
+        == "Wren context requires a selected project or schema."
+    )
+
+
+def test_graph_infers_schema_from_pinned_project(tmp_path) -> None:
+    # The AI SQL dropdown bug: a pinned project arrives with project_id but no
+    # schema_name (the SQL Lab tab has none). The project's schema is inferred so
+    # Wren context loads instead of blocking on "select a schema".
+    project_store = InMemorySemanticProjectStore()
+    mdl_store = InMemoryMdlFileStore()
+    project = project_store.resolve(
+        SemanticProjectResolveRequest(
+            database_id=1,
+            database_label="Examples",
+            schema_name="main",
+        ),
+        owner_id="analyst",
+    )
+    file = mdl_store.create(
+        project.id,
+        MdlFileCreateRequest(
+            path="models/birth_names.json",
+            content=json.dumps({"models": [{"name": "birth_names"}]}),
+        ),
+        owner_id="analyst",
+    )
+    mdl_store.update(
+        file.id,
+        MdlFileUpdateRequest(status="active"),
+        owner_id="analyst",
+    )
+    wren_client = FakeWrenClient()
+    graph = TextToSqlGraph(
+        config=AgentConfig(agent_storage_dir=str(tmp_path)),
+        model_client=FakeModelClient(
+            "SELECT name, SUM(num) AS total_births FROM birth_names GROUP BY name"
+        ),
+        context_provider=FakeContextProvider(),
+        superset_client=FakeSupersetClient(),
+        wren_client=wren_client,
+        semantic_project_store=project_store,
+        mdl_file_store=mdl_store,
+    )
+
+    response = graph.run(
+        AgentQueryRequest(
+            question="Show total births",
+            database_id=1,
+            # No schema_name — only the project pin, as the dropdown sends it.
+            project_id=project.id,
+        ),
+        owner_id="analyst",
+    )
+
+    assert response.wren_context is not None
+    assert response.wren_context.available is True
+    assert response.wren_context.project_id == project.id
+    assert response.wren_context.materialized_file_count == 1
 
 
 def test_graph_materializes_schema_project_for_wren_context(tmp_path) -> None:
@@ -388,9 +447,7 @@ def test_graph_injects_materialized_mdl_into_sql_prompt(tmp_path) -> None:
     assert response.wren_context.available is True
     # The model/column descriptions must reach the prompt the model received.
     prompt_text = "\n".join(
-        message.content
-        for messages in model_client.messages
-        for message in messages
+        message.content for messages in model_client.messages for message in messages
     )
     assert "Annual baby name registrations" in prompt_text
 
@@ -504,16 +561,16 @@ def test_graph_injects_instructions_into_sql_prompt() -> None:
 
 
 def test_dry_plan_diagnostics_extracts_error_and_errors() -> None:
-    assert dry_plan_diagnostics({"error": "table foo missing"}) == [
-        "table foo missing"
+    assert dry_plan_diagnostics({"error": "table foo missing"}) == ["table foo missing"]
+    assert dry_plan_diagnostics({"errors": ["bad column a", "bad column b"]}) == [
+        "bad column a",
+        "bad column b",
     ]
-    assert dry_plan_diagnostics(
-        {"errors": ["bad column a", "bad column b"]}
-    ) == ["bad column a", "bad column b"]
     # error + errors combine, with dedup and order preserved.
-    assert dry_plan_diagnostics(
-        {"error": "dup", "errors": ["dup", "other"]}
-    ) == ["dup", "other"]
+    assert dry_plan_diagnostics({"error": "dup", "errors": ["dup", "other"]}) == [
+        "dup",
+        "other",
+    ]
 
 
 def test_dry_plan_diagnostics_degrades_for_clean_or_missing_plan() -> None:

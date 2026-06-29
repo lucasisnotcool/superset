@@ -1,6 +1,18 @@
 # MDL Copilot — Follow-ups: Token Telemetry · Targeted Read · Removal · Input Levers — Implementation Plan
 
-**Status:** NOT STARTED · **Created:** 2026-06-29 · **Predecessor:** `plan_mdl_copilot_patch_tools_impl.md` (A+B, SHIPPED)
+**Status:** Item D (Phase 6) SHIPPED 2026-06-29 · Items C/E/B2 (Phases 1–5) DEFERRED ·
+**Predecessor:** `plan_mdl_copilot_patch_tools_impl.md` (A+B, SHIPPED)
+
+**Item D completion log (2026-06-29):** `remove_mdl_entity` tool added — name-keyed
+removal of a model/relationship/metric/view/**calculated** column via new pure
+helpers `remove_named`/`remove_manifest_entities` in `mdl_merge.py`; physical-column
+removal refused (DC-D3); empties-file → file deleted (DC-D4); per-item rejects/missing
+reported. New `remove` `ToolActionKind` (backend `copilot/schemas.py` + frontend
+`api.ts` + `MdlProvenanceDialog.tsx` ACTION_VERBS/ORDER → "Removed N entit(ies)");
+backend `action_summary` already generic so it counts `remove` with no change. Prompt
++ generate-mdl skill updated. Tests: 5 merge + 8 tool + 1 FE rollup; my suites green
+(backend 74, FE 14). **Items C (telemetry), E (input levers), B2 (read_mdl_model)
+remain DEFERRED — see Phases 1–5 below; build C first as the measurement gate.**
 
 A resumable, source-backed checklist for the items deferred from the A+B work
 (Phase 6 there). Each phase has a status box, explicit blockers/dependencies,

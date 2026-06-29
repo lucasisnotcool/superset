@@ -774,6 +774,12 @@ class SupersetAppInitializer:  # pylint: disable=too-many-public-methods
 
             return response
 
+        # Emit the Server-Timing response header (backend per-phase timings) so
+        # frontend/backend latency attribution is unambiguous.
+        from superset.utils import server_timing
+
+        server_timing.register_request_handlers(self.superset_app)
+
         @self.superset_app.after_request
         def cleanup_analytics_memory(response: Response) -> Response:
             """Force garbage collection after each request if feature flag enabled"""

@@ -59,12 +59,18 @@ class SchemaIndex:
     #: live ``from_agent_context`` path only; empty on the names-only snapshot path,
     #: so schema-aware checks degrade closed (to the bare-table behaviour) there.
     tables_by_schema: dict[str, dict[str, set[str]]] = field(default_factory=dict)
+    #: schema → table → {column: type}. The schema-qualified twin of ``column_types``
+    #: (which is flat and collides same-named tables across schemas). Lets a
+    #: cross-schema lookup return the *right* schema's type; empty when types are
+    #: unknown (names-only snapshot) or the index is unqualified.
+    types_by_schema: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)
 
     @classmethod
     def from_agent_context(cls, context: AgentContext) -> "SchemaIndex":
         tables: dict[str, set[str]] = {}
         column_types: dict[str, dict[str, str]] = {}
         tables_by_schema: dict[str, dict[str, set[str]]] = {}
+        types_by_schema: dict[str, dict[str, dict[str, str]]] = {}
         for dataset in context.datasets:
             if not dataset.table_name:
                 continue
@@ -81,10 +87,13 @@ class SchemaIndex:
             schema = (dataset.schema_name or "").lower()
             if schema:
                 tables_by_schema.setdefault(schema, {})[table] = columns
+                if types:
+                    types_by_schema.setdefault(schema, {})[table] = types
         return cls(
             tables=tables,
             column_types=column_types,
             tables_by_schema=tables_by_schema,
+            types_by_schema=types_by_schema,
         )
 
     @classmethod
@@ -92,6 +101,8 @@ class SchemaIndex:
         cls,
         tables: dict[str, list[str]],
         types: dict[str, dict[str, str]] | None = None,
+        tables_by_schema: dict[str, dict[str, list[str]]] | None = None,
+        types_by_schema: dict[str, dict[str, dict[str, str]]] | None = None,
     ) -> "SchemaIndex":
         index = cls(
             tables={
@@ -106,6 +117,27 @@ class SchemaIndex:
                 }
                 for table, cols in types.items()
             }
+        # F3: a multi-schema snapshot restores the qualified maps so cross-schema
+        # validation/surfacing keeps working on a Superset outage (not just the flat,
+        # collidable fallback). Absent → degrades closed to the names-only behaviour.
+        if tables_by_schema:
+            index.tables_by_schema = {
+                str(schema).lower(): {
+                    str(table).lower(): {str(col).lower() for col in cols}
+                    for table, cols in tbl.items()
+                }
+                for schema, tbl in tables_by_schema.items()
+            }
+        if types_by_schema:
+            index.types_by_schema = {
+                str(schema).lower(): {
+                    str(table).lower(): {
+                        str(col).lower(): str(type_) for col, type_ in cols.items()
+                    }
+                    for table, cols in tbl.items()
+                }
+                for schema, tbl in types_by_schema.items()
+            }
         return index
 
     def to_tables(self) -> dict[str, list[str]]:
@@ -117,6 +149,47 @@ class SchemaIndex:
         """Table → {column: type} for prompt grounding; empty when no types known."""
 
         return {table: dict(cols) for table, cols in self.column_types.items() if cols}
+
+    def to_tables_by_schema(self) -> dict[str, dict[str, list[str]]]:
+        """schema → table → sorted columns (persistence + the F3 snapshot)."""
+
+        return {
+            schema: {table: sorted(cols) for table, cols in tables.items()}
+            for schema, tables in self.tables_by_schema.items()
+        }
+
+    def typed_tables_by_schema(self) -> dict[str, dict[str, dict[str, str]]]:
+        """schema → table → {column: type}; empty when types are unknown."""
+
+        return {
+            schema: {table: dict(cols) for table, cols in tables.items() if cols}
+            for schema, tables in self.types_by_schema.items()
+            if tables
+        }
+
+    def schema_qualified_view(self) -> dict[str, dict[str, dict[str, object]]]:
+        """schema → table → {columns, types?} for a schema-qualified surfacing (F1).
+
+        Unlike the flat ``to_tables``/``typed_tables`` (which collide same-named
+        tables across schemas and carry no schema), this preserves every table under
+        its own schema so the agent can author a correct ``tableReference.schema``.
+        """
+
+        view: dict[str, dict[str, dict[str, object]]] = {}
+        for schema, tables in self.tables_by_schema.items():
+            view[schema] = {}
+            for table, cols in tables.items():
+                entry: dict[str, object] = {"columns": sorted(cols)}
+                types = self.types_by_schema.get(schema, {}).get(table)
+                if types:
+                    entry["types"] = dict(types)
+                view[schema][table] = entry
+        return view
+
+    def is_multi_schema(self) -> bool:
+        """True when this index spans more than one physical schema."""
+
+        return len(self.tables_by_schema) > 1
 
     def has_types(self) -> bool:
         return any(self.column_types.values())
@@ -141,7 +214,22 @@ class SchemaIndex:
             return column.lower() in scoped.get(table.lower(), set())
         return column.lower() in self.tables.get(table.lower(), set())
 
-    def column_type(self, table: str, column: str) -> str | None:
+    def column_type(
+        self, table: str, column: str, schema: str | None = None
+    ) -> str | None:
+        """Catalog type of a column. ``schema`` resolves cross-schema collisions.
+
+        With a ``schema`` (and a qualified index) the type comes from that schema's
+        table, so two same-named tables in different schemas no longer return each
+        other's types. Without one it falls back to the flat (collidable) map, which
+        is correct for single-schema scopes and the names-only snapshot.
+        """
+
+        if schema and self.types_by_schema:
+            scoped = self.types_by_schema.get(schema.lower(), {})
+            typed = scoped.get(table.lower())
+            if typed is not None:
+                return typed.get(column.lower())
         return self.column_types.get(table.lower(), {}).get(column.lower())
 
     def columns_for(self, table: str, schema: str | None = None) -> list[str]:
@@ -175,9 +263,9 @@ class SchemaIndex:
                 (schema.lower(), table, cols) for table, cols in scoped.items()
             ]
         elif self.tables_by_schema:
-            for schema_name, tables in self.tables_by_schema.items():
+            for qualified_schema, tables in self.tables_by_schema.items():
                 for table, cols in tables.items():
-                    candidates.append((schema_name, table, cols))
+                    candidates.append((qualified_schema, table, cols))
         else:
             # Names-only snapshot (or single-schema live index without schema map).
             candidates = [(None, table, cols) for table, cols in self.tables.items()]
@@ -659,6 +747,7 @@ def _validate_column_semantics(
         column,
         is_calculated,
         physical_name=physical_name,
+        schema=schema,
     )
     if mismatch is not None:
         messages.append(mismatch)
@@ -673,19 +762,22 @@ def _type_mismatch_message(
     is_calculated: bool,
     *,
     physical_name: str | None = None,
+    schema: str | None = None,
 ) -> MdlValidationMessage | None:
     """Cross-family type-mismatch error for a physical-mapped column (C3), or None.
 
     Conservative: fires only when the catalog type and the proposed type both resolve
     to a known, *different* family. Calculated columns are derived (a CAST may change
     family legitimately), so they are skipped. Degrades to ``None`` for unknown types
-    or the names-only snapshot path (no catalog type).
+    or the names-only snapshot path (no catalog type). ``schema`` is the model's
+    physical schema, so a cross-schema project compares against the right table's
+    type rather than a same-named table in another schema (F2).
     """
 
     if schema_index is None or is_calculated:
         return None
     lookup = physical_name or column_name
-    catalog_family = _type_family(schema_index.column_type(table, lookup))
+    catalog_family = _type_family(schema_index.column_type(table, lookup, schema))
     proposed_type = column.get("type")
     proposed_family = (
         _type_family(proposed_type) if isinstance(proposed_type, str) else None
@@ -696,7 +788,7 @@ def _type_mismatch_message(
         or catalog_family == proposed_family
     ):
         return None
-    catalog_type = schema_index.column_type(table, lookup)
+    catalog_type = schema_index.column_type(table, lookup, schema)
     return MdlValidationMessage(
         message=(
             f"Column {model_name}.{column_name} is typed '{proposed_type}' "

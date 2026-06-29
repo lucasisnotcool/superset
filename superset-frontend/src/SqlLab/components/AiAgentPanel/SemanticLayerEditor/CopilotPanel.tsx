@@ -16,14 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import {
-  ChangeEvent,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ReactDiffViewer from 'react-diff-viewer-continued';
 import { t } from '@apache-superset/core/translation';
 import { css, isThemeDark, useTheme } from '@apache-superset/core/theme';
@@ -60,11 +53,11 @@ import {
   streamCopilot,
   updateCopilotConversationTitle,
 } from '../api';
-import useDocumentIngestion from '../useDocumentIngestion';
 import {
   getDocumentStatusMeta,
   isPendingDocumentStatus,
 } from './documentStatus';
+import AttachDocumentDialog from './AttachDocumentDialog';
 import CopilotInspectorDialog from './CopilotInspectorDialog';
 import CoverageDialog from './CoverageDialog';
 
@@ -165,7 +158,6 @@ const CopilotPanel = ({
   onDocumentsChanged,
 }: CopilotPanelProps) => {
   const theme = useTheme();
-  const { ingest, isIngesting } = useDocumentIngestion(projectId);
   const isReady = readinessStatus === 'ready';
   // F4: the Copilot is usable pre-onboarding — it can drive onboarding itself
   // (propose models from a BI doc, human-in-the-loop). The only hard block is an
@@ -206,7 +198,9 @@ const CopilotPanel = ({
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [coverageOpen, setCoverageOpen] = useState(false);
   const [liveSteps, setLiveSteps] = useState<AgentStep[]>([]);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  // Drives the Attach dialog (pick existing `raw/` documents and/or upload new
+  // ones). Replaces the former bare hidden file input.
+  const [attachOpen, setAttachOpen] = useState(false);
 
   const diffStyles = useMemo(() => {
     const variables = {
@@ -334,32 +328,17 @@ const CopilotPanel = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId]);
 
-  const handleAttach = useCallback(
-    async (event: ChangeEvent<HTMLInputElement>) => {
-      const files = Array.from(event.target.files ?? []);
-      event.target.value = '';
-      if (!files.length) return;
-      // Persist through the shared ingestion pipeline (upload + dedup + vectorize).
-      const results = await ingest(files);
-      if (!results.length) return;
-      // Ground the current turn on what was persisted; de-dupe by id so a
-      // re-attached (deduplicated) document is not staged twice.
-      setAttachedDocs(prev => {
-        const seen = new Set(prev.map(doc => doc.id));
-        const additions = results
-          .map(result => result.document)
-          .filter(doc => !seen.has(doc.id));
-        return [...prev, ...additions];
-      });
-      // A fresh attachment re-arms the poll's give-up budget (so a previous
-      // exhausted poll doesn't leave the new doc's Send gate disengaged).
-      setAttachPollGaveUp(false);
-      // The new documents now live in the workspace; let the editor refresh so
-      // they appear in the file browser tree.
-      onDocumentsChanged?.();
-    },
-    [ingest, onDocumentsChanged],
-  );
+  // Commit the Attach dialog's chosen document set as this turn's attachments.
+  // The dialog is seeded from the current `attachedDocs`, so its selection is
+  // authoritative — this replaces the set (deselecting in the dialog removes a
+  // chip; uploads add and ground new documents). Status polling + the Send gate
+  // then operate on the new set unchanged.
+  const handleAttachConfirm = useCallback((docs: SemanticDocument[]) => {
+    setAttachedDocs(docs);
+    // A fresh selection re-arms the poll's give-up budget (so a previous
+    // exhausted poll doesn't leave a newly-added doc's Send gate disengaged).
+    setAttachPollGaveUp(false);
+  }, []);
 
   // Live-update staged attachments that are still extracting (large files extract
   // on a background thread). Polls each pending doc to its terminal status so the
@@ -1187,31 +1166,19 @@ const CopilotPanel = ({
               data-test="copilot-input"
             />
             <Flex justify="space-between" align="center">
-              <input
-                ref={fileInputRef}
-                type="file"
-                multiple
-                accept=".json,.md,.markdown,.txt,.csv,.html,.pdf,.docx,.xlsx,.pptx"
-                css={css`
-                  display: none;
-                `}
-                onChange={handleAttach}
-                data-test="copilot-attach-input"
-              />
               <Tooltip
                 title={t(
-                  'Attach a document (PDF, Word, Excel, PowerPoint, CSV, HTML, ' +
-                    'Markdown, JSON). It is added to the workspace, vectorized, ' +
-                    'and used to ground this chat.',
+                  'Attach documents (PDF, Word, Excel, PowerPoint, CSV, HTML, ' +
+                    'Markdown, JSON). Pick from this project’s documents or upload ' +
+                    'new ones; they ground this chat.',
                 )}
               >
                 <Button
                   buttonStyle="link"
                   buttonSize="small"
                   icon={<Icons.UploadOutlined />}
-                  disabled={!canWrite || isRunning || isIngesting}
-                  loading={isIngesting}
-                  onClick={() => fileInputRef.current?.click()}
+                  disabled={!canWrite || isRunning}
+                  onClick={() => setAttachOpen(true)}
                   data-test="copilot-attach"
                 >
                   {t('Attach')}
@@ -1257,6 +1224,15 @@ const CopilotPanel = ({
         projectId={projectId}
         open={coverageOpen}
         onClose={() => setCoverageOpen(false)}
+      />
+      <AttachDocumentDialog
+        open={attachOpen}
+        projectId={projectId}
+        attachedDocs={attachedDocs}
+        canWrite={canWrite}
+        onConfirm={handleAttachConfirm}
+        onClose={() => setAttachOpen(false)}
+        onDocumentsChanged={onDocumentsChanged}
       />
     </Flex>
   );

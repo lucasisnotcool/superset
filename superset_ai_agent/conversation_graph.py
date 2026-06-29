@@ -34,6 +34,7 @@ from superset_ai_agent.conversations.schemas import (
     Conversation,
     ConversationArtifact,
     ConversationMessage,
+    ConversationScope,
     ConversationSqlExecutionRequest,
     ConversationTurnRequest,
     ConversationTurnResponse,
@@ -97,6 +98,7 @@ from superset_ai_agent.semantic_layer.schemas import (
 from superset_ai_agent.semantic_layer.store import scope_hash
 from superset_ai_agent.semantic_layer.wren_runtime import (
     materialize_request_semantic_project,
+    resolve_effective_schema,
 )
 from superset_ai_agent.tools.sql import validate_read_only_sql
 from superset_ai_agent.tools.sql_policy import decide, SqlClassification
@@ -796,14 +798,52 @@ class ConversationGraph:
         # Force an answer shape — this path never executes SQL.
         return draft.model_copy(update={"response_type": "answer", "sql": ""})
 
+    def _inferred_scope(self, state: ConversationState) -> ConversationScope:
+        """Project-wins schema inference for the turn's scope (backend-only).
+
+        When a project is pinned (this turn's scope or the conversation's stable
+        pin) but the turn carries no/a different tab schema, ground on the
+        project's schema(s) — the full set for a multi-schema project. Selects
+        *context*, not *access* (per-schema context-load stays Superset-gated).
+        Applied once here and propagated on ``state['request']`` so the gate and
+        grounding in ``_load_wren_context`` see the inferred scope too.
+        """
+
+        scope = state["request"].scope
+        conversation = state.get("conversation")
+        project_id = scope.project_id or (
+            conversation.project_id if conversation is not None else None
+        )
+        schema_name, schema_names = resolve_effective_schema(
+            semantic_project_store=self.semantic_project_store,
+            owner_id=state["owner_id"],
+            database_id=scope.database_id,
+            schema_name=scope.schema_name,
+            project_id=project_id,
+        )
+        if (
+            schema_name == scope.schema_name
+            and schema_names == scope.effective_schema_names
+        ):
+            return scope
+        return scope.model_copy(
+            update={"schema_name": schema_name, "schema_names": schema_names}
+        )
+
     def _load_context(self, state: ConversationState) -> ConversationState:
         request = state["request"]
+        scope = self._inferred_scope(state)
+        if scope is not request.scope:
+            # Propagate the inferred scope so the gate + grounding downstream
+            # (``_load_wren_context``) ground on the same schema set.
+            request = request.model_copy(update={"scope": scope})
         agent_request = AgentQueryRequest(
             question=request.message,
-            database_id=request.scope.database_id,
-            catalog_name=request.scope.catalog_name,
-            schema_name=request.scope.schema_name,
-            dataset_ids=request.scope.dataset_ids,
+            database_id=scope.database_id,
+            catalog_name=scope.catalog_name,
+            schema_name=scope.schema_name,
+            schema_names=scope.schema_names,
+            dataset_ids=scope.dataset_ids,
             execute=request.resolved_execution_mode() != "manual",
             model=request.model,
             max_steps=min(request.max_steps, 12),
@@ -822,6 +862,7 @@ class ConversationGraph:
         }
         return {
             **state,
+            "request": request,
             "context": context,
             "wren_retrieval": retrieval_artifact,
             "trace": [
@@ -883,7 +924,10 @@ class ConversationGraph:
             wren_context = WrenContextArtifact(
                 enabled=self.config.wren_enabled,
                 available=False,
-                warnings=["Select a database schema before loading Wren context."],
+                warnings=[
+                    "Select a semantic-layer project or a database schema before "
+                    "loading Wren context."
+                ],
             )
             return {
                 **state,
@@ -893,7 +937,7 @@ class ConversationGraph:
                     TraceEvent(
                         step="load_wren_context",
                         status="warning",
-                        summary="Wren context requires a selected schema.",
+                        summary="Wren context requires a selected project or schema.",
                         details=wren_context.model_dump(),
                     ),
                 ],

@@ -1431,6 +1431,10 @@ export interface CoverageRun {
   status: CoverageRunStatus;
   score?: number | null;
   report?: CoverageReport | null;
+  /** Chained recovery agent state (gap-closing suggestions). */
+  recovery_status?: CoverageRecoveryStatus;
+  recovery_conversation_id?: string | null;
+  recovery_dismissed_at?: string | null;
   error?: string | null;
   created_at: string;
   updated_at: string;
@@ -1458,6 +1462,10 @@ export interface CoverageStatusInfo {
   run_id?: string | null;
   /** Present only while a run is in flight; null otherwise (Feature C). */
   progress?: CoverageProgressInfo | null;
+  /** Recovery agent state for the latest run — drives the suggestions banner. */
+  recovery_status?: CoverageRecoveryStatus;
+  recovery_run_id?: string | null;
+  recovery_dismissed?: boolean;
 }
 
 /** The latest completed directory coverage run (score + report), or null. */
@@ -1528,6 +1536,44 @@ export const applyCopilotChangeset = (
       method: 'POST',
       body: JSON.stringify({ items, conversation_id: conversationId ?? null }),
     },
+  );
+
+// -- Coverage recovery agent (gap-closing suggestions) ----------------------
+
+export type CoverageRecoveryStatus =
+  | 'none'
+  | 'pending'
+  | 'running'
+  | 'ready'
+  | 'failed'
+  | 'empty';
+
+/** Recovery suggestions for a coverage run — a reviewable changeset + state. */
+export interface CoverageRecoveryInfo {
+  run_id: string;
+  status: CoverageRecoveryStatus;
+  conversation_id?: string | null;
+  suggestion_count: number;
+  /** The gap-closing edits to review; null until the agent produces them. */
+  changeset?: Changeset | null;
+  /** Durable, per-run dismissal of the "suggestions ready" notification. */
+  dismissed: boolean;
+  /** True when the active MDL moved on since this run was audited. */
+  stale: boolean;
+}
+
+/** Fetch the recovery agent's suggestions (changeset) for a coverage run. */
+export const getCoverageRecovery = (projectId: string, runId: string) =>
+  requestJson<CoverageRecoveryInfo>(
+    `/agent/semantic-layer/projects/${projectId}/coverage/runs/${runId}/recovery`,
+    { method: 'GET' },
+  );
+
+/** Durably dismiss the recovery "suggestions ready" notification for a run. */
+export const dismissCoverageRecovery = (projectId: string, runId: string) =>
+  requestJson<{ dismissed: boolean }>(
+    `/agent/semantic-layer/projects/${projectId}/coverage/runs/${runId}/recovery/dismiss`,
+    { method: 'POST' },
   );
 
 /**
@@ -1951,7 +1997,12 @@ export type ProvenanceKind =
 export type ProvenanceActorType = 'user' | 'agent' | 'system';
 
 /** Semantic verb for one MDL-mutating agent tool call (provenance ledger). */
-export type ToolActionKind = 'write' | 'delete' | 'onboard' | 'relate';
+export type ToolActionKind =
+  | 'write'
+  | 'delete'
+  | 'onboard'
+  | 'relate'
+  | 'remove';
 
 /**
  * One MDL-mutating tool call an agent made during a turn. Folded into an

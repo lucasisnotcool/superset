@@ -96,9 +96,7 @@ def _agent_context() -> AgentContext:
                     ColumnSummary(name="gross_moves", type="BIGINT"),
                 ],
                 metrics=[
-                    MetricSummary(
-                        name="total_moves", expression="SUM(gross_moves)"
-                    )
+                    MetricSummary(name="total_moves", expression="SUM(gross_moves)")
                 ],
             )
         ],
@@ -260,9 +258,7 @@ def test_generate_base_model_falls_back_on_bad_output() -> None:
     assert parsed["models"][0]["tableReference"]["table"] == "deals"
     # F5: the degradation (structure-only draft, no enrichment) is surfaced, not
     # hidden — the provider likely didn't honor structured output.
-    assert any(
-        "structured" in warning.lower() for warning in proposals[0].warnings
-    )
+    assert any("structured" in warning.lower() for warning in proposals[0].warnings)
 
 
 def test_propose_mdl_from_document_surfaces_fallback_warning() -> None:
@@ -298,9 +294,7 @@ def test_propose_mdl_from_document_uses_llm() -> None:
     client = LlmWrenClient(_config(), FakeModelClient(json.dumps(payload)))
     document = _document()
 
-    proposal = client.propose_mdl_from_document(
-        project=_project(), document=document
-    )
+    proposal = client.propose_mdl_from_document(project=_project(), document=document)
 
     assert proposal.source_document_id == document.id
     assert proposal.validation.valid is True
@@ -440,9 +434,7 @@ def test_fetch_context_surfaces_materialized_mdl(tmp_path) -> None:
                         ],
                     }
                 ],
-                "relationships": [
-                    {"name": "deals_site", "join_type": "MANY_TO_ONE"}
-                ],
+                "relationships": [{"name": "deals_site", "join_type": "MANY_TO_ONE"}],
             }
         ),
         encoding="utf-8",
@@ -570,9 +562,12 @@ def test_enrichment_does_not_retype_existing_column() -> None:
     # E4: the overlay tries to change "id" from INT to VARCHAR. Physical type is
     # authoritative and must survive.
     store = _FakeFileStore(
-        [_active_file("models/b.json", [_model_with_columns(
-            "beta", [{"name": "id", "type": "INT"}]
-        )])]
+        [
+            _active_file(
+                "models/b.json",
+                [_model_with_columns("beta", [{"name": "id", "type": "INT"}])],
+            )
+        ]
     )
     overlay_model = _model_with_columns(
         "beta", [{"name": "id", "type": "VARCHAR", "description": "id col"}]
@@ -596,9 +591,12 @@ def test_enrichment_appends_genuinely_new_column() -> None:
     # E4: a new column the overlay introduces is appended (subject to downstream
     # physical validation), while existing columns are kept.
     store = _FakeFileStore(
-        [_active_file("models/b.json", [_model_with_columns(
-            "beta", [{"name": "id", "type": "INT"}]
-        )])]
+        [
+            _active_file(
+                "models/b.json",
+                [_model_with_columns("beta", [{"name": "id", "type": "INT"}])],
+            )
+        ]
     )
     overlay_model = _model_with_columns(
         "beta",
@@ -628,10 +626,12 @@ def test_enrichment_fallback_preserves_columns_across_files() -> None:
         [
             _active_file(
                 "models/a.json",
-                [_model_with_columns(
-                    "alpha", [{"name": "id", "type": "INT"},
-                              {"name": "k", "type": "TEXT"}]
-                )],
+                [
+                    _model_with_columns(
+                        "alpha",
+                        [{"name": "id", "type": "INT"}, {"name": "k", "type": "TEXT"}],
+                    )
+                ],
             ),
             _active_file(
                 "models/b.json",
@@ -683,9 +683,10 @@ def test_dropped_columns_helper_detects_a_real_drop() -> None:
 
     assert _dropped_columns(base_models, proposed) == ["beta.amount"]
     # "other" is not in the proposal at all -> not reported as dropped.
-    assert all(not item.startswith("other.") for item in _dropped_columns(
-        base_models, proposed
-    ))
+    assert all(
+        not item.startswith("other.")
+        for item in _dropped_columns(base_models, proposed)
+    )
 
 
 # --- E2: the prompt sees a trimmed reference, not full re-emittable bodies ----
@@ -921,8 +922,11 @@ def test_cube_merge_preserves_omitted_measures() -> None:
             }
         ]
     }
-    overlay = {"cubes": [{"name": "sales", "measures": [{"name": "m1",
-                                                         "description": "enriched"}]}]}
+    overlay = {
+        "cubes": [
+            {"name": "sales", "measures": [{"name": "m1", "description": "enriched"}]}
+        ]
+    }
 
     merged = _merge_manifest_sections(base, overlay)
 
@@ -984,8 +988,7 @@ def test_enrichment_repairs_hallucinated_column_against_schema() -> None:
     assert len(model.calls) == 2
     second = _payload_sent(model.calls[1])
     assert any(
-        "ghost" in error.lower()
-        for error in second["previous_validation_errors"]
+        "ghost" in error.lower() for error in second["previous_validation_errors"]
     )
 
 
@@ -1132,8 +1135,9 @@ def test_enrichment_prefers_active_over_draft_for_same_path() -> None:
             _active_file("models/deals.json", [_model("deals", description="live")]),
         ]
     )
-    client = LlmWrenClient(_config(), FakeModelClient(json.dumps({"files": []})),
-                           mdl_file_store=store)
+    client = LlmWrenClient(
+        _config(), FakeModelClient(json.dumps({"files": []})), mdl_file_store=store
+    )
 
     proposal = client.propose_mdl_from_document(
         project=_project(), document=_document()
@@ -1172,3 +1176,17 @@ def test_bare_project_still_degrades_to_deterministic_draft() -> None:
     )
 
     assert any("structured" in w.lower() for w in proposal.warnings)
+
+
+def test_split_schema_view_separates_tables_and_types() -> None:
+    from superset_ai_agent.integrations.wren.llm_client import _split_schema_view
+
+    view = {
+        "sales": {"orders": {"columns": ["id"], "types": {"id": "BIGINT"}}},
+        "crm": {"customers": {"columns": ["id", "name"]}},
+    }
+    tables, types = _split_schema_view(view)
+
+    assert tables == {"sales": {"orders": ["id"]}, "crm": {"customers": ["id", "name"]}}
+    assert types == {"sales": {"orders": {"id": "BIGINT"}}}  # crm has no types
+    assert _split_schema_view(None) == (None, None)

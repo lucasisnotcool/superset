@@ -153,3 +153,90 @@ def test_matched_models_still_boosts_current_schema_browsing() -> None:
         mdl=mdl,
     )
     assert matched[0] == "orders"
+
+
+# --- Phase 3: dataset boost reaches secondary-schema models in the union ------
+
+_TWO_SCHEMA_MDL = {
+    "models": [
+        {
+            "name": "orders",
+            "tableReference": {"schema": "public", "table": "orders"},
+            "columns": [{"name": "id", "type": "BIGINT"}],
+        },
+        {
+            "name": "customers",
+            "tableReference": {"schema": "crm", "table": "customers"},
+            "columns": [{"name": "id", "type": "BIGINT"}],
+        },
+    ]
+}
+
+
+def _ctx_tables(tables: list[tuple[str, str]]) -> AgentContext:
+    return AgentContext(
+        database=DatabaseSummary(id=1, name="db"),
+        datasets=[
+            DatasetMetadata(
+                id=i,
+                table_name=name,
+                schema_name=schema,
+                database_id=1,
+                columns=[ColumnSummary(name="id", type="BIGINT")],
+                metrics=[],
+            )
+            for i, (name, schema) in enumerate(tables)
+        ],
+    )
+
+
+def test_dataset_boost_reaches_secondary_schema_only_in_union() -> None:
+    client = FileWrenClient(AgentConfig())
+    # Single-schema context (pre-Fix-C): only public.orders is loaded, so the crm
+    # model misses the "actively browsing" +3 dataset boost and the question word.
+    single = _ctx_tables([("orders", "public")])
+    assert "customers" not in client._matched_models(
+        question="orders", superset_context=single, mdl=_TWO_SCHEMA_MDL
+    )
+    # Unioned multi-schema context (Fix C, Phase 2): crm.customers is now loaded,
+    # so its model earns the +3 dataset boost and reaches matched_models.
+    union = _ctx_tables([("orders", "public"), ("customers", "crm")])
+    assert "customers" in client._matched_models(
+        question="orders", superset_context=union, mdl=_TWO_SCHEMA_MDL
+    )
+
+
+def test_scope_hash_distinguishes_multi_schema_scope() -> None:
+    from superset_ai_agent.conversations.schemas import ConversationScope
+    from superset_ai_agent.semantic_layer.store import scope_hash
+
+    single = ConversationScope(database_id=1, schema_name="public")
+    multi = ConversationScope(
+        database_id=1, schema_name="public", schema_names=["public", "crm"]
+    )
+    # A multi-schema scope hashes distinctly (memory/instructions key on the set)...
+    assert scope_hash(single) != scope_hash(multi)
+    # ...order-independently...
+    multi_reordered = ConversationScope(
+        database_id=1, schema_name="public", schema_names=["crm", "public"]
+    )
+    assert scope_hash(multi) == scope_hash(multi_reordered)
+    # ...and a single-schema set stays byte-identical to the legacy scalar shape.
+    same = ConversationScope(
+        database_id=1, schema_name="public", schema_names=["public"]
+    )
+    assert scope_hash(same) == scope_hash(single)
+
+
+# --- Phase 4: direct-SQL prompt instructs schema qualification -----------------
+
+
+def test_text_to_sql_prompt_instructs_cross_schema_qualification() -> None:
+    # Regression guard: the passthrough/direct-SQL path relies on the prompt to
+    # qualify tables when the datasets span schemas (the wren_core path qualifies
+    # via the engine rewrite instead).
+    from superset_ai_agent.prompts.registry import get_prompt
+
+    prompt = get_prompt("text_to_sql").lower()
+    assert "schema.table" in prompt
+    assert "more than one schema" in prompt or "span" in prompt

@@ -336,6 +336,11 @@ class AiAgentSchemaSnapshot(Base):
     catalog_name = Column(String(255), nullable=True)
     schema_name = Column(String(255), nullable=True)
     tables = Column(JSON, nullable=False)
+    # Schema-qualified twin of ``tables`` (schema → table → columns) so a
+    # multi-schema project's outage-fallback validation stays schema-aware instead
+    # of collapsing to the flat, collidable map. Nullable: old rows + single-schema
+    # snapshots leave it empty and degrade closed (F3).
+    tables_by_schema = Column(JSON, nullable=True)
     captured_at = Column(DateTime(timezone=True), nullable=False)
 
 
@@ -442,6 +447,14 @@ class AiAgentCoverageRun(Base):
     # Live, coarse progress while ``running`` (Feature C); null before the first
     # stage tick and once the run reaches a terminal state.
     progress = Column(JSON, nullable=True)
+    # Coverage recovery agent (chained Copilot turn that proposes gap-closing
+    # edits). ``recovery_conversation_id`` links the persisted recovery thread (its
+    # changeset artifact is the suggestion set); ``recovery_status`` tracks that
+    # chained job; ``recovery_dismissed_at`` is the durable, per-run dismissal of
+    # the "suggestions ready" notification.
+    recovery_conversation_id = Column(String(36), nullable=True)
+    recovery_status = Column(String(32), nullable=True)
+    recovery_dismissed_at = Column(DateTime(timezone=True), nullable=True)
     error = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), index=True, nullable=False)
     updated_at = Column(DateTime(timezone=True), index=True, nullable=False)

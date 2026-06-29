@@ -82,6 +82,39 @@ test('shows the source document tag for directory-level findings', () => {
   expect(sources[1]).toHaveTextContent('glossary.md');
 });
 
+test('virtualizes a large claims list (renders only the visible window)', () => {
+  const manyFindings = Array.from({ length: 200 }, (_, index) => ({
+    claim: {
+      kind: 'definition' as const,
+      subject: `subject_${index}`,
+      statement: `statement number ${index}`,
+    },
+    status: 'covered' as const,
+  }));
+  render(
+    <CoverageReportModal
+      open
+      report={{ ...report, findings: manyFindings }}
+      onClose={jest.fn()}
+    />,
+  );
+
+  // The list mounts far fewer rows than the 200 findings (react-window only
+  // renders the visible window plus a small overscan).
+  const rendered = screen.getAllByTestId('coverage-finding');
+  expect(rendered.length).toBeGreaterThan(0);
+  expect(rendered.length).toBeLessThan(manyFindings.length);
+});
+
+test('keeps the score and badges in a pinned summary alongside extra content', () => {
+  render(<CoverageReportModal open report={report} onClose={jest.fn()} />);
+
+  const summary = screen.getByTestId('coverage-summary');
+  expect(summary).toHaveTextContent('50% covered');
+  expect(summary).toHaveTextContent('1 covered');
+  expect(summary).toHaveTextContent('1 missing');
+});
+
 test('shows a loading state while auditing', () => {
   render(
     <CoverageReportModal open report={null} loading onClose={jest.fn()} />,

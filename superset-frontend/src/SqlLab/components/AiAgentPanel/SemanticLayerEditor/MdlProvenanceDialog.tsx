@@ -184,9 +184,16 @@ const ACTION_VERBS: Record<ToolActionKind, (n: number) => string> = {
   onboard: n => t('Onboarded %s table(s)', n),
   write: n => t('Wrote %s file(s)', n),
   relate: n => t('Added %s relationship(s)', n),
+  remove: n => t('Removed %s entit(ies)', n),
   delete: n => t('Deleted %s file(s)', n),
 };
-const ACTION_ORDER: ToolActionKind[] = ['onboard', 'write', 'relate', 'delete'];
+const ACTION_ORDER: ToolActionKind[] = [
+  'onboard',
+  'write',
+  'relate',
+  'remove',
+  'delete',
+];
 
 const toolCalls = (entry: ProvenanceEntry): ToolCallRecord[] => {
   const raw = entry.detail?.tool_calls;
@@ -444,6 +451,7 @@ const MdlProvenanceDialog = ({
         onHide={onClose}
         title={t('Coverage report')}
         footer={null}
+        centered
       >
         <Button
           type="link"
@@ -471,6 +479,7 @@ const MdlProvenanceDialog = ({
       onHide={onClose}
       title={t('MDL provenance')}
       footer={null}
+      centered
     >
       <Header>
         <Typography.Text type="secondary">

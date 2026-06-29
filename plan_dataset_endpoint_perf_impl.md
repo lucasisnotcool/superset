@@ -266,3 +266,27 @@ additionally verified live against the running `superset-superset-1` container.
 - **B-R2:** memoized write-permission is session-stable; a mid-session role grant isn't reflected until reload (create POST still server-enforced).
 - **C-G1:** the card's column options are dataset-static (the fetch never used filter state); removing the `dependencies` dep only deletes dead re-fires. If a future cascading requirement needs filter-aware columns it must be re-added deliberately. The dead `col.name` fallback is left in place (API returns `column_name`) to avoid scope creep.
 - **FE-DEPLOY:** Tracks B/C are verified by unit tests only; not exercised in a live browser this session. A Playwright/manual pass (open picker -> alt-tab repeatedly -> confirm no `/dataset/?q=` storm; open a group-by dashboard -> confirm one projected `/dataset/<id>?q=` and no re-fetch on filter change) would close the empirical loop. Backend (A) is verified live.
+
+---
+
+## 13. THE ACTUAL DOMINANT SOURCE — agent-side N+1 (F1 + F2)
+
+**Correction:** the "incessant" `GET /api/v1/dataset/?q=(...page_size:8/100...)` + `GET /dataset/{id}` lines the user still saw are **server-side calls from the AI agent container** (client IP `172.26.0.9`), NOT the browser. The original frontend-scoped analysis (Tracks A–C) never looked at this layer. Root cause:
+
+- `rest.py::list_datasets` (default `limit=8` → `page_size:8`) does **1 list + N×`get_dataset_raw`** (per-dataset detail) — an N+1 over the network.
+- `get_context`/`get_full_schema` ([superset_metadata.py](superset_ai_agent/context/superset_metadata.py)) call it **twice** (base `limit=8` + candidates `limit=max(100,12,8)=100` → `page_size:100`), **per project schema**.
+- `_schema_index_for_project` ([app.py](superset_ai_agent/app.py)) — called by **7 Copilot/MDL endpoints** (create/update MDL file, deploy preview, copilot run/stream, enrich) — runs this per schema, **uncached**, on each interaction. (`_project_readiness` does NOT — readiness polling is not the trigger.)
+
+**Fixes implemented (user approved F1+F2):**
+- **F2b** — `get_dataset_raw` now column-projects to only the fields `_normalize_dataset` reads (~10x smaller per call; leverages Track A's projection + eager-load). [rest.py](superset_ai_agent/integrations/superset/rest.py) `_DATASET_DETAIL_COLUMNS`.
+- **F2a** — `get_agent_context(include_datasets=False)` returns just the database shell; `get_context`/`get_full_schema` use it for the base context so the per-dataset scan isn't paid twice (the base fetch's datasets were discarded anyway). Touches the interface ([client.py](superset_ai_agent/integrations/superset/client.py)), REST ([rest.py](superset_ai_agent/integrations/superset/rest.py)), MCP ([mcp.py](superset_ai_agent/integrations/superset/mcp.py)), and the provider ([superset_metadata.py](superset_ai_agent/context/superset_metadata.py)). Halves the dataset calls per cold build.
+- **F1** — a project-keyed short-TTL cache ([persistence/ttl_cache.py](superset_ai_agent/persistence/ttl_cache.py), `wren_schema_index_cache_ttl_seconds=60`) fronts `_schema_index_for_project`. Repeated Copilot/MDL operations within the window do **zero** dataset calls. Keyed by `(project.id, sorted schema_names)` — safe because project access is authorized upstream of the cache read; only successful live builds are cached.
+
+**Net effect:** cold build ≈ halved call count (F2a) with each call ~10x cheaper (F2b + Track A eager-load); warm build (within 60s) ≈ **zero** dataset calls (F1).
+
+**Tests (10 passed):** `persistence/test_ttl_cache.py` (6: fresh/expiry/evict/invalidate/clear/disabled/tuple-keys) + `integrations/superset/test_dataset_fetch_efficiency.py` (4: projection on detail; `include_datasets=False` skips scan; `get_full_schema`/`get_context` single-scan). ruff + mypy clean for changed files (4 pre-existing ruff findings in untouched agent lines left alone; `# noqa: C901` added to `_schema_index_for_project` matching the codebase's own convention).
+
+**Residual gaps / not done:**
+- **AGENT-DEPLOY:** the agent image **bakes its source** (no bind-mount — only the `.data` volume), so these changes need a **`docker compose build superset-ai-agent`** + up to take effect. NOT live-verified this session (stack was down). Verify after rebuild: with panels open, `docker logs superset-superset-1 | grep -c 'GET /api/v1/dataset/'` over a fixed window should drop sharply, and a repeated Copilot action within 60s should emit **no** new dataset lines.
+- **Per-query AI-SQL path not cached (F1 scope):** the AI SQL agent's per-turn `load_context`/`get_context` ([app.py:508](superset_ai_agent/app.py)) benefits from F2a/F2b but **not** F1 — caching it safely needs **per-principal** keying (user_session mode runs as the end user; a db/schema-only key would leak across users, the A-R1 class). If logs show the AI SQL agent (not the Copilot/MDL panels) is the dominant source, extend F1 there with an identity-scoped key. Deferred deliberately.
+- **Not a literal N→1:** a cold build still issues N projected detail calls (the dataset *list* endpoint can't return nested `columns.*` without bloating `list_columns` for every consumer). True N→1 would need a dedicated bulk-columns backend endpoint — a larger follow-up. F1 makes the repeat cost 0, which is the bigger lever for the observed symptom.

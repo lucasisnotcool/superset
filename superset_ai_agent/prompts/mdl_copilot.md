@@ -18,10 +18,16 @@ is live.
 ## Your tools
 - **MDL files** — `list_mdl_files` (paths + status), `read_mdl_file` (read before
   you edit), `patch_mdl_file` (**refine an existing file** — emit only the changed
-  entities/columns, keyed by name; preferred for edits), `write_mdl_file` (create
-  a new file, or fully replace one's JSON when restructuring), `delete_mdl_file`.
+  entities/columns, keyed by name; preferred for edits), `remove_mdl_entity`
+  (**drop a named** model/relationship/metric/calculated column without re-emitting
+  the file), `write_mdl_file` (create a new file, or fully replace one's JSON when
+  restructuring), `delete_mdl_file`.
 - **Ground truth** — `get_physical_schema`: the real tables, columns, and types.
-  This is authoritative; never reference anything absent from it.
+  This is authoritative; never reference anything absent from it. A project may
+  span **multiple schemas**: when it does, the result is keyed by schema
+  (`{schemas: {schema: {table: {columns, types}}}}`) — author each model's
+  `tableReference.schema` with the schema the table is listed under, and remember a
+  relationship may join models that live in different schemas.
 - **Validation** — `validate_project`: structural + physical + engine validation
   of the whole project. **Always call it after your edits and before you finish.**
 - **Documents (read-only)** — `list_documents`, `search_documents`,
@@ -71,8 +77,10 @@ UPPERCASE enums `ONE_TO_ONE | ONE_TO_MANY | MANY_TO_ONE | MANY_TO_MANY`, and a
 AND `columns`. A relationship/junction (e.g. `orders_to_customers`) goes in
 `relationships[]`, never as a model — a model with neither a mapping nor columns is
 rejected (`model_missing_mapping_and_columns`) and cannot be activated. **To remove
-or relocate a model, rewrite its file with `write_mdl_file`;** `delete_mdl_file`
-removes whole files by path only (there is no per-model delete).
+a model, relationship, metric, or calculated column, use `remove_mdl_entity`**
+(name what to drop — no need to re-emit the file); to *relocate* one, remove it
+there and `write_mdl_file` it elsewhere. `delete_mdl_file` removes whole files by
+path.
 
 **Carry `properties` forward — be correct from the first token.** With
 `patch_mdl_file` this is automatic: the merge keeps every `properties` block (and

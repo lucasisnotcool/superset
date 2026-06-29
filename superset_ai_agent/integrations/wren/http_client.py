@@ -139,6 +139,7 @@ class WrenHttpClient:
         document: SemanticDocument,
         schema: dict[str, list[str]] | None = None,
         schema_types: dict[str, dict[str, str]] | None = None,
+        schema_by_schema: dict[str, dict[str, dict[str, object]]] | None = None,
         instructions: list[str] | None = None,
     ) -> MdlEnrichmentProposal:
         if not self.config.wren_onboarding_enabled:

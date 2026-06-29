@@ -21,8 +21,12 @@ from pathlib import Path
 
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.conversations.store import DEFAULT_OWNER_ID
+from superset_ai_agent.schemas import normalize_schema_names
 from superset_ai_agent.semantic_layer.mdl_files import MdlFileStore
-from superset_ai_agent.semantic_layer.projects import SemanticProjectStore
+from superset_ai_agent.semantic_layer.projects import (
+    SemanticProjectNotFoundError,
+    SemanticProjectStore,
+)
 from superset_ai_agent.semantic_layer.schemas import (
     SemanticProject,
     WrenMaterializationResult,
@@ -30,6 +34,53 @@ from superset_ai_agent.semantic_layer.schemas import (
 from superset_ai_agent.semantic_layer.wren_materializer import (
     materialize_wren_project,
 )
+
+
+def resolve_effective_schema(
+    *,
+    semantic_project_store: SemanticProjectStore | None,
+    owner_id: str = DEFAULT_OWNER_ID,
+    database_id: int,
+    schema_name: str | None,
+    project_id: str | None,
+) -> tuple[str | None, list[str]]:
+    """Resolve the schema scope for a query, **project-wins** over the tab schema.
+
+    The frontend sets ``schema_name`` from the SQL Lab tab, not the project — so a
+    user who pins a project in the AI panel but has no tab schema would otherwise
+    send ``schema_name=None``. A :class:`SemanticProject` already declares its
+    schema set, so a pinned project is the source of truth: it overrides the tab
+    schema and, for a multi-schema project, yields the **full** set.
+
+    Returns ``(primary, full_set)``: ``primary`` (back-compat scalar, ``None`` when
+    nothing resolved) and the ordered, de-duplicated schema set. Degrades closed to
+    the passed schema when there is no store/pin, the pin is unresolvable, or the
+    project belongs to a different database (never infer onto the wrong DB).
+    Selects *context*, not *access* — the per-schema context-load stays
+    Superset-gated, so this never widens what a user can reach.
+    """
+
+    passthrough = (schema_name, normalize_schema_names(schema_name, None))
+    if semantic_project_store is None or project_id is None:
+        return passthrough
+    try:
+        project = semantic_project_store.get(project_id, owner_id=owner_id)
+    except SemanticProjectNotFoundError:
+        return passthrough
+    except Exception:  # pylint: disable=broad-except - degrade to the tab schema
+        return passthrough
+    if project is None:
+        return passthrough
+    # DB guard: a project pinned for a different database must not infer its schema
+    # onto this request (avoid grounding on the wrong DB).
+    if (
+        project.default_database_id is not None
+        and project.default_database_id != database_id
+    ):
+        return passthrough
+    return project.schema_name, normalize_schema_names(
+        project.schema_name, project.schema_names
+    )
 
 
 def materialize_request_semantic_project(
@@ -55,8 +106,23 @@ def materialize_request_semantic_project(
     for the caller to surface. Returns ``(project, materialization, warnings)``.
     """
 
-    if semantic_project_store is None or mdl_file_store is None or schema_name is None:
+    if semantic_project_store is None or mdl_file_store is None:
         return None
+    if schema_name is None:
+        # No tab schema: infer it from the pinned project (project-wins) instead of
+        # failing the whole semantic layer. ``store.list`` below is schema-filtered,
+        # so we need a concrete schema to find the project's candidate set.
+        if project_id is None:
+            return None
+        schema_name, _ = resolve_effective_schema(
+            semantic_project_store=semantic_project_store,
+            owner_id=owner_id,
+            database_id=database_id,
+            schema_name=None,
+            project_id=project_id,
+        )
+        if schema_name is None:
+            return None
     projects = semantic_project_store.list(
         owner_id=owner_id,
         database_id=database_id,

@@ -92,6 +92,7 @@ import OnboardingTablePicker from './OnboardingTablePicker';
 import AutoOnboardModal from './AutoOnboardModal';
 import MdlProvenanceDialog from './MdlProvenanceDialog';
 import CoverageBadge from './CoverageBadge';
+import RecoveryBanner from './RecoveryBanner';
 import SchemaSetControl from './SchemaSetControl';
 import DocumentDetailPane from './DocumentDetailPane';
 import ProjectBrowser, { ProjectBrowserProject } from './ProjectBrowser';
@@ -1470,6 +1471,7 @@ export default function SemanticLayerEditor({
                   </Button>
                 </Flex>
               </WorkspaceStrip>
+              <RecoveryBanner projectId={project.id} canWrite={canWrite} />
               <ContentTabs
                 defaultActiveKey="models"
                 items={[

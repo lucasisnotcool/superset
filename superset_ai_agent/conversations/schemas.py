@@ -29,6 +29,7 @@ from superset_ai_agent.schemas import (
     ChartSpec,
     ExecutionResult,
     InsightCard,
+    normalize_schema_names,
     SqlValidation,
     TraceEvent,
     WrenContextArtifact,
@@ -45,25 +46,6 @@ def _utc_now() -> datetime:
 
 def _new_id() -> str:
     return str(uuid4())
-
-
-def normalize_schema_names(
-    primary: str | None,
-    extras: list[str] | None,
-) -> list[str]:
-    """Return an ordered, de-duplicated schema set with ``primary`` first.
-
-    The single source of truth for "what schemas does this scope/project cover".
-    ``primary`` (the scalar ``schema_name``) is always element 0 when present, so
-    every existing reader of ``schema_name`` keeps seeing the primary schema while
-    ``schema_names`` carries the full multi-schema set.
-    """
-
-    ordered: list[str] = []
-    for name in [primary, *(extras or [])]:
-        if name and name not in ordered:
-            ordered.append(name)
-    return ordered
 
 
 class ConversationScope(BaseModel):

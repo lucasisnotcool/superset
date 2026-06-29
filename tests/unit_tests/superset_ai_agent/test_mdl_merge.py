@@ -161,3 +161,72 @@ def test_merge_columns_ignores_non_dict_entries() -> None:
         [{"name": "id", "type": "INT"}, "junk"], [{"name": "id", "description": "pk"}]
     )
     assert result == [{"name": "id", "type": "INT", "description": "pk"}]
+
+
+# --- removal (Item D) --------------------------------------------------------
+
+from superset_ai_agent.semantic_layer.mdl_merge import (  # noqa: E402
+    remove_manifest_entities,
+    remove_named,
+)
+
+
+def test_remove_named_drops_only_targets_preserving_order() -> None:
+    items = [{"name": "a"}, {"name": "b"}, {"name": "c"}]
+    assert remove_named(items, {"b"}) == [{"name": "a"}, {"name": "c"}]
+
+
+def test_remove_named_passes_through_non_dict_and_unnamed() -> None:
+    items = [{"name": "a"}, "junk", {"no_name": 1}]
+    assert remove_named(items, {"a"}) == ["junk", {"no_name": 1}]
+
+
+def test_remove_manifest_entity_drops_whole_entity() -> None:
+    base = {
+        "models": [{"name": "orders"}],
+        "relationships": [{"name": "o_to_c"}, {"name": "o_to_p"}],
+    }
+
+    new, removed, missing = remove_manifest_entities(
+        base, [{"section": "relationships", "name": "o_to_c"}]
+    )
+
+    assert [r["name"] for r in new["relationships"]] == ["o_to_p"]
+    assert new["models"] == [{"name": "orders"}]  # untouched section preserved
+    assert removed == ["relationships/o_to_c"]
+    assert missing == []
+
+
+def test_remove_manifest_column_drops_one_column() -> None:
+    base = {
+        "models": [
+            {
+                "name": "orders",
+                "columns": [
+                    {"name": "id", "type": "BIGINT"},
+                    {"name": "tax", "type": "DOUBLE", "isCalculated": True},
+                ],
+            }
+        ]
+    }
+
+    new, removed, missing = remove_manifest_entities(
+        base, [{"section": "models", "name": "orders", "column": "tax"}]
+    )
+
+    cols = [c["name"] for c in new["models"][0]["columns"]]
+    assert cols == ["id"]
+    assert removed == ["models/orders.tax"]
+    assert missing == []
+
+
+def test_remove_manifest_reports_missing_target() -> None:
+    base = {"models": [{"name": "orders"}]}
+
+    new, removed, missing = remove_manifest_entities(
+        base, [{"section": "models", "name": "ghost"}]
+    )
+
+    assert new["models"] == [{"name": "orders"}]
+    assert removed == []
+    assert missing == ["models/ghost"]

@@ -8,8 +8,10 @@ job is the *meaning* that makes the layer answerable: descriptions and
 retrieval-facing terms. Anything structural you return is ignored, so don't spend
 effort re-deriving column types or table references — describe, don't restate.
 
-You are given the permission-filtered datasets of one schema (table names,
-columns, types, metrics) purely as **context for writing good descriptions**.
+You are given the permission-filtered datasets of one or more schemas (table
+names, columns, types, metrics) purely as **context for writing good
+descriptions**. A project may span multiple schemas; keep each model's
+`tableReference.schema` as given — never move a table to a different schema.
 
 You return a structured JSON object (not text) matching the provided schema: an
 object with a `files` array and an optional `warnings` array. Each file has a

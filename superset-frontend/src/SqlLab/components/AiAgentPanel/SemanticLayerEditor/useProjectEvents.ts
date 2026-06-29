@@ -66,6 +66,8 @@ export const COVERAGE_EVENT_TYPES = [
   // Live, non-provenance stage ticks (Feature C) — nudge the badge to re-poll
   // status so the analysing label/stepper advances during a run.
   'coverage_progress',
+  // The recovery agent finished — wakes the "suggestions ready" banner.
+  'recovery_suggestions_ready',
   'mdl_activated',
   'mdl_deleted',
   'mdl_agent_edit',

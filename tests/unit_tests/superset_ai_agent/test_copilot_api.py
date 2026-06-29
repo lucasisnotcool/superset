@@ -473,6 +473,227 @@ def test_directory_coverage_is_idempotent_for_same_version(tmp_path) -> None:
     assert before["id"] == after["id"]
 
 
+# A second model that maps the known ``moves`` table — the recovery agent's
+# proposed file, so manifest validation passes in the test schema.
+RECOVERY_MDL = json.dumps(
+    {
+        "models": [
+            {
+                "name": "moves_documented",
+                "tableReference": {"table": "moves"},
+                "columns": [
+                    {
+                        "name": "id",
+                        "type": "BIGINT",
+                        "properties": {"description": "the order id"},
+                    }
+                ],
+            }
+        ]
+    }
+)
+
+
+class CoverageThenRecoveryModel:
+    """Coverage extract+judge (one missing claim), then a Copilot recovery turn.
+
+    Dispatches on call shape: coverage stages pass ``format_schema``; the Copilot
+    loop passes ``tools``. The recovery turn writes one model then finalizes.
+    """
+
+    def __init__(self) -> None:
+        self.copilot_calls = 0
+
+    def is_reachable(self) -> bool:
+        return True
+
+    def list_models(self) -> list[ModelInfo]:
+        return [ModelInfo(name="test-model")]
+
+    def chat(self, messages: list[ChatMessage], **kwargs: Any) -> ModelResult:
+        schema = kwargs.get("format_schema")
+        if schema is not None:
+            props = (schema or {}).get("properties", {})
+            if "claims" in props:
+                return ModelResult(
+                    content=json.dumps(
+                        {
+                            "claims": [
+                                {
+                                    "kind": "definition",
+                                    "subject": "id",
+                                    "statement": "id is the order id",
+                                }
+                            ]
+                        }
+                    )
+                )
+            # Judge: the single claim is missing → the report has a gap.
+            return ModelResult(
+                content=json.dumps(
+                    {"findings": [{"claim_id": "c0", "status": "missing"}]}
+                )
+            )
+        # Copilot recovery turn: propose one file, then finalize.
+        self.copilot_calls += 1
+        if self.copilot_calls == 1:
+            return ModelResult(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="r1",
+                        name="write_mdl_file",
+                        arguments={
+                            "path": "models/recovery.json",
+                            "content": RECOVERY_MDL,
+                        },
+                    )
+                ],
+            )
+        return ModelResult(content="Proposed documenting the order id.")
+
+
+def test_build_recovery_message_lists_gaps_only() -> None:
+    from superset_ai_agent.app import _build_recovery_message
+    from superset_ai_agent.semantic_layer.copilot.schemas import (
+        CoverageClaim,
+        CoverageFinding,
+        CoverageReport,
+    )
+
+    report = CoverageReport(
+        findings=[
+            CoverageFinding(
+                claim=CoverageClaim(subject="id", statement="id is the order id"),
+                status="missing",
+                suggestion="Add a description to orders.id",
+                document_filename="glossary.md",
+            ),
+            CoverageFinding(
+                claim=CoverageClaim(subject="x", statement="covered already"),
+                status="covered",
+            ),
+        ],
+        total=2,
+        covered=1,
+        missing=1,
+        score=0.5,
+    )
+    message = _build_recovery_message(report)
+    assert "id is the order id" in message
+    assert "glossary.md" in message
+    assert "Add a description to orders.id" in message
+    # Covered findings are not work items — they must not appear.
+    assert "covered already" not in message
+    # The instruction explicitly permits justified removals.
+    assert "remove" in message.lower()
+
+
+def test_coverage_recovery_auto_runs_and_surfaces_suggestions(tmp_path) -> None:
+    client = _client(
+        tmp_path,
+        model_client=CoverageThenRecoveryModel(),
+        wren_coverage_recovery_enabled=True,
+    )
+    project = _resolve(client)
+    pid = project["id"]
+    client.post(
+        f"/agent/semantic-layer/projects/{pid}/documents/text",
+        json={
+            "filename": "glossary.md",
+            "text": "id = order id.",
+            "content_type": "text/markdown",
+        },
+    )
+    # Activation → coverage (gap) → chained recovery agent (all inline).
+    _seed_active_model(client, pid)
+
+    latest = client.get(f"/agent/semantic-layer/projects/{pid}/coverage/latest").json()
+    run_id = latest["id"]
+    assert latest["report"]["missing"] == 1
+    assert latest["recovery_status"] == "ready"
+    assert latest["recovery_conversation_id"]
+
+    rec = client.get(
+        f"/agent/semantic-layer/projects/{pid}/coverage/runs/{run_id}/recovery"
+    )
+    assert rec.status_code == 200, rec.text
+    body = rec.json()
+    assert body["status"] == "ready"
+    assert body["suggestion_count"] >= 1
+    assert body["changeset"]["items"][0]["op"] == "create"
+    assert body["dismissed"] is False
+    assert body["stale"] is False
+
+    # The proposed file is NOT persisted (propose, don't apply).
+    listing = client.get(f"/agent/semantic-layer/projects/{pid}/mdl-files").json()
+    assert "models/recovery.json" not in {f["path"] for f in listing}
+
+    # The status endpoint surfaces the recovery state for the banner.
+    status = client.get(f"/agent/semantic-layer/projects/{pid}/coverage/status").json()
+    assert status["recovery_status"] == "ready"
+    assert status["recovery_run_id"] == run_id
+    assert status["recovery_dismissed"] is False
+
+
+def test_recovery_dismissal_is_durable_and_keeps_suggestions(tmp_path) -> None:
+    client = _client(
+        tmp_path,
+        model_client=CoverageThenRecoveryModel(),
+        wren_coverage_recovery_enabled=True,
+    )
+    project = _resolve(client)
+    pid = project["id"]
+    client.post(
+        f"/agent/semantic-layer/projects/{pid}/documents/text",
+        json={
+            "filename": "g.md",
+            "text": "id = order id.",
+            "content_type": "text/markdown",
+        },
+    )
+    _seed_active_model(client, pid)
+    run_id = client.get(f"/agent/semantic-layer/projects/{pid}/coverage/latest").json()[
+        "id"
+    ]
+
+    dismiss = client.post(
+        f"/agent/semantic-layer/projects/{pid}/coverage/runs/{run_id}/recovery/dismiss"
+    )
+    assert dismiss.status_code == 200, dismiss.text
+    assert dismiss.json()["dismissed"] is True
+
+    after = client.get(
+        f"/agent/semantic-layer/projects/{pid}/coverage/runs/{run_id}/recovery"
+    ).json()
+    assert after["dismissed"] is True
+    # Dismissal hides the banner but the suggestions remain reachable.
+    assert after["status"] == "ready"
+    assert after["suggestion_count"] >= 1
+
+
+def test_recovery_does_not_run_when_flag_disabled(tmp_path) -> None:
+    # Default: recovery feature off → coverage runs, no recovery is scheduled.
+    client = _client(tmp_path, model_client=CoverageModel())
+    project = _resolve(client)
+    pid = project["id"]
+    client.post(
+        f"/agent/semantic-layer/projects/{pid}/documents/text",
+        json={
+            "filename": "g.md",
+            "text": "id = order id.",
+            "content_type": "text/markdown",
+        },
+    )
+    _seed_active_model(client, pid)
+
+    latest = client.get(f"/agent/semantic-layer/projects/{pid}/coverage/latest").json()
+    assert latest["report"]["missing"] == 1  # there is a gap…
+    # …but recovery never ran (feature gated off).
+    assert latest["recovery_status"] == "none"
+    assert latest["recovery_conversation_id"] is None
+
+
 def test_copilot_routes_404_when_disabled(tmp_path) -> None:
     client = _client(tmp_path, enabled=False)
     project = _resolve(client)

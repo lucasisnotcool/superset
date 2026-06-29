@@ -36,12 +36,16 @@ jest.mock('../useDocumentIngestion', () => ({
   default: () => ({ ingest: mockIngest, isIngesting: false }),
 }));
 
-// Override only the single-document getter the attach-status poll calls; the rest
-// of `../api` (streaming, conversations) stays real and rides the fetch mock.
+// Override the single-document getter the attach-status poll calls and the
+// project-document lister the Attach dialog calls; the rest of `../api`
+// (streaming, conversations) stays real and rides the fetch mock.
 const mockGetSemanticDocument = jest.fn();
+const mockListProjectDocuments = jest.fn();
 jest.mock('../api', () => ({
   ...jest.requireActual('../api'),
   getSemanticDocument: (...args: unknown[]) => mockGetSemanticDocument(...args),
+  listProjectDocuments: (...args: unknown[]) =>
+    mockListProjectDocuments(...args),
 }));
 
 const ingestedDoc = (
@@ -62,9 +66,15 @@ const ingestedDoc = (
   ...overrides,
 });
 
+// Attach now goes through the dialog: open it, upload a file (auto-selected), and
+// confirm to stage it on the turn.
 const attachFile = async (name = 'spec.pdf', type = 'application/pdf') => {
-  const input = screen.getByTestId('copilot-attach-input') as HTMLInputElement;
+  await userEvent.click(screen.getByTestId('copilot-attach'));
+  const input = (await screen.findByTestId(
+    'copilot-attach-input',
+  )) as HTMLInputElement;
   await userEvent.upload(input, new File(['bytes'], name, { type }));
+  await userEvent.click(await screen.findByTestId('modal-confirm-button'));
 };
 
 const originalAgentUrl = process.env.SUPERSET_AI_AGENT_URL;
@@ -219,6 +229,10 @@ beforeEach(() => {
   localStorage.clear();
   mockIngest.mockReset();
   mockGetSemanticDocument.mockReset();
+  mockListProjectDocuments.mockReset();
+  // The Attach dialog lists existing project documents on open; default to none
+  // so attach tests assert on the freshly-uploaded document only.
+  mockListProjectDocuments.mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -635,10 +649,18 @@ test('attaching inlines the extracted text into the next turn', async () => {
 // These use fake timers + fireEvent for deterministic control of the 1500ms poll.
 
 const attachViaInput = async (name = 'spec.pdf', type = 'application/pdf') => {
+  // Drive the dialog with fireEvent (deterministic under fake timers): open it,
+  // upload (ingest resolves on the microtask queue flushed by act), then confirm.
+  await act(async () => {
+    fireEvent.click(screen.getByTestId('copilot-attach'));
+  });
   await act(async () => {
     fireEvent.change(screen.getByTestId('copilot-attach-input'), {
       target: { files: [new File(['x'], name, { type })] },
     });
+  });
+  await act(async () => {
+    fireEvent.click(screen.getByTestId('modal-confirm-button'));
   });
 };
 

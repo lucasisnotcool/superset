@@ -121,6 +121,13 @@ class AgentConfig:
     wren_example_limit: int = 5
     wren_schema_table_scan_limit: int = 100
     wren_schema_table_candidate_limit: int = 12
+    # Cross-schema query context: when grounding on a multi-schema project, the
+    # dataset candidate scan unions every member schema (so the agent can rank +
+    # join across the project's full scope). This caps the TOTAL datasets fetched
+    # across all member schemas (bounds the N+1 scan); ranking then selects the
+    # top ``wren_schema_table_candidate_limit`` from the union. Single-schema
+    # scopes are unaffected. 0 = unbounded (not recommended).
+    wren_schema_total_candidate_limit: int = 100
     wren_schema_metric_candidate_limit: int = 20
     wren_schema_example_candidate_limit: int = 5
     wren_schema_document_candidate_limit: int = 5
@@ -213,6 +220,16 @@ class AgentConfig:
     wren_coverage_debounce_seconds: float = 0.0
     # Also flag MDL facts unsupported by any document (overreach) in auto runs.
     wren_coverage_include_overreach: bool = False
+    # Coverage recovery agent: after a coverage run finds gaps, auto-run an MDL
+    # Copilot turn that proposes edits to close them (reviewable changeset, never
+    # auto-applied). Off by default until proven; gated behind copilot being on.
+    wren_coverage_recovery_enabled: bool = False
+    # TTL (seconds) for the per-project physical schema index. Copilot/MDL
+    # operations (validate-on-edit, deploy preview, copilot turns) otherwise rebuild
+    # it from Superset's dataset API every call — a list + per-dataset N+1, per
+    # project schema. The physical schema rarely changes mid-session, so a short
+    # cache collapses the repeated bursts. 0 disables caching.
+    wren_schema_index_cache_ttl_seconds: float = 60.0
     # Prior Copilot turns fed back into the edit loop as conversation history
     # (multi-turn memory). Mirrors ``max_history_messages`` for the SQL agent;
     # windows the most recent N messages to bound token cost.
@@ -574,6 +591,12 @@ class AgentConfig:
                     str(cls.wren_schema_table_candidate_limit),
                 )
             ),
+            wren_schema_total_candidate_limit=int(
+                os.getenv(
+                    "WREN_SCHEMA_TOTAL_CANDIDATE_LIMIT",
+                    str(cls.wren_schema_total_candidate_limit),
+                )
+            ),
             wren_schema_metric_candidate_limit=int(
                 os.getenv(
                     "WREN_SCHEMA_METRIC_CANDIDATE_LIMIT",
@@ -728,6 +751,16 @@ class AgentConfig:
             wren_coverage_include_overreach=_env_bool(
                 "WREN_COVERAGE_INCLUDE_OVERREACH",
                 cls.wren_coverage_include_overreach,
+            ),
+            wren_coverage_recovery_enabled=_env_bool(
+                "WREN_COVERAGE_RECOVERY_ENABLED",
+                cls.wren_coverage_recovery_enabled,
+            ),
+            wren_schema_index_cache_ttl_seconds=float(
+                os.getenv(
+                    "WREN_SCHEMA_INDEX_CACHE_TTL_SECONDS",
+                    str(cls.wren_schema_index_cache_ttl_seconds),
+                )
             ),
             wren_copilot_max_history_messages=int(
                 os.getenv(

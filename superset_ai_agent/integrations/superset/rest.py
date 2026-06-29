@@ -198,10 +198,39 @@ class SupersetRestClient:
             },
         )
 
-    def get_dataset_raw(self, dataset_id: int) -> dict[str, Any]:
-        """Return raw `GET /api/v1/dataset/{id}` payload."""
+    #: Only the fields ``_normalize_dataset``/``_normalize_column``/
+    #: ``_normalize_metric`` actually read. Projecting the dataset detail to these
+    #: shrinks the per-dataset payload ~10x vs. the full columns+metrics dump
+    #: (Superset honors this ``columns`` projection — see the dataset ``get``
+    #: override). Pull this out of the hot ``list_datasets`` N+1 loop.
+    _DATASET_DETAIL_COLUMNS = (
+        "id",
+        "table_name",
+        "schema",
+        "description",
+        "database.id",
+        "columns.column_name",
+        "columns.type",
+        "columns.is_dttm",
+        "columns.description",
+        "metrics.metric_name",
+        "metrics.expression",
+        "metrics.description",
+    )
 
-        return self.request("GET", f"/api/v1/dataset/{dataset_id}")
+    def get_dataset_raw(self, dataset_id: int) -> dict[str, Any]:
+        """Return raw `GET /api/v1/dataset/{id}` payload (projected).
+
+        Only the fields the agent normalizes are requested, so a wide dataset
+        doesn't ship its entire columns+metrics serialization on every call.
+        """
+
+        projection = ",".join(self._DATASET_DETAIL_COLUMNS)
+        return self.request(
+            "GET",
+            f"/api/v1/dataset/{dataset_id}",
+            params={"q": "(columns:!(%s))" % projection},
+        )
 
     def execute_sql_raw(
         self,
@@ -335,10 +364,18 @@ class SupersetRestClient:
         catalog_name: str | None = None,
         schema_name: str | None = None,
         dataset_ids: list[int] | None = None,
+        include_datasets: bool = True,
     ) -> AgentContext:
-        """Build compact metadata context from REST database and dataset payloads."""
+        """Build compact metadata context from REST database and dataset payloads.
+
+        ``include_datasets=False`` returns just the database shell (no dataset
+        scan) — for callers that immediately replace ``datasets`` with their own
+        candidate set, so the per-dataset N+1 isn't paid twice.
+        """
 
         database = _normalize_database(self.get_database_raw(database_id))
+        if not include_datasets:
+            return AgentContext(database=database, datasets=[])
         datasets = self.list_datasets(
             database_id=database_id,
             catalog_name=catalog_name,

@@ -54,7 +54,7 @@ ChangesetOp = Literal["create", "update", "delete"]
 #: Semantic verb for an MDL-mutating tool call, named at dispatch time (not
 #: reverse-engineered from a diff). An unmapped/future tool defaults to ``write``
 #: and still surfaces its raw ``tool`` name — extend additively, no migration.
-ToolActionKind = Literal["write", "delete", "onboard", "relate"]
+ToolActionKind = Literal["write", "delete", "onboard", "relate", "remove"]
 
 
 class ToolCallRecord(BaseModel):
@@ -318,6 +318,17 @@ CoverageRunStatus = Literal[
     "superseded",
 ]
 
+#: Lifecycle of the chained coverage-recovery agent for a run. ``none`` = not
+#: applicable (no gaps / feature off); ``empty`` = ran but proposed nothing.
+CoverageRecoveryStatus = Literal[
+    "none",
+    "pending",
+    "running",
+    "ready",
+    "failed",
+    "empty",
+]
+
 
 class CoverageProgress(BaseModel):
     """Coarse live progress of an in-flight coverage run (Feature C).
@@ -353,6 +364,13 @@ class CoverageRun(BaseModel):
     report: CoverageReport | None = None
     #: Live progress while ``running``; ``None`` before first tick / once terminal.
     progress: CoverageProgress | None = None
+    #: Chained recovery agent (proposes gap-closing edits as a reviewable
+    #: changeset). ``recovery_conversation_id`` points at the persisted thread whose
+    #: changeset artifact is the suggestion set; ``recovery_dismissed_at`` is the
+    #: durable per-run dismissal of the "suggestions ready" notification.
+    recovery_status: CoverageRecoveryStatus = "none"
+    recovery_conversation_id: str | None = None
+    recovery_dismissed_at: datetime | None = None
     error: str | None = None
     created_at: datetime = Field(default_factory=_utc_now)
     updated_at: datetime = Field(default_factory=_utc_now)

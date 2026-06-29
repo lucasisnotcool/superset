@@ -1582,6 +1582,21 @@ DEFAULT_HTTP_HEADERS: dict[str, Any] = {}
 OVERRIDE_HTTP_HEADERS: dict[str, Any] = {}
 HTTP_HEADERS: dict[str, Any] = {}
 
+# -------------------------------------------------------------------------
+# Server-Timing
+# -------------------------------------------------------------------------
+# Emit a `Server-Timing` response header carrying the backend's own per-phase
+# timings (total server time, database time, and any instrumented phases). This
+# lets the browser and the frontend Logger attribute latency to the backend vs
+# the frontend without guessing: the otherwise-opaque time-to-first-byte becomes
+# a labelled breakdown readable via `PerformanceResourceTiming.serverTiming`.
+SERVER_TIMING_ENABLED = True
+# Value for the `Timing-Allow-Origin` header. Required for the browser to expose
+# `Server-Timing` durations to JavaScript on cross-origin/embedded responses
+# (same-origin reads work without it). Set to "*" or a specific origin to enable
+# attribution for embedded dashboards; leave as None to omit the header.
+SERVER_TIMING_ALLOW_ORIGIN: str | None = None
+
 # The db id here results in selecting this one as a default in SQL Lab
 DEFAULT_DB_ID = None
 
@@ -1665,8 +1680,8 @@ SQLLAB_CTAS_NO_LIMIT = False
 #         else:
 #             return f'tmp_{schema}'
 # Function accepts database object, user object, schema name and sql that will be run.
-SQLLAB_CTAS_SCHEMA_NAME_FUNC: (
-    None | (Callable[[Database, models.User, str, str], str])
+SQLLAB_CTAS_SCHEMA_NAME_FUNC: None | (
+    Callable[[Database, models.User, str, str], str]
 ) = None
 
 # If enabled, it can be used to store the results of long-running queries

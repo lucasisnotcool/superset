@@ -243,3 +243,87 @@ def merge_manifest_sections(
                 base_list, overlay_list, merge_entry=merge_entry
             )
     return merged
+
+
+# -- removal (the inverse of the additive overlay) ---------------------------
+
+
+def removal_label(section: str, name: str, column: str | None = None) -> str:
+    """Stable ``section/name`` (or ``section/name.column``) label for reporting."""
+
+    return f"{section}/{name}.{column}" if column else f"{section}/{name}"
+
+
+def remove_named(items: list[Any], names: set[str]) -> list[Any]:
+    """Drop entries whose ``name`` is in ``names``; preserve the order of the rest.
+
+    Non-dict and unnamed entries pass through untouched — removal is the inverse of
+    the additive overlay and never reshuffles or discards what it wasn't asked to.
+    """
+
+    return [
+        item
+        for item in items
+        if not (isinstance(item, dict) and item.get("name") in names)
+    ]
+
+
+def remove_manifest_entities(
+    base: dict[str, Any], removals: list[dict[str, Any]]
+) -> tuple[dict[str, Any], list[str], list[str]]:
+    """Apply name-keyed removals to a manifest. Returns ``(new, removed, missing)``.
+
+    Each removal is ``{section, name, column?}``: a column removal drops the named
+    column from the named model; an entity removal drops the named entity from its
+    section. Survivor order is preserved. ``removed``/``missing`` are
+    ``removal_label`` strings the caller reports back. Mechanical only — physical
+    authority (a column may only be removed when calculated) is enforced by the
+    caller, not here, so this stays a pure structural transform.
+    """
+
+    new = dict(base)
+    removed: list[str] = []
+    missing: list[str] = []
+    for removal in removals:
+        section = removal.get("section")
+        name = removal.get("name")
+        column = removal.get("column")
+        if not isinstance(section, str) or not isinstance(name, str):
+            continue
+        items = new.get(section)
+        if not isinstance(items, list):
+            missing.append(removal_label(section, name, column))
+            continue
+        if column:
+            new_items, found = _remove_column(items, name, column)
+            new[section] = new_items
+            (removed if found else missing).append(removal_label(section, name, column))
+        else:
+            kept = remove_named(items, {name})
+            new[section] = kept
+            target = removed if len(kept) != len(items) else missing
+            target.append(removal_label(section, name))
+    return new, removed, missing
+
+
+def _remove_column(
+    items: list[Any], model_name: str, column: str
+) -> tuple[list[Any], bool]:
+    """Drop ``column`` from the model named ``model_name``; report whether it hit."""
+
+    found = False
+    new_items: list[Any] = []
+    for item in items:
+        if isinstance(item, dict) and item.get("name") == model_name:
+            cols = item.get("columns")
+            if isinstance(cols, list):
+                kept = [
+                    col
+                    for col in cols
+                    if not (isinstance(col, dict) and col.get("name") == column)
+                ]
+                if len(kept) != len(cols):
+                    found = True
+                    item = {**item, "columns": kept}
+        new_items.append(item)
+    return new_items, found

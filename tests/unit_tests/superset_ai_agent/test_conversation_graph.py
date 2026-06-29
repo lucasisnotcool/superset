@@ -591,8 +591,7 @@ def test_conversation_graph_can_take_multiple_sql_steps() -> None:
                 "outcome": "retry",
                 "message": "The first result needs detail for the top candidate.",
                 "retry_feedback": (
-                    "Inspect detail rows for the top candidate using a different "
-                    "query."
+                    "Inspect detail rows for the top candidate using a different query."
                 ),
             },
             {
@@ -649,8 +648,7 @@ def test_conversation_graph_skips_duplicate_sql_retry() -> None:
     conversation = store.create(scope)
     superset_client = FakeSupersetClient()
     repeated_sql = (
-        "SELECT name, SUM(num) AS total_births "
-        "FROM birth_names GROUP BY name LIMIT 5"
+        "SELECT name, SUM(num) AS total_births FROM birth_names GROUP BY name LIMIT 5"
     )
     model_client = FakeModelClient(
         [
@@ -1141,6 +1139,27 @@ def _answer_turn(
         conversation_id=conversation_id,
         request=ConversationTurnRequest(message="What's available?", scope=scope),
     )
+
+
+def test_conversation_infers_schema_from_pinned_project(tmp_path) -> None:
+    # The AI SQL dropdown bug, conversational path: a scope carrying a project pin
+    # but no schema must still ground (infer the project's schema) instead of
+    # blocking on "select a schema". Grounding pins the project, which only happens
+    # once the schema gate has passed.
+    store = InMemoryConversationStore()
+    project_store = InMemorySemanticProjectStore()
+    project_store._projects["p1"] = _semantic_project(  # noqa: SLF001
+        "p1", "Sales", datetime(2026, 1, 1, tzinfo=timezone.utc)
+    )
+    # No schema_name on the scope — only the project pin, as the dropdown sends it.
+    scope = ConversationScope(database_id=1, project_id="p1", dataset_ids=[16])
+    conversation = store.create(scope)
+
+    _answer_turn(
+        _grounding_graph(store, project_store, str(tmp_path)), conversation.id, scope
+    )
+
+    assert store.get(conversation.id).project_id == "p1"
 
 
 def test_grounded_turn_pins_resolved_project_onto_conversation(tmp_path) -> None:

@@ -73,6 +73,14 @@ class CoverageRunStore(Protocol):
 
     def fail(self, run_id: str, error: str) -> CoverageRun: ...
 
+    def set_recovery(
+        self, run_id: str, *, status: str, conversation_id: str | None = None
+    ) -> CoverageRun:
+        """Set the recovery agent status (and optionally its conversation id)."""
+
+    def dismiss_recovery(self, run_id: str) -> CoverageRun:
+        """Durably dismiss the 'recovery suggestions ready' notification."""
+
     def supersede(self, project_id: str, *, except_run_id: str | None = None) -> int:
         """Mark in-flight runs for the project ``superseded`` (except one)."""
 
@@ -162,6 +170,35 @@ class InMemoryCoverageRunStore:
 
     def fail(self, run_id: str, error: str) -> CoverageRun:
         return self._update(run_id, status="failed", error=error)
+
+    def set_recovery(
+        self, run_id: str, *, status: str, conversation_id: str | None = None
+    ) -> CoverageRun:
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise CoverageRunNotFoundError(run_id)
+            update: dict[str, object] = {
+                "recovery_status": status,
+                "updated_at": _now(),
+            }
+            if conversation_id is not None:
+                update["recovery_conversation_id"] = conversation_id
+            updated = run.model_copy(update=update)
+            self._runs[run_id] = updated
+            return updated.model_copy(deep=True)
+
+    def dismiss_recovery(self, run_id: str) -> CoverageRun:
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise CoverageRunNotFoundError(run_id)
+            now = _now()
+            updated = run.model_copy(
+                update={"recovery_dismissed_at": now, "updated_at": now}
+            )
+            self._runs[run_id] = updated
+            return updated.model_copy(deep=True)
 
     def supersede(self, project_id: str, *, except_run_id: str | None = None) -> int:
         count = 0
@@ -329,6 +366,31 @@ class SqlAlchemyCoverageRunStore:
     def fail(self, run_id: str, error: str) -> CoverageRun:
         return self._update(run_id, status="failed", error=error)
 
+    def set_recovery(
+        self, run_id: str, *, status: str, conversation_id: str | None = None
+    ) -> CoverageRun:
+        with self.session_factory() as session:
+            model = session.get(AiAgentCoverageRun, run_id)
+            if model is None:
+                raise CoverageRunNotFoundError(run_id)
+            model.recovery_status = status
+            if conversation_id is not None:
+                model.recovery_conversation_id = conversation_id
+            model.updated_at = _now()
+            session.commit()
+            return _from_model(model)
+
+    def dismiss_recovery(self, run_id: str) -> CoverageRun:
+        with self.session_factory() as session:
+            model = session.get(AiAgentCoverageRun, run_id)
+            if model is None:
+                raise CoverageRunNotFoundError(run_id)
+            now = _now()
+            model.recovery_dismissed_at = now
+            model.updated_at = now
+            session.commit()
+            return _from_model(model)
+
     def supersede(self, project_id: str, *, except_run_id: str | None = None) -> int:
         with self.session_factory() as session:
             stmt = (
@@ -470,6 +532,9 @@ def _to_model(run: CoverageRun) -> AiAgentCoverageRun:
         progress=(
             run.progress.model_dump(mode="json") if run.progress is not None else None
         ),
+        recovery_status=run.recovery_status,
+        recovery_conversation_id=run.recovery_conversation_id,
+        recovery_dismissed_at=run.recovery_dismissed_at,
         error=run.error,
         created_at=run.created_at,
         updated_at=run.updated_at,
@@ -495,6 +560,9 @@ def _from_model(model: AiAgentCoverageRun) -> CoverageRun:
             if model.progress is not None
             else None
         ),
+        recovery_status=model.recovery_status or "none",
+        recovery_conversation_id=model.recovery_conversation_id,
+        recovery_dismissed_at=model.recovery_dismissed_at,
         error=model.error,
         created_at=model.created_at,
         updated_at=model.updated_at,

@@ -153,9 +153,16 @@ A compact, structured serialization of the report focused on the **gaps**:
 - A recovery **instruction block** (system-prompt-grounded): *"Propose the minimal
   set of MDL edits that capture these missing/partial claims. Only add semantics
   the source documents support — descriptions, synonyms/aliases, metrics,
-  relationships. Do not invent data, do not delete or rename existing fields unless
-  a claim explicitly contradicts them, and prefer additive edits. Cite the claim
-  each edit closes."* Covered findings are omitted (no work to do).
+  relationships. Do not invent data. **Removals are allowed** — you may propose
+  deleting or rewriting existing MDL (drop a whole file via a delete, or remove a
+  model/column/metric by rewriting its file) when the documents contradict it or it
+  is redundant/unsupported — but every removal must cite the claim or contradiction
+  that justifies it. Cite the claim each edit closes."* Covered findings are omitted.
+  - Removal mechanics (verified): the agent removes a **whole MDL file** with
+    `delete_mdl_file` (→ `op="delete"`), and removes an **element inside a file**
+    (a model/column/metric/relationship) with `write_mdl_file`/`patch_mdl_file`
+    (→ `op="update"` with that element dropped). Both are first-class changeset
+    ops the apply path already handles.
 
 ### 4.4 Apply (unchanged path, reused)
 The review dialog posts accepted items + the `recovery_conversation_id` to the
@@ -184,10 +191,17 @@ item additionally shows **which coverage claim it closes** + the agent rationale
 ### 5.2 `RecoverySuggestionsDialog`
 A modal opened from the notification or the coverage report. Header: "N coverage
 suggestions" + a **stale** notice if the MDL moved on (offer "re-run recovery").
-Body: `ChangesetReviewPanel` (per-item Apply/Dismiss, validation status, diff).
-Footer: **Apply selected** (drafts) / **Dismiss all**. Destructive items (deletes)
-default to *rejected* and are visually flagged (HITL: irreversible needs explicit
-opt-in).
+Body: `ChangesetReviewPanel` (per-item approve/reject, validation status, diff).
+Footer: **Apply selected** (drafts) / **Dismiss all**. **Removals are first-class,
+proposable suggestions** — the agent may propose deleting a file or stripping a
+model/column/metric, and the user approves or rejects it like any other item.
+Default decision follows the existing Copilot rule **op-agnostically**: an item is
+pre-accepted unless it *fails validation* (then pre-rejected) — deletes are **not**
+singled out for pre-rejection. Removals stay **conspicuous** (the existing red
+"Delete" op tag; for an intra-file removal, the diff shows the dropped element), so
+a destructive change is obvious without being suppressed. Because every applied
+item lands as a reversible **draft** (not an activation), a wrongly-approved removal
+is recoverable before deploy.
 
 ### 5.3 Persistent notification (the "alert")
 A **persistent, nonmodal, dismissible banner** (Material banner / Carbon inline
@@ -243,7 +257,7 @@ all Copilot tools (§4.1), report+instructions as the user message (§4.3).
 
 | # | Risk | Mitigation |
 |---|---|---|
-| R1 | Agent proposes destructive / hallucinated edits | **Never auto-applies** (human review, per-item); each item carries `MdlValidationResult`; deletes/invalid default to *rejected* and are flagged; system prompt constrains to additive, source-grounded edits citing the closed claim. |
+| R1 | Agent proposes hallucinated / unjustified edits (incl. removals) | **Never auto-applies** (human review, per-item); each item carries `MdlValidationResult`; **only invalid items pre-reject (op-agnostic)** — removals are legitimate, reviewable proposals, not pre-blocked; they stay conspicuous (red delete tag / diff shows dropped element); the system prompt requires every removal to cite the contradiction/claim that justifies it; applied items are reversible **drafts**, so nothing is destroyed until a separate human activation. |
 | R2 | Cost/latency: every gappy run spawns another LLM loop | Gate on `missing+partial > 0` **and** a `wren_coverage_recovery_enabled` flag; run as a **separate** job; cap `max_steps`; only the latest run; superseded runs skip. |
 | R3 | Stale suggestions — MDL moved on since recovery ran | Tag recovery with the run's `mdl_checksum`; dialog shows a *stale* notice + "re-run" when current active checksum differs; supersession cancels in-flight recovery. |
 | R4 | Notification fatigue | One banner per run, only when gaps exist; **server-side** dismissal (no re-notify on reload); only-core-purpose alert (NN/g). |

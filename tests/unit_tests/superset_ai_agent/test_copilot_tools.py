@@ -65,6 +65,7 @@ def test_specs_expose_the_tool_surface() -> None:
         "write_mdl_file",
         "patch_mdl_file",
         "delete_mdl_file",
+        "remove_mdl_entity",
         "validate_project",
         "get_physical_schema",
         "propose_onboard_table",
@@ -330,7 +331,7 @@ def test_delete_file_produces_delete_item() -> None:
 
 def test_delete_missing_file_returns_actionable_guidance() -> None:
     # Deleting a non-existent path (e.g. a model name treated as a file) steers the
-    # agent toward rewriting the containing file rather than delete-by-name (P4).
+    # agent toward per-entity removal rather than delete-by-name (P4).
     toolset = MdlToolset([_file("models/orders.json", ORDERS)], schema_index=SCHEMA)
 
     result = toolset.dispatch(
@@ -338,7 +339,7 @@ def test_delete_missing_file_returns_actionable_guidance() -> None:
     )
 
     assert "error" in result
-    assert "write_mdl_file" in result["error"]
+    assert "remove_mdl_entity" in result["error"]
     assert "whole files by path" in result["error"]
 
 
@@ -882,3 +883,223 @@ def test_patch_flags_silently_ignored_structural_edits() -> None:
     merged = json.loads(toolset._working["models/orders.json"])
     tax = {c["name"]: c for c in merged["models"][0]["columns"]}["tax"]
     assert tax["expression"] == "amount * 0.1"
+
+
+# --- remove_mdl_entity: name-keyed removal (Item D) --------------------------
+
+CALC = json.dumps(
+    {
+        "models": [
+            {
+                "name": "orders",
+                "tableReference": {"schema": "public", "table": "orders"},
+                "columns": [
+                    {"name": "id", "type": "BIGINT"},
+                    {"name": "amount", "type": "BIGINT"},
+                    {
+                        "name": "tax",
+                        "type": "BIGINT",
+                        "isCalculated": True,
+                        "expression": "amount * 0.1",
+                    },
+                ],
+            }
+        ]
+    }
+)
+
+RELS = json.dumps(
+    {
+        "relationships": [
+            {
+                "name": "o_to_c",
+                "models": ["orders", "customers"],
+                "joinType": "MANY_TO_ONE",
+                "condition": "orders.cid = customers.id",
+            },
+            {
+                "name": "o_to_p",
+                "models": ["orders", "products"],
+                "joinType": "MANY_TO_ONE",
+                "condition": "orders.pid = products.id",
+            },
+        ]
+    }
+)
+
+
+def test_remove_calculated_column() -> None:
+    toolset = MdlToolset([_file("models/orders.json", CALC)], schema_index=SCHEMA)
+
+    result = toolset.dispatch(
+        "remove_mdl_entity",
+        {
+            "path": "models/orders.json",
+            "removals": [{"section": "models", "name": "orders", "column": "tax"}],
+        },
+    )
+
+    assert result["removed"] == ["models/orders.tax"]
+    assert result["validation"]["valid"] is True
+    cols = [
+        c["name"]
+        for c in json.loads(toolset._working["models/orders.json"])["models"][0][
+            "columns"
+        ]
+    ]
+    assert cols == ["id", "amount"]  # only the calculated column went
+
+
+def test_remove_refuses_physical_column() -> None:
+    toolset = MdlToolset([_file("models/orders.json", CALC)], schema_index=SCHEMA)
+
+    result = toolset.dispatch(
+        "remove_mdl_entity",
+        {
+            "path": "models/orders.json",
+            "removals": [{"section": "models", "name": "orders", "column": "amount"}],
+        },
+    )
+
+    assert result["removed"] == []
+    assert "physical column" in result["rejected"][0]["error"]
+    # The physical column is untouched.
+    cols = [
+        c["name"]
+        for c in json.loads(toolset._working["models/orders.json"])["models"][0][
+            "columns"
+        ]
+    ]
+    assert "amount" in cols
+
+
+def test_remove_relationship_keeps_siblings() -> None:
+    toolset = MdlToolset([_file("relationships.json", RELS)], schema_index=SCHEMA)
+
+    result = toolset.dispatch(
+        "remove_mdl_entity",
+        {
+            "path": "relationships.json",
+            "removals": [{"section": "relationships", "name": "o_to_c"}],
+        },
+    )
+
+    assert result["removed"] == ["relationships/o_to_c"]
+    names = [
+        r["name"]
+        for r in json.loads(toolset._working["relationships.json"])["relationships"]
+    ]
+    assert names == ["o_to_p"]
+
+
+def test_remove_last_entity_deletes_file() -> None:
+    one = json.dumps({"relationships": [{"name": "o_to_c"}]})
+    toolset = MdlToolset([_file("relationships.json", one)], schema_index=SCHEMA)
+
+    result = toolset.dispatch(
+        "remove_mdl_entity",
+        {
+            "path": "relationships.json",
+            "removals": [{"section": "relationships", "name": "o_to_c"}],
+        },
+    )
+
+    assert result["deleted"] is True
+    assert "relationships.json" not in toolset._working
+    # The changeset records the file as deleted.
+    ops = {i.path: i.op for i in toolset.build_changeset().items}
+    assert ops["relationships.json"] == "delete"
+
+
+def test_remove_reports_missing_target() -> None:
+    toolset = MdlToolset([_file("models/orders.json", CALC)], schema_index=SCHEMA)
+
+    result = toolset.dispatch(
+        "remove_mdl_entity",
+        {
+            "path": "models/orders.json",
+            "removals": [{"section": "models", "name": "ghost"}],
+        },
+    )
+
+    assert result["removed"] == []
+    assert result["missing"] == ["models/ghost"]
+
+
+def test_remove_missing_file_errors() -> None:
+    toolset = MdlToolset([_file("models/orders.json", CALC)], schema_index=SCHEMA)
+
+    result = toolset.dispatch(
+        "remove_mdl_entity",
+        {
+            "path": "models/nope.json",
+            "removals": [{"section": "models", "name": "orders"}],
+        },
+    )
+
+    assert "error" in result
+
+
+def test_remove_rejects_unknown_section() -> None:
+    toolset = MdlToolset([_file("models/orders.json", CALC)], schema_index=SCHEMA)
+
+    result = toolset.dispatch(
+        "remove_mdl_entity",
+        {
+            "path": "models/orders.json",
+            "removals": [{"section": "widgets", "name": "orders"}],
+        },
+    )
+
+    assert result["removed"] == []
+    assert "section" in result["rejected"][0]["error"]
+
+
+def test_remove_provenance_records_remove_verb() -> None:
+    toolset = MdlToolset([_file("relationships.json", RELS)], schema_index=SCHEMA)
+    toolset.dispatch(
+        "remove_mdl_entity",
+        {
+            "path": "relationships.json",
+            "removals": [{"section": "relationships", "name": "o_to_c"}],
+        },
+    )
+
+    calls = [
+        c for c in toolset.build_changeset().tool_calls if c.tool == "remove_mdl_entity"
+    ]
+    assert len(calls) == 1
+    assert calls[0].action == "remove"
+    assert calls[0].args_summary["removed_count"] == 1
+
+
+# --- get_physical_schema cross-schema qualification (F1) ----------------------
+
+
+def test_get_physical_schema_qualified_when_multi_schema() -> None:
+    index = SchemaIndex.from_snapshot(
+        tables={"orders": ["id"], "customers": ["id"]},
+        tables_by_schema={"sales": {"orders": ["id"]}, "crm": {"customers": ["id"]}},
+        types_by_schema={"sales": {"orders": {"id": "BIGINT"}}},
+    )
+    toolset = MdlToolset([], schema_index=index)
+
+    result = toolset.dispatch("get_physical_schema", {})
+
+    assert "schemas" in result  # qualified shape, not flat
+    assert "tables" not in result
+    assert set(result["schemas"]) == {"sales", "crm"}
+    assert result["schemas"]["sales"]["orders"]["columns"] == ["id"]
+    assert result["schemas"]["sales"]["orders"]["types"] == {"id": "BIGINT"}
+    assert "multiple schemas" in result["note"]
+
+
+def test_get_physical_schema_flat_when_single_schema() -> None:
+    # The single-schema path is unchanged (no schemas key, flat tables).
+    toolset = MdlToolset([], schema_index=SCHEMA)
+
+    result = toolset.dispatch("get_physical_schema", {})
+
+    assert "tables" in result  # flat shape preserved for single-schema
+    assert "schemas" not in result
+    assert "orders" in result["tables"]
