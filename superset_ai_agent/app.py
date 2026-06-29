@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json  # noqa: TID251 - keep the standalone agent independent of Superset
 import logging
@@ -37,6 +38,7 @@ from fastapi import (
     Request,
     UploadFile,
 )
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
@@ -244,6 +246,14 @@ from superset_ai_agent.semantic_layer.store import (
 from superset_ai_agent.semantic_layer.wren_core_validator import wren_core_available
 from superset_ai_agent.semantic_layer.wren_materializer import materialize_wren_project
 from superset_ai_agent.tools.sql import validate_read_only_sql
+
+# Durable project-events SSE tuning. The stream tails the event store on this
+# interval, recycles the connection after the max lifetime (the client reconnects
+# once, cheaply), and advertises the reconnect backoff so a dropped connection
+# never becomes a hot loop.
+SEMANTIC_EVENTS_POLL_INTERVAL_SECONDS = 2.0
+SEMANTIC_EVENTS_MAX_STREAM_SECONDS = 300.0
+SEMANTIC_EVENTS_RETRY_MS = 15000
 
 
 def _conversation_sse(event: dict[str, Any]) -> str:
@@ -501,12 +511,41 @@ def create_app(  # noqa: C901
             retriever=active_retriever,
         )
 
+    # Authorization derives a project's read/write level from the caller's *live*
+    # Superset DB-access, which means a dataset list + per-dataset N+1 introspection
+    # for every schema in scope — on every authorized request. Every MDL Lab call
+    # authorizes, and the editor's coverage badge/banner each hold an SSE channel
+    # that re-polls status, so without memoization a single open project storms
+    # Superset with identical introspection. A short TTL makes repeated checks
+    # within the window reuse one build. Keyed by ``owner_id`` so one principal's
+    # access view never satisfies another's check; access only changes on a role
+    # change (a re-login), so a brief staleness window is safe. Only positive-TTL
+    # builds are cached (the cache no-ops at ttl<=0).
+    _auth_context_cache: TtlCache[tuple[Any, ...], Any] = TtlCache(
+        ttl_seconds=app_config.wren_schema_index_cache_ttl_seconds,
+    )
+
     def build_semantic_access_service(
         request: Request,
+        *,
+        owner_id: str | None = None,
     ) -> SemanticAccessService:
         def load_context(scope: ConversationScope) -> Any:
+            # Cache only when the caller identifies the principal (the hot
+            # authorize paths do); anonymous builds fall through uncached.
+            cache_key = (
+                owner_id,
+                scope.database_id,
+                scope.catalog_name,
+                scope.schema_name,
+                tuple(scope.dataset_ids or ()),
+            )
+            if owner_id is not None:
+                cached = _auth_context_cache.get(cache_key)
+                if cached is not None:
+                    return cached
             request_context_provider, _ = build_superset_runtime(request)
-            return request_context_provider.get_context(
+            context = request_context_provider.get_context(
                 AgentQueryRequest(
                     question="semantic layer scope authorization",
                     database_id=scope.database_id,
@@ -515,6 +554,9 @@ def create_app(  # noqa: C901
                     dataset_ids=scope.dataset_ids,
                 )
             )
+            if owner_id is not None:
+                _auth_context_cache.set(cache_key, context)
+            return context
 
         def get_database_identity(
             database_id: int,
@@ -544,7 +586,9 @@ def create_app(  # noqa: C901
         permission: SemanticPermission = SemanticPermission.READ,
     ) -> None:
         try:
-            build_semantic_access_service(request).require_scope_permission(
+            build_semantic_access_service(
+                request, owner_id=identity.owner_id
+            ).require_scope_permission(
                 identity=identity,
                 scope=scope,
                 permission=permission,
@@ -560,7 +604,9 @@ def create_app(  # noqa: C901
         permission: str = "read",
     ) -> SemanticProject:
         try:
-            return build_semantic_access_service(request).require_project_permission(
+            return build_semantic_access_service(
+                request, owner_id=owner_id
+            ).require_project_permission(
                 identity=AgentIdentity(owner_id=owner_id),
                 project_id=project_id,
                 permission=SemanticPermission(permission),
@@ -1395,6 +1441,25 @@ def create_app(  # noqa: C901
                 project.id, mdl_checksum, docs_checksum
             )
             if existing is not None:
+                # The active version was already audited (idempotent — no re-run).
+                # But a run audited before the recovery feature existed (or whose
+                # recovery failed) carries no suggestions, so back-fill recovery for
+                # it: this lets already-active projects pick up recovery on the next
+                # trigger (including a manual refresh) without a fresh audit. The
+                # recovery job re-checks the gate and is idempotent on its
+                # conversation id.
+                if (
+                    app_config.wren_coverage_recovery_enabled
+                    and existing.recovery_status in ("none", "failed")
+                    and existing.report is not None
+                    and (existing.report.missing + existing.report.partial) > 0
+                ):
+                    active_coverage_run_store.set_recovery(
+                        existing.id, status="pending"
+                    )
+                    active_job_runner.submit(
+                        lambda: _run_recovery_job(existing.id, project, owner_id)
+                    )
                 return
             active_coverage_run_store.supersede(project.id)
             run = active_coverage_run_store.create(
@@ -1414,8 +1479,7 @@ def create_app(  # noqa: C901
     ) -> None:
         """Background body: debounce → claim → audit → persist + emit event."""
 
-        debounce = app_config.wren_coverage_debounce_seconds
-        if debounce > 0:
+        if (debounce := app_config.wren_coverage_debounce_seconds) > 0:
             time.sleep(debounce)
         # Claim-on-start lease: a newer trigger that superseded this run wins, so
         # only the latest pending run proceeds (cross-worker safe).
@@ -1754,8 +1818,7 @@ def create_app(  # noqa: C901
         if project.default_database_id is None:
             return None
         cache_key = (project.id, tuple(sorted(project.schema_names)))
-        cached_index = _schema_index_cache.get(cache_key)
-        if cached_index is not None:
+        if (cached_index := _schema_index_cache.get(cache_key)) is not None:
             return cached_index
         try:
             request_context_provider, _ = build_superset_runtime(fastapi_request)
@@ -4255,25 +4318,72 @@ def create_app(  # noqa: C901
         )
 
     @api.get("/agent/semantic-layer/projects/{project_id}/events")
-    def get_project_semantic_layer_events(
+    async def get_project_semantic_layer_events(
         project_id: str,
         fastapi_request: Request,
         identity: AgentIdentity = identity_dependency,
     ) -> StreamingResponse:
-        """Stream stored semantic-layer events for a governed project."""
+        """Stream a project's semantic-layer events as a durable SSE channel.
 
-        authorize_semantic_project(
+        Authorizes once, replays the stored backlog, then tails new events on a
+        short interval with heartbeats. A previous version emitted the backlog
+        through a *finite* generator and returned immediately; the browser
+        ``EventSource`` treats every close as a drop and reconnects, so the
+        connection looped — and because each request re-authorizes via a live
+        Superset schema introspection (a dataset list + per-dataset N+1 per
+        schema), that loop stormed Superset. Holding the connection open removes
+        the reconnect amplifier; the authorization cache bounds the per-request
+        cost.
+
+        Async by design: the wait between ticks yields to the event loop rather
+        than parking a worker thread, so an always-open editor panel does not
+        consume a thread for its lifetime (which would starve the sync endpoints
+        that share the pool). The blocking store read is offloaded per tick, and
+        the connection is recycled after a bounded lifetime (the client
+        reconnects once, cheaply).
+        """
+
+        # Offload the synchronous (Superset-touching) authorization so a cold
+        # cache does not block the event loop.
+        await run_in_threadpool(
+            authorize_semantic_project,
             fastapi_request,
             project_id,
             owner_id=identity.owner_id,
             permission="read",
         )
-        events = active_semantic_layer_store.list_project_events(
-            project_id,
-            owner_id=identity.owner_id,
-        )
+
+        async def event_stream() -> Any:
+            # If the connection ever does drop, tell EventSource to back off so a
+            # transient close never becomes a hot reconnect loop.
+            yield f"retry: {SEMANTIC_EVENTS_RETRY_MS}\n\n"
+            seen: set[str] = set()
+            deadline = time.monotonic() + SEMANTIC_EVENTS_MAX_STREAM_SECONDS
+            while True:
+                try:
+                    events = await run_in_threadpool(
+                        active_semantic_layer_store.list_project_events,
+                        project_id,
+                        owner_id=identity.owner_id,
+                    )
+                except Exception:  # pylint: disable=broad-except
+                    # Best-effort tail — a transient store error should not kill
+                    # the stream; retry on the next tick.
+                    events = []
+                for event in events:
+                    if event.id not in seen:
+                        seen.add(event.id)
+                        yield to_sse(event)
+                if time.monotonic() >= deadline:
+                    return
+                # A comment frame keeps the connection (and any buffering proxy)
+                # alive; awaiting the sleep lets the server notice a client
+                # disconnect promptly, so closing the editor tears the stream down.
+                yield ": keep-alive\n\n"
+                await asyncio.sleep(SEMANTIC_EVENTS_POLL_INTERVAL_SECONDS)
+
         return StreamingResponse(
-            (to_sse(event) for event in events),
+            event_stream(),
             media_type="text/event-stream",
         )
 

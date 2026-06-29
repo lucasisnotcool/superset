@@ -1142,3 +1142,33 @@ def test_enrich_injects_scope_instructions_into_prompt(tmp_path) -> None:
     assert any(
         "Always exclude internal test moves" in prompt for prompt in model.prompts
     )
+
+
+def test_project_events_stream_replays_backlog_and_heartbeats(
+    tmp_path, monkeypatch
+) -> None:
+    # The durable project-events SSE stream must replay the stored backlog,
+    # advertise a reconnect backoff, emit heartbeats, and TERMINATE on its own
+    # (the bounded lifetime) rather than reconnect-looping. Squeeze the lifetime
+    # so the test reads a complete, finite body instead of hanging.
+    import superset_ai_agent.app as agent_app
+
+    monkeypatch.setattr(agent_app, "SEMANTIC_EVENTS_MAX_STREAM_SECONDS", 0.3)
+    monkeypatch.setattr(agent_app, "SEMANTIC_EVENTS_POLL_INTERVAL_SECONDS", 0.05)
+
+    client, _provider = _client(tmp_path)
+    project = _resolve_project(client)
+    # Creating a model appends a provenance event to the project's backlog.
+    _seed_base_model(client, project["id"])
+
+    response = client.get(f"/agent/semantic-layer/projects/{project['id']}/events")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    body = response.text
+    # Reconnect backoff so a dropped connection never becomes a hot loop.
+    assert f"retry: {agent_app.SEMANTIC_EVENTS_RETRY_MS}" in body
+    # The backlog (the model-created provenance event) was replayed.
+    assert "event: mdl_created" in body
+    # At least one heartbeat kept the connection alive before the lifetime cap.
+    assert ": keep-alive" in body
