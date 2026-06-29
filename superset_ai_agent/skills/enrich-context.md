@@ -33,16 +33,19 @@ folder, no `wren` CLI, no `queries.yml`, no cube authoring.
 
 ### Universal (apply to both modes)
 
-1. **Only add, never modify or strip existing.** When you re-emit a model or
-   column, copy every physical field (`tableReference`, column `name`, `type`,
-   `expression`, `relationship`, `isCalculated`, `notNull`) and every existing
-   `properties` key (`displayName`, `alias`, `synonyms`, `description`) **forward
-   verbatim**, *then* add your new semantics. Emit the full preserved object,
-   never a partial overlay. These keys feed retrieval (`schema_retriever`) and
-   coverage scoring (`copilot/coverage`); silently dropping one degrades both
-   without any error. The `_preserve_superset_properties` / `_merge_*_preserving_
-   structure` guards exist as defense-in-depth — do not rely on them; be correct
-   from the first token.
+1. **Only add, never modify or strip existing.** Enrichment is the ideal case for
+   **`patch_mdl_file`**: emit a *sparse overlay* — only the models/columns you are
+   adding semantics to, keyed by name, carrying only your new keys. The
+   structure-preserving merge keeps every physical field (`tableReference`, column
+   `name`, `type`, `expression`, `relationship`, `isCalculated`, `notNull`) and
+   every existing `properties` key (`displayName`, `alias`, `synonyms`,
+   `description`) for you, and additively merges `properties`. These keys feed
+   retrieval (`schema_retriever`) and coverage scoring (`copilot/coverage`);
+   dropping one degrades both without any error, which is exactly why the overlay
+   path never touches what you omit. If you ever fall back to `write_mdl_file`
+   (restructuring), copy every physical field and `properties` key forward
+   verbatim, then add — be correct from the first token; do not rely on the
+   `_preserve_superset_properties` guard.
 2. **If existing MDL looks wrong, do not edit it.** A description, relationship,
    type, or rule that looks incorrect goes on the "please fix manually" list in
    Step 9 — never silently corrected.
@@ -285,8 +288,10 @@ Print a tight report:
   in conversation.
 - Do not modify or strip any existing MDL field or `properties` key — only
   add/append. Surface mismatches on the manual-fix list.
-- Do not emit a partial column/model object; always re-emit the full preserved
-  object so no physical field or `properties` key is lost.
+- Prefer `patch_mdl_file` with a sparse overlay (only the entities/columns you are
+  enriching); the merge preserves every omitted physical field and `properties`
+  key. Only when you fall back to `write_mdl_file` must you re-emit the full
+  preserved object so nothing is lost.
 - Do not attach semantics to a table or physical column absent from
   `get_physical_schema`.
 - Do not auto-resolve a conflict between a document and current MDL — escalate in

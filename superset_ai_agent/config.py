@@ -223,6 +223,12 @@ class AgentConfig:
     # for large projects. Operator-tunable at runtime (no rebuild) via
     # WREN_COPILOT_MAX_STEPS. Recommended range 8–24.
     wren_copilot_max_steps: int = 16
+    # Default char cap on a tool result fed back into the edit loop (bounds context
+    # cost). Reads (read_mdl_file, read_document) and validation are EXEMPT so the
+    # agent never reasons over — or, for write/patch, reproduces — a silently
+    # truncated file; physical-schema dumps keep a higher multiple. Operator-tunable
+    # via WREN_COPILOT_TOOL_RESULT_MAX_CHARS.
+    wren_copilot_tool_result_max_chars: int = 4000
     # Wren full-parity seams (see wren_full.md). All default to the
     # zero-dependency binding so the service starts unchanged; turning any of
     # these on requires durable semantic persistence (semantic_layer_store=
@@ -733,6 +739,12 @@ class AgentConfig:
                 os.getenv(
                     "WREN_COPILOT_MAX_STEPS",
                     str(cls.wren_copilot_max_steps),
+                )
+            ),
+            wren_copilot_tool_result_max_chars=int(
+                os.getenv(
+                    "WREN_COPILOT_TOOL_RESULT_MAX_CHARS",
+                    str(cls.wren_copilot_tool_result_max_chars),
                 )
             ),
             wren_engine=cast(

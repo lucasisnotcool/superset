@@ -54,6 +54,10 @@ from superset_ai_agent.semantic_layer.document_retriever import (
     find_exact_duplicate_matches,
 )
 from superset_ai_agent.semantic_layer.mdl_files import normalize_mdl_path
+from superset_ai_agent.semantic_layer.mdl_merge import (
+    merge_manifest_sections,
+    MERGE_SECTIONS,
+)
 from superset_ai_agent.semantic_layer.mdl_schema import JOIN_TYPES
 from superset_ai_agent.semantic_layer.mdl_validator import (
     SchemaIndex,
@@ -200,6 +204,40 @@ class MdlToolset:
                         },
                     },
                     "required": ["path", "content"],
+                },
+            ),
+            ToolSpec(
+                name="patch_mdl_file",
+                description=(
+                    "Refine an EXISTING MDL file by merging a partial overlay — emit "
+                    "only the models/columns/relationships/metrics you change, keyed "
+                    "by name, not the whole file. Omitted entities/columns and their "
+                    "existing properties are preserved automatically. Prefer this for "
+                    "adding descriptions, synonyms, new calculated columns, metrics, "
+                    "and relationships. It only refines description/properties on an "
+                    "existing column and appends new ones; to change an existing "
+                    "column's type/expression or to remove/restructure an entity, use "
+                    "write_mdl_file (a full overwrite). Returns validation."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": path_param,
+                        "overlay": {
+                            "type": "string",
+                            "description": (
+                                "Partial MDL JSON with ONLY the changed entities/"
+                                "columns, keyed by name, e.g. "
+                                '{"models":[{"name":"orders","columns":'
+                                '[{"name":"revenue","description":"Gross USD"}]}]}.'
+                            ),
+                        },
+                        "summary": {
+                            "type": "string",
+                            "description": "Short human label for this edit.",
+                        },
+                    },
+                    "required": ["path", "overlay"],
                 },
             ),
             ToolSpec(
@@ -458,6 +496,7 @@ class MdlToolset:
             "list_mdl_files": self._list_mdl_files,
             "read_mdl_file": self._read_mdl_file,
             "write_mdl_file": self._write_mdl_file,
+            "patch_mdl_file": self._patch_mdl_file,
             "delete_mdl_file": self._delete_mdl_file,
             "validate_project": self._validate_project,
             "get_physical_schema": self._get_physical_schema,
@@ -549,12 +588,21 @@ class MdlToolset:
         content = args.get("content")
         if not isinstance(content, str) or not content.strip():
             return {"error": "write_mdl_file requires non-empty 'content'."}
-        # Full-content overwrite is the code-editor model, but an LLM that
-        # re-emits a file can silently drop the Superset-extension `properties`
-        # (displayName/alias/synonyms) that back governance + retrieval. wren-core
-        # tolerates the omission, so validation never catches it. Restore any
-        # dropped keys against the prior version of this file (additive; the agent
-        # can still *edit* a property, just not silently *delete* one).
+        return self._stage_content(path, content, args.get("summary"))
+
+    def _stage_content(self, path: str, content: str, summary: Any) -> dict[str, Any]:
+        """Stage full file content into the working copy and validate it.
+
+        Shared by ``write_mdl_file`` (full overwrite) and ``patch_mdl_file`` (merged
+        overlay). Full-content overwrite is the code-editor model, but an LLM that
+        re-emits a file can silently drop the Superset-extension ``properties``
+        (displayName/alias/synonyms) that back governance + retrieval. wren-core
+        tolerates the omission, so validation never catches it. Restore any dropped
+        keys against the prior version of this file (additive; the agent can still
+        *edit* a property, just not silently *delete* one). For ``patch_mdl_file``
+        the merge already preserved them, so this guard is a defensive no-op there.
+        """
+
         prior = self._working.get(path)
         restored = False
         if prior is not None:
@@ -562,18 +610,88 @@ class MdlToolset:
             restored = preserved != content
             content = preserved
         self._working[path] = content
-        if args.get("summary"):
-            self._summaries[path] = str(args["summary"])
+        if summary:
+            self._summaries[path] = str(summary)
         validation = validate_mdl(
             content, schema_index=self._schema_index, strict_models=True
         )
-        result = {"path": path, "validation": validation.model_dump(mode="json")}
+        result: dict[str, Any] = {
+            "path": path,
+            "validation": validation.model_dump(mode="json"),
+        }
         if restored:
             result["note"] = (
                 "Restored Superset `properties` (displayName/alias/synonyms) that "
                 "the new content omitted — these back governance and retrieval and "
                 "must be preserved."
             )
+        return result
+
+    def _patch_mdl_file(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Merge a sparse, name-keyed overlay onto an existing file (token-efficient).
+
+        The agent emits only the entities/columns it changes; the overlay is merged
+        onto the file's *current working* content via the shared structure-preserving
+        merge, so omitted entities/columns — and their ``properties`` — survive by
+        construction. Refines existing files only: creating, restructuring, or
+        removing an entity stays with ``write_mdl_file`` (P4/D2).
+        """
+
+        path = normalize_mdl_path(self._require_path(args))
+        if path not in self._working:
+            return {
+                "error": (
+                    f"No MDL file at {path!r} to patch. patch_mdl_file refines an "
+                    "existing file by merging a partial overlay; use write_mdl_file "
+                    "to create a new file."
+                )
+            }
+        overlay = _parse_overlay(args.get("overlay"))
+        if overlay is None:
+            return {
+                "error": (
+                    "patch_mdl_file requires a non-empty 'overlay' — an MDL JSON "
+                    "object (or JSON string) carrying only the changed entities/"
+                    "columns, keyed by name."
+                )
+            }
+        try:
+            base = json.loads(self._working[path])
+        except (ValueError, TypeError):
+            return {"error": f"Working copy of {path!r} is not valid JSON."}
+        if not isinstance(base, dict):
+            return {"error": f"Working copy of {path!r} is not a JSON object."}
+
+        merged = merge_manifest_sections(base, overlay)
+        result = self._stage_content(
+            path, json.dumps(merged, indent=2), args.get("summary")
+        )
+        matched, appended = _overlay_entity_names(base, overlay)
+        ignored = _ignored_structural_edits(base, overlay)
+        result["patched"] = {
+            "matched": sorted(matched),
+            "appended": sorted(appended),
+            "ignored_structural": ignored,
+        }
+        notes: list[str] = []
+        if appended:
+            notes.append(
+                "Overlay introduced new entit(ies) not in the base file: "
+                f"{sorted(appended)}. If you meant to refine an existing entity, "
+                "check the name; otherwise this is an intentional addition."
+            )
+        if ignored:
+            # The additive merge keeps a column's physical/structural fields from
+            # the base (E4), so these overlay changes were silently NOT applied.
+            # Surface them so the agent re-issues a structural edit the right way.
+            notes.append(
+                "patch_mdl_file preserves existing physical/structural column "
+                f"fields, so these overlay changes were NOT applied: {ignored}. To "
+                "change a column's type/expression/isCalculated/notNull, use "
+                "write_mdl_file (full-content overwrite)."
+            )
+        if notes:
+            result["note"] = f"{result.get('note', '')} {' '.join(notes)}".strip()
         return result
 
     def _delete_mdl_file(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -1146,6 +1264,104 @@ class MdlToolset:
         return path
 
 
+def _parse_overlay(value: Any) -> dict[str, Any] | None:
+    """Parse a ``patch_mdl_file`` overlay leniently (D1/R11).
+
+    Accepts an already-decoded object (some providers hand back parsed JSON) or a
+    JSON string (matches ``write_mdl_file``'s ``content`` convention). Returns
+    ``None`` for anything empty/unparseable so the caller can return a correctable
+    error the loop feeds back to the model.
+    """
+
+    if isinstance(value, dict):
+        return value or None
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except (ValueError, TypeError):
+            return None
+        return parsed if isinstance(parsed, dict) and parsed else None
+    return None
+
+
+#: Column fields the structure-preserving merge takes from the BASE, never the
+#: overlay (physical authority, E4). A patch that sets one to a new value silently
+#: no-ops; we surface that so the agent re-issues it via ``write_mdl_file``.
+_MERGE_IGNORED_COLUMN_FIELDS: tuple[str, ...] = (
+    "type",
+    "expression",
+    "isCalculated",
+    "notNull",
+    "relationship",
+)
+
+
+def _ignored_structural_edits(
+    base: dict[str, Any], overlay: dict[str, Any]
+) -> list[str]:
+    """List overlay column fields the additive merge drops (a silent no-op).
+
+    The merge refines only ``description`` and ``properties`` on an *existing*
+    column; an overlay that sets ``type``/``expression``/etc. to a value differing
+    from the base is silently ignored (E4 physical authority). Returns
+    ``model.column.field`` labels for those, so ``patch_mdl_file`` can warn the
+    agent to make a structural edit through ``write_mdl_file`` instead. A brand-new
+    column (or model) appends whole, so its fields are kept — not reported here.
+    """
+
+    ignored: list[str] = []
+    base_models = {
+        model["name"]: model
+        for model in (base.get("models") or [])
+        if isinstance(model, dict) and isinstance(model.get("name"), str)
+    }
+    for model in overlay.get("models") or []:
+        if not isinstance(model, dict):
+            continue
+        base_model = base_models.get(model.get("name"))
+        if base_model is None:
+            continue
+        base_cols = {
+            col["name"]: col
+            for col in (base_model.get("columns") or [])
+            if isinstance(col, dict) and isinstance(col.get("name"), str)
+        }
+        for col in model.get("columns") or []:
+            if not isinstance(col, dict):
+                continue
+            base_col = base_cols.get(col.get("name"))
+            if base_col is None:
+                continue
+            for field in _MERGE_IGNORED_COLUMN_FIELDS:
+                if field in col and col[field] != base_col.get(field):
+                    ignored.append(f"{model['name']}.{col['name']}.{field}")
+    return ignored
+
+
+def _overlay_entity_names(
+    base: dict[str, Any], overlay: dict[str, Any]
+) -> tuple[set[str], set[str]]:
+    """Split overlay entity names into matched-in-base vs newly-appended (D8).
+
+    Surfaced in the tool result so a typo'd name (which the additive merge would
+    otherwise append silently) is visible to the agent and the reviewer.
+    """
+
+    matched: set[str] = set()
+    appended: set[str] = set()
+    for section in MERGE_SECTIONS:
+        base_names = {
+            item["name"]
+            for item in (base.get(section) or [])
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        }
+        for item in overlay.get(section) or []:
+            if isinstance(item, dict) and isinstance(item.get("name"), str):
+                target = matched if item["name"] in base_names else appended
+                target.add(item["name"])
+    return matched, appended
+
+
 def _safe_model_name(table: str) -> str:
     """Identifier-safe model name from a physical table name."""
 
@@ -1159,6 +1375,7 @@ def _safe_model_name(table: str) -> str:
 #: (not recorded in the ledger). Extend additively as the toolset grows.
 _MUTATING_ACTIONS: dict[str, ToolActionKind] = {
     "write_mdl_file": "write",
+    "patch_mdl_file": "write",
     "delete_mdl_file": "delete",
     "propose_onboard_table": "onboard",
     "propose_onboard_tables": "onboard",
@@ -1192,7 +1409,7 @@ def _summarize_mutation(
 
     if not isinstance(result, dict):
         return [], {}, None
-    if name in ("write_mdl_file", "delete_mdl_file"):
+    if name in ("write_mdl_file", "patch_mdl_file", "delete_mdl_file"):
         path = result.get("path")
         paths = [path] if isinstance(path, str) else []
         return paths, {"path": path} if paths else {}, None

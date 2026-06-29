@@ -115,6 +115,7 @@ def run_copilot(
     model: str | None = None,
     max_steps: int = 8,
     max_correction_retries: int = 1,
+    tool_result_max_chars: int = 4000,
     deep_validate: bool = False,
     autopilot: bool = False,
     on_step: StepSink | None = None,
@@ -158,6 +159,7 @@ def run_copilot(
         model=model,
         max_steps=max_steps,
         max_correction_retries=max_correction_retries,
+        tool_result_max_chars=tool_result_max_chars,
         autopilot=autopilot,
         on_step=on_step,
     )
@@ -228,9 +230,7 @@ def apply_changeset_items(
                         content=item.proposed_content,
                         # Only re-stamp origin when this edit is doc-grounded;
                         # a plain agent edit must not relabel a manual file.
-                        source_type=(
-                            source_type if item.source_document_id else None
-                        ),
+                        source_type=(source_type if item.source_document_id else None),
                         source_document_id=item.source_document_id,
                     ),
                     owner_id=owner_id,

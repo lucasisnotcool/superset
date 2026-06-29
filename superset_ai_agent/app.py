@@ -2730,6 +2730,7 @@ def create_app(  # noqa: C901
                 history=history,
                 model=request.model,
                 max_steps=request.max_steps or app_config.wren_copilot_max_steps,
+                tool_result_max_chars=app_config.wren_copilot_tool_result_max_chars,
                 deep_validate=app_config.wren_modeling_deep_validation,
                 autopilot=app_config.wren_copilot_autopilot_enabled,
                 document_store=active_semantic_layer_store,
@@ -2819,6 +2820,9 @@ def create_app(  # noqa: C901
                         model=request.model,
                         max_steps=(
                             request.max_steps or app_config.wren_copilot_max_steps
+                        ),
+                        tool_result_max_chars=(
+                            app_config.wren_copilot_tool_result_max_chars
                         ),
                         deep_validate=app_config.wren_modeling_deep_validation,
                         autopilot=app_config.wren_copilot_autopilot_enabled,

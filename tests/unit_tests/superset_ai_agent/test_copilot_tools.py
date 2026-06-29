@@ -63,6 +63,7 @@ def test_specs_expose_the_tool_surface() -> None:
         "list_mdl_files",
         "read_mdl_file",
         "write_mdl_file",
+        "patch_mdl_file",
         "delete_mdl_file",
         "validate_project",
         "get_physical_schema",
@@ -615,3 +616,269 @@ def test_relationships_record_a_relate_verb() -> None:
     relate = [r for r in toolset.build_changeset().tool_calls if r.action == "relate"]
     assert len(relate) == 1
     assert relate[0].args_summary["relationship_count"] == 1
+
+
+# --- patch_mdl_file: sparse name-keyed overlay edits (A) ---------------------
+
+
+def test_patch_adds_column_description_without_dropping_siblings() -> None:
+    toolset = MdlToolset([_file("models/orders.json", ORDERS)], schema_index=SCHEMA)
+
+    result = toolset.dispatch(
+        "patch_mdl_file",
+        {
+            "path": "models/orders.json",
+            "overlay": json.dumps(
+                {
+                    "models": [
+                        {
+                            "name": "orders",
+                            "columns": [
+                                {"name": "amount", "description": "Order total"}
+                            ],
+                        }
+                    ]
+                }
+            ),
+        },
+    )
+
+    assert result["validation"]["valid"] is True
+    assert result["patched"] == {
+        "matched": ["orders"],
+        "appended": [],
+        "ignored_structural": [],
+    }
+    merged = json.loads(toolset._working["models/orders.json"])
+    columns = {c["name"]: c for c in merged["models"][0]["columns"]}
+    assert set(columns) == {"id", "amount"}  # sibling column kept
+    assert columns["amount"]["type"] == "BIGINT"  # type never dropped
+    assert columns["amount"]["description"] == "Order total"
+
+
+def test_patch_preserves_properties_the_overlay_omits() -> None:
+    seeded = json.dumps(
+        {
+            "models": [
+                {
+                    "name": "orders",
+                    "tableReference": {"schema": "public", "table": "orders"},
+                    "properties": {"displayName": "Orders", "superset_dataset_id": "9"},
+                    "columns": [{"name": "id", "type": "BIGINT"}],
+                }
+            ]
+        }
+    )
+    toolset = MdlToolset([_file("models/orders.json", seeded)], schema_index=SCHEMA)
+
+    toolset.dispatch(
+        "patch_mdl_file",
+        {
+            "path": "models/orders.json",
+            "overlay": json.dumps(
+                {"models": [{"name": "orders", "properties": {"synonyms": ["sales"]}}]}
+            ),
+        },
+    )
+
+    model = json.loads(toolset._working["models/orders.json"])["models"][0]
+    assert model["properties"] == {
+        "displayName": "Orders",
+        "superset_dataset_id": "9",
+        "synonyms": ["sales"],
+    }
+
+
+def test_patch_composes_on_prior_working_edit() -> None:
+    # A write earlier in the turn, then a patch on top — patch must see the
+    # staged working copy, not the original file.
+    toolset = MdlToolset([_file("models/orders.json", ORDERS)], schema_index=SCHEMA)
+    toolset.dispatch(
+        "write_mdl_file",
+        {
+            "path": "models/orders.json",
+            "content": json.dumps(
+                {
+                    "models": [
+                        {
+                            "name": "orders",
+                            "tableReference": {"schema": "public", "table": "orders"},
+                            "description": "Sales orders",
+                            "columns": [
+                                {"name": "id", "type": "BIGINT"},
+                                {"name": "amount", "type": "BIGINT"},
+                            ],
+                        }
+                    ]
+                }
+            ),
+        },
+    )
+    toolset.dispatch(
+        "patch_mdl_file",
+        {
+            "path": "models/orders.json",
+            "overlay": json.dumps(
+                {
+                    "models": [
+                        {
+                            "name": "orders",
+                            "columns": [{"name": "id", "description": "PK"}],
+                        }
+                    ]
+                }
+            ),
+        },
+    )
+
+    model = json.loads(toolset._working["models/orders.json"])["models"][0]
+    assert model["description"] == "Sales orders"  # earlier write survives
+    columns = {c["name"]: c for c in model["columns"]}
+    assert columns["id"]["description"] == "PK"  # patch applied on top
+
+
+def test_patch_missing_file_points_to_write() -> None:
+    toolset = MdlToolset([_file("models/orders.json", ORDERS)], schema_index=SCHEMA)
+
+    result = toolset.dispatch(
+        "patch_mdl_file",
+        {"path": "models/new.json", "overlay": json.dumps({"models": [{"name": "x"}]})},
+    )
+
+    assert "error" in result
+    assert "write_mdl_file" in result["error"]
+
+
+def test_patch_malformed_overlay_errors() -> None:
+    toolset = MdlToolset([_file("models/orders.json", ORDERS)], schema_index=SCHEMA)
+
+    result = toolset.dispatch(
+        "patch_mdl_file", {"path": "models/orders.json", "overlay": "{not json"}
+    )
+
+    assert "error" in result
+    assert "overlay" in result["error"]
+
+
+def test_patch_typo_name_appends_and_flags_note() -> None:
+    toolset = MdlToolset([_file("models/orders.json", ORDERS)], schema_index=SCHEMA)
+
+    result = toolset.dispatch(
+        "patch_mdl_file",
+        {
+            "path": "models/orders.json",
+            "overlay": json.dumps(
+                {"models": [{"name": "ordrs", "description": "typo"}]}
+            ),
+        },
+    )
+
+    assert result["patched"] == {
+        "matched": [],
+        "appended": ["ordrs"],
+        "ignored_structural": [],
+    }
+    assert "ordrs" in result["note"]
+
+
+def test_patch_provenance_records_write_verb() -> None:
+    toolset = MdlToolset([_file("models/orders.json", ORDERS)], schema_index=SCHEMA)
+    toolset.dispatch(
+        "patch_mdl_file",
+        {
+            "path": "models/orders.json",
+            "overlay": json.dumps({"models": [{"name": "orders", "description": "d"}]}),
+        },
+    )
+
+    calls = toolset.build_changeset().tool_calls
+    assert len(calls) == 1
+    assert calls[0].tool == "patch_mdl_file"
+    assert calls[0].action == "write"
+    assert calls[0].paths == ["models/orders.json"]
+
+
+def test_patch_and_write_yield_equivalent_changeset(  # R6 invariant
+) -> None:
+    overlay = {
+        "models": [
+            {"name": "orders", "columns": [{"name": "amount", "description": "Total"}]}
+        ]
+    }
+
+    patched = MdlToolset([_file("models/orders.json", ORDERS)], schema_index=SCHEMA)
+    patched.dispatch(
+        "patch_mdl_file",
+        {"path": "models/orders.json", "overlay": json.dumps(overlay)},
+    )
+    patch_item = [
+        i for i in patched.build_changeset().items if i.path == "models/orders.json"
+    ][0]
+
+    # Equivalent whole-file write: the merged result re-emitted by hand.
+    full = json.loads(ORDERS)
+    full["models"][0]["columns"][1]["description"] = "Total"
+    written = MdlToolset([_file("models/orders.json", ORDERS)], schema_index=SCHEMA)
+    written.dispatch(
+        "write_mdl_file",
+        {"path": "models/orders.json", "content": json.dumps(full)},
+    )
+    write_item = [
+        i for i in written.build_changeset().items if i.path == "models/orders.json"
+    ][0]
+
+    # Reviewer sees the same logical file regardless of how it was produced.
+    assert patch_item.op == write_item.op == "update"
+    assert json.loads(patch_item.proposed_content) == json.loads(
+        write_item.proposed_content
+    )
+
+
+def test_patch_flags_silently_ignored_structural_edits() -> None:
+    # The additive merge keeps a column's type/expression from the base (E4), so a
+    # patch that tries to change them is a no-op — the tool must surface that so the
+    # agent re-issues the edit via write_mdl_file instead of silently losing it.
+    seeded = json.dumps(
+        {
+            "models": [
+                {
+                    "name": "orders",
+                    "tableReference": {"schema": "public", "table": "orders"},
+                    "columns": [
+                        {"name": "id", "type": "BIGINT"},
+                        {
+                            "name": "tax",
+                            "type": "DOUBLE",
+                            "isCalculated": True,
+                            "expression": "amount * 0.1",
+                        },
+                    ],
+                }
+            ]
+        }
+    )
+    toolset = MdlToolset([_file("models/orders.json", seeded)], schema_index=SCHEMA)
+
+    result = toolset.dispatch(
+        "patch_mdl_file",
+        {
+            "path": "models/orders.json",
+            "overlay": json.dumps(
+                {
+                    "models": [
+                        {
+                            "name": "orders",
+                            "columns": [{"name": "tax", "expression": "amount * 0.2"}],
+                        }
+                    ]
+                }
+            ),
+        },
+    )
+
+    assert result["patched"]["ignored_structural"] == ["orders.tax.expression"]
+    assert "write_mdl_file" in result["note"]
+    # And the base expression is genuinely unchanged (the no-op is real).
+    merged = json.loads(toolset._working["models/orders.json"])
+    tax = {c["name"]: c for c in merged["models"][0]["columns"]}["tax"]
+    assert tax["expression"] == "amount * 0.1"

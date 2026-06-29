@@ -29,6 +29,7 @@ from superset_ai_agent.semantic_layer.copilot.loop import (
 )
 from superset_ai_agent.semantic_layer.copilot.tools import MdlToolset
 from superset_ai_agent.semantic_layer.mdl_validator import SchemaIndex
+from superset_ai_agent.semantic_layer.schemas import MdlFile
 
 SCHEMA = SchemaIndex.from_snapshot({"orders": ["id", "amount"]})
 
@@ -223,7 +224,9 @@ def test_system_prompt_scopes_edit_breadth_to_request() -> None:
 
     assert "smallest set of edits" in prompt  # targeted requests stay minimal
     assert "enrichment" in prompt.lower()
-    assert "relationships, and metrics" in prompt or "relationships and metrics" in prompt
+    assert (
+        "relationships, and metrics" in prompt or "relationships and metrics" in prompt
+    )
 
 
 def test_loop_sends_grill_banner_by_default() -> None:
@@ -301,3 +304,83 @@ def test_loop_emits_progress_via_on_step() -> None:
     )
 
     assert "copilot_tool" in seen
+
+
+# --- B1: read results are not silently truncated into history ----------------
+
+
+def _loop_file(path: str, content: str) -> MdlFile:
+    return MdlFile(
+        project_id="p1",
+        path=path,
+        filename=path.rsplit("/", 1)[-1],
+        content=content,
+        checksum="x",
+        status="active",
+    )
+
+
+def test_result_limit_exempts_reads_and_validation() -> None:
+    from superset_ai_agent.semantic_layer.copilot.loop import _result_limit
+
+    assert _result_limit("read_mdl_file", 4000) is None
+    assert _result_limit("read_document", 4000) is None
+    assert _result_limit("validate_project", 4000) is None
+    assert _result_limit("get_physical_schema", 4000) == 24000  # high cap
+    assert _result_limit("write_mdl_file", 4000) == 4000  # default
+
+
+def test_read_mdl_file_result_reaches_model_untruncated() -> None:
+    # A model file larger than the default cap must reach the model whole — the
+    # agent cannot reason over (or, under whole-file write, reproduce) a file cut
+    # mid-JSON. This is the correctness hazard B1 closes.
+    big = {
+        "models": [
+            {
+                "name": "orders",
+                "tableReference": {"schema": "public", "table": "orders"},
+                "columns": [
+                    {"name": f"c{i}", "type": "BIGINT", "description": "x" * 100}
+                    for i in range(60)
+                ],
+            }
+        ]
+    }
+    content = json.dumps(big)
+    assert len(content) > 4000  # exceeds the default cap
+
+    toolset = MdlToolset(
+        [_loop_file("models/orders.json", content)], schema_index=SCHEMA
+    )
+    model = ScriptedModel(
+        [
+            ModelResult(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="1",
+                        name="read_mdl_file",
+                        arguments={"path": "models/orders.json"},
+                    )
+                ],
+            ),
+            ModelResult(content="done"),
+        ]
+    )
+
+    run_copilot_loop(
+        model_client=model,
+        toolset=toolset,
+        user_message="show orders",
+        tool_result_max_chars=4000,
+    )
+
+    tool_msgs = [
+        message
+        for call in model.calls
+        for message in call["messages"]
+        if message.role == "tool" and message.name == "read_mdl_file"
+    ]
+    assert tool_msgs
+    assert "(truncated)" not in tool_msgs[-1].content
+    assert "c59" in tool_msgs[-1].content  # the tail column survived

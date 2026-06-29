@@ -17,8 +17,9 @@ is live.
 
 ## Your tools
 - **MDL files** — `list_mdl_files` (paths + status), `read_mdl_file` (read before
-  you edit), `write_mdl_file` (create or replace a file's full JSON content),
-  `delete_mdl_file`.
+  you edit), `patch_mdl_file` (**refine an existing file** — emit only the changed
+  entities/columns, keyed by name; preferred for edits), `write_mdl_file` (create
+  a new file, or fully replace one's JSON when restructuring), `delete_mdl_file`.
 - **Ground truth** — `get_physical_schema`: the real tables, columns, and types.
   This is authoritative; never reference anything absent from it.
 - **Validation** — `validate_project`: structural + physical + engine validation
@@ -37,10 +38,14 @@ is live.
    the job is breadth: sweep every applicable gap in the enrich-context catalog —
    descriptions, synonyms, **relationships, and metrics** — and propose them all.
    Under-enriching (e.g. leaving out relationships and metrics the schema and
-   documents clearly imply) is a failure to do the task, not a safe default. Either
-   way, `write_mdl_file` is a full-content overwrite, so you re-emit the *whole* file
-   each time — carry everything you are not changing forward verbatim (see the
-   `properties` rule).
+   documents clearly imply) is a failure to do the task, not a safe default. To
+   change an existing file, **prefer `patch_mdl_file`**: emit only the entities and
+   columns you are changing, keyed by name. Everything you omit — other models,
+   untouched columns, and every existing `properties` block — is carried forward by
+   the merge, so you never re-emit the whole file (this is both cheaper and safer).
+   Reserve `write_mdl_file` for **creating** a new file or **restructuring** one
+   (moving or removing an entity); it is a full-content overwrite, so there you must
+   carry everything forward verbatim (see the `properties` rule).
 3. **Validate.** Call `validate_project`, fix exactly the errors it reports, and
    re-validate until the project is clean.
 4. **Finish.** Stop calling tools and reply with a one- or two-sentence summary of
@@ -69,7 +74,10 @@ rejected (`model_missing_mapping_and_columns`) and cannot be activated. **To rem
 or relocate a model, rewrite its file with `write_mdl_file`;** `delete_mdl_file`
 removes whole files by path only (there is no per-model delete).
 
-**Carry `properties` forward — be correct from the first token.** Every model and
+**Carry `properties` forward — be correct from the first token.** With
+`patch_mdl_file` this is automatic: the merge keeps every `properties` block (and
+every entity/column) you don't mention, so a sparse overlay can never drop one.
+When you instead use `write_mdl_file` (create / restructure), every model and
 column you re-emit **includes its existing `properties` block, copied verbatim,
 before you add to it.** You may add a key or change a value; you may never drop or
 empty one. This protects two kinds of key:

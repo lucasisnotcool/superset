@@ -45,8 +45,9 @@ that improve recall, validate before finishing. Only the mechanics change.
 |------|------|-------|
 | See real tables/columns/types | `get_physical_schema` | The authority. Never reference anything absent from it. |
 | List existing MDL files | `list_mdl_files` | Path + status (new / unchanged / modified). |
-| Read a file's full JSON | `read_mdl_file` | Read before you re-emit, so you preserve `properties`. |
-| Create / replace a file | `write_mdl_file` | Full-content overwrite; returns structural + physical validation. |
+| Read a file's full JSON | `read_mdl_file` | Read before you edit. |
+| Refine an existing file | `patch_mdl_file` | **Preferred for edits.** Emit only the changed entities/columns, keyed by name; omitted entities/columns and their `properties` are preserved by the merge. |
+| Create / restructure a file | `write_mdl_file` | Full-content overwrite — for a NEW file or moving/removing an entity. Returns structural + physical validation. |
 | Delete a file | `delete_mdl_file` | |
 | Validate the whole project | `validate_project` | Structural + physical + (when available) engine deep-validate. Run before finishing. |
 | Ground edits in operator docs | `search_documents` / `list_documents` / `find_duplicate_documents` | Glossaries, metric formulas, synonyms. |
@@ -54,10 +55,13 @@ that improve recall, validate before finishing. Only the mechanics change.
 ## Phase 0 — Survey what exists
 
 Call `list_mdl_files`. If models already exist, `read_mdl_file` the relevant ones
-before editing. **Editing means re-emitting the full file** (these are
-full-content overwrites), so you must carry the existing object forward verbatim —
-see the `properties` rule below. Do not regenerate a model from scratch when you
-mean to extend it.
+before editing. **To change an existing file, prefer `patch_mdl_file`** — emit
+only the entities/columns you change, keyed by name; the merge preserves
+everything you omit (other models, untouched columns, every `properties` block).
+Use `write_mdl_file` only to create a new file or restructure one (move/remove an
+entity); there you re-emit the full file and must carry the existing object
+forward verbatim (see the `properties` rule below). Do not regenerate a model from
+scratch when you mean to extend it.
 
 ## Phase 1 — Ground in the physical schema (physical authority)
 
@@ -264,9 +268,10 @@ positive rule, not an optional extra:
 - Use the keys the consumers read: `displayName` (string), `alias` (string),
   `synonyms` (list of strings). Free-form governance keys (`unit`, business notes)
   are fine — `properties` allows extra keys.
-- **When you re-emit an existing model or column, copy its existing `properties`
-  forward verbatim, then add to them.** Never drop or empty a key you did not
-  intend to change.
+- **With `patch_mdl_file` the merge keeps existing `properties` automatically** —
+  just include the keys you are adding. **When you instead `write_mdl_file` an
+  existing model or column, copy its existing `properties` forward verbatim, then
+  add to them.** Never drop or empty a key you did not intend to change.
 
 **Why this matters / why you can't rely on validation to catch it:** wren-core
 treats `properties` as a tolerated unknown field — dropping it does **not** fail
@@ -300,8 +305,9 @@ check it after each write. Common errors and fixes:
   model as having no source. Use camelCase.
 - Do **not** invent tables, columns, or types — ground every one in
   `get_physical_schema`.
-- Do **not** drop or empty `properties` when re-emitting an entity — retrieval and
-  governance read it and validation won't catch its loss.
+- Do **not** drop or empty `properties` when you `write_mdl_file` an existing
+  entity — retrieval and governance read it and validation won't catch its loss.
+  (`patch_mdl_file` preserves it for you — prefer it for edits.)
 - Do **not** author cubes — express aggregations as metrics.
 - Do **not** finish without a clean `validate_project` (zero errors).
 - Do **not** hand-write joins into model SQL — define `relationships` instead.

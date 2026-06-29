@@ -43,8 +43,34 @@ logger = logging.getLogger(__name__)
 StepSink = Callable[[AgentStep], None]
 
 
-def _truncate(text: str, limit: int = 4000) -> str:
-    return text if len(text) <= limit else text[:limit] + "\n…(truncated)…"
+def _truncate(text: str, limit: int | None = 4000) -> str:
+    if limit is None or len(text) <= limit:
+        return text
+    return text[:limit] + "\n…(truncated)…"
+
+
+#: Tool results are truncated before re-entering the model to bound context cost.
+#: But reads and validation must NOT be silently cut: the agent reasons over their
+#: full content and, for write/patch, must reproduce it — a truncated read is the
+#: correctness hazard this exempts (a model file >~4 KB used to be cut mid-JSON
+#: while the agent was told to re-emit it whole). Large physical-schema dumps keep
+#: a higher cap (``find_tables`` is the targeted alternative); the rest use the
+#: configured default.
+_UNTRUNCATED_RESULT_TOOLS = frozenset(
+    {"read_mdl_file", "read_document", "validate_project"}
+)
+_HIGH_LIMIT_RESULT_TOOLS = frozenset({"get_physical_schema", "find_tables"})
+_HIGH_LIMIT_MULTIPLIER = 6
+
+
+def _result_limit(tool_name: str, default: int) -> int | None:
+    """Per-tool truncation cap for a tool result (``None`` = do not truncate)."""
+
+    if tool_name in _UNTRUNCATED_RESULT_TOOLS:
+        return None
+    if tool_name in _HIGH_LIMIT_RESULT_TOOLS:
+        return default * _HIGH_LIMIT_MULTIPLIER
+    return default
 
 
 #: Active-mode banner injected into the system prompt so the agent knows which
@@ -108,6 +134,7 @@ def run_copilot_loop(  # noqa: C901 - a tool-call+correction loop is irreducibly
     model: str | None = None,
     max_steps: int = 8,
     max_correction_retries: int = 1,
+    tool_result_max_chars: int = 4000,
     autopilot: bool = False,
     on_step: StepSink | None = None,
 ) -> Changeset:
@@ -193,7 +220,10 @@ def run_copilot_loop(  # noqa: C901 - a tool-call+correction loop is irreducibly
                 messages.append(
                     ChatMessage(
                         role="tool",
-                        content=_truncate(json.dumps(output, default=str)),
+                        content=_truncate(
+                            json.dumps(output, default=str),
+                            _result_limit(call.name, tool_result_max_chars),
+                        ),
                         tool_call_id=call.id,
                         name=call.name,
                     )
