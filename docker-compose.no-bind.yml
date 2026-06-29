@@ -42,8 +42,12 @@ x-superset-runtime-volumes: &superset-runtime-volumes
 x-common-build: &common-build
   context: .
   target: ${SUPERSET_BUILD_TARGET:-dev}
-  cache_from:
-    - apache/superset-cache:3.10-slim-trixie
+  # Registry build-cache import disabled for the no-bind stack: networks that
+  # proxy Docker Hub can 502 on the BuildKit cache-manifest fetch
+  # ("unable to upgrade to h2c"), which aborts the whole build. The cache is
+  # only a speed optimization; local layer cache still applies without it.
+  # cache_from:
+  #   - apache/superset-cache:3.10-slim-trixie
   args:
     DEV_MODE: "true"
     INCLUDE_CHROMIUM: ${INCLUDE_CHROMIUM:-false}
