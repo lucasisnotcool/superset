@@ -78,6 +78,12 @@ class ConversationScope(BaseModel):
     #: scope is single-schema (use ``schema_name``). Prefer ``effective_schema_names``.
     schema_names: list[str] | None = None
     dataset_ids: list[int] = Field(default_factory=list)
+    #: Explicit semantic-layer project the AI SQL agent should ground on. When a
+    #: schema is covered by more than one active project the client may pin a
+    #: choice here; the backend honors it only after re-checking access + schema
+    #: coverage, falling back to the heuristic otherwise. ``None`` means "let the
+    #: backend resolve" (pinned-conversation project, then most-recent match).
+    project_id: str | None = None
     query_editor_id: str | None = None
     current_sql: str | None = None
     selected_text: str | None = None

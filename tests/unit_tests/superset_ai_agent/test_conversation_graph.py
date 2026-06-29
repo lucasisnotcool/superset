@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json  # noqa: TID251 - tests cover the standalone agent JSON contract
+from datetime import datetime, timezone
 from typing import Any
 
 from superset_ai_agent.config import AgentConfig
@@ -46,6 +47,9 @@ from superset_ai_agent.schemas import (
     SqlExecutionSource,
     SqlValidation,
 )
+from superset_ai_agent.semantic_layer.mdl_files import InMemoryMdlFileStore
+from superset_ai_agent.semantic_layer.projects import InMemorySemanticProjectStore
+from superset_ai_agent.semantic_layer.schemas import SemanticProject
 
 
 class FakeModelClient:
@@ -1085,3 +1089,132 @@ def test_can_execute_sql_respects_iteration_cap() -> None:
         "sql_iterations": graph.config.max_agent_sql_iterations,
     }
     assert graph._can_execute_sql(state) is False  # noqa: SLF001
+
+
+# --- Semantic project grounding: pin + stability (F1/F2) ----------------------
+
+
+def _semantic_project(
+    project_id: str, name: str, updated_at: datetime
+) -> SemanticProject:
+    return SemanticProject(
+        id=project_id,
+        name=name,
+        owner_id="local",
+        database_uri_fingerprint="fp",
+        schema_name="public",
+        schema_names=["public"],
+        default_database_id=1,
+        updated_at=updated_at,
+    )
+
+
+def _grounding_graph(
+    store: InMemoryConversationStore,
+    project_store: InMemorySemanticProjectStore,
+    storage_dir: str,
+) -> ConversationGraph:
+    return ConversationGraph(
+        # Isolate wren materialization to a tmp dir so the test never writes to
+        # the repo-relative default ``./.data``.
+        config=AgentConfig(agent_storage_dir=storage_dir),
+        model_client=FakeModelClient(
+            {
+                "response_type": "answer",
+                "message": "answer",
+                "sql": "",
+                "explanation": None,
+            }
+        ),
+        context_provider=FakeContextProvider(),
+        superset_client=FakeSupersetClient(),
+        conversation_store=store,
+        semantic_project_store=project_store,
+        mdl_file_store=InMemoryMdlFileStore(),
+    )
+
+
+def _answer_turn(
+    graph: ConversationGraph, conversation_id: str, scope: ConversationScope
+):
+    return graph.run(
+        conversation_id=conversation_id,
+        request=ConversationTurnRequest(message="What's available?", scope=scope),
+    )
+
+
+def test_grounded_turn_pins_resolved_project_onto_conversation(tmp_path) -> None:
+    # First grounded turn records the resolved project on the conversation so later
+    # turns reuse it (F2 groundwork).
+    store = InMemoryConversationStore()
+    project_store = InMemorySemanticProjectStore()
+    older = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    newer = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    for project in (
+        _semantic_project("p-recent", "Recent", newer),
+        _semantic_project("p-old", "Older", older),
+    ):
+        project_store._projects[project.id] = project  # noqa: SLF001
+    scope = ConversationScope(database_id=1, schema_name="public", dataset_ids=[16])
+    conversation = store.create(scope)
+
+    _answer_turn(
+        _grounding_graph(store, project_store, str(tmp_path)), conversation.id, scope
+    )
+
+    assert store.get(conversation.id).project_id == "p-recent"
+
+
+def test_pinned_project_is_stable_when_another_project_becomes_recent(tmp_path) -> None:
+    # The core F2 fix: once a conversation is pinned, editing another project that
+    # covers the same schema (making it most-recent) must NOT re-point the thread.
+    store = InMemoryConversationStore()
+    project_store = InMemorySemanticProjectStore()
+    older = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    newer = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    for project in (
+        _semantic_project("p-recent", "Recent", newer),
+        _semantic_project("p-old", "Older", older),
+    ):
+        project_store._projects[project.id] = project  # noqa: SLF001
+    scope = ConversationScope(database_id=1, schema_name="public", dataset_ids=[16])
+    conversation = store.create(scope)
+    graph = _grounding_graph(store, project_store, str(tmp_path))
+
+    _answer_turn(graph, conversation.id, scope)
+    assert store.get(conversation.id).project_id == "p-recent"
+
+    # p-old is edited and becomes the most-recently-updated match.
+    project_store._projects["p-old"] = _semantic_project(  # noqa: SLF001
+        "p-old", "Older", datetime(2026, 3, 1, tzinfo=timezone.utc)
+    )
+
+    _answer_turn(graph, conversation.id, scope)
+
+    # Still grounded on the originally-pinned project, not the new most-recent one.
+    assert store.get(conversation.id).project_id == "p-recent"
+
+
+def test_explicit_scope_project_id_overrides_pin_and_heuristic(tmp_path) -> None:
+    # An explicit scope.project_id wins over both the heuristic and any prior pin,
+    # and re-pins the conversation (F1 user override).
+    store = InMemoryConversationStore()
+    project_store = InMemorySemanticProjectStore()
+    older = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    newer = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    for project in (
+        _semantic_project("p-recent", "Recent", newer),
+        _semantic_project("p-old", "Older", older),
+    ):
+        project_store._projects[project.id] = project  # noqa: SLF001
+    conversation = store.create(
+        ConversationScope(database_id=1, schema_name="public", dataset_ids=[16])
+    )
+    graph = _grounding_graph(store, project_store, str(tmp_path))
+
+    pinned_scope = ConversationScope(
+        database_id=1, schema_name="public", dataset_ids=[16], project_id="p-old"
+    )
+    _answer_turn(graph, conversation.id, pinned_scope)
+
+    assert store.get(conversation.id).project_id == "p-old"

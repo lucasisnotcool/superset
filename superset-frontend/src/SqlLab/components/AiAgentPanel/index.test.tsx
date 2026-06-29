@@ -985,3 +985,165 @@ test('renames the active conversation via the header title', async () => {
     });
   });
 });
+
+const makeSemanticProject = (id: string, name: string) => ({
+  id,
+  name,
+  owner_id: 'local',
+  database_uri_fingerprint: 'fingerprint',
+  catalog_name: null,
+  schema_name: 'main',
+  default_database_id: 1,
+  visibility: 'db_access',
+  status: 'active',
+  permission: 'admin',
+  created_at: '2026-06-19T00:00:00Z',
+  updated_at: '2026-06-19T00:00:00Z',
+});
+
+const stateWithSchema = () => ({
+  ...initialState,
+  sqlLab: {
+    ...initialState.sqlLab,
+    queryEditors: initialState.sqlLab.queryEditors.map(queryEditor => ({
+      ...queryEditor,
+      schema: 'main',
+    })),
+  },
+});
+
+test('surfaces the resolved semantic project name when one project covers the schema', async () => {
+  fetchMock.get('begin:http://agent.local/agent/semantic-layer/projects?', [
+    makeSemanticProject('project-1', 'Sales'),
+  ]);
+  fetchMock.get(
+    'begin:http://agent.local/agent/semantic-layer/projects/project-1/state',
+    {
+      project_id: 'project-1',
+      database_id: 1,
+      schema_name: 'main',
+      dataset_ids: [],
+      document_count: 3,
+      last_error: null,
+    },
+  );
+
+  const store = createStore(stateWithSchema(), reducerIndex);
+  render(<AiAgentPanel />, { store });
+
+  // A single covering project is shown by name (transparency) with no picker.
+  expect(await screen.findByText('Semantic layer: Sales')).toBeInTheDocument();
+  expect(
+    screen.queryByTestId('semantic-project-select'),
+  ).not.toBeInTheDocument();
+});
+
+test('lets the user pick among multiple semantic projects and sends the choice', async () => {
+  fetchMock.get('begin:http://agent.local/agent/semantic-layer/projects?', [
+    makeSemanticProject('project-a', 'Sales'),
+    makeSemanticProject('project-b', 'Marketing'),
+  ]);
+  fetchMock.get(
+    'begin:http://agent.local/agent/semantic-layer/projects/project-a/state',
+    {
+      project_id: 'project-a',
+      database_id: 1,
+      schema_name: 'main',
+      dataset_ids: [],
+      document_count: 1,
+      last_error: null,
+    },
+  );
+  fetchMock.get(
+    'begin:http://agent.local/agent/semantic-layer/projects/project-b/state',
+    {
+      project_id: 'project-b',
+      database_id: 1,
+      schema_name: 'main',
+      dataset_ids: [],
+      document_count: 2,
+      last_error: null,
+    },
+  );
+
+  const conversation = {
+    id: 'conversation-1',
+    title: 'New chat',
+    owner_id: 'local',
+    project_id: null,
+    scope: { database_id: 1, schema_name: 'main', dataset_ids: [] },
+    messages: [],
+    created_at: '2026-06-19T00:00:00Z',
+    updated_at: '2026-06-19T00:00:00Z',
+  };
+  const turned = {
+    ...conversation,
+    messages: [
+      {
+        id: 'm1',
+        role: 'user',
+        content: 'hi',
+        created_at: '2026-06-19T00:00:00Z',
+        artifacts: [],
+      },
+      {
+        id: 'm2',
+        role: 'assistant',
+        content: 'ok',
+        created_at: '2026-06-19T00:00:00Z',
+        artifacts: [],
+      },
+    ],
+  };
+  fetchMock.post('http://agent.local/agent/conversations', conversation);
+  fetchMock.post(
+    'http://agent.local/agent/conversations/conversation-1/messages/stream',
+    404,
+  );
+  fetchMock.post(
+    'http://agent.local/agent/conversations/conversation-1/messages',
+    {
+      status: 'ok',
+      conversation_id: 'conversation-1',
+      message: turned.messages[1],
+      artifacts: [],
+      trace: [],
+      conversation: turned,
+    },
+  );
+
+  const store = createStore(stateWithSchema(), reducerIndex);
+  render(<AiAgentPanel />, { store });
+
+  // More than one project covers the schema → a picker appears, defaulting to
+  // the most-recent (first) match.
+  const picker = await screen.findByTestId('semantic-project-select');
+  expect(picker).toBeInTheDocument();
+
+  // Switch the grounding project to "Marketing".
+  await userEvent.click(
+    picker.querySelector('.ant-select-selector') as Element,
+  );
+  await userEvent.click(await screen.findByText('Marketing'));
+
+  await userEvent.type(
+    screen.getByPlaceholderText('Ask about this database'),
+    'hi',
+  );
+  await userEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+  await waitFor(() => {
+    expect(
+      fetchMock.callHistory.calls(
+        'http://agent.local/agent/conversations/conversation-1/messages',
+      ),
+    ).toHaveLength(1);
+  });
+  const [messageCall] = fetchMock.callHistory.calls(
+    'http://agent.local/agent/conversations/conversation-1/messages',
+  );
+  // The turn carries the user's chosen project so the backend grounds on it.
+  expect(JSON.parse(String(messageCall.options.body)).scope.project_id).toBe(
+    'project-b',
+  );
+});

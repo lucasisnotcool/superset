@@ -498,6 +498,57 @@ def test_run_directory_coverage_unions_claims_across_documents() -> None:
     assert by_doc["b.md"].document_id == "d2"
 
 
+def test_run_directory_coverage_emits_stage_progress() -> None:
+    # One document, one claim, one judge call — the run should report each
+    # coarse stage in pipeline order with a countable extraction tick.
+    model = ScriptedModel(
+        [
+            json.dumps(
+                {"claims": [{"kind": "definition", "subject": "a", "statement": "x"}]}
+            ),
+            json.dumps({"findings": [{"claim_id": "c0", "status": "covered"}]}),
+        ]
+    )
+    ticks: list[Any] = []
+    run_directory_coverage(
+        model,
+        documents=[CoverageDocument("d1", "orders.pdf", "doc a")],
+        files=[_file()],
+        progress_cb=ticks.append,
+    )
+
+    stages = [tick.stage for tick in ticks]
+    assert stages == ["building_facts", "extracting", "judging", "aggregating"]
+    extracting = next(tick for tick in ticks if tick.stage == "extracting")
+    assert extracting.detail == "orders.pdf"
+    assert (extracting.current, extracting.total) == (1, 1)
+    judging = next(tick for tick in ticks if tick.stage == "judging")
+    assert "claims" in judging.detail
+    assert judging.phase_index == 2
+
+
+def test_progress_callback_failure_never_breaks_the_audit() -> None:
+    # Progress is advisory: a throwing callback must not abort the run.
+    model = ScriptedModel(
+        [
+            json.dumps({"claims": [{"kind": "definition", "statement": "x"}]}),
+            json.dumps({"findings": [{"claim_id": "c0", "status": "covered"}]}),
+        ]
+    )
+
+    def boom(_tick: Any) -> None:
+        raise RuntimeError("progress sink down")
+
+    report = run_directory_coverage(
+        model,
+        documents=[CoverageDocument("d1", "a.md", "doc a")],
+        files=[_file()],
+        progress_cb=boom,
+    )
+    assert report.total == 1
+    assert report.covered == 1
+
+
 def test_run_directory_coverage_no_documents_is_a_noop() -> None:
     model = ScriptedModel([])  # never called
     report = run_directory_coverage(model, documents=[], files=[_file()])

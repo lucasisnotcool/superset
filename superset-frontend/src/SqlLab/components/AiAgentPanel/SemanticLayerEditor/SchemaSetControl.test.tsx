@@ -84,6 +84,21 @@ test('add-schema control opens a schema picker', async () => {
   expect(await screen.findByTestId('add-schema-popover')).toBeInTheDocument();
 });
 
+test('shows a spinner on the add-schema button while an add is in flight', () => {
+  render(
+    <SchemaSetControl
+      schemaNames={['sales']}
+      primarySchema="sales"
+      databaseId={1}
+      canEdit
+      adding
+      onAddSchema={jest.fn()}
+    />,
+  );
+  const button = screen.getByTestId('add-schema-button').closest('button');
+  expect(button).toHaveClass('ant-btn-loading');
+});
+
 test('selecting a schema invokes onAddSchema with the chosen schema', async () => {
   const onAddSchema = jest.fn();
   render(

@@ -45,6 +45,7 @@ def _new_id() -> str:
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
+
 #: Default attachment ceiling (chars). The route enforces the configured value.
 ATTACHMENT_MAX_CHARS = 200_000
 
@@ -80,6 +81,7 @@ class ToolCallRecord(BaseModel):
     status: Literal["ok", "error"] = "ok"
     #: Short human note — onboarded table names, a rejection reason, etc.
     detail: str | None = None
+
 
 WorkspaceNodeKind = Literal[
     "folder",
@@ -317,6 +319,21 @@ CoverageRunStatus = Literal[
 ]
 
 
+class CoverageProgress(BaseModel):
+    """Coarse live progress of an in-flight coverage run (Feature C).
+
+    Persisted on the run row while ``running`` and surfaced via the status
+    endpoint; advisory, so a missing/partial payload is acceptable.
+    """
+
+    stage: str = ""
+    detail: str = ""
+    current: int = 0
+    total: int = 0
+    phase_index: int = 0
+    phase_total: int = 4
+
+
 class CoverageRun(BaseModel):
     """A background coverage run over the active MDL directory (Feature B).
 
@@ -334,6 +351,8 @@ class CoverageRun(BaseModel):
     status: CoverageRunStatus = "pending"
     score: float | None = None
     report: CoverageReport | None = None
+    #: Live progress while ``running``; ``None`` before first tick / once terminal.
+    progress: CoverageProgress | None = None
     error: str | None = None
     created_at: datetime = Field(default_factory=_utc_now)
     updated_at: datetime = Field(default_factory=_utc_now)

@@ -95,6 +95,20 @@ class ConversationStore(Protocol):
     ) -> Conversation:
         """Rename a conversation."""
 
+    def update_project_id(
+        self,
+        conversation_id: str,
+        project_id: str | None,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> Conversation:
+        """Pin the semantic-layer project that grounds this conversation.
+
+        Used by the AI SQL agent to record the project it resolved on the first
+        grounded turn so later turns reuse it deterministically instead of
+        re-racing the most-recently-updated match.
+        """
+
     def append(
         self,
         conversation_id: str,

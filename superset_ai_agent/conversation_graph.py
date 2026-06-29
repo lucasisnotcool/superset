@@ -90,7 +90,10 @@ from superset_ai_agent.semantic_layer.schema_retriever import (
     retrieve_mdl_context,
     Retriever,
 )
-from superset_ai_agent.semantic_layer.schemas import WrenMaterializationResult
+from superset_ai_agent.semantic_layer.schemas import (
+    SemanticProject,
+    WrenMaterializationResult,
+)
 from superset_ai_agent.semantic_layer.store import scope_hash
 from superset_ai_agent.semantic_layer.wren_runtime import (
     materialize_request_semantic_project,
@@ -807,9 +810,7 @@ class ConversationGraph:
         )
         context = self.context_provider.get_context(agent_request)
         retrieval = getattr(self.context_provider, "last_retrieval", None)
-        retrieval_artifact = (
-            retrieval.retrieval if retrieval is not None else None
-        )
+        retrieval_artifact = retrieval.retrieval if retrieval is not None else None
         details = {
             "dataset_count": len(context.datasets),
             "database_name": context.database.name,
@@ -836,6 +837,45 @@ class ConversationGraph:
             ],
         }
 
+    def _resolve_semantic_grounding(
+        self,
+        state: ConversationState,
+        request: ConversationTurnRequest,
+    ) -> tuple[SemanticProject, WrenMaterializationResult, list[str]] | None:
+        """Resolve the grounding project and pin it onto the conversation.
+
+        Resolution order (F1/F2): an explicit scope pin wins; else the project
+        already pinned to this conversation (stable across turns); else the
+        heuristic most-recent match. The resolver re-checks access + schema
+        coverage, so a stale/unauthorized pin degrades to the heuristic. The
+        resolved project is recorded on the conversation so later turns reuse it
+        deterministically instead of re-racing the most-recent match.
+        """
+
+        conversation = state.get("conversation")
+        pinned_project_id = conversation.project_id if conversation else None
+        requested_project_id = request.scope.project_id or pinned_project_id
+        materialized = materialize_request_semantic_project(
+            config=self.config,
+            semantic_project_store=self.semantic_project_store,
+            mdl_file_store=self.mdl_file_store,
+            owner_id=state["owner_id"],
+            database_id=request.scope.database_id,
+            catalog_name=request.scope.catalog_name,
+            schema_name=request.scope.schema_name,
+            project_id=requested_project_id,
+        )
+        if materialized is None:
+            return None
+        project, _materialization, _warnings = materialized
+        if conversation is not None and conversation.project_id != project.id:
+            self.conversation_store.update_project_id(
+                state["conversation_id"],
+                project.id,
+                owner_id=state["owner_id"],
+            )
+        return materialized
+
     def _load_wren_context(self, state: ConversationState) -> ConversationState:
         request = state["request"]
         context = state["context"]
@@ -861,18 +901,11 @@ class ConversationGraph:
         materialization = None
         project_id = None
         mdl_path = None
+        resolve_warnings: list[str] = []
         try:
-            materialized = materialize_request_semantic_project(
-                config=self.config,
-                semantic_project_store=self.semantic_project_store,
-                mdl_file_store=self.mdl_file_store,
-                owner_id=state["owner_id"],
-                database_id=request.scope.database_id,
-                catalog_name=request.scope.catalog_name,
-                schema_name=request.scope.schema_name,
-            )
+            materialized = self._resolve_semantic_grounding(state, request)
             if materialized is not None:
-                project, materialization = materialized
+                project, materialization, resolve_warnings = materialized
                 project_id = project.id
                 mdl_path = materialization.path
             wren_context = self.wren_client.fetch_context(
@@ -890,7 +923,7 @@ class ConversationGraph:
         else:
             status = "ok" if wren_context.available else "warning"
         if materialization is not None:
-            warnings = list(wren_context.warnings)
+            warnings = [*wren_context.warnings, *resolve_warnings]
             if materialization.file_count == 0:
                 warnings.append("Semantic project has no active MDL files.")
             wren_context = wren_context.model_copy(

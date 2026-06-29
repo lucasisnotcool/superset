@@ -167,18 +167,85 @@ test("shows a teammate's captured name (not 'You') for another user's edit", asy
   expect(actor).not.toHaveTextContent('You');
 });
 
-test('opens a stored coverage report from a coverage entry', async () => {
+const SCORES_BY_VERSION =
+  'http://agent.local/agent/semantic-layer/projects/project-1/coverage/scores-by-version';
+
+test('labels versions with coverage scores and a before/after delta', async () => {
+  // Newest-first: a Copilot edit produced version c2 (60%), the prior activation
+  // produced c1 (88%). Coverage is NOT a timeline entry — it annotates each
+  // version-producing entry, with the delta on the newer one.
   fetchMock.get(PROVENANCE, [
     {
-      id: 'cov1',
-      kind: 'coverage',
+      id: 'edit1',
+      kind: 'copilot_edit',
       status: 'ok',
-      summary: 'Coverage 80%',
+      summary: 'Agent edit',
+      created_at: '2026-06-26T07:00:00Z',
+      actor_type: 'agent',
+      detail: { mdl_checksum: 'c2' },
+    },
+    {
+      id: 'act1',
+      kind: 'mdl_activated',
+      status: 'ok',
+      summary: 'Activated models/orders.json',
       created_at: '2026-06-26T06:00:00Z',
-      actor_type: 'system',
-      detail: { run_id: 'run-7', score: 0.8 },
+      detail: { mdl_checksum: 'c1', status_from: 'draft', status_to: 'active' },
     },
   ]);
+  fetchMock.get(SCORES_BY_VERSION, {
+    c1: {
+      score: 0.88,
+      run_id: 'run-1',
+      status: 'complete',
+      computed_at: '2026-06-26T06:01:00Z',
+      docs_checksum: 'd1',
+    },
+    c2: {
+      score: 0.6,
+      run_id: 'run-2',
+      status: 'complete',
+      computed_at: '2026-06-26T07:01:00Z',
+      docs_checksum: 'd1',
+    },
+  });
+
+  render(
+    <MdlProvenanceDialog open projectId="project-1" onClose={jest.fn()} />,
+  );
+
+  const entries = await screen.findAllByTestId('provenance-entry');
+  // No coverage row injected into the timeline.
+  expect(entries).toHaveLength(2);
+  const chips = await screen.findAllByTestId('provenance-coverage-chip');
+  expect(chips[0]).toHaveTextContent('60%'); // newest version
+  expect(chips[1]).toHaveTextContent('88%'); // prior version
+  // The newer version shows the drop vs the prior scored version.
+  expect(screen.getByTestId('provenance-coverage-delta')).toHaveTextContent(
+    '↓28%',
+  );
+});
+
+test('opens a stored coverage report by clicking a version chip', async () => {
+  fetchMock.get(PROVENANCE, [
+    {
+      id: 'act1',
+      kind: 'mdl_activated',
+      status: 'ok',
+      summary: 'Activated models/orders.json',
+      created_at: '2026-06-26T06:00:00Z',
+      detail: { mdl_checksum: 'c1', status_from: 'draft', status_to: 'active' },
+    },
+  ]);
+  fetchMock.get(SCORES_BY_VERSION, {
+    c1: {
+      score: 0.8,
+      run_id: 'run-7',
+      status: 'complete',
+      computed_at: '2026-06-26T06:01:00Z',
+      docs_checksum: 'd1',
+    },
+  });
   fetchMock.get(
     'http://agent.local/agent/semantic-layer/projects/project-1/coverage/runs/run-7',
     {
@@ -210,7 +277,7 @@ test('opens a stored coverage report from a coverage entry', async () => {
     <MdlProvenanceDialog open projectId="project-1" onClose={jest.fn()} />,
   );
 
-  await userEvent.click(await screen.findByTestId('provenance-open-coverage'));
+  await userEvent.click(await screen.findByTestId('provenance-coverage-chip'));
   // The report body replaces the timeline; a back link returns to history.
   expect(
     await screen.findByTestId('provenance-coverage-back'),

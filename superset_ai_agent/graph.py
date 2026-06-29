@@ -424,6 +424,7 @@ class TextToSqlGraph:
         materialization = None
         project_id = None
         mdl_path = None
+        resolve_warnings: list[str] = []
         try:
             materialized = materialize_request_semantic_project(
                 config=self.config,
@@ -433,9 +434,10 @@ class TextToSqlGraph:
                 database_id=request.database_id,
                 catalog_name=request.catalog_name,
                 schema_name=request.schema_name,
+                project_id=request.project_id,
             )
             if materialized is not None:
-                project, materialization = materialized
+                project, materialization, resolve_warnings = materialized
                 project_id = project.id
                 mdl_path = materialization.path
             wren_context = self.wren_client.fetch_context(
@@ -453,7 +455,7 @@ class TextToSqlGraph:
         else:
             status = "ok" if wren_context.available else "warning"
         if materialization is not None:
-            warnings = list(wren_context.warnings)
+            warnings = [*wren_context.warnings, *resolve_warnings]
             if materialization.file_count == 0:
                 warnings.append("Semantic project has no active MDL files.")
             wren_context = wren_context.model_copy(

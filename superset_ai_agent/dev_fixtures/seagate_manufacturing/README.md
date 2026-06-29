@@ -73,35 +73,76 @@ Record the `answer_summary`/`sql` from each response — this is the
 "intuition only" baseline. Expect jargon questions (patty, griddle, 86'd,
 Tigerline, Golden Yield, Diner Week, ...) to be misread or refused outright.
 
-## 4. Upload and review the BI glossary
+## 4. Onboard the base layer, then enrich from the BI glossary
+
+> **Note (API change).** The old upload → `proposed_updates` review →
+> `index/rebuild` overlay flow was removed (migration
+> `0006_drop_semantic_overlay`). The current flow is **project-scoped**: resolve a
+> project (step 2), onboard the base structure, attach the glossary as a document,
+> then enrich and activate. This is exactly what the Python harness
+> (`superset_ai_agent/evaluation/eval_common.py`) automates — prefer it for repeated
+> runs; the `curl` calls below are the manual equivalent.
+
+First onboard the base structure (one base model per table; auto-activated). Use the
+`<PROJECT_ID>` returned by step 2:
 
 ```bash
-curl -X POST http://localhost:8090/ai-agent/agent/semantic-layer/documents \
-  -F 'scope={"database_id": <DB_ID>, "schema_name": "seagate"}' \
-  -F 'file=@superset_ai_agent/dev_fixtures/seagate_manufacturing/bi_glossary.md;type=text/markdown'
+curl -X POST http://localhost:8090/ai-agent/agent/semantic-layer/projects/<PROJECT_ID>/onboard
+# -> { "id": "<JOB_ID>", "status": "running", ... }
 ```
 
-Note the returned `id` (the document id) and inspect `proposed_updates`.
-Approve everything that looks reasonable:
+Poll the job until it completes:
 
 ```bash
-curl -X PATCH http://localhost:8090/ai-agent/agent/semantic-layer/documents/<DOCUMENT_ID>/review \
+curl http://localhost:8090/ai-agent/agent/semantic-layer/projects/<PROJECT_ID>/jobs/<JOB_ID>
+# -> { "status": "completed", ... }   (or "failed" with an error)
+```
+
+Attach the BI glossary as a project document:
+
+```bash
+curl -X POST http://localhost:8090/ai-agent/agent/semantic-layer/projects/<PROJECT_ID>/documents/text \
   -H "Content-Type: application/json" \
-  -d '{"approved_update_ids": ["<update-id-1>", "<update-id-2>", "..."]}'
+  -d @- <<'JSON'
+{"filename": "bi_glossary.md",
+ "text": "<contents of superset_ai_agent/dev_fixtures/seagate_manufacturing/bi_glossary.md>",
+ "content_type": "text/markdown"}
+JSON
+# -> note the returned document "id"  (<DOCUMENT_ID>)
 ```
 
-(List documents at any point with
-`GET /ai-agent/agent/semantic-layer/documents?database_id=<DB_ID>&schema_name=seagate`.)
+## 5. Enrich and activate the MDL
 
-## 5. Rebuild the semantic-layer index
+Produce an enrichment proposal from the glossary (requires base models from step 4 —
+returns 409 otherwise):
 
 ```bash
-curl -X POST http://localhost:8090/ai-agent/agent/semantic-layer/index/rebuild \
-  -H "Content-Type: application/json" \
-  -d '{"scope": {"database_id": <DB_ID>, "schema_name": "seagate"}}'
+curl -X POST http://localhost:8090/ai-agent/agent/semantic-layer/projects/<PROJECT_ID>/documents/<DOCUMENT_ID>/enrich
+# -> { "proposed_path": "...", "proposed_content": "<whole enriched MDL manifest>" }
 ```
 
-This materializes the approved updates into active Wren MDL files.
+Persist `proposed_content` as a new active MDL file, then deactivate the base files
+it supersedes (the enriched manifest re-emits *all* models into one file —
+activating it alongside the base files causes `Duplicate model name` errors):
+
+```bash
+# Create the enriched file
+curl -X POST http://localhost:8090/ai-agent/agent/semantic-layer/projects/<PROJECT_ID>/mdl-files \
+  -H "Content-Type: application/json" \
+  -d '{"path": "<proposed_path>", "content": "<proposed_content>", "source_type": "enriched_markdown"}'
+# -> note the returned file "id" (<FILE_ID>)
+
+# Activate it
+curl -X PATCH http://localhost:8090/ai-agent/agent/semantic-layer/projects/<PROJECT_ID>/mdl-files/<FILE_ID> \
+  -H "Content-Type: application/json" -d '{"status": "active"}'
+
+# List files and set each superseded base file (models/<table>.json) to "draft"
+curl http://localhost:8090/ai-agent/agent/semantic-layer/projects/<PROJECT_ID>/mdl-files
+```
+
+The next query lazily re-indexes from the active manifest, so the enriched semantics
+reach retrieval. (`eval_common.AgentClient.apply_enrichment` does the supersede-and-
+activate bookkeeping for you.)
 
 ## 6. Re-run the same queries (after onboarding)
 

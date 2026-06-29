@@ -63,6 +63,9 @@ export function useProjectEvents(
 /** Event types that change a project's coverage/provenance surface. */
 export const COVERAGE_EVENT_TYPES = [
   'coverage_completed',
+  // Live, non-provenance stage ticks (Feature C) — nudge the badge to re-poll
+  // status so the analysing label/stepper advances during a run.
+  'coverage_progress',
   'mdl_activated',
   'mdl_deleted',
   'mdl_agent_edit',

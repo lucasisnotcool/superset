@@ -40,11 +40,24 @@ const Badge = styled.span`
 
 export interface SemanticLayerStateBadgeProps {
   state?: SemanticLayerState | null;
+  /** Name of the project the AI SQL agent grounds on, when one is resolved.
+   * Surfacing it makes the (otherwise invisible) grounding choice transparent. */
+  projectName?: string | null;
 }
 
 export default function SemanticLayerStateBadge({
   state,
+  projectName,
 }: SemanticLayerStateBadgeProps) {
+  if (projectName) {
+    return (
+      <Badge
+        title={state ? t('%s document(s)', state.document_count) : undefined}
+      >
+        {t('Semantic layer: %s', projectName)}
+      </Badge>
+    );
+  }
   if (!state) {
     return <Badge>{t('Semantic layer')}</Badge>;
   }

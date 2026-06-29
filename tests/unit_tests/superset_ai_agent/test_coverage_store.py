@@ -24,7 +24,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from superset_ai_agent.persistence.models import Base
-from superset_ai_agent.semantic_layer.copilot.schemas import CoverageReport
+from superset_ai_agent.semantic_layer.copilot.schemas import (
+    CoverageProgress,
+    CoverageReport,
+)
 from superset_ai_agent.semantic_layer.coverage_store import (
     InMemoryCoverageRunStore,
     SqlAlchemyCoverageRunStore,
@@ -99,6 +102,71 @@ def test_find_complete_is_idempotency_key(store) -> None:
     assert store.find_complete("p1", "c2", "d1") is None
 
 
+def test_latest_complete_bulk_returns_one_entry_per_project(store) -> None:
+    # Two projects with a complete run, one with only an in-flight (pending) run,
+    # and one unknown id. The bulk lookup must return only the complete ones.
+    p1 = store.create(
+        project_id="p1", owner_id="u1", mdl_checksum="c1", docs_checksum="d1"
+    )
+    store.claim(p1.id)
+    store.complete(p1.id, CoverageReport(score=0.5), score=0.5)
+
+    p2 = store.create(
+        project_id="p2", owner_id="u1", mdl_checksum="c1", docs_checksum="d1"
+    )
+    store.claim(p2.id)
+    store.complete(p2.id, CoverageReport(score=0.9), score=0.9)
+
+    # p3 has only a pending run — no complete score yet.
+    store.create(project_id="p3", owner_id="u1", mdl_checksum="c1", docs_checksum="d1")
+
+    result = store.latest_complete_bulk(["p1", "p2", "p3", "p4"])
+    assert set(result) == {"p1", "p2"}
+    assert result["p1"].score == 0.5
+    assert result["p2"].score == 0.9
+    # Matches the per-project method one-for-one (same answer, one query).
+    assert result["p1"].id == store.latest_complete("p1").id
+
+
+def test_latest_complete_bulk_empty_input(store) -> None:
+    assert store.latest_complete_bulk([]) == {}
+
+
+def test_scores_by_checksum_keeps_latest_run_per_version(store) -> None:
+    # Version c1 audited twice (the later run wins), version c2 once. The overlay
+    # is keyed by MDL version, not by run, so c1 returns only its newest score.
+    first = store.create(
+        project_id="p1", owner_id="u1", mdl_checksum="c1", docs_checksum="d1"
+    )
+    store.claim(first.id)
+    store.complete(first.id, CoverageReport(score=0.5), score=0.5)
+
+    second = store.create(
+        project_id="p1", owner_id="u1", mdl_checksum="c1", docs_checksum="d2"
+    )
+    store.claim(second.id)
+    store.complete(second.id, CoverageReport(score=0.6), score=0.6)
+
+    other = store.create(
+        project_id="p1", owner_id="u1", mdl_checksum="c2", docs_checksum="d1"
+    )
+    store.claim(other.id)
+    store.complete(other.id, CoverageReport(score=0.9), score=0.9)
+
+    # A different project's run must not leak into p1's overlay.
+    elsewhere = store.create(
+        project_id="p2", owner_id="u1", mdl_checksum="c1", docs_checksum="d1"
+    )
+    store.claim(elsewhere.id)
+    store.complete(elsewhere.id, CoverageReport(score=0.1), score=0.1)
+
+    scores = store.scores_by_checksum("p1")
+    assert set(scores) == {"c1", "c2"}
+    assert scores["c1"].id == second.id  # newest run for c1
+    assert scores["c1"].score == 0.6
+    assert scores["c2"].score == 0.9
+
+
 def test_active_run_returns_newest_inflight(store) -> None:
     assert store.active_run("p1") is None
     run = store.create(
@@ -108,3 +176,34 @@ def test_active_run_returns_newest_inflight(store) -> None:
     assert active is not None and active.id == run.id
     store.fail(run.id, "boom")
     assert store.active_run("p1") is None
+
+
+def test_report_progress_records_live_stage(store) -> None:
+    run = store.create(
+        project_id="p1", owner_id="u1", mdl_checksum="c1", docs_checksum="d1"
+    )
+    store.claim(run.id)
+    store.report_progress(
+        run.id,
+        CoverageProgress(stage="extracting", detail="orders.pdf", current=1, total=5),
+    )
+    persisted = store.get(run.id)
+    assert persisted.progress is not None
+    assert persisted.progress.stage == "extracting"
+    assert persisted.progress.current == 1
+    assert persisted.progress.total == 5
+    # Live progress surfaces through the active-run lookup the badge reads.
+    active = store.active_run("p1")
+    assert active is not None and active.progress is not None
+    assert active.progress.detail == "orders.pdf"
+
+
+def test_terminal_transition_clears_progress(store) -> None:
+    run = store.create(
+        project_id="p1", owner_id="u1", mdl_checksum="c1", docs_checksum="d1"
+    )
+    store.claim(run.id)
+    store.report_progress(run.id, CoverageProgress(stage="judging"))
+    store.complete(run.id, CoverageReport(score=0.8), score=0.8)
+    # A completed run carries no live progress (it no longer applies).
+    assert store.get(run.id).progress is None

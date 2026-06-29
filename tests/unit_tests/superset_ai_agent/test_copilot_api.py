@@ -400,9 +400,12 @@ def test_copilot_coverage_falls_back_to_extracted_text_without_indexing(
     assert report.json()["total"] == 2
 
 
-def test_directory_coverage_auto_runs_and_surfaces_in_provenance(tmp_path) -> None:
+def test_directory_coverage_auto_runs_and_labels_the_version(tmp_path) -> None:
     # Activating MDL while a document exists auto-runs directory coverage (inline
-    # job runner) and records a coverage entry in provenance + a latest report.
+    # job runner) and stores a latest report. Coverage is decoupled from
+    # provenance (Feature B): it is NOT a timeline entry — instead the score is
+    # exposed per MDL version (mdl_checksum) and the version-producing provenance
+    # entry carries that checksum so the UI can label it.
     client = _client(tmp_path, model_client=CoverageModel())
     project = _resolve(client)
     pid = project["id"]
@@ -424,20 +427,28 @@ def test_directory_coverage_auto_runs_and_surfaces_in_provenance(tmp_path) -> No
     assert body is not None
     assert body["status"] == "complete"
     assert body["report"]["total"] == 2
+    checksum = body["mdl_checksum"]
 
-    status = client.get(
-        f"/agent/semantic-layer/projects/{pid}/coverage/status"
-    ).json()
+    status = client.get(f"/agent/semantic-layer/projects/{pid}/coverage/status").json()
     assert status["status"] == "ready"
     assert status["running"] is False
+    # No run in flight → the live-progress field is present but empty (Feature C).
+    assert status["progress"] is None
 
-    provenance = client.get(
-        f"/agent/semantic-layer/projects/{pid}/provenance"
+    # Coverage is NOT a provenance timeline entry anymore...
+    provenance = client.get(f"/agent/semantic-layer/projects/{pid}/provenance").json()
+    assert [e for e in provenance if e["kind"] == "coverage"] == []
+    # ...but the version-producing entry carries the checksum the label joins on.
+    activations = [e for e in provenance if e["detail"].get("mdl_checksum") == checksum]
+    assert activations, "expected a provenance entry stamped with the MDL checksum"
+
+    # The score is exposed as a version label, keyed by mdl_checksum.
+    scores = client.get(
+        f"/agent/semantic-layer/projects/{pid}/coverage/scores-by-version"
     ).json()
-    coverage_entries = [e for e in provenance if e["kind"] == "coverage"]
-    assert len(coverage_entries) == 1
-    assert coverage_entries[0]["actor_type"] == "system"
-    assert coverage_entries[0]["detail"]["run_id"] == body["id"]
+    assert checksum in scores
+    assert scores[checksum]["score"] == body["score"]
+    assert scores[checksum]["run_id"] == body["id"]
 
 
 def test_directory_coverage_is_idempotent_for_same_version(tmp_path) -> None:
@@ -578,9 +589,7 @@ def test_copilot_blocked_while_onboarding_is_indexing(tmp_path) -> None:
 
     started = client.post(f"/agent/semantic-layer/projects/{pid}/onboard")
     assert started.status_code == 202, started.text
-    readiness = client.get(
-        f"/agent/semantic-layer/projects/{pid}/readiness"
-    ).json()
+    readiness = client.get(f"/agent/semantic-layer/projects/{pid}/readiness").json()
     assert readiness["status"] == "indexing", readiness
 
     run = client.post(
@@ -989,9 +998,7 @@ def test_copilot_apply_emits_agent_provenance(tmp_path) -> None:
     )
     assert apply.status_code == 200, apply.text
 
-    provenance = client.get(
-        f"/agent/semantic-layer/projects/{pid}/provenance"
-    ).json()
+    provenance = client.get(f"/agent/semantic-layer/projects/{pid}/provenance").json()
     agent_edits = [e for e in provenance if e["kind"] == "copilot_edit"]
     assert len(agent_edits) == 1
     entry = agent_edits[0]
@@ -1036,9 +1043,7 @@ def test_copilot_apply_with_attachment_records_enrichment(tmp_path) -> None:
     )
     assert apply.status_code == 200, apply.text
 
-    provenance = client.get(
-        f"/agent/semantic-layer/projects/{pid}/provenance"
-    ).json()
+    provenance = client.get(f"/agent/semantic-layer/projects/{pid}/provenance").json()
     enrichments = [e for e in provenance if e["kind"] == "enrichment"]
     assert len(enrichments) == 1
     assert enrichments[0]["detail"]["documents"] == [
@@ -1103,3 +1108,124 @@ def test_project_list_carries_latest_coverage_score_for_the_browser_badge(
     )
     after = client.get(listing_url).json()
     assert after[0]["coverage_score"] == 0.75
+
+
+# A metric whose ``baseObject`` references the ``moves`` model. Activating this
+# file before its model is the exact dependency-order case that broke
+# "Activate all": the metric resolves only once the model is in the manifest.
+_REVENUE_METRIC = json.dumps(
+    {"metrics": [{"name": "revenue", "baseObject": "moves", "expression": "count(id)"}]}
+)
+
+
+def _create_draft(client: TestClient, pid: str, path: str, content: str) -> str:
+    created = client.post(
+        f"/agent/semantic-layer/projects/{pid}/mdl-files",
+        json={"path": path, "content": content},
+    )
+    assert created.status_code == 200, created.text
+    return created.json()["id"]
+
+
+def test_single_file_activation_still_blocks_unresolved_metric(tmp_path) -> None:
+    # The per-file gate stays strict: activating a metric whose model is not yet
+    # active 422s. This is the behaviour the bulk endpoint exists to work around.
+    client = _client(tmp_path)
+    pid = _resolve(client)["id"]
+    _create_draft(client, pid, "models/moves.json", MOVES)
+    metric_id = _create_draft(client, pid, "metrics/revenue.json", _REVENUE_METRIC)
+
+    blocked = client.patch(
+        f"/agent/semantic-layer/projects/{pid}/mdl-files/{metric_id}",
+        json={"status": "active"},
+    )
+    assert blocked.status_code == 422, blocked.text
+    codes = {msg["code"] for msg in blocked.json()["detail"]["validation"]["messages"]}
+    assert "unresolved_metric_base" in codes
+
+
+def test_bulk_activate_resolves_cross_file_dependency_order(tmp_path) -> None:
+    # The regression: "Activate all" must succeed for a metric + its model even
+    # though the metric file sorts (and could be toggled) before the model.
+    client = _client(tmp_path)
+    pid = _resolve(client)["id"]
+    _create_draft(client, pid, "models/moves.json", MOVES)
+    _create_draft(client, pid, "metrics/revenue.json", _REVENUE_METRIC)
+
+    result = client.post(
+        f"/agent/semantic-layer/projects/{pid}/mdl-files/bulk-status",
+        json={"status": "active", "file_ids": None},
+    )
+    assert result.status_code == 200, result.text
+    body = result.json()
+    assert body["changed_count"] == 2
+    statuses = {file["path"]: file["status"] for file in body["files"]}
+    assert statuses["models/moves.json"] == "active"
+    assert statuses["metrics/revenue.json"] == "active"
+
+
+def test_bulk_activate_is_atomic_when_manifest_is_invalid(tmp_path) -> None:
+    # A metric referencing a model that does not exist anywhere fails the union
+    # validation → 422 and NOTHING is activated (all-or-nothing).
+    client = _client(tmp_path)
+    pid = _resolve(client)["id"]
+    _create_draft(client, pid, "models/moves.json", MOVES)
+    ghost = json.dumps(
+        {"metrics": [{"name": "ghost", "baseObject": "absent", "expression": "1"}]}
+    )
+    _create_draft(client, pid, "metrics/ghost.json", ghost)
+
+    result = client.post(
+        f"/agent/semantic-layer/projects/{pid}/mdl-files/bulk-status",
+        json={"status": "active", "file_ids": None},
+    )
+    assert result.status_code == 422, result.text
+
+    listing = client.get(f"/agent/semantic-layer/projects/{pid}/mdl-files").json()
+    assert all(file["status"] == "draft" for file in listing)
+
+
+def test_bulk_deactivate_all(tmp_path) -> None:
+    client = _client(tmp_path)
+    pid = _resolve(client)["id"]
+    _seed_active_model(client, pid)
+
+    result = client.post(
+        f"/agent/semantic-layer/projects/{pid}/mdl-files/bulk-status",
+        json={"status": "draft", "file_ids": None},
+    )
+    assert result.status_code == 200, result.text
+    assert result.json()["changed_count"] == 1
+    listing = client.get(f"/agent/semantic-layer/projects/{pid}/mdl-files").json()
+    assert all(file["status"] == "draft" for file in listing)
+
+
+def test_bulk_activate_subset_by_file_ids(tmp_path) -> None:
+    client = _client(tmp_path)
+    pid = _resolve(client)["id"]
+    model_id = _create_draft(client, pid, "models/moves.json", MOVES)
+    _create_draft(client, pid, "metrics/revenue.json", _REVENUE_METRIC)
+
+    # Activate only the model; the metric is left a draft.
+    result = client.post(
+        f"/agent/semantic-layer/projects/{pid}/mdl-files/bulk-status",
+        json={"status": "active", "file_ids": [model_id]},
+    )
+    assert result.status_code == 200, result.text
+    assert result.json()["changed_count"] == 1
+    statuses = {file["path"]: file["status"] for file in result.json()["files"]}
+    assert statuses["models/moves.json"] == "active"
+    assert statuses["metrics/revenue.json"] == "draft"
+
+
+def test_bulk_activate_noop_when_nothing_to_change(tmp_path) -> None:
+    client = _client(tmp_path)
+    pid = _resolve(client)["id"]
+    _seed_active_model(client, pid)
+
+    result = client.post(
+        f"/agent/semantic-layer/projects/{pid}/mdl-files/bulk-status",
+        json={"status": "active", "file_ids": None},
+    )
+    assert result.status_code == 200, result.text
+    assert result.json()["changed_count"] == 0

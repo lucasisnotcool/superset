@@ -25,12 +25,15 @@ import {
   Flex,
   Modal,
   Tag,
+  Tooltip,
   Typography,
 } from '@superset-ui/core/components';
 import { Icons } from '@superset-ui/core/components/Icons';
 import {
   CoverageReport,
+  CoverageScoresByVersion,
   getCoverageRun,
+  getCoverageScoresByVersion,
   getCoverageStatus,
   getMdlProvenance,
   ProvenanceActorType,
@@ -232,6 +235,106 @@ const sourceDocByPath = (entry: ProvenanceEntry): Map<string, string> => {
   return map;
 };
 
+// Coverage label for one provenance entry (Feature B): the score of the MDL
+// version that entry produced, plus the delta vs the nearest older scored
+// version. ``score === null`` marks a version that changed but has no coverage
+// run yet (rendered muted, the Codecov "not computed" state).
+interface CoverageLabel {
+  score: number | null;
+  runId: string | null;
+  delta: number | null;
+}
+
+// Joins provenance entries (newest-first) to per-version coverage scores by
+// ``mdl_checksum``. Only entries that produced a version (carry a checksum) get
+// a label; the delta compares each scored version to the nearest older one with
+// a *different* checksum (Codecov "compare to previous commit" semantics).
+const buildCoverageLabels = (
+  entries: ProvenanceEntry[],
+  scores: CoverageScoresByVersion,
+): Map<string, CoverageLabel> => {
+  const labels = new Map<string, CoverageLabel>();
+  // Scored versions in newest-first order, as they appear down the timeline.
+  const scored: { entryId: string; checksum: string; score: number }[] = [];
+  entries.forEach(entry => {
+    const checksum = entry.detail?.mdl_checksum as string | undefined;
+    if (!checksum) return;
+    const hit = scores[checksum];
+    const score = typeof hit?.score === 'number' ? hit.score : null;
+    labels.set(entry.id, {
+      score,
+      runId: hit?.run_id ?? null,
+      delta: null,
+    });
+    if (score !== null) scored.push({ entryId: entry.id, checksum, score });
+  });
+  // Delta vs the nearest older scored version with a different checksum.
+  scored.forEach((current, index) => {
+    const older = scored
+      .slice(index + 1)
+      .find(candidate => candidate.checksum !== current.checksum);
+    if (older) {
+      const label = labels.get(current.entryId);
+      if (label) label.delta = current.score - older.score;
+    }
+  });
+  return labels;
+};
+
+// "↑5%" / "↓28%" delta of one version's coverage vs the nearest older one. An
+// integer-point change of zero renders nothing (no spurious "±0%").
+const formatDelta = (delta: number): string => {
+  const points = Math.round(delta * 100);
+  if (points === 0) return '';
+  return `${points > 0 ? '↑' : '↓'}${Math.abs(points)}%`;
+};
+
+// The coverage label on a provenance entry (Feature B): a clickable score chip
+// (opens that version's report) plus a colour-coded delta. A version with no run
+// yet renders a muted "—" (the "not computed" state), and non-version entries
+// render nothing.
+const CoverageChip = ({
+  label,
+  onOpen,
+}: {
+  label?: CoverageLabel;
+  onOpen: (runId: string) => void;
+}) => {
+  if (!label) return null;
+  if (label.score === null) {
+    return (
+      <Tooltip title={t('Coverage not computed for this version')}>
+        <Tag data-test="provenance-coverage-chip">{t('Coverage —')}</Tag>
+      </Tooltip>
+    );
+  }
+  const pct = Math.round(label.score * 100);
+  const deltaText = label.delta !== null ? formatDelta(label.delta) : '';
+  const { runId } = label;
+  return (
+    <Flex align="center" gap="small">
+      <Tooltip title={t('View coverage report for this version')}>
+        <Tag
+          color="success"
+          onClick={runId ? () => onOpen(runId) : undefined}
+          style={runId ? { cursor: 'pointer' } : undefined}
+          data-test="provenance-coverage-chip"
+        >
+          {t('Coverage')} {pct}%
+        </Tag>
+      </Tooltip>
+      {deltaText ? (
+        <Typography.Text
+          type={(label.delta ?? 0) > 0 ? 'success' : 'danger'}
+          data-test="provenance-coverage-delta"
+        >
+          {deltaText}
+        </Typography.Text>
+      ) : null}
+    </Flex>
+  );
+};
+
 export interface MdlProvenanceDialogProps {
   open: boolean;
   projectId?: string | null;
@@ -247,6 +350,9 @@ const MdlProvenanceDialog = ({
   onOpenConversation,
 }: MdlProvenanceDialogProps) => {
   const [entries, setEntries] = useState<ProvenanceEntry[]>([]);
+  // Per-version coverage scores (mdl_checksum → score), overlaid as labels on
+  // the entries — coverage is decoupled from the timeline itself (Feature B).
+  const [scores, setScores] = useState<CoverageScoresByVersion>({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // True while a background coverage run is in flight for the current version —
@@ -279,6 +385,13 @@ const MdlProvenanceDialog = ({
       setCoverageRunning(status.running === true);
     } catch {
       setCoverageRunning(false);
+    }
+    // Coverage scores are an independent overlay — a fetch failure must not blank
+    // the timeline, only its labels.
+    try {
+      setScores(await getCoverageScoresByVersion(projectId));
+    } catch {
+      setScores({});
     }
   }, [projectId]);
 
@@ -321,6 +434,8 @@ const MdlProvenanceDialog = ({
     load,
     open && !viewingReport,
   );
+
+  const coverageLabels = buildCoverageLabels(entries, scores);
 
   if (viewingReport) {
     return (
@@ -417,7 +532,6 @@ const MdlProvenanceDialog = ({
           const conversationId = entry.detail?.conversation_id as
             | string
             | undefined;
-          const runId = entry.detail?.run_id as string | undefined;
           return (
             <Row key={entry.id} data-test="provenance-entry">
               <Dot status={entry.status} />
@@ -433,6 +547,10 @@ const MdlProvenanceDialog = ({
                     >
                       {actorLabel}
                     </Tag>
+                    <CoverageChip
+                      label={coverageLabels.get(entry.id)}
+                      onOpen={openCoverage}
+                    />
                   </Flex>
                   <Stamp>{stampLine(entry)}</Stamp>
                 </Header>
@@ -526,16 +644,6 @@ const MdlProvenanceDialog = ({
                         data-test="provenance-open-conversation"
                       >
                         {t('View conversation')}
-                      </Button>
-                    ) : null}
-                    {entry.kind === 'coverage' && runId ? (
-                      <Button
-                        type="link"
-                        size="small"
-                        onClick={() => openCoverage(runId)}
-                        data-test="provenance-open-coverage"
-                      >
-                        {t('View report')}
                       </Button>
                     ) : null}
                   </Flex>

@@ -59,7 +59,15 @@ EXPECTED: dict[str, dict[str, Any]] = {
     "Q13": {"nums": [0.960, 0.962, 729, 521]},  # Tigerline/Reef GY + Combo+DineIn
     "Q14": {"nums": [0.972, 0.882]},  # Tigerline vs Reef True Pass Rate (Heat Lamp)
     "Q15": {"nums": [0.355, 0.120]},  # Combo share Tigerline 35.5% / Reef 12.0%
+    # --- L5: cross-schema only (seagate_multi fixture; see EVAL_V2_SPEC.md) ---
+    "Q16": {"nums": [1751, 3017]},  # patties plated on WARM lines: Cobalt / Vantage
+    "Q17": {"nums": [0.951]},  # Golden Yield, Vantage family, Q4 2025 (n=1567)
+    "Q18": {"nums": [175, 151, 0.960, 0.962]},  # Nimbus Combo+DineIn units + region GY
 }
+
+#: Questions that only exist in the multi-schema fixture (seagate_multi). The
+#: single-schema scoring run keys off ``EXPECTED`` minus these.
+CROSS_SCHEMA_ONLY = ("Q16", "Q17", "Q18")
 
 
 def _all_numbers(rows: list[dict[str, Any]]) -> list[float]:

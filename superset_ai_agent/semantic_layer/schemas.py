@@ -66,6 +66,9 @@ SemanticLayerEventType = Literal[
     # runs (plan_provenance_and_coverage_impl.md, Features A & B).
     "mdl_agent_edit",
     "coverage_completed",
+    # Live, non-provenance coverage progress (Feature C): emitted at stage
+    # boundaries to nudge the badge to re-poll; never a provenance timeline entry.
+    "coverage_progress",
     # Project lifecycle: the origin entry stamped on a duplicated project
     # (plan_mdl_lab_spec.md DP8) recording its ``duplicated_from`` lineage.
     "mdl_project_created",
@@ -86,7 +89,9 @@ PROVENANCE_EVENT_TYPES: frozenset[str] = frozenset(
         "mdl_deleted",
         "document_enriched",
         "mdl_agent_edit",
-        "coverage_completed",
+        # ``coverage_completed`` is intentionally NOT a provenance entry: coverage
+        # is a read-only annotation over an MDL version, surfaced as a label on the
+        # version-producing entries (Feature B), not a timeline event of its own.
         "mdl_project_created",
     }
 )
@@ -365,6 +370,27 @@ class MdlFileUpdateRequest(BaseModel):
     source_document_id: str | None = None
 
 
+class MdlBulkStatusRequest(BaseModel):
+    """Set the status of many MDL files in one atomic operation.
+
+    ``file_ids=None`` targets every file in the project not already at ``status``
+    (the "Activate all" / "Deactivate all" rail action). Activation validates the
+    whole projected active manifest *once*, so files can be activated together
+    regardless of cross-file dependency order (a metric and the model it
+    references need not be toggled in sequence).
+    """
+
+    status: MdlFileStatus
+    file_ids: list[str] | None = None
+
+
+class MdlBulkStatusResult(BaseModel):
+    """Outcome of a bulk status change: the project's files and how many changed."""
+
+    files: list[MdlFile]
+    changed_count: int
+
+
 class MdlEnrichmentProposal(BaseModel):
     """Proposed MDL (native JSON) generated from a source document."""
 
@@ -475,7 +501,8 @@ _PROVENANCE_KIND_BY_EVENT: dict[str, ProvenanceKind] = {
     "onboarding_failed": "onboarding",
     "document_enriched": "enrichment",
     "mdl_agent_edit": "copilot_edit",
-    "coverage_completed": "coverage",
+    # ``coverage_completed`` is deliberately omitted — coverage is a version
+    # label overlay, not a provenance entry (Feature B). It returns None here.
     "mdl_created": "mdl_created",
     "mdl_updated": "mdl_updated",
     "mdl_activated": "mdl_activated",

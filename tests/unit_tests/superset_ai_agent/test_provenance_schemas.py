@@ -197,12 +197,14 @@ def test_provenance_sets_actor_type_for_new_kinds() -> None:
     assert agent_edit.edit_count == 1
     assert agent_edit.first_at is None
 
-    coverage = provenance_from_event(
-        _event("coverage_completed", detail={"score": 0.8, "run_id": "r1"})
+    # Coverage is decoupled (Feature B): a coverage_completed event is NOT a
+    # provenance entry — it surfaces as a per-version label overlay instead.
+    assert (
+        provenance_from_event(
+            _event("coverage_completed", detail={"score": 0.8, "run_id": "r1"})
+        )
+        is None
     )
-    assert coverage is not None
-    assert coverage.kind == "coverage"
-    assert coverage.actor_type == "system"
 
     user_edit = provenance_from_event(
         _event("mdl_updated", detail={"source_type": "manual"})

@@ -122,7 +122,10 @@ docker/requirements-local.txt
 # Legacy per-Docker AI agent env file. Keep ignored so old secret files do not
 # appear in git status after moving to superset_ai_agent/.env.
 docker/.env-ai-agent
-superset_ai_agent/.env
+# Ignore all AI agent env variants (incl. .env, .env.eval, *_backup) so real
+# secrets never get committed; keep the .env.example template tracked.
+superset_ai_agent/.env*
+!superset_ai_agent/.env.example
 
 cache/
 docker/*local*

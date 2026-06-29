@@ -171,9 +171,7 @@ class InMemorySemanticProjectStore:
         *,
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> SemanticProject:
-        return self._create(
-            request, _request_fingerprint(request), owner_id=owner_id
-        )
+        return self._create(request, _request_fingerprint(request), owner_id=owner_id)
 
     def _create(
         self,
@@ -531,16 +529,22 @@ class SqlAlchemySemanticProjectStore:
                     )
                 )
             models = (
-                session.execute(query.order_by(AiAgentSemanticProject.updated_at.desc()))
+                session.execute(
+                    query.order_by(AiAgentSemanticProject.updated_at.desc())
+                )
                 .scalars()
                 .all()
+            )
+            # Batch the membership lookup so the list is one query, not 1+N.
+            schema_names_by_project = _load_schema_names_bulk(
+                session, [model.id for model in models]
             )
             return [
                 _with_permission(
                     _project_from_model(
                         model,
-                        schema_names=_load_schema_names(
-                            session, model.id, model.schema_name
+                        schema_names=(
+                            schema_names_by_project.get(model.id) or [model.schema_name]
                         ),
                     ),
                     owner_id,
@@ -767,9 +771,7 @@ def _merge_schema_names(existing: list[str], requested: list[str]) -> list[str]:
     return merged
 
 
-def _load_schema_names(
-    session: Session, project_id: str, primary: str
-) -> list[str]:
+def _load_schema_names(session: Session, project_id: str, primary: str) -> list[str]:
     """Load a project's ordered schema set, falling back to its primary schema.
 
     The fallback keeps projects readable before the backfill migration has run
@@ -787,6 +789,37 @@ def _load_schema_names(
     )
     names = [row.schema_name for row in rows if row.schema_name]
     return names or [primary]
+
+
+def _load_schema_names_bulk(
+    session: Session, project_ids: list[str]
+) -> dict[str, list[str]]:
+    """Batch ``_load_schema_names`` for many projects in one query.
+
+    Avoids the per-project N+1 on the project list. Returns only the membership
+    rows that exist; the caller applies the primary-schema fallback (it knows
+    each project's ``schema_name``).
+    """
+
+    if not project_ids:
+        return {}
+    rows = (
+        session.execute(
+            select(AiAgentSemanticProjectSchema)
+            .where(AiAgentSemanticProjectSchema.project_id.in_(project_ids))
+            .order_by(
+                AiAgentSemanticProjectSchema.project_id,
+                AiAgentSemanticProjectSchema.position,
+            )
+        )
+        .scalars()
+        .all()
+    )
+    grouped: dict[str, list[str]] = {}
+    for row in rows:
+        if row.schema_name:
+            grouped.setdefault(row.project_id, []).append(row.schema_name)
+    return grouped
 
 
 def _sync_membership_rows(session: Session, project: SemanticProject) -> None:

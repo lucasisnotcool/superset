@@ -439,6 +439,9 @@ class AiAgentCoverageRun(Base):
     status = Column(String(32), index=True, nullable=False)
     score = Column(Float, nullable=True)
     report = Column(JSON, nullable=True)
+    # Live, coarse progress while ``running`` (Feature C); null before the first
+    # stage tick and once the run reaches a terminal state.
+    progress = Column(JSON, nullable=True)
     error = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), index=True, nullable=False)
     updated_at = Column(DateTime(timezone=True), index=True, nullable=False)

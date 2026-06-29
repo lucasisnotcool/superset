@@ -890,6 +890,120 @@ test('opens by projectId without resolving by schema (F1 first-class entry)', as
   ).toHaveLength(0);
 });
 
+test('toggling a file spins only that switch, not the bulk button (G3/G4 keyed spinner)', async () => {
+  mockBaseRoutes([mdlFile('a', 'models/a.json')]);
+  fetchMock.get(
+    'http://agent.local/agent/semantic-layer/projects/project-1',
+    project,
+  );
+  fetchMock.get(
+    'http://agent.local/agent/semantic-layer/projects/project-1/documents',
+    [],
+  );
+  fetchMock.get('begin:http://agent.local/agent/semantic-layer/projects?', [
+    project,
+  ]);
+  // Hold the toggle PATCH open so the in-flight loading state is observable.
+  let releaseToggle: () => void = () => {};
+  const gate = new Promise<void>(resolve => {
+    releaseToggle = resolve;
+  });
+  fetchMock.patch(
+    'http://agent.local/agent/semantic-layer/projects/project-1/mdl-files/a',
+    async () => {
+      await gate;
+      return mdlFile('a', 'models/a.json');
+    },
+  );
+
+  render(
+    <SemanticLayerEditor
+      databaseId={1}
+      catalogName="prod"
+      schemaName=""
+      projectId="project-1"
+    />,
+    { useRedux: true },
+  );
+
+  await screen.findByTestId('mdl-workspace');
+  await userEvent.click(screen.getByRole('switch'));
+
+  // The toggled switch shows its own spinner …
+  await waitFor(() =>
+    expect(screen.getByRole('switch')).toHaveClass('ant-switch-loading'),
+  );
+  // … while the bulk Activate/Deactivate-all button does NOT (keyed spinner).
+  expect(screen.getByRole('button', { name: /all$/i })).not.toHaveClass(
+    'ant-btn-loading',
+  );
+
+  releaseToggle();
+  await waitFor(() =>
+    expect(screen.getByRole('switch')).not.toHaveClass('ant-switch-loading'),
+  );
+});
+
+test('deep-link entry shows a workspace skeleton until the project opens (G2)', async () => {
+  // The deep-linked Lab tab seeds `isOpening` from `projectId`, so the very first
+  // paint is a skeleton — never the `mdl-empty` "Select a project" state, which
+  // would misread an in-flight open as "nothing selected".
+  mockBaseRoutes([mdlFile('a', 'models/a.json')]);
+  fetchMock.get(
+    'http://agent.local/agent/semantic-layer/projects/project-1',
+    project,
+  );
+  fetchMock.get(
+    'http://agent.local/agent/semantic-layer/projects/project-1/documents',
+    [],
+  );
+  fetchMock.get('begin:http://agent.local/agent/semantic-layer/projects?', [
+    project,
+  ]);
+
+  render(
+    <SemanticLayerEditor
+      databaseId={1}
+      catalogName="prod"
+      schemaName="main"
+      projectId="project-1"
+    />,
+    { useRedux: true },
+  );
+
+  // Skeleton on first paint; the false empty must not show.
+  expect(screen.getByTestId('mdl-loading')).toBeInTheDocument();
+  expect(screen.queryByTestId('mdl-empty')).not.toBeInTheDocument();
+
+  // It resolves into the real workspace and the skeleton goes away.
+  await screen.findByTestId('mdl-workspace');
+  expect(screen.queryByTestId('mdl-loading')).not.toBeInTheDocument();
+});
+
+test('deep-link entry clears the skeleton and falls back to empty when the project fails to load (G2)', async () => {
+  // If the project GET fails before `openProject` runs, the seeded skeleton must
+  // be cleared so it does not pin forever; the detail pane falls back to empty.
+  mockBaseRoutes([]);
+  fetchMock.get(
+    'http://agent.local/agent/semantic-layer/projects/project-1',
+    500,
+  );
+  fetchMock.get('begin:http://agent.local/agent/semantic-layer/projects?', []);
+
+  render(
+    <SemanticLayerEditor
+      databaseId={1}
+      catalogName="prod"
+      schemaName="main"
+      projectId="project-1"
+    />,
+    { useRedux: true },
+  );
+
+  expect(await screen.findByTestId('mdl-empty')).toBeInTheDocument();
+  expect(screen.queryByTestId('mdl-loading')).not.toBeInTheDocument();
+});
+
 test('Lab entry (no schema): a refresh-triggering action keeps the project selected', async () => {
   // Reproduces the "UI autocloses / deselects" bug: in the MDL Lab the entry tab
   // carries no schema, so a scope-based refresh would `setProject(null)` and blank
@@ -1005,4 +1119,54 @@ test('browses the database projects and opens a second one (F1/F2)', async () =>
       ),
     ).toHaveLength(1);
   });
+});
+
+test('Activate all uses one atomic bulk call, not a per-file loop', async () => {
+  // Two draft files (a metric depends on a model). The old loop PATCHed each
+  // file and raced on dependency order; the rail now posts one bulk-status call
+  // the server validates as a whole manifest.
+  const draft = (id: string, path: string) => ({
+    ...mdlFile(id, path),
+    status: 'draft',
+  });
+  mockBaseRoutes([
+    draft('moves', 'models/moves.json'),
+    draft('revenue', 'metrics/revenue.json'),
+  ]);
+  const bulkRoute =
+    'http://agent.local/agent/semantic-layer/projects/project-1/mdl-files/bulk-status';
+  fetchMock.post(bulkRoute, {
+    files: [
+      mdlFile('moves', 'models/moves.json'),
+      mdlFile('revenue', 'metrics/revenue.json'),
+    ],
+    changed_count: 2,
+  });
+  // A guard route: if the code ever falls back to per-file PATCH, this records it.
+  fetchMock.patch(
+    'glob:http://agent.local/agent/semantic-layer/projects/project-1/mdl-files/*',
+    mdlFile('moves', 'models/moves.json'),
+  );
+
+  render(
+    <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="main" />,
+    { useRedux: true },
+  );
+
+  await screen.findByTestId('mdl-workspace');
+  const button = await screen.findByText('Activate all');
+  await userEvent.click(button);
+
+  await waitFor(() => {
+    expect(fetchMock.callHistory.calls(bulkRoute)).toHaveLength(1);
+  });
+  const call = fetchMock.callHistory.calls(bulkRoute)[0];
+  expect(JSON.parse(String(call.options.body))).toEqual({
+    status: 'active',
+    file_ids: null,
+  });
+  // No per-file PATCH fallback: the bulk call is the only mutation.
+  expect(
+    fetchMock.callHistory.calls(undefined, { method: 'patch' }),
+  ).toHaveLength(0);
 });

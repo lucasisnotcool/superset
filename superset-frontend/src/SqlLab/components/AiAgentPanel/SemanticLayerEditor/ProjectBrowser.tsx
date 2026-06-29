@@ -27,6 +27,7 @@ import {
   Flex,
   Input,
   type MenuItem,
+  Skeleton,
   Tag,
   Tooltip,
   Typography,
@@ -57,6 +58,13 @@ const coverageColor = (score: number): string => {
 
 export interface ProjectBrowserProps {
   projects: ProjectBrowserProject[];
+  /**
+   * The project list is being (re)fetched. While loading AND no projects are
+   * known yet, the browser shows a skeleton instead of the empty-state — never
+   * a "false empty" ("No semantic projects yet") that misreads an in-flight
+   * fetch as "you have none". A background refresh with rows already present
+   * keeps showing the rows.
+   */
   loading?: boolean;
   activeProjectId?: string | null;
   onOpen: (projectId: string) => void;
@@ -218,6 +226,9 @@ export default function ProjectBrowser({
 
   const hasMore = filtered.length > visibleCount;
   const isEmpty = filteredGroups.length === 0;
+  // Show the skeleton only on the first load (loading with nothing to show yet);
+  // a background refresh that already has rows keeps rendering them.
+  const showSkeleton = loading && projects.length === 0;
 
   const buildMenuItems = (project: ProjectBrowserProject): MenuItem[] => {
     const readOnly = project.permission === 'read';
@@ -264,7 +275,6 @@ export default function ProjectBrowser({
             buttonSize="small"
             icon={<Icons.PlusOutlined iconSize="s" />}
             onClick={onCreate}
-            loading={loading}
             data-test="project-new"
           >
             {t('New project')}
@@ -281,7 +291,13 @@ export default function ProjectBrowser({
         />
       </Header>
       <GroupList>
-        {isEmpty ? (
+        {showSkeleton ? (
+          <Flex vertical gap={16} data-test="project-loading">
+            <Skeleton active title={false} paragraph={{ rows: 2 }} />
+            <Skeleton active title={false} paragraph={{ rows: 2 }} />
+            <Skeleton active title={false} paragraph={{ rows: 2 }} />
+          </Flex>
+        ) : isEmpty ? (
           <Empty
             image={Empty.PRESENTED_IMAGE_SIMPLE}
             description={

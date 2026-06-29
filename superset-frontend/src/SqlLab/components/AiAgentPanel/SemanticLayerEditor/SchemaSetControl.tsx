@@ -39,6 +39,8 @@ export interface SchemaSetControlProps {
   catalogName?: string | null;
   /** Disabled when the user lacks write permission on the project. */
   canEdit?: boolean;
+  /** True while an add-schema re-resolve is in flight (shows a spinner). */
+  adding?: boolean;
   /** Called with a new schema to add to the project's set. */
   onAddSchema: (schema: string) => void;
 }
@@ -57,10 +59,11 @@ export default function SchemaSetControl({
   databaseId,
   catalogName,
   canEdit = false,
+  adding = false,
   onAddSchema,
 }: SchemaSetControlProps) {
   const [open, setOpen] = useState(false);
-  const { data: schemaOptions = [] } = useSchemasQuery(
+  const { data: schemaOptions = [], isFetching } = useSchemasQuery(
     {
       dbId: databaseId,
       catalog: catalogName || undefined,
@@ -80,6 +83,8 @@ export default function SchemaSetControl({
       <Select
         autoFocus
         showSearch
+        loading={isFetching}
+        disabled={adding}
         ariaLabel={t('Add schema')}
         placeholder={t('Select a schema to add')}
         options={addable}
@@ -123,6 +128,7 @@ export default function SchemaSetControl({
           <Button
             buttonStyle="link"
             buttonSize="small"
+            loading={adding}
             icon={<Icons.PlusOutlined iconSize="s" />}
             data-test="add-schema-button"
             aria-label={t('Add schema to project')}

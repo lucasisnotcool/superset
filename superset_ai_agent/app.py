@@ -95,6 +95,7 @@ from superset_ai_agent.semantic_layer.access import (
 from superset_ai_agent.semantic_layer.copilot.coverage import (
     CoverageCancelledError,
     CoverageDocument,
+    CoverageProgress as CoverageProgressEvent,
     InMemoryCoverageCache,
     run_coverage_audit,
     run_directory_coverage,
@@ -105,6 +106,7 @@ from superset_ai_agent.semantic_layer.copilot.schemas import (
     ChangesetItem,
     CopilotInspector,
     CopilotTurnRequest,
+    CoverageProgress,
     CoverageReport,
     CoverageRequest,
     CoverageRun,
@@ -204,9 +206,12 @@ from superset_ai_agent.semantic_layer.schema_snapshot import (
 from superset_ai_agent.semantic_layer.schemas import (
     coalesce_user_runs,
     InstructionCreateRequest,
+    MdlBulkStatusRequest,
+    MdlBulkStatusResult,
     MdlEnrichmentProposal,
     MdlFile,
     MdlFileCreateRequest,
+    MdlFileStatus,
     MdlFileUpdateRequest,
     MdlValidationResult,
     OnboardingRequest,
@@ -966,16 +971,18 @@ def create_app(  # noqa: C901
         except SupersetAuthError as ex:
             raise HTTPException(status_code=ex.status_code, detail=str(ex)) from ex
         # Enrich each row with its latest coverage score for the browser badge.
-        # Best-effort: a coverage-store hiccup must never break the project list.
-        for project in projects:
-            try:
-                run = active_coverage_run_store.latest_complete(project.id)
+        # One batched lookup instead of one query per project (N+1). Best-effort:
+        # a coverage-store hiccup must never break the project list.
+        try:
+            coverage_by_project = active_coverage_run_store.latest_complete_bulk(
+                [project.id for project in projects]
+            )
+            for project in projects:
+                run = coverage_by_project.get(project.id)
                 if run is not None:
                     project.coverage_score = run.score
-            except Exception:  # pylint: disable=broad-except
-                logger.debug(
-                    "coverage score lookup failed for project %s", project.id
-                )
+        except Exception:  # pylint: disable=broad-except
+            logger.debug("coverage score bulk lookup failed", exc_info=True)
         return projects
 
     @api.get(
@@ -1190,6 +1197,9 @@ def create_app(  # noqa: C901
                 "path": file.path,
                 "file_id": file.id,
                 "source_type": file.source_type,
+                # The active-set version this entry produced — the join key the
+                # coverage-label overlay uses to annotate the entry (Feature B).
+                "mdl_checksum": _active_mdl_checksum(project.id, owner_id),
             }
             if actor_name:
                 detail["actor_name"] = actor_name
@@ -1289,6 +1299,9 @@ def create_app(  # noqa: C901
                 documents=documents,
                 tool_calls=tool_calls,
             )
+            # Stamp the resulting active-set version so the coverage-label overlay
+            # can annotate this Copilot edit with its score (Feature B).
+            detail["mdl_checksum"] = _active_mdl_checksum(project.id, owner_id)
             _append_semantic_event(
                 store=active_semantic_layer_store,
                 owner_id=owner_id,
@@ -1324,9 +1337,7 @@ def create_app(  # noqa: C901
         )
         return digest.hexdigest()
 
-    def _coverage_documents(
-        project_id: str, owner_id: str
-    ) -> list[CoverageDocument]:
+    def _coverage_documents(project_id: str, owner_id: str) -> list[CoverageDocument]:
         """Gather each project document's text (chunks, else extracted text)."""
 
         chunks_by_doc: dict[str, list[Any]] = {}
@@ -1370,8 +1381,7 @@ def create_app(  # noqa: C901
         """
 
         if not (
-            app_config.wren_copilot_enabled
-            and app_config.wren_coverage_auto_enabled
+            app_config.wren_copilot_enabled and app_config.wren_coverage_auto_enabled
         ):
             return
         try:
@@ -1398,7 +1408,7 @@ def create_app(  # noqa: C901
         except Exception:  # pylint: disable=broad-except
             logger.warning("Failed to schedule coverage run.", exc_info=True)
 
-    def _run_coverage_job(
+    def _run_coverage_job(  # noqa: C901 - debounce/claim/progress/persist seams
         run_id: str, project: SemanticProject, owner_id: str
     ) -> None:
         """Background body: debounce → claim → audit → persist + emit event."""
@@ -1417,6 +1427,43 @@ def create_app(  # noqa: C901
             except CoverageRunNotFoundError:
                 return True
 
+        # Live progress (Feature C): persist each stage tick on the run row and
+        # emit a non-provenance liveness event only on stage *transitions* (≤4 per
+        # run) so the badge re-polls promptly without flooding the event log.
+        last_stage: dict[str, str] = {}
+
+        def _on_progress(event: CoverageProgressEvent) -> None:
+            try:
+                active_coverage_run_store.report_progress(
+                    run_id,
+                    CoverageProgress(
+                        stage=event.stage,
+                        detail=event.detail,
+                        current=event.current,
+                        total=event.total,
+                        phase_index=event.phase_index,
+                        phase_total=event.phase_total,
+                    ),
+                )
+            except CoverageRunNotFoundError:
+                return
+            if last_stage.get("stage") == event.stage:
+                return
+            last_stage["stage"] = event.stage
+            try:
+                _append_semantic_event(
+                    store=active_semantic_layer_store,
+                    owner_id=owner_id,
+                    event_type="coverage_progress",
+                    scope=_scope_from_project(project),
+                    document_id=None,
+                    message=f"Coverage: {event.detail or event.stage}",
+                    project_id=project.id,
+                    detail={"run_id": run_id, "stage": event.stage},
+                )
+            except Exception:  # pylint: disable=broad-except
+                logger.warning("Failed to emit coverage progress.", exc_info=True)
+
         try:
             files = active_mdl_file_store.list(project.id, owner_id=owner_id)
             documents = _coverage_documents(project.id, owner_id)
@@ -1433,6 +1480,7 @@ def create_app(  # noqa: C901
                 votes=app_config.wren_copilot_coverage_votes,
                 include_overreach=app_config.wren_coverage_include_overreach,
                 should_cancel=_superseded,
+                progress_cb=_on_progress,
             )
         except CoverageCancelledError:
             return  # superseded mid-run; the newer run will report
@@ -1627,21 +1675,28 @@ def create_app(  # noqa: C901
                 return True
         return False
 
-    def _enforce_activation(
+    def _enforce_activation_manifest(
         *,
         project: SemanticProject,
         fastapi_request: Request,
-        owner_id: str,
-        file_id: str,
-        new_content: str,
-    ) -> None:
-        """Block activation when the resulting project manifest is invalid."""
+        contents: list[str],
+    ) -> SchemaIndex | None:
+        """Validate the *projected* active manifest and block if it is invalid.
 
-        siblings = [
-            file.content
-            for file in active_mdl_file_store.list(project.id, owner_id=owner_id)
-            if file.id != file_id and file.status == "active"
-        ]
+        ``contents`` is the full set of file contents that will be active once the
+        activation completes (already-active siblings plus the file(s) being
+        activated) — validated as one manifest so cross-file references (a
+        metric's ``baseObject``, a relationship's models) resolve. This is the
+        atomic invariant: a single-file activation passes its active siblings +
+        the new file; a bulk activation passes the whole projected active set,
+        so dependency *order* among the activated files never matters.
+
+        Returns the resolved physical ``SchemaIndex`` (or ``None`` when the
+        project has no live/snapshot schema and live validation is not required)
+        so callers can reuse it for the subsequent per-file validation instead of
+        re-fetching the live schema a second time within the same request.
+        """
+
         schema_index = _schema_index_for_project(project, fastapi_request)
         if schema_index is None and app_config.semantic_activation_requires_live_schema:
             raise HTTPException(
@@ -1664,12 +1719,12 @@ def create_app(  # noqa: C901
                 ),
             )
         validation = validate_project_manifest(
-            [*siblings, new_content],
+            contents,
             schema_index=schema_index,
             deep_validate=app_config.wren_core_validation_enabled or require_engine,
             # W4: an enrichment that re-emits an existing model supersedes the
-            # older copy instead of failing as a duplicate_model. new_content is
-            # last, so the file being activated wins.
+            # older copy instead of failing as a duplicate_model. The file(s)
+            # being activated come last, so they win.
             dedup_models=True,
         )
         if not validation.valid:
@@ -1680,6 +1735,179 @@ def create_app(  # noqa: C901
                     "validation": validation.model_dump(mode="json"),
                 },
             )
+        return schema_index
+
+    def _enforce_activation(
+        *,
+        project: SemanticProject,
+        fastapi_request: Request,
+        owner_id: str,
+        file_id: str,
+        new_content: str,
+    ) -> SchemaIndex | None:
+        """Block activation when the resulting project manifest is invalid.
+
+        Returns the resolved physical ``SchemaIndex`` so the caller can reuse it
+        for the file's own validation (one live schema fetch per request).
+        """
+
+        siblings = [
+            file.content
+            for file in active_mdl_file_store.list(project.id, owner_id=owner_id)
+            if file.id != file_id and file.status == "active"
+        ]
+        return _enforce_activation_manifest(
+            project=project,
+            fastapi_request=fastapi_request,
+            contents=[*siblings, new_content],
+        )
+
+    def _resolve_bulk_targets(
+        files: list[MdlFile],
+        *,
+        status: str,
+        file_ids: list[str] | None,
+    ) -> list[MdlFile]:
+        """The files that must change to reach ``status`` (already-there skipped)."""
+
+        if file_ids is None:
+            return [file for file in files if file.status != status]
+        by_id = {file.id: file for file in files}
+        targets: list[MdlFile] = []
+        for file_id in file_ids:
+            file = by_id.get(file_id)
+            if file is None:
+                raise HTTPException(status_code=404, detail="MDL file not found.")
+            if file.status != status:
+                targets.append(file)
+        return targets
+
+    def _apply_bulk_status(
+        *,
+        project: SemanticProject,
+        identity: AgentIdentity,
+        targets: list[MdlFile],
+        status: MdlFileStatus,
+        schema_index: SchemaIndex | None,
+    ) -> list[MdlFile]:
+        """Flip each target to ``status`` and record provenance; returns the updates."""
+
+        activating = status == "active"
+        changed: list[MdlFile] = []
+        for file in targets:
+            file_validation = (
+                validate_mdl(file.content, schema_index=schema_index)
+                if activating
+                else None
+            )
+            updated = active_mdl_file_store.update(
+                file.id,
+                MdlFileUpdateRequest(status=status),
+                owner_id=identity.owner_id,
+                validation=file_validation,
+            )
+            changed.append(updated)
+            _emit_mdl_provenance(
+                project=project,
+                owner_id=identity.owner_id,
+                event_type="mdl_activated" if activating else "mdl_updated",
+                file=updated,
+                message=(
+                    f"Activated {updated.path}"
+                    if activating
+                    else f"Deactivated {updated.path}"
+                ),
+                status_from=file.status,
+                actor_name=identity.username or identity.email,
+            )
+        return changed
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/mdl-files/bulk-status",
+        response_model=MdlBulkStatusResult,
+    )
+    def set_mdl_files_status(
+        project_id: str,
+        request: MdlBulkStatusRequest,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> MdlBulkStatusResult:
+        """Activate or deactivate many MDL files in one atomic operation.
+
+        Activation validates the *whole projected active manifest* once, so files
+        whose validity depends on each other — a metric and the model its
+        ``baseObject`` references, a relationship and its endpoint models — can be
+        activated together without being ordered by hand. All-or-nothing: an
+        invalid projected manifest 422s and nothing changes. This replaces the
+        per-file activation loop, which validated each file against only the
+        already-active subset and so failed when a dependent was toggled first.
+        """
+
+        if request.status == "deleted":
+            raise HTTPException(
+                status_code=400,
+                detail="Bulk status change supports 'active' or 'draft' only.",
+            )
+        project = authorize_semantic_project(
+            fastapi_request,
+            project_id,
+            owner_id=identity.owner_id,
+            permission="write",
+        )
+        files = active_mdl_file_store.list(project_id, owner_id=identity.owner_id)
+        targets = _resolve_bulk_targets(
+            files, status=request.status, file_ids=request.file_ids
+        )
+        if not targets:
+            return MdlBulkStatusResult(files=files, changed_count=0)
+
+        # Resolve the physical schema once per request. Activation enforces the
+        # projected manifest and hands back the index it used, which the per-file
+        # validation below reuses — one live schema fetch, not two. Deactivation
+        # neither enforces nor re-validates files, so it needs no schema fetch at
+        # all (the old code fetched one and threw it away).
+        schema_index: SchemaIndex | None = None
+        if request.status == "active":
+            target_ids = {file.id for file in targets}
+            # Projected active set = files staying active + the files being
+            # activated. Validate it as one manifest so dependency order among the
+            # targets never matters (the activated files come last → W4 last-wins).
+            projected = [file.content for file in files if file.status == "active"] + [
+                file.content for file in targets if file.id in target_ids
+            ]
+            schema_index = _enforce_activation_manifest(
+                project=project,
+                fastapi_request=fastapi_request,
+                contents=projected,
+            )
+
+        try:
+            changed = _apply_bulk_status(
+                project=project,
+                identity=identity,
+                targets=targets,
+                status=request.status,
+                schema_index=schema_index,
+            )
+        except MdlFileNotFoundError as ex:
+            raise HTTPException(status_code=404, detail="MDL file not found.") from ex
+        except MdlFileValidationError as ex:
+            raise HTTPException(status_code=422, detail=str(ex)) from ex
+        except ValueError as ex:
+            raise HTTPException(status_code=400, detail=str(ex)) from ex
+
+        # The active MDL directory changed → reindex once and re-audit coverage
+        # once for the whole batch (the per-file loop did both N times).
+        reindex_project_mdl(
+            retriever=active_retriever,
+            project_id=project_id,
+            owner_id=identity.owner_id,
+            mdl_file_store=active_mdl_file_store,
+        )
+        _schedule_coverage(project, identity.owner_id)
+
+        refreshed = active_mdl_file_store.list(project_id, owner_id=identity.owner_id)
+        return MdlBulkStatusResult(files=refreshed, changed_count=len(changed))
 
     @api.patch(
         "/agent/semantic-layer/projects/{project_id}/mdl-files/{file_id}",
@@ -1707,8 +1935,13 @@ def create_app(  # noqa: C901
             )
             if existing.project_id != project_id:
                 raise MdlFileNotFoundError(file_id)
+            # Resolve the physical schema at most once per request: activation
+            # enforcement returns the index it used, which the file's own
+            # validation reuses instead of re-fetching the live schema.
+            enforced_index: SchemaIndex | None = None
+            enforced = False
             if request.status == "active":
-                _enforce_activation(
+                enforced_index = _enforce_activation(
                     project=project,
                     fastapi_request=fastapi_request,
                     owner_id=identity.owner_id,
@@ -1719,14 +1952,18 @@ def create_app(  # noqa: C901
                         else existing.content
                     ),
                 )
-            file_validation = (
-                validate_mdl(
-                    request.content,
-                    schema_index=_schema_index_for_project(project, fastapi_request),
+                enforced = True
+            if request.content is not None:
+                schema_index = (
+                    enforced_index
+                    if enforced
+                    else _schema_index_for_project(project, fastapi_request)
                 )
-                if request.content is not None
-                else None
-            )
+                file_validation = validate_mdl(
+                    request.content, schema_index=schema_index
+                )
+            else:
+                file_validation = None
             updated = active_mdl_file_store.update(
                 file_id,
                 request,
@@ -2204,6 +2441,12 @@ def create_app(  # noqa: C901
             "stale": stale,
             "score": latest.score if latest is not None else None,
             "run_id": latest.id if latest is not None else None,
+            # Live, coarse stage progress while a run is in flight (Feature C).
+            "progress": (
+                active.progress.model_dump(mode="json")
+                if active is not None and active.progress is not None
+                else None
+            ),
         }
 
     @api.post(
@@ -2222,6 +2465,37 @@ def create_app(  # noqa: C901
         )
         _schedule_coverage(project, identity.owner_id)
         return {"scheduled": True}
+
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}/coverage/scores-by-version",
+    )
+    def get_coverage_scores_by_version(
+        project_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> dict[str, dict[str, Any]]:
+        """Latest coverage score per MDL version, keyed by ``mdl_checksum``.
+
+        The provenance dialog joins this against each entry's
+        ``detail.mdl_checksum`` to render a coverage label (and before/after
+        delta) per version — a read-only overlay, not a timeline entry (Feature B).
+        """
+
+        _require_copilot_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="read"
+        )
+        runs = active_coverage_run_store.scores_by_checksum(project_id)
+        return {
+            checksum: {
+                "score": run.score,
+                "run_id": run.id,
+                "status": run.status,
+                "computed_at": run.updated_at.isoformat(),
+                "docs_checksum": run.docs_checksum,
+            }
+            for checksum, run in runs.items()
+        }
 
     # -- Copilot conversations (persistent, multi-turn threads) -----------
     # Parallel to the AI SQL ``/agent/conversations`` surface but project-scoped
@@ -2877,6 +3151,9 @@ def create_app(  # noqa: C901
                     "activated_count": result.activated_count,
                     "paths": [f.path for f in result.files],
                     "warnings": result.warnings,
+                    # Active-set version produced by onboarding — the coverage
+                    # overlay's join key (Feature B).
+                    "mdl_checksum": _active_mdl_checksum(project.id, owner_id),
                 },
             )
             # Onboarding activated the base layer → audit coverage on it.

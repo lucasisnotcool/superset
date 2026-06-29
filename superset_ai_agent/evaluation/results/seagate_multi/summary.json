@@ -1,0 +1,56 @@
+{
+  "fixture": "seagate_multi",
+  "schema_names": [
+    "seagate_core",
+    "seagate_ops"
+  ],
+  "backend": "postgresql",
+  "headline": [
+    {
+      "condition": "basic",
+      "correct_of_18": 2,
+      "cross_schema_only_of_3": 0
+    },
+    {
+      "condition": "context_dump",
+      "correct_of_18": 9,
+      "cross_schema_only_of_3": 1
+    },
+    {
+      "condition": "wren_base",
+      "correct_of_18": 5,
+      "cross_schema_only_of_3": 1
+    },
+    {
+      "condition": "wren_bi",
+      "correct_of_18": 9,
+      "cross_schema_only_of_3": 2
+    }
+  ],
+  "selection_metrics": {
+    "precision": 0.583,
+    "recall": 1.0,
+    "f1": 0.737,
+    "selected_relevant": [
+      "seagate_drive_skus",
+      "seagate_production_events",
+      "seagate_production_lines",
+      "seagate_quality_tests",
+      "seagate_shipments",
+      "seagate_sites",
+      "seagate_work_orders"
+    ],
+    "distractor_inclusions": [
+      "seagate_finance_ledger",
+      "seagate_hr_roster",
+      "seagate_iot_sensor_logs",
+      "seagate_maintenance_logs",
+      "seagate_vendor_contracts"
+    ],
+    "distractor_inclusion_rate": 0.714,
+    "missed_relevant": []
+  },
+  "warnings": [
+    "WREN_MEMORY_STORE is not exposed by any API; the operator MUST start the agent with WREN_MEMORY_STORE=none for a fair grounding ablation (RESULTS.md F1 / EVAL_V2_SPEC.md R1). This guard cannot verify it."
+  ]
+}

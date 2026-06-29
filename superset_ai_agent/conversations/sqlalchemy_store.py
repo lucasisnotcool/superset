@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from typing import cast
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session, selectinload, sessionmaker
+from sqlalchemy.orm import selectinload, Session, sessionmaker
 
 from superset_ai_agent.conversations.schemas import (
     Conversation,
@@ -165,6 +165,24 @@ class SqlAlchemyConversationStore:
                 owner_id=owner_id,
             )
             conversation.title = title
+            conversation.updated_at = _utc_now()
+            session.commit()
+        return self.get(conversation_id, owner_id=owner_id)
+
+    def update_project_id(
+        self,
+        conversation_id: str,
+        project_id: str | None,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> Conversation:
+        with self.session_factory() as session:
+            conversation = self._get_model(
+                session,
+                conversation_id,
+                owner_id=owner_id,
+            )
+            conversation.project_id = project_id
             conversation.updated_at = _utc_now()
             session.commit()
         return self.get(conversation_id, owner_id=owner_id)

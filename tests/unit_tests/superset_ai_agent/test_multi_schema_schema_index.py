@@ -172,6 +172,56 @@ def test_model_in_a_secondary_member_schema_validates(tmp_path) -> None:
     assert "pipeline" in provider.schemas_requested
 
 
+def _resolve_single_schema(client: TestClient, schema: str) -> dict:
+    response = client.post(
+        "/agent/semantic-layer/projects/resolve",
+        json={
+            "database_id": 1,
+            "database_label": "Sales",
+            "schema_name": schema,
+            "schema_names": [schema],
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_bulk_activate_fetches_live_schema_once_and_deactivate_zero(tmp_path) -> None:
+    # Perceived-latency fix: on top of the unavoidable per-request auth fetch,
+    # activation must resolve the live schema exactly ONCE (manifest enforcement
+    # hands its index to the per-file validation — previously it fetched twice),
+    # and deactivation must add ZERO schema fetches (it neither enforces nor
+    # re-validates — previously it fetched one and threw it away).
+    client, provider = _client(tmp_path)
+    project = _resolve_single_schema(client, "archive")
+    pid = project["id"]
+    bulk = f"/agent/semantic-layer/projects/{pid}/mdl-files/bulk-status"
+    # A valid draft model whose column matches `archive.invoices`.
+    _create_model(client, pid, name="invoices", schema="archive", table="invoices")
+
+    # Auth-only baseline: a no-op bulk-status (already draft) authorizes but does
+    # no schema work, isolating the per-request auth fetch from activation's.
+    provider.schemas_requested.clear()
+    noop = client.post(bulk, json={"status": "draft"})
+    assert noop.status_code == 200, noop.text
+    assert noop.json()["changed_count"] == 0
+    baseline = len(provider.schemas_requested)
+
+    # Activate adds exactly ONE schema fetch (enforce + per-file validation share).
+    provider.schemas_requested.clear()
+    activate = client.post(bulk, json={"status": "active"})
+    assert activate.status_code == 200, activate.text
+    assert activate.json()["changed_count"] == 1
+    assert len(provider.schemas_requested) == baseline + 1
+
+    # Deactivate adds ZERO schema fetches beyond the auth baseline.
+    provider.schemas_requested.clear()
+    deactivate = client.post(bulk, json={"status": "draft"})
+    assert deactivate.status_code == 200, deactivate.text
+    assert deactivate.json()["changed_count"] == 1
+    assert len(provider.schemas_requested) == baseline
+
+
 def test_model_in_an_out_of_set_schema_is_still_rejected(tmp_path) -> None:
     client, _provider = _client(tmp_path)
     project = _resolve_multi_schema(client)

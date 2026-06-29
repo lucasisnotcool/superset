@@ -130,6 +130,22 @@ def test_sqlalchemy_conversation_store_isolates_owners() -> None:
         store.get(conversation.id, owner_id="user-2")
 
 
+def test_sqlalchemy_conversation_store_pins_project_id() -> None:
+    store = _store()
+    conversation = store.create(_scope(), owner_id="user-1")
+    assert conversation.project_id is None
+
+    pinned = store.update_project_id(
+        conversation.id, "proj-123", owner_id="user-1"
+    )
+    assert pinned.project_id == "proj-123"
+    assert store.get(conversation.id, owner_id="user-1").project_id == "proj-123"
+
+    # Re-pinning (and clearing) is supported.
+    cleared = store.update_project_id(conversation.id, None, owner_id="user-1")
+    assert cleared.project_id is None
+
+
 def test_sqlalchemy_conversation_store_replaces_artifact() -> None:
     store = _store()
     conversation = store.create(_scope(), owner_id="user-1")

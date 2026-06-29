@@ -588,6 +588,66 @@ def _raise_if_cancelled(should_cancel: Callable[[], bool] | None) -> None:
         raise CoverageCancelledError()
 
 
+# -- Live progress (Feature C) ----------------------------------------------
+
+#: Coarse pipeline position per stage, for the UI stepper (Extract → Build →
+#: Judge → Aggregate). Over-reach reuses the Judge slot (it is a second judge).
+_PHASE_INDEX: dict[str, int] = {
+    "extracting": 0,
+    "building_facts": 1,
+    "judging": 2,
+    "checking_overreach": 2,
+    "aggregating": 3,
+}
+_PHASE_TOTAL = 4
+
+
+class CoverageProgress(NamedTuple):
+    """One coarse progress tick emitted at a coverage-audit stage boundary.
+
+    Advisory only — the same ``should_cancel`` seams carry these, so a callback
+    failure must never break the audit (see ``_report_progress``).
+    """
+
+    stage: str
+    detail: str = ""
+    current: int = 0
+    total: int = 0
+    phase_index: int = 0
+    phase_total: int = _PHASE_TOTAL
+
+
+#: Polled at stage boundaries to surface live progress; mirrors ``should_cancel``.
+ProgressCallback = Callable[[CoverageProgress], None]
+
+
+def _report_progress(
+    progress_cb: ProgressCallback | None,
+    stage: str,
+    *,
+    detail: str = "",
+    current: int = 0,
+    total: int = 0,
+) -> None:
+    """Emit a progress tick; swallow any callback error (progress is advisory)."""
+
+    if progress_cb is None:
+        return
+    try:
+        progress_cb(
+            CoverageProgress(
+                stage=stage,
+                detail=detail,
+                current=current,
+                total=total,
+                phase_index=_PHASE_INDEX.get(stage, 0),
+                phase_total=_PHASE_TOTAL,
+            )
+        )
+    except Exception:  # pylint: disable=broad-except
+        logger.warning("Coverage progress callback failed.", exc_info=True)
+
+
 def run_coverage_audit(
     model_client: ModelClient,
     *,
@@ -693,6 +753,7 @@ def run_directory_coverage(
     votes: int = 1,
     include_overreach: bool = False,
     should_cancel: Callable[[], bool] | None = None,
+    progress_cb: ProgressCallback | None = None,
 ) -> CoverageReport:
     """Audit the whole MDL directory against the union of project documents.
 
@@ -701,8 +762,10 @@ def run_directory_coverage(
     together against the active MDL facts (Feature B, decision D2 = union). With
     no documents the run is a no-op (score 1.0, a warning). ``should_cancel`` is
     polled per document and per stage so a superseded run stops promptly.
+    ``progress_cb`` rides the same stage boundaries to surface live progress.
     """
 
+    _report_progress(progress_cb, "building_facts")
     facts = build_mdl_facts(files, instructions=instructions)
     if not documents:
         return aggregate_report(
@@ -715,11 +778,17 @@ def run_directory_coverage(
     # tagged back to the document its claim came from).
     sources: list[CoverageDocument] = []
     warnings: list[str] = []
-    for document in documents:
+    total_docs = len(documents)
+    for index, document in enumerate(documents):
         _raise_if_cancelled(should_cancel)
-        claims = extract_claims(
-            model_client, document_text=document.text, model=model
+        _report_progress(
+            progress_cb,
+            "extracting",
+            detail=document.filename,
+            current=index + 1,
+            total=total_docs,
         )
+        claims = extract_claims(model_client, document_text=document.text, model=model)
         if claims is None:
             warnings.append(f"Claim extraction failed for {document.filename}.")
             continue
@@ -731,6 +800,11 @@ def run_directory_coverage(
         return aggregate_report([], warnings=warnings)
 
     _raise_if_cancelled(should_cancel)
+    _report_progress(
+        progress_cb,
+        "judging",
+        detail=f"{len(all_claims)} claims vs {len(facts)} facts",
+    )
     findings = judge_coverage(
         model_client,
         all_claims,
@@ -747,12 +821,12 @@ def run_directory_coverage(
             finding.document_id = source.document_id
             finding.document_filename = source.filename
     if not facts:
-        warnings.append(
-            "The project has no MDL semantics yet; everything is missing."
-        )
+        warnings.append("The project has no MDL semantics yet; everything is missing.")
+    _report_progress(progress_cb, "aggregating")
     report = aggregate_report(findings, warnings=warnings)
     if include_overreach:
         _raise_if_cancelled(should_cancel)
+        _report_progress(progress_cb, "checking_overreach")
         overreach = judge_overreach(model_client, all_claims, facts, model=model)
         report.overreach = overreach
         report.unsupported = len(overreach)

@@ -41,8 +41,19 @@ def materialize_request_semantic_project(
     database_id: int,
     catalog_name: str | None,
     schema_name: str | None,
-) -> tuple[SemanticProject, WrenMaterializationResult] | None:
-    """Materialize the visible schema project for an agent request."""
+    project_id: str | None = None,
+) -> tuple[SemanticProject, WrenMaterializationResult, list[str]] | None:
+    """Materialize the semantic project that grounds an agent request.
+
+    ``project_id`` is an optional explicit pin (from the request scope or a
+    conversation). It is honored only when it appears in the access- and
+    schema-filtered candidate set returned by ``store.list`` — so a client can
+    never name a project it lacks access to (visibility/owner filter) or one
+    that does not cover the requested schema (schema-membership filter). When
+    the pin is unavailable (unauthorized, wrong schema, archived/deleted) the
+    resolver falls back to the most-recently-updated match and returns a warning
+    for the caller to surface. Returns ``(project, materialization, warnings)``.
+    """
 
     if semantic_project_store is None or mdl_file_store is None or schema_name is None:
         return None
@@ -54,14 +65,24 @@ def materialize_request_semantic_project(
     )
     if not projects:
         return None
+    warnings: list[str] = []
     project = projects[0]
+    if project_id is not None and project_id != project.id:
+        match = next((item for item in projects if item.id == project_id), None)
+        if match is not None:
+            project = match
+        else:
+            warnings.append(
+                f"Requested semantic project is unavailable for this schema; "
+                f"grounding on '{project.name}' instead."
+            )
     mdl_files = mdl_file_store.list(project.id, owner_id=owner_id)
     materialization = materialize_wren_project(
         project=project,
         mdl_files=mdl_files,
         base_path=_wren_materialization_base(config),
     )
-    return project, materialization
+    return project, materialization, warnings
 
 
 def _wren_materialization_base(config: AgentConfig) -> Path:

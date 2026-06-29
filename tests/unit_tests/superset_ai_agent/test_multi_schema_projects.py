@@ -112,6 +112,31 @@ def test_resolve_by_non_primary_member_finds_same_project(kind: str) -> None:
 
 
 @pytest.mark.parametrize("kind", ALL_STORES)
+def test_list_returns_correct_schema_set_per_project(kind: str) -> None:
+    # Listing many projects must batch the membership lookup (one query, not
+    # 1+N) AND still return each project's own ordered schema set — primary
+    # first — plus the single-schema fallback for a project with no extra rows.
+    store = _store(kind)
+    multi = store.resolve(
+        _request(schema_name="sales", schema_names=["crm", "sales"]),
+        owner_id="owner",
+    )
+    single = store.resolve(
+        _request(schema_name="hr", schema_names=["hr"]),
+        owner_id="owner",
+    )
+
+    listed = {p.id: p for p in store.list(owner_id="owner")}
+    assert listed[multi.id].schema_names == ["sales", "crm"]
+    assert listed[single.id].schema_names == ["hr"]
+    # The batched list agrees with the per-project read for each.
+    assert (
+        listed[multi.id].schema_names
+        == store.get(multi.id, owner_id="owner").schema_names
+    )
+
+
+@pytest.mark.parametrize("kind", ALL_STORES)
 def test_list_finds_project_by_member_schema(kind: str) -> None:
     store = _store(kind)
     project = store.resolve(

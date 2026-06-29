@@ -444,10 +444,32 @@ class AgentClient:
         return file
 
     def activate_all(self, project_id: str) -> int:
-        """Ensure every non-deleted MDL file is active. Returns count activated."""
+        """Ensure every non-deleted MDL file is active. Returns count activated.
+
+        Prefers the atomic bulk-status endpoint, which validates the whole projected
+        active manifest once. If the (possibly older / baked) agent does not expose
+        that route — it returns 405 because ``bulk-status`` matches the per-file
+        ``{file_id}`` path — fall back to per-file activation, ordering ``models/``
+        before ``metrics/``/``relationships/`` so a metric is never activated before
+        the model its ``baseObject`` references (the reason the bulk route exists).
+        """
+        resp = self._agent(
+            "POST",
+            f"/agent/semantic-layer/projects/{project_id}/mdl-files/bulk-status",
+            json={"status": "active", "file_ids": None},
+        )
+        if resp.status_code != 405:
+            result = self._ok(resp, "POST mdl-files/bulk-status")
+            return int(result.get("changed_count", 0))
+
+        # Fallback: per-file activation, models first.
+        def _rank(path: str) -> int:
+            return 0 if "models/" in (path or "") else 1
+
+        files = sorted(self.list_mdl_files(project_id), key=lambda f: _rank(f["path"]))
         activated = 0
-        for file in self.list_mdl_files(project_id):
-            if file.get("status") != "active":
+        for file in files:
+            if file.get("status") not in ("active", "deleted"):
                 self.update_mdl_file(project_id, file["id"], status="active")
                 activated += 1
         return activated

@@ -35,6 +35,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from superset_ai_agent.persistence.models import AiAgentCoverageRun
 from superset_ai_agent.semantic_layer.copilot.schemas import (
+    CoverageProgress,
     CoverageReport,
     CoverageRun,
 )
@@ -63,6 +64,9 @@ class CoverageRunStore(Protocol):
     def claim(self, run_id: str) -> bool:
         """Atomically transition ``pending`` → ``running``; True if claimed."""
 
+    def report_progress(self, run_id: str, progress: CoverageProgress) -> CoverageRun:
+        """Record live progress on a running run (advisory; Feature C)."""
+
     def complete(
         self, run_id: str, report: CoverageReport, *, score: float
     ) -> CoverageRun: ...
@@ -73,6 +77,23 @@ class CoverageRunStore(Protocol):
         """Mark in-flight runs for the project ``superseded`` (except one)."""
 
     def latest_complete(self, project_id: str) -> CoverageRun | None: ...
+
+    def latest_complete_bulk(self, project_ids: list[str]) -> dict[str, CoverageRun]:
+        """Batch ``latest_complete`` — newest complete run per project id.
+
+        Returns only the project ids that have a complete run, so the project
+        list can enrich coverage scores with one query instead of one per row.
+        """
+        ...
+
+    def scores_by_checksum(self, project_id: str) -> dict[str, CoverageRun]:
+        """Latest complete run per ``mdl_checksum`` for the project.
+
+        The coverage-label overlay (Feature B) joins this against each provenance
+        entry's resulting ``mdl_checksum`` to annotate a version with its score —
+        keyed on the MDL version (not docs), latest run wins per version.
+        """
+        ...
 
     def active_run(self, project_id: str) -> CoverageRun | None:
         """The newest pending/running run for the project, if any."""
@@ -123,12 +144,21 @@ class InMemoryCoverageRunStore:
             )
             return True
 
+    def report_progress(self, run_id: str, progress: CoverageProgress) -> CoverageRun:
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise CoverageRunNotFoundError(run_id)
+            updated = run.model_copy(
+                update={"progress": progress, "updated_at": _now()}
+            )
+            self._runs[run_id] = updated
+            return updated.model_copy(deep=True)
+
     def complete(
         self, run_id: str, report: CoverageReport, *, score: float
     ) -> CoverageRun:
-        return self._update(
-            run_id, status="complete", report=report, score=score
-        )
+        return self._update(run_id, status="complete", report=report, score=score)
 
     def fail(self, run_id: str, error: str) -> CoverageRun:
         return self._update(run_id, status="failed", error=error)
@@ -157,6 +187,33 @@ class InMemoryCoverageRunStore:
             ]
         runs.sort(key=lambda run: run.created_at, reverse=True)
         return runs[0] if runs else None
+
+    def latest_complete_bulk(self, project_ids: list[str]) -> dict[str, CoverageRun]:
+        wanted = set(project_ids)
+        with self._lock:
+            runs = [
+                run.model_copy(deep=True)
+                for run in self._runs.values()
+                if run.project_id in wanted and run.status == "complete"
+            ]
+        runs.sort(key=lambda run: run.created_at, reverse=True)
+        latest: dict[str, CoverageRun] = {}
+        for run in runs:  # newest-first: keep the first seen per project
+            latest.setdefault(run.project_id, run)
+        return latest
+
+    def scores_by_checksum(self, project_id: str) -> dict[str, CoverageRun]:
+        with self._lock:
+            runs = [
+                run.model_copy(deep=True)
+                for run in self._runs.values()
+                if run.project_id == project_id and run.status == "complete"
+            ]
+        runs.sort(key=lambda run: run.created_at, reverse=True)
+        latest: dict[str, CoverageRun] = {}
+        for run in runs:  # newest-first: keep the first seen per checksum
+            latest.setdefault(run.mdl_checksum, run)
+        return latest
 
     def active_run(self, project_id: str) -> CoverageRun | None:
         with self._lock:
@@ -201,6 +258,8 @@ class InMemoryCoverageRunStore:
                     "status": status,
                     "report": report if report is not None else run.report,
                     "score": score if score is not None else run.score,
+                    # Terminal transition: live progress no longer applies.
+                    "progress": None,
                     "error": error,
                     "updated_at": _now(),
                 }
@@ -252,6 +311,16 @@ class SqlAlchemyCoverageRunStore:
             session.commit()
             return bool(result.rowcount)
 
+    def report_progress(self, run_id: str, progress: CoverageProgress) -> CoverageRun:
+        with self.session_factory() as session:
+            model = session.get(AiAgentCoverageRun, run_id)
+            if model is None:
+                raise CoverageRunNotFoundError(run_id)
+            model.progress = progress.model_dump(mode="json")
+            model.updated_at = _now()
+            session.commit()
+            return _from_model(model)
+
     def complete(
         self, run_id: str, report: CoverageReport, *, score: float
     ) -> CoverageRun:
@@ -278,6 +347,48 @@ class SqlAlchemyCoverageRunStore:
 
     def latest_complete(self, project_id: str) -> CoverageRun | None:
         return self._newest(project_id, statuses=("complete",))
+
+    def latest_complete_bulk(self, project_ids: list[str]) -> dict[str, CoverageRun]:
+        if not project_ids:
+            return {}
+        with self.session_factory() as session:
+            models = (
+                session.execute(
+                    select(AiAgentCoverageRun)
+                    .where(
+                        AiAgentCoverageRun.project_id.in_(project_ids),
+                        AiAgentCoverageRun.status == "complete",
+                    )
+                    .order_by(AiAgentCoverageRun.created_at.desc())
+                )
+                .scalars()
+                .all()
+            )
+        latest: dict[str, CoverageRun] = {}
+        for model in models:  # newest-first: keep the first seen per project
+            if model.project_id not in latest:
+                latest[model.project_id] = _from_model(model)
+        return latest
+
+    def scores_by_checksum(self, project_id: str) -> dict[str, CoverageRun]:
+        with self.session_factory() as session:
+            models = (
+                session.execute(
+                    select(AiAgentCoverageRun)
+                    .where(
+                        AiAgentCoverageRun.project_id == project_id,
+                        AiAgentCoverageRun.status == "complete",
+                    )
+                    .order_by(AiAgentCoverageRun.created_at.desc())
+                )
+                .scalars()
+                .all()
+            )
+        latest: dict[str, CoverageRun] = {}
+        for model in models:  # newest-first: keep the first seen per checksum
+            if model.mdl_checksum not in latest:
+                latest[model.mdl_checksum] = _from_model(model)
+        return latest
 
     def active_run(self, project_id: str) -> CoverageRun | None:
         return self._newest(project_id, statuses=_ACTIVE_STATES)
@@ -338,6 +449,8 @@ class SqlAlchemyCoverageRunStore:
                 model.report = report.model_dump(mode="json")
             if score is not None:
                 model.score = score
+            # Terminal transition: live progress no longer applies.
+            model.progress = None
             model.error = error
             model.updated_at = _now()
             session.commit()
@@ -354,6 +467,9 @@ def _to_model(run: CoverageRun) -> AiAgentCoverageRun:
         status=run.status,
         score=run.score,
         report=run.report.model_dump(mode="json") if run.report is not None else None,
+        progress=(
+            run.progress.model_dump(mode="json") if run.progress is not None else None
+        ),
         error=run.error,
         created_at=run.created_at,
         updated_at=run.updated_at,
@@ -372,6 +488,11 @@ def _from_model(model: AiAgentCoverageRun) -> CoverageRun:
         report=(
             CoverageReport.model_validate(model.report)
             if model.report is not None
+            else None
+        ),
+        progress=(
+            CoverageProgress.model_validate(model.progress)
+            if model.progress is not None
             else None
         ),
         error=model.error,

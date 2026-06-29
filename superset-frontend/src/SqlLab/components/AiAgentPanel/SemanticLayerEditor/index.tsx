@@ -37,6 +37,7 @@ import {
   ConfirmModal,
   Flex,
   Input,
+  Skeleton,
   Switch,
   Tabs,
   Tag,
@@ -78,6 +79,7 @@ import {
   SemanticLayerState,
   SemanticProject,
   SemanticProjectReadinessStatus,
+  setMdlFilesStatus,
   updateMdlFile,
   validateMdlFile,
 } from '../api';
@@ -131,6 +133,16 @@ const WorkspaceStrip = styled.div`
     padding: ${theme.sizeUnit * 2}px ${theme.sizeUnit * 3}px;
     border-bottom: 1px solid ${theme.colorBorderSecondary};
     flex-wrap: wrap;
+  `}
+`;
+
+// Fills the workspace detail pane while a project is opening (G2): a skeleton in
+// the content area so the open reads as "loading", not as "nothing selected".
+const SkeletonBody = styled.div`
+  ${({ theme }) => css`
+    flex: 1;
+    min-height: 0;
+    padding: ${theme.sizeUnit * 4}px;
   `}
 `;
 
@@ -352,6 +364,10 @@ export default function SemanticLayerEditor({
   // ``selectedProjectIdRef`` makes the scope-resolve refresh prefer an explicitly
   // opened project without re-arming on every selection change.
   const [projects, setProjects] = useState<SemanticProject[]>([]);
+  // The project-list fetch runs on its own effect (not `withLoading`), so it
+  // needs its own flag — `isLoading` reflects per-project mutations, not the
+  // list. Starts `true` so the first paint is a skeleton, never a false empty.
+  const [isListLoading, setIsListLoading] = useState(true);
   const [projectsReloadSignal, setProjectsReloadSignal] = useState(0);
   const selectedProjectIdRef = useRef<string | null>(null);
   const [renameTarget, setRenameTarget] = useState<SemanticProject | null>(
@@ -361,6 +377,8 @@ export default function SemanticLayerEditor({
   const [duplicateTarget, setDuplicateTarget] =
     useState<SemanticProject | null>(null);
   const [duplicateIncludeDocs, setDuplicateIncludeDocs] = useState(false);
+  const [isDuplicating, setIsDuplicating] = useState(false);
+  const [isRenaming, setIsRenaming] = useState(false);
   const [showNewProject, setShowNewProject] = useState(false);
   const [mdlFiles, setMdlFiles] = useState<MdlFile[]>([]);
   const [documents, setDocuments] = useState<SemanticDocument[]>([]);
@@ -396,7 +414,15 @@ export default function SemanticLayerEditor({
   const [pendingJobId, setPendingJobId] = useState<string | null>(null);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
+  const [isAddingSchema, setIsAddingSchema] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  // True while a project is being opened but none is shown yet — drives the
+  // workspace skeleton so the deep-link / row-click open shows "loading" rather
+  // than the `mdl-empty` "Select a project" state (which misreads an in-flight
+  // open as "nothing selected"). Seeded from `projectId` so the very first paint
+  // of a deep-linked Lab tab is a skeleton, covering the gap before the project
+  // GET resolves and `openProject` runs.
+  const [isOpening, setIsOpening] = useState(!!projectId);
   const [showCopilot, setShowCopilot] = useState(true);
   // Mirror the active file id in a ref so `refresh` can read the current
   // selection without depending on it (which would re-create the callback and
@@ -599,12 +625,16 @@ export default function SemanticLayerEditor({
   // an unscoped database) just yields an empty list; never blocks the editor.
   useEffect(() => {
     let cancelled = false;
+    setIsListLoading(true);
     listSemanticProjects(databaseId, catalogName ?? null, null)
       .then(list => {
         if (!cancelled) setProjects(list);
       })
       .catch(() => {
         if (!cancelled) setProjects([]);
+      })
+      .finally(() => {
+        if (!cancelled) setIsListLoading(false);
       });
     return () => {
       cancelled = true;
@@ -622,6 +652,7 @@ export default function SemanticLayerEditor({
     async (target: SemanticProject) => {
       selectedProjectIdRef.current = target.id;
       setIsLoading(true);
+      setIsOpening(true);
       try {
         const [files, projectState, docs, readiness] = await Promise.all([
           listMdlFiles(target.id),
@@ -654,6 +685,7 @@ export default function SemanticLayerEditor({
         );
       } finally {
         setIsLoading(false);
+        setIsOpening(false);
       }
     },
     [dispatch],
@@ -676,6 +708,9 @@ export default function SemanticLayerEditor({
       .then(target => (cancelled ? undefined : openProject(target)))
       .catch(ex => {
         if (!cancelled) {
+          // The seeded `isOpening` would otherwise pin the skeleton forever when
+          // the project GET fails before `openProject` (which clears it) runs.
+          setIsOpening(false);
           dispatch(
             addDangerToast(
               ex instanceof Error ? ex.message : t('Unable to open project'),
@@ -742,7 +777,9 @@ export default function SemanticLayerEditor({
     if (!duplicateTarget) return;
     const target = duplicateTarget;
     const includeDocuments = duplicateIncludeDocs;
-    setDuplicateTarget(null);
+    // Keep the dialog open (with a spinner) until the clone resolves; close only
+    // on success so a failure leaves the dialog up to retry.
+    setIsDuplicating(true);
     try {
       const clone = await duplicateSemanticProject(
         target.id,
@@ -752,12 +789,15 @@ export default function SemanticLayerEditor({
       reloadProjects();
       await openProject(clone);
       dispatch(addSuccessToast(t('Project duplicated.')));
+      setDuplicateTarget(null);
     } catch (ex) {
       dispatch(
         addDangerToast(
           ex instanceof Error ? ex.message : t('Unable to duplicate project'),
         ),
       );
+    } finally {
+      setIsDuplicating(false);
     }
   }, [
     duplicateTarget,
@@ -792,18 +832,21 @@ export default function SemanticLayerEditor({
     if (!renameTarget) return;
     const name = renameValue.trim();
     if (!name) return;
+    setIsRenaming(true);
     try {
       const renamed = await renameSemanticProject(renameTarget.id, name);
       reloadProjects();
-      setRenameTarget(null);
       if (selectedProjectIdRef.current === renamed.id) setProject(renamed);
       dispatch(addSuccessToast(t('Project renamed.')));
+      setRenameTarget(null);
     } catch (ex) {
       dispatch(
         addDangerToast(
           ex instanceof Error ? ex.message : t('Unable to rename project'),
         ),
       );
+    } finally {
+      setIsRenaming(false);
     }
   }, [renameTarget, renameValue, reloadProjects, dispatch]);
 
@@ -833,6 +876,7 @@ export default function SemanticLayerEditor({
       if (!project || project.schema_names?.includes(schema)) {
         return;
       }
+      setIsAddingSchema(true);
       try {
         await resolveSemanticProject({
           database_id: scope.database_id,
@@ -852,6 +896,8 @@ export default function SemanticLayerEditor({
             ex instanceof Error ? ex.message : t('Unable to add schema'),
           ),
         );
+      } finally {
+        setIsAddingSchema(false);
       }
     },
     [project, scope, refresh, dispatch],
@@ -873,14 +919,27 @@ export default function SemanticLayerEditor({
     [ingest, refresh],
   );
 
-  const withLoading = async (action: () => Promise<void>, fallback: string) => {
+  // Identifies the specific mutation in flight so each control can show its own
+  // spinner (G3–G6) without a separate boolean per action. `isLoading` still
+  // disables the whole toolbar to prevent overlapping writes; `pendingAction`
+  // only drives which control spins. Per-file toggles key on the file id.
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const withLoading = async (
+    action: () => Promise<void>,
+    fallback: string,
+    key?: string,
+  ) => {
     setIsLoading(true);
+    if (key) {
+      setPendingAction(key);
+    }
     try {
       await action();
     } catch (ex) {
       dispatch(addDangerToast(ex instanceof Error ? ex.message : fallback));
     } finally {
       setIsLoading(false);
+      setPendingAction(null);
     }
   };
 
@@ -928,41 +987,49 @@ export default function SemanticLayerEditor({
   };
 
   const saveFile = (status?: MdlFileStatus) =>
-    withLoading(async () => {
-      if (!project) {
-        return;
-      }
-      const payload = {
-        path: editorPath,
-        content: editorValue,
-        status: status ?? activeFile?.status ?? 'draft',
-      };
-      let savedFile = activeFile
-        ? await updateMdlFile(project.id, activeFile.id, payload)
-        : await createMdlFile(project.id, {
-            path: editorPath,
-            content: editorValue,
-            source_type: 'manual',
-          });
-      if (!activeFile && status) {
-        savedFile = await updateMdlFile(project.id, savedFile.id, { status });
-      }
-      activeFileIdRef.current = savedFile.id;
-      setActiveFileId(savedFile.id);
-      setEditorPath(savedFile.path);
-      setEditorValue(savedFile.content);
-      await refresh();
-    }, t('Unable to save MDL file'));
+    withLoading(
+      async () => {
+        if (!project) {
+          return;
+        }
+        const payload = {
+          path: editorPath,
+          content: editorValue,
+          status: status ?? activeFile?.status ?? 'draft',
+        };
+        let savedFile = activeFile
+          ? await updateMdlFile(project.id, activeFile.id, payload)
+          : await createMdlFile(project.id, {
+              path: editorPath,
+              content: editorValue,
+              source_type: 'manual',
+            });
+        if (!activeFile && status) {
+          savedFile = await updateMdlFile(project.id, savedFile.id, { status });
+        }
+        activeFileIdRef.current = savedFile.id;
+        setActiveFileId(savedFile.id);
+        setEditorPath(savedFile.path);
+        setEditorValue(savedFile.content);
+        await refresh();
+      },
+      t('Unable to save MDL file'),
+      status === 'active' ? 'save:active' : 'save',
+    );
 
   const deleteFile = (file: MdlFile) =>
-    withLoading(async () => {
-      if (!project) {
-        return;
-      }
-      await deleteMdlFile(project.id, file.id);
-      startNewFile();
-      await refresh();
-    }, t('Unable to delete MDL file'));
+    withLoading(
+      async () => {
+        if (!project) {
+          return;
+        }
+        await deleteMdlFile(project.id, file.id);
+        startNewFile();
+        await refresh();
+      },
+      t('Unable to delete MDL file'),
+      'delete',
+    );
 
   // Bulk delete (context menu / multi-select) — parity with a file browser.
   const deleteFiles = (fileIds: string[]) =>
@@ -1220,15 +1287,19 @@ export default function SemanticLayerEditor({
 
   // Toggle a single file between active (in the semantic layer) and draft.
   const toggleFileStatus = (file: MdlFile, activate: boolean) =>
-    withLoading(async () => {
-      if (!project) {
-        return;
-      }
-      await updateMdlFile(project.id, file.id, {
-        status: activate ? 'active' : 'draft',
-      });
-      await refresh();
-    }, t('Unable to update MDL file'));
+    withLoading(
+      async () => {
+        if (!project) {
+          return;
+        }
+        await updateMdlFile(project.id, file.id, {
+          status: activate ? 'active' : 'draft',
+        });
+        await refresh();
+      },
+      t('Unable to update MDL file'),
+      `toggle:${file.id}`,
+    );
 
   const allActive =
     mdlFiles.length > 0 && mdlFiles.every(file => file.status === 'active');
@@ -1247,23 +1318,24 @@ export default function SemanticLayerEditor({
     ? 'indexing'
     : (readinessStatus ?? (hasActiveModels ? 'ready' : 'empty'));
 
-  // Activate (or deactivate) every MDL file in the library in one pass, then
-  // refresh once so the browser reflects the new statuses.
+  // Activate (or deactivate) every MDL file in the library in one atomic call.
+  // The server validates the whole projected active manifest once, so dependent
+  // files (a metric and the model its baseObject references) activate together
+  // regardless of order — the old per-file Promise.all raced and rejected a
+  // metric activated before its model. Activation is all-or-nothing.
   const setAllStatuses = (activate: boolean) =>
-    withLoading(async () => {
-      if (!project) {
-        return;
-      }
-      const nextStatus: MdlFileStatus = activate ? 'active' : 'draft';
-      await Promise.all(
-        mdlFiles
-          .filter(file => file.status !== nextStatus)
-          .map(file =>
-            updateMdlFile(project.id, file.id, { status: nextStatus }),
-          ),
-      );
-      await refresh();
-    }, t('Unable to update MDL files'));
+    withLoading(
+      async () => {
+        if (!project) {
+          return;
+        }
+        const nextStatus: MdlFileStatus = activate ? 'active' : 'draft';
+        await setMdlFilesStatus(project.id, nextStatus);
+        await refresh();
+      },
+      t('Unable to update MDL files'),
+      'bulk',
+    );
 
   return (
     <EditorRoot data-test="semantic-layer-editor">
@@ -1280,7 +1352,7 @@ export default function SemanticLayerEditor({
           <BrowserPane>
             <ProjectBrowser
               projects={browserProjects}
-              loading={isLoading}
+              loading={isListLoading}
               activeProjectId={project?.id ?? null}
               onOpen={projectId => {
                 const target = projects.find(p => p.id === projectId);
@@ -1309,6 +1381,7 @@ export default function SemanticLayerEditor({
                   databaseId={databaseId}
                   catalogName={catalogName}
                   canEdit={canWrite}
+                  adding={isAddingSchema}
                   onAddSchema={addSchema}
                 />
                 <Flex align="center" gap="small" wrap="wrap">
@@ -1362,6 +1435,7 @@ export default function SemanticLayerEditor({
                             <Flex gap="small" wrap="wrap">
                               <Button
                                 buttonStyle="primary"
+                                loading={pendingAction === 'save'}
                                 disabled={!project || !canWrite || isLoading}
                                 onClick={() => saveFile()}
                                 icon={<Icons.SaveOutlined iconSize="m" />}
@@ -1406,6 +1480,9 @@ export default function SemanticLayerEditor({
                                         size="small"
                                         checked={file.status === 'active'}
                                         disabled={!canWrite || isLoading}
+                                        loading={
+                                          pendingAction === `toggle:${file.id}`
+                                        }
                                         checkedChildren={t('Active')}
                                         unCheckedChildren={t('Draft')}
                                         onChange={checked =>
@@ -1420,6 +1497,7 @@ export default function SemanticLayerEditor({
                             <Button
                               block
                               buttonStyle="tertiary"
+                              loading={pendingAction === 'bulk'}
                               disabled={
                                 !project ||
                                 !canWrite ||
@@ -1556,6 +1634,7 @@ export default function SemanticLayerEditor({
                                   <Flex gap="small" wrap="wrap">
                                     <Button
                                       buttonStyle="primary"
+                                      loading={pendingAction === 'save'}
                                       disabled={
                                         !project || !canWrite || isLoading
                                       }
@@ -1566,6 +1645,7 @@ export default function SemanticLayerEditor({
                                     </Button>
                                     <Button
                                       buttonStyle="tertiary"
+                                      loading={pendingAction === 'save:active'}
                                       disabled={
                                         !project || !canWrite || isLoading
                                       }
@@ -1593,6 +1673,7 @@ export default function SemanticLayerEditor({
                                   </Flex>
                                   <Button
                                     buttonStyle="danger"
+                                    loading={pendingAction === 'delete'}
                                     disabled={
                                       !activeFile ||
                                       !project ||
@@ -1666,7 +1747,13 @@ export default function SemanticLayerEditor({
                     key: 'graph',
                     label: t('Graph'),
                     children: (
-                      <Suspense fallback={null}>
+                      <Suspense
+                        fallback={
+                          <SkeletonBody data-test="graph-loading">
+                            <Skeleton active paragraph={{ rows: 6 }} />
+                          </SkeletonBody>
+                        }
+                      >
                         <SchemaGraph
                           mdlFiles={mdlFiles}
                           databaseId={databaseId}
@@ -1678,6 +1765,15 @@ export default function SemanticLayerEditor({
                   },
                 ]}
               />
+            </WorkspacePane>
+          ) : isOpening ? (
+            <WorkspacePane data-test="mdl-loading">
+              <WorkspaceStrip>
+                <Skeleton.Button active size="small" />
+              </WorkspaceStrip>
+              <SkeletonBody>
+                <Skeleton active paragraph={{ rows: 8 }} />
+              </SkeletonBody>
             </WorkspacePane>
           ) : (
             <EmptyWorkspace data-test="mdl-empty">
@@ -1749,6 +1845,7 @@ export default function SemanticLayerEditor({
         show={!!renameTarget}
         onHide={() => setRenameTarget(null)}
         onConfirm={handleRenameSubmit}
+        loading={isRenaming}
         confirmText={t('Rename')}
         title={t('Rename project')}
         body={
@@ -1772,6 +1869,7 @@ export default function SemanticLayerEditor({
         show={!!duplicateTarget}
         onHide={() => setDuplicateTarget(null)}
         onConfirm={handleDuplicateConfirm}
+        loading={isDuplicating}
         confirmText={t('Duplicate')}
         title={t('Duplicate project')}
         body={

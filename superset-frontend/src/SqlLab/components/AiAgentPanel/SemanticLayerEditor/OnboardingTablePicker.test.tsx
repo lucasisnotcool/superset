@@ -112,6 +112,37 @@ test('renders a schema header with its tables nested under it', async () => {
   expect(screen.getByText('customers')).toBeInTheDocument();
 });
 
+test('shows a per-schema loading row while the registered scan is in flight (G8)', async () => {
+  // Hold the registered-dataset scan open so the in-flight loading state is
+  // observable; the schema header still renders, with a loading row beneath it.
+  let release: () => void = () => {};
+  const gate = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  jest.spyOn(SupersetClient, 'get').mockImplementation(({ endpoint }: any) => {
+    const url = String(endpoint);
+    if (url.includes('/_info'))
+      return Promise.resolve(infoPage(['can_read', 'can_write']));
+    if (url.includes('/tables/'))
+      return Promise.resolve(physicalPage(['orders']));
+    return gate.then(() => datasetsPage([{ id: 1, table_name: 'orders' }], 1));
+  });
+
+  renderPicker();
+
+  expect(
+    await screen.findByTestId('picker-schema-loading'),
+  ).toBeInTheDocument();
+
+  release();
+  await waitFor(() =>
+    expect(
+      screen.queryByTestId('picker-schema-loading'),
+    ).not.toBeInTheDocument(),
+  );
+  expect(await screen.findByText('orders')).toBeInTheDocument();
+});
+
 test('onboards the checked subset as an explicit include list', async () => {
   const onConfirm = renderPicker();
 

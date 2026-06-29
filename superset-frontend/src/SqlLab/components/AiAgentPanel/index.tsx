@@ -76,6 +76,7 @@ import {
   type ConversationTurnResponse,
   type ExecutionMode,
   type SemanticLayerState,
+  type SemanticProject,
   type SqlClassification,
 } from './api';
 import AiChartPreview from './AiChartPreview';
@@ -493,11 +494,13 @@ const buildConversationScope = (
   queryEditor: Partial<QueryEditor> | undefined,
   databaseId: number,
   datasetIds: number[],
+  projectId: string | null,
 ): ConversationScope => ({
   database_id: databaseId,
   catalog_name: queryEditor?.catalog || null,
   schema_name: queryEditor?.schema || null,
   dataset_ids: datasetIds,
+  project_id: projectId,
   query_editor_id: queryEditor?.id || null,
   current_sql: queryEditor?.sql || null,
   selected_text: queryEditor?.selectedText || null,
@@ -689,14 +692,29 @@ const AiAgentPanel = () => {
   const [feedback, setFeedback] = useState<Record<string, 'up' | 'down'>>({});
   const [semanticLayerState, setSemanticLayerState] =
     useState<SemanticLayerState | null>(null);
+  // The active schema scope can be covered by more than one semantic project.
+  // `semanticProjects` is the candidate set (most-recent first, mirroring the
+  // backend heuristic); `selectedProjectId` is the user's pin (defaulting to the
+  // heuristic's top match) that the SQL turn sends so the backend grounds on it.
+  const [semanticProjects, setSemanticProjects] = useState<SemanticProject[]>(
+    [],
+  );
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(
+    null,
+  );
 
   const databaseId = queryEditor?.dbId;
   const currentScope = useMemo(
     () =>
       typeof databaseId === 'number'
-        ? buildConversationScope(queryEditor, databaseId, datasetIds)
+        ? buildConversationScope(
+            queryEditor,
+            databaseId,
+            datasetIds,
+            selectedProjectId,
+          )
         : null,
-    [databaseId, datasetIds, queryEditor],
+    [databaseId, datasetIds, queryEditor, selectedProjectId],
   );
   const canSend =
     Boolean(composerValue.trim()) && typeof databaseId === 'number';
@@ -748,35 +766,37 @@ const AiAgentPanel = () => {
 
   useEffect(() => {
     if (!currentScope?.schema_name) {
-      setSemanticLayerState(null);
+      setSemanticProjects([]);
+      setSelectedProjectId(null);
       return undefined;
     }
     let isMounted = true;
-    // Probe for an existing schema-scoped project without creating one. Using the
-    // listing endpoint (200 + possibly-empty array) instead of resolve avoids a
-    // spurious 404 in the console when no project exists yet for the schema.
+    // Probe for the schema-scoped project candidates without creating one. Using
+    // the listing endpoint (200 + possibly-empty array) instead of resolve avoids
+    // a spurious 404 in the console when no project exists yet for the schema. The
+    // list is ordered most-recent first, so [0] mirrors the backend's heuristic
+    // default — keep it the default selection, but preserve the user's pin when it
+    // still covers the (unchanged) schema.
     listSemanticProjects(
       currentScope.database_id,
       currentScope.catalog_name ?? null,
       currentScope.schema_name,
     )
       .then(projects => {
-        const project = projects[0];
-        if (!project) {
-          if (isMounted) {
-            setSemanticLayerState(null);
-          }
-          return undefined;
+        if (!isMounted) {
+          return;
         }
-        return getProjectSemanticLayerState(project.id).then(nextState => {
-          if (isMounted) {
-            setSemanticLayerState(nextState);
-          }
-        });
+        setSemanticProjects(projects);
+        setSelectedProjectId(prev =>
+          prev && projects.some(project => project.id === prev)
+            ? prev
+            : (projects[0]?.id ?? null),
+        );
       })
       .catch(() => {
         if (isMounted) {
-          setSemanticLayerState(null);
+          setSemanticProjects([]);
+          setSelectedProjectId(null);
         }
       });
     return () => {
@@ -787,6 +807,30 @@ const AiAgentPanel = () => {
     currentScope?.catalog_name,
     currentScope?.schema_name,
   ]);
+
+  // Fetch the document/coverage state for whichever project is selected so the
+  // badge reflects the project actually grounding the turn.
+  useEffect(() => {
+    if (!selectedProjectId) {
+      setSemanticLayerState(null);
+      return undefined;
+    }
+    let isMounted = true;
+    getProjectSemanticLayerState(selectedProjectId)
+      .then(nextState => {
+        if (isMounted) {
+          setSemanticLayerState(nextState);
+        }
+      })
+      .catch(() => {
+        if (isMounted) {
+          setSemanticLayerState(null);
+        }
+      });
+    return () => {
+      isMounted = false;
+    };
+  }, [selectedProjectId]);
 
   useEffect(() => {
     if (isPinnedToBottom && transcriptRef.current) {
@@ -976,6 +1020,12 @@ const AiAgentPanel = () => {
       const result = await getConversation(conversationId);
       setConversation(result);
       setDatasetIds(result.scope.dataset_ids);
+      // Restore the project this thread was pinned to so its grounding stays
+      // stable across reopen (the probe preserves a pin that still covers the
+      // schema; an out-of-scope pin falls back to the heuristic default).
+      if (result.project_id) {
+        setSelectedProjectId(result.project_id);
+      }
       setExecutionMode(
         loadExecutionMode(result.id) ?? loadExecutionMode() ?? 'manual',
       );
@@ -1198,7 +1248,29 @@ const AiAgentPanel = () => {
           {queryEditor?.schema && <Chip>{queryEditor.schema}</Chip>}
           {queryEditor?.catalog && <Chip>{queryEditor.catalog}</Chip>}
           {queryEditor?.selectedText && <Chip>{t('Selection')}</Chip>}
-          <SemanticLayerStateBadge state={semanticLayerState} />
+          {semanticProjects.length > 1 ? (
+            <Select
+              ariaLabel={t('Semantic layer project')}
+              options={semanticProjects.map(project => ({
+                value: project.id,
+                label: project.name,
+              }))}
+              value={selectedProjectId ?? undefined}
+              onChange={value => setSelectedProjectId(value as string)}
+              showSearch={false}
+              size="small"
+              data-test="semantic-project-select"
+            />
+          ) : (
+            <SemanticLayerStateBadge
+              state={semanticLayerState}
+              projectName={
+                semanticProjects.find(
+                  project => project.id === selectedProjectId,
+                )?.name ?? null
+              }
+            />
+          )}
         </ContextChips>
         {health?.semantic_layer_persistent === false && (
           <Alert

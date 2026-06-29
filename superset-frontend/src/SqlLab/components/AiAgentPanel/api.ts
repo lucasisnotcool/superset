@@ -299,6 +299,10 @@ export interface ConversationScope {
   /** Full schema set for a multi-schema semantic project (primary first). */
   schema_names?: string[] | null;
   dataset_ids: number[];
+  /** Explicit semantic-layer project to ground on when a schema is covered by
+   * more than one. The backend honors it only after re-checking access + schema
+   * coverage; `null`/absent means "let the backend resolve". */
+  project_id?: string | null;
   query_editor_id?: string | null;
   current_sql?: string | null;
   selected_text?: string | null;
@@ -1163,6 +1167,28 @@ export const updateMdlFile = (
     },
   );
 
+export interface MdlBulkStatusResult {
+  files: MdlFile[];
+  changed_count: number;
+}
+
+// Activate or deactivate many MDL files atomically. Activation validates the
+// whole projected active manifest once on the server, so dependent files (a
+// metric and the model it references) are activated together without ordering —
+// replacing the per-file loop that raced and failed on dependency order.
+export const setMdlFilesStatus = (
+  projectId: string,
+  status: MdlFileStatus,
+  fileIds?: string[],
+) =>
+  requestJson<MdlBulkStatusResult>(
+    `/agent/semantic-layer/projects/${projectId}/mdl-files/bulk-status`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ status, file_ids: fileIds ?? null }),
+    },
+  );
+
 export const deleteMdlFile = (projectId: string, fileId: string) =>
   requestJson<{ deleted: boolean }>(
     `/agent/semantic-layer/projects/${projectId}/mdl-files/${fileId}`,
@@ -1410,12 +1436,28 @@ export interface CoverageRun {
   updated_at: string;
 }
 
+/** Live, coarse progress of an in-flight coverage run (Feature C). */
+export interface CoverageProgressInfo {
+  /** Backend stage: extracting | building_facts | judging | checking_overreach | aggregating. */
+  stage?: string;
+  /** Human-readable detail, e.g. a filename or "142 claims vs 38 facts". */
+  detail?: string;
+  /** Countable progress within a stage (e.g. document 2 of 5). */
+  current?: number;
+  total?: number;
+  /** Coarse pipeline position for the stepper (0-based). */
+  phase_index?: number;
+  phase_total?: number;
+}
+
 export interface CoverageStatusInfo {
   status: 'analysing' | 'stale' | 'ready' | 'none';
   running: boolean;
   stale: boolean;
   score?: number | null;
   run_id?: string | null;
+  /** Present only while a run is in flight; null otherwise (Feature C). */
+  progress?: CoverageProgressInfo | null;
 }
 
 /** The latest completed directory coverage run (score + report), or null. */
@@ -1444,6 +1486,29 @@ export const refreshCoverage = (projectId: string) =>
   requestJson<{ scheduled: boolean }>(
     `/agent/semantic-layer/projects/${projectId}/coverage/refresh`,
     { method: 'POST' },
+  );
+
+/** Latest coverage score for one MDL version (Feature B label overlay). */
+export interface CoverageVersionScore {
+  score?: number | null;
+  run_id: string;
+  status: CoverageRunStatus;
+  computed_at: string;
+  docs_checksum: string;
+}
+
+/** Map of mdl_checksum → latest coverage score, for labelling provenance. */
+export type CoverageScoresByVersion = Record<string, CoverageVersionScore>;
+
+/**
+ * Coverage score per MDL version (keyed by mdl_checksum). The provenance dialog
+ * joins this against each entry's detail.mdl_checksum to render a coverage label
+ * and before/after delta — a read-only overlay, never a timeline entry.
+ */
+export const getCoverageScoresByVersion = (projectId: string) =>
+  requestJson<CoverageScoresByVersion>(
+    `/agent/semantic-layer/projects/${projectId}/coverage/scores-by-version`,
+    { method: 'GET' },
   );
 
 export const runCopilot = (projectId: string, payload: CopilotTurnRequest) =>

@@ -167,6 +167,22 @@ test('renders an empty state when there are no projects', () => {
   expect(screen.getByText('No semantic projects yet')).toBeInTheDocument();
 });
 
+test('shows a skeleton (not a false empty) while the list is loading', () => {
+  setup({ projects: [], loading: true });
+  expect(screen.getByTestId('project-loading')).toBeInTheDocument();
+  // The "false empty" must NOT appear while the fetch is in flight.
+  expect(
+    screen.queryByText('No semantic projects yet'),
+  ).not.toBeInTheDocument();
+  expect(screen.queryByTestId('project-empty')).not.toBeInTheDocument();
+});
+
+test('a background refresh with rows already present keeps the rows (no skeleton)', () => {
+  setup({ loading: true });
+  expect(screen.queryByTestId('project-loading')).not.toBeInTheDocument();
+  expect(screen.getByText('Sales Mart')).toBeInTheDocument();
+});
+
 test('renders an empty state when the search matches nothing', async () => {
   setup();
   await userEvent.type(screen.getByTestId('project-search'), 'nonexistent');
