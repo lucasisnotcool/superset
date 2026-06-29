@@ -48,11 +48,29 @@ in `test_conversation_graph.py` (3), `update_project_id` store test;
 frontend transparency + picker tests in `index.test.tsx` (2). Full suites green
 (985 backend / 285 AiAgentPanel).
 
-Notable as-built deviation from D1 wording: switching the picker mid-conversation
-re-points the *same* conversation (explicit override re-pins) rather than forcing a
-brand-new thread — this matches how schema/catalog changes already update scope
-in place, and the silent per-turn drift (F2) is still eliminated. The switch is
-user-initiated and explicit, never silent.
+### Follow-on (dataset selector removal + switch = new chat)
+
+- **Removed the "All datasets in scope" `DatasetSelect`** from the panel (component +
+  test deleted). The turn now sends `dataset_ids: []` — the selected semantic-layer
+  project's MDL already scopes the tables, so the agent grounds on the whole project
+  rather than a hand-picked dataset subset. No backend change (empty `dataset_ids`
+  was already "all in scope").
+- **Decision (revisits D1): switching the semantic-layer project forces a fresh chat.**
+  Rationale: the project defines the agent's entire vocabulary (model names,
+  relationships, metrics) and is injected into every turn; the transcript is also fed
+  to the model, so carrying a thread written against project A while grounding on
+  project B feeds stale/invalid references — the user-initiated form of the F2 drift.
+  A semantic-layer switch is a context boundary like switching databases. So an
+  explicit switch on a **non-empty** thread resets the transcript (`onSelectProject`),
+  shows an info toast ("Switched semantic layer to ‹name› — started a new chat. Your
+  previous chat is saved in history."), and the prior thread stays in history (already
+  server-persisted). A switch on an empty thread retargets silently; programmatic
+  default-selection and reopen-restore go through `setSelectedProjectId` directly and
+  never reset. The picker still renders only when **>1** project covers the schema
+  (when exactly one, the badge shows its name — nothing to switch to).
+- Tests: `index.test.tsx` adds "switching the semantic layer mid-conversation starts a
+  fresh chat" (transcript resets after a switch on a non-empty thread). Full panel
+  suite green (292 tests).
 
 ## 1. Problem
 

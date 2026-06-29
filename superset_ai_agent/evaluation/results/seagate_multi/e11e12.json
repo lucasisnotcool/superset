@@ -1,0 +1,57 @@
+{
+  "auto_selection": {
+    "precision": 1.0,
+    "recall": 1.0,
+    "f1": 1.0,
+    "selected_relevant": [
+      "seagate_drive_skus",
+      "seagate_production_events",
+      "seagate_production_lines",
+      "seagate_quality_tests",
+      "seagate_shipments",
+      "seagate_sites",
+      "seagate_work_orders"
+    ],
+    "distractor_inclusions": [],
+    "distractor_inclusion_rate": 0.0,
+    "missed_relevant": []
+  },
+  "auto_proposed": [
+    "seagate_drive_skus",
+    "seagate_production_events",
+    "seagate_production_lines",
+    "seagate_quality_tests",
+    "seagate_shipments",
+    "seagate_sites",
+    "seagate_work_orders"
+  ],
+  "auto_activated": true,
+  "auto_items": 13,
+  "e12": [
+    {
+      "K": 0,
+      "graded": 8,
+      "leaks": 2,
+      "coverage": 0.909,
+      "n_models": 7
+    },
+    {
+      "K": 1,
+      "graded": 5,
+      "leaks": 2,
+      "coverage": 0.909,
+      "n_models": 7,
+      "activated": true,
+      "err": "None"
+    },
+    {
+      "K": 2,
+      "graded": 5,
+      "leaks": 2,
+      "coverage": 0.909,
+      "n_models": 7,
+      "activated": true,
+      "err": "None"
+    }
+  ]
+}

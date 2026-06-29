@@ -63,6 +63,23 @@ test('Create is disabled until a schema is chosen, then submits the schema set',
   expect(onSubmit).toHaveBeenCalledWith({ name: '', schemaNames: ['sales'] });
 });
 
+test('spins Create and locks the form while creating', () => {
+  render(
+    <NewProjectModal
+      open
+      databaseId={1}
+      catalogName={null}
+      onSubmit={jest.fn()}
+      onCancel={jest.fn()}
+      creating
+    />,
+  );
+  expect(
+    screen.getByTestId('new-project-create').closest('button'),
+  ).toHaveClass('ant-btn-loading');
+  expect(screen.getByRole('button', { name: /Cancel/i })).toBeDisabled();
+});
+
 test('passes a typed name and multiple schemas (first is primary)', async () => {
   const { onSubmit } = setup();
 

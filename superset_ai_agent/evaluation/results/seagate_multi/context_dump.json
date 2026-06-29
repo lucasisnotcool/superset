@@ -4,11 +4,11 @@
     "level": "L1",
     "question": "How many patties got 86'd on 2025-10-30?",
     "status": "ok",
-    "sql": "SELECT SUM(units_scrapped) AS total_patties_86d\nFROM seagate_ops.seagate_production_events\nWHERE event_date::date = '2025-10-30'\nLIMIT 1000",
-    "answer_summary": "The result includes 1 row(s) with total total patties 86d of 6.",
+    "sql": "SELECT SUM(units_scrapped) AS total_units_scrapped\nFROM seagate_ops.seagate_production_events\nWHERE event_date::date = '2025-10-30'\nLIMIT 1000",
+    "answer_summary": "The result includes 1 row(s) with total total units scrapped of 6.",
     "result_rows": [
       {
-        "total_patties_86d": 6
+        "total_units_scrapped": 6
       }
     ],
     "result_value": 6,
@@ -29,11 +29,11 @@
     "level": "L1",
     "question": "How many tickets are currently short order and not yet closed?",
     "status": "ok",
-    "sql": "SELECT COUNT(*) AS short_order_open_tickets\nFROM seagate_ops.seagate_work_orders\nWHERE ticket_type = 'SHORT_ORDER'\n  AND closed_at IS NULL\nLIMIT 1000",
-    "answer_summary": "The result includes 1 row(s) with total short order open tickets of 1.",
+    "sql": "SELECT COUNT(*) AS short_order_not_closed_count\nFROM seagate_ops.seagate_work_orders\nWHERE ticket_type = 'SHORT_ORDER'\n  AND status <> 'CLOSED'\nLIMIT 100",
+    "answer_summary": "The result includes 1 row(s) with total short order not closed count of 1.",
     "result_rows": [
       {
-        "short_order_open_tickets": 1
+        "short_order_not_closed_count": 1
       }
     ],
     "result_value": 1,
@@ -54,7 +54,7 @@
     "level": "L1",
     "question": "How many patties are currently on the griddle, company-wide?",
     "status": "ok",
-    "sql": "SELECT COALESCE(SUM(pe.units_completed), 0) AS patties_on_the_griddle\nFROM seagate_ops.seagate_production_events pe\nJOIN seagate_ops.seagate_work_orders wo ON pe.work_order_id = wo.work_order_id\nWHERE wo.status = 'BAKING'\nLIMIT 1000",
+    "sql": "SELECT SUM(se_pe.units_completed) AS patties_on_the_griddle\nFROM seagate_ops.seagate_production_events se_pe\nJOIN seagate_ops.seagate_work_orders se_wo ON se_pe.work_order_id = se_wo.work_order_id\nWHERE se_wo.status = 'BAKING'\nLIMIT 1000",
     "answer_summary": "The result includes 1 row(s) with total patties on the griddle of 39.",
     "result_rows": [
       {
@@ -79,7 +79,7 @@
     "level": "L1",
     "question": "How many heat lamp tests have a garnish problem logged?",
     "status": "ok",
-    "sql": "SELECT COUNT(*) AS heat_lamp_garnish_problems\nFROM seagate_ops.seagate_quality_tests\nWHERE test_type = 'HEAT_LAMP'\nAND garnish_defect = true\nLIMIT 1000",
+    "sql": "SELECT COUNT(*) AS heat_lamp_garnish_problems\nFROM seagate_ops.seagate_quality_tests\nWHERE test_type = 'HEAT_LAMP' AND garnish_defect = true\nLIMIT 1000",
     "answer_summary": "The result includes 1 row(s) with total heat lamp garnish problems of 14.",
     "result_rows": [
       {
@@ -104,7 +104,7 @@
     "level": "L2",
     "question": "Which sites currently have a line that's WARM?",
     "status": "ok",
-    "sql": "SELECT DISTINCT s.site_id, s.site_code, s.site_name\nFROM seagate_core.seagate_sites s\nJOIN seagate_core.seagate_production_lines pl ON s.site_id = pl.site_id\nWHERE pl.status = 'WARM'\nLIMIT 100",
+    "sql": "SELECT DISTINCT s.site_id, s.site_code, s.site_name\nFROM seagate_core.seagate_sites s\nJOIN seagate_core.seagate_production_lines l ON s.site_id = l.site_id\nWHERE l.status = 'WARM'\nLIMIT 100",
     "answer_summary": "Reef Hollow has the highest site id in the result.",
     "result_rows": [
       {
@@ -140,12 +140,16 @@
     "id": "Q6",
     "level": "L2",
     "question": "How many patties has the Tigerline region plated in total?",
-    "status": "error",
-    "sql": "SELECT SUM(seagate_ops.seagate_production_events.units_completed) AS total_patties_plated\nFROM seagate_ops.seagate_production_events\nJOIN seagate_ops.seagate_work_orders ON seagate_production_events.work_order_id = seagate_work_orders.work_order_id\nJOIN seagate_core.seagate_production_lines ON seagate_work_orders.line_id = seagate_production_lines.line_id\nJOIN seagate_core.seagate_sites ON seagate_production_lines.site_id = seagate_sites.site_id\nWHERE seagate_sites.site_id IN ('SGY', 'SGT')\nLIMIT 1000",
-    "answer_summary": null,
-    "result_rows": [],
-    "result_value": null,
-    "row_count": null,
+    "status": "ok",
+    "sql": "SELECT SUM(spe.units_completed) AS total_patties_plated\nFROM seagate_ops.seagate_production_events AS spe\nJOIN seagate_ops.seagate_work_orders AS swo ON spe.work_order_id = swo.work_order_id\nJOIN seagate_core.seagate_production_lines AS spl ON swo.line_id = spl.line_id\nJOIN seagate_core.seagate_sites AS ss ON spl.site_id = ss.site_id\nWHERE ss.site_code IN ('SGY', 'SGT')\nLIMIT 1000",
+    "answer_summary": "The result includes 1 row(s) with total total patties plated of 9,386.",
+    "result_rows": [
+      {
+        "total_patties_plated": 9386
+      }
+    ],
+    "result_value": 9386,
+    "row_count": 1,
     "wren": {
       "wren_enabled": true,
       "wren_available": false,
@@ -162,7 +166,7 @@
     "level": "L2",
     "question": "How many To-Go units has the Reef region shipped, in total?",
     "status": "ok",
-    "sql": "SELECT COALESCE(SUM(s.qty_units), 0) AS total_to_go_units\nFROM seagate_ops.seagate_shipments s\nJOIN seagate_ops.seagate_work_orders wo ON s.work_order_id = wo.work_order_id\nJOIN seagate_core.seagate_production_lines pl ON wo.line_id = pl.line_id\nJOIN seagate_core.seagate_sites site ON pl.site_id = site.site_id\nWHERE s.fulfillment_type = 'TO_GO'\n  AND site.site_code IN ('SGW', 'SGN')\nLIMIT 1000",
+    "sql": "SELECT SUM(sh.qty_units) AS total_to_go_units\nFROM seagate_ops.seagate_shipments sh\nJOIN seagate_ops.seagate_work_orders wo ON sh.work_order_id = wo.work_order_id\nJOIN seagate_core.seagate_production_lines pl ON wo.line_id = pl.line_id\nJOIN seagate_core.seagate_sites si ON pl.site_id = si.site_id\nWHERE sh.fulfillment_type = 'TO_GO'\n  AND si.site_code IN ('SGW', 'SGN')\nLIMIT 1000",
     "answer_summary": "The result includes 1 row(s) with total total to go units of 2,979.",
     "result_rows": [
       {
@@ -186,25 +190,12 @@
     "id": "Q8",
     "level": "L2",
     "question": "How many patties were plated between 2025-12-25 and 2025-12-31, broken down by drive family?",
-    "status": "ok",
-    "sql": "SELECT d.drive_family, SUM(e.units_completed) AS plated_patties\nFROM seagate_ops.seagate_production_events e\nJOIN seagate_ops.seagate_work_orders w ON e.work_order_id = w.work_order_id\nJOIN seagate_core.seagate_drive_skus d ON w.sku_id = d.sku_id\nWHERE e.event_date >= '2025-12-25' AND e.event_date <= '2025-12-31'\nGROUP BY d.drive_family\nORDER BY d.drive_family\nLIMIT 100",
-    "answer_summary": "Cobalt has the highest plated patties in the result.",
-    "result_rows": [
-      {
-        "drive_family": "Cobalt",
-        "plated_patties": 193
-      },
-      {
-        "drive_family": "Nimbus",
-        "plated_patties": 40
-      },
-      {
-        "drive_family": "Vantage",
-        "plated_patties": 106
-      }
-    ],
+    "status": "error",
+    "sql": "SELECT\n  sku.sku_family AS drive_family,\n  SUM(pe.units_completed) AS total_patties_plated\nFROM seagate_ops.seagate_production_events pe\nJOIN seagate_ops.seagate_work_orders wo ON pe.work_order_id = wo.work_order_id\nJOIN seagate_core.seagate_drive_skus sku ON wo.sku_id = sku.sku_id\nWHERE pe.event_date >= '2025-12-25'::date\n  AND pe.event_date <= '2025-12-31'::date\nGROUP BY sku.sku_family\nORDER BY sku.sku_family\nLIMIT 100",
+    "answer_summary": null,
+    "result_rows": [],
     "result_value": null,
-    "row_count": 3,
+    "row_count": null,
     "wren": {
       "wren_enabled": true,
       "wren_available": false,
@@ -220,16 +211,12 @@
     "id": "Q9",
     "level": "L3",
     "question": "What was the Golden Yield for the Cobalt drive family in December 2025?",
-    "status": "ok",
-    "sql": "SELECT\n  SUM(COALESCE(pe.units_completed, 0) - COALESCE(pe.units_scrapped, 0) - COALESCE(pe.units_reworked, 0))::FLOAT / NULLIF(SUM(COALESCE(pe.units_completed, 0)), 0) AS golden_yield\nFROM seagate_ops.seagate_production_events pe\nJOIN seagate_ops.seagate_work_orders wo ON pe.work_order_id = wo.work_order_id\nJOIN seagate_core.seagate_drive_skus ds ON wo.sku_id = ds.sku_id\nWHERE ds.drive_family = 'Cobalt'\n  AND pe.event_date >= '2025-12-01' AND pe.event_date < '2026-01-01'\n  AND wo.ticket_type = 'STANDARD'\nLIMIT 1000",
-    "answer_summary": "The result includes 1 row(s) with total golden yield of 0.96.",
-    "result_rows": [
-      {
-        "golden_yield": 0.9609467455621302
-      }
-    ],
-    "result_value": 0.9609467455621302,
-    "row_count": 1,
+    "status": "error",
+    "sql": "SELECT\n  SUM(events.units_completed - events.units_scrapped - events.units_reworked)::FLOAT / NULLIF(SUM(events.units_completed), 0) AS golden_yield\nFROM seagate_ops.seagate_production_events AS events\nJOIN seagate_ops.seagate_work_orders AS orders\n  ON events.work_order_id = orders.work_order_id\nJOIN seagate_core.seagate_drive_skus AS skus\n  ON orders.sku_id = skus.sku_id\nWHERE\n  skus.sku_id IN (\n    SELECT sku_id FROM seagate_core.seagate_drive_skus\n    WHERE sku_name LIKE '%Cobalt%' OR drive_family LIKE '%Cobalt%'\n  )\n  AND orders.ticket_type = 'STANDARD'\n  AND events.event_date >= '2025-12-01'\n  AND events.event_date < '2026-01-01'\nLIMIT 1000",
+    "answer_summary": null,
+    "result_rows": [],
+    "result_value": null,
+    "row_count": null,
     "wren": {
       "wren_enabled": true,
       "wren_available": false,
@@ -246,14 +233,14 @@
     "level": "L3",
     "question": "What is the True Pass Rate for Plate Spin tests at Tigerline Point?",
     "status": "ok",
-    "sql": "SELECT\n  CAST(COUNT(CASE WHEN qq.result = 'PASS' THEN 1 END) AS FLOAT) / COUNT(*) AS true_pass_rate\nFROM\n  seagate_ops.seagate_quality_tests qq\n  JOIN seagate_ops.seagate_work_orders wo ON qq.work_order_id = wo.work_order_id\n  JOIN seagate_core.seagate_production_lines pl ON wo.line_id = pl.line_id\n  JOIN seagate_core.seagate_sites s ON pl.site_id = s.site_id\nWHERE\n  qq.test_type = 'PLATE_SPIN'\n  AND NOT (qq.result = 'FAIL' AND qq.garnish_defect = true)\n  AND s.site_code = 'SGT'\nLIMIT 1",
-    "answer_summary": "The result includes 1 row(s) with total true pass rate of 0.93.",
+    "sql": "SELECT\n  CAST(SUM(CASE WHEN qt.result = 'PASS' THEN 1 ELSE 0 END) AS FLOAT) / NULLIF(COUNT(*), 0) AS true_pass_rate\nFROM seagate_ops.seagate_quality_tests qt\nJOIN seagate_ops.seagate_work_orders wo ON qt.work_order_id = wo.work_order_id\nJOIN seagate_core.seagate_production_lines pl ON wo.line_id = pl.line_id\nJOIN seagate_core.seagate_sites s ON pl.site_id = s.site_id\nWHERE qt.test_type = 'PLATE_SPIN' AND s.site_code = 'SGT' -- Tigerline Point\nLIMIT 1000",
+    "answer_summary": "The result includes 1 row(s) with total true pass rate of 0.9.",
     "result_rows": [
       {
-        "true_pass_rate": 0.9347826086956522
+        "true_pass_rate": 0.8958333333333334
       }
     ],
-    "result_value": 0.9347826086956522,
+    "result_value": 0.8958333333333334,
     "row_count": 1,
     "wren": {
       "wren_enabled": true,
@@ -271,11 +258,11 @@
     "level": "L3",
     "question": "How many patties were plated during the Moonlight shift in the Diner Week of 2025-12-17 to 2025-12-23?",
     "status": "ok",
-    "sql": "SELECT SUM(seagate_production_events.units_completed) AS plated_patties_moonlight_shift\nFROM seagate_ops.seagate_production_events\nWHERE seagate_production_events.shift_code = 'MOONLIGHT'\n  AND seagate_production_events.event_date >= '2025-12-17'::date\n  AND seagate_production_events.event_date < '2025-12-24'::date\nLIMIT 1000",
-    "answer_summary": "The result includes 1 row(s) with total plated patties moonlight shift of 145.",
+    "sql": "SELECT SUM(seagate_production_events.units_completed) AS plated_patties\nFROM seagate_ops.seagate_production_events\nWHERE seagate_production_events.shift_code = 'MOONLIGHT'\n  AND seagate_production_events.event_date >= '2025-12-17'\n  AND seagate_production_events.event_date < '2025-12-24'\nLIMIT 1000",
+    "answer_summary": "The result includes 1 row(s) with total plated patties of 145.",
     "result_rows": [
       {
-        "plated_patties_moonlight_shift": 145
+        "plated_patties": 145
       }
     ],
     "result_value": 145,
@@ -296,11 +283,11 @@
     "level": "L3",
     "question": "What is the Golden Yield for Short Order tickets at Scotts Valley West?",
     "status": "ok",
-    "sql": "SELECT NULL AS golden_yield_short_order_svw LIMIT 1",
+    "sql": "SELECT NULL AS golden_yield\nLIMIT 1000",
     "answer_summary": "The query returned 1 row(s).",
     "result_rows": [
       {
-        "golden_yield_short_order_svw": null
+        "golden_yield": null
       }
     ],
     "result_value": null,
@@ -320,23 +307,12 @@
     "id": "Q13",
     "level": "L4",
     "question": "For Q4 2025 (2025-10-01 to 2025-12-31), compare the Tigerline and Reef regions on both Golden Yield and on units shipped via Combo pallets through Dine-In fulfillment.",
-    "status": "ok",
-    "sql": "WITH Q4_2025_filtered AS (\n    SELECT\n        w.work_order_id,\n        w.line_id,\n        w.sku_id,\n        w.ticket_type,\n        pe.units_completed,\n        pe.units_scrapped,\n        pe.units_reworked\n    FROM seagate_ops.seagate_work_orders w\n    JOIN seagate_ops.seagate_production_events pe ON w.work_order_id = pe.work_order_id\n    WHERE pe.event_date >= '2025-10-01'::DATE\n      AND pe.event_date <= '2025-12-31'::DATE\n      AND w.ticket_type = 'STANDARD'\n),\n\n-- Calculate Golden Yield by region for Q4 2025\nGolden_Yield_Region AS (\n    SELECT\n        CASE\n            WHEN s.site_code IN ('SGY', 'SGT') THEN 'Tigerline'\n            WHEN s.site_code IN ('SGW', 'SGN') THEN 'Reef'\n            ELSE NULL\n        END AS region,\n        SUM(pe.units_completed - pe.units_scrapped - pe.units_reworked) AS numerator,\n        SUM(pe.units_completed) AS denominator\n    FROM Q4_2025_filtered pe\n    JOIN seagate_core.seagate_production_lines pl ON pe.line_id = pl.line_id\n    JOIN seagate_core.seagate_sites s ON pl.site_id = s.site_id\n    WHERE s.site_code IN ('SGY', 'SGT', 'SGW', 'SGN')\n    GROUP BY region\n),\n\n-- Sum units shipped in Q4 2025 by region with combo pallets and dine-in fulfillment\nShipments_Region AS (\n    SELECT \n        CASE\n            WHEN s.site_code IN ('SGY', 'SGT') THEN 'Tigerline'\n            WHEN s.site_code IN ('SGW', 'SGN') THEN 'Reef'\n            ELSE NULL\n        END AS region,\n        SUM(sh.qty_units) AS units_shipped_combo_dinein\n    FROM seagate_ops.seagate_shipments sh\n    JOIN seagate_ops.seagate_work_orders wo ON sh.work_order_id = wo.work_order_id\n    JOIN seagate_core.seagate_production_lines pl ON wo.line_id = pl.line_id\n    JOIN seagate_core.seagate_sites s ON pl.site_id = s.site_id\n    WHERE sh.ship_date >= '2025-10-01'::DATE\n      AND sh.ship_date <= '2025-12-31'::DATE\n      AND sh.pallet_type = 'COMBO'\n      AND sh.fulfillment_type = 'DINE_IN'\n      AND s.site_code IN ('SGY', 'SGT', 'SGW', 'SGN')\n    GROUP BY region\n)\n\nSELECT\n    gy.region,\n    CASE WHEN gy.denominator = 0 THEN NULL ELSE CAST(gy.numerator AS FLOAT)/gy.denominator END AS golden_yield,\n    COALESCE(sr.units_shipped_combo_dinein, 0) AS units_shipped_combo_dine_in\nFROM Golden_Yield_Region gy\nLEFT JOIN Shipments_Region sr ON gy.region = sr.region\nORDER BY gy.region\nLIMIT 1000",
-    "answer_summary": "Reef has the highest golden yield in the result.",
-    "result_rows": [
-      {
-        "region": "Reef",
-        "golden_yield": 0.9620938628158845,
-        "units_shipped_combo_dine_in": 521
-      },
-      {
-        "region": "Tigerline",
-        "golden_yield": 0.9601885804085909,
-        "units_shipped_combo_dine_in": 729
-      }
-    ],
+    "status": "error",
+    "sql": "WITH event_summary AS (\n  SELECT\n    site_id,\n    SUM(units_completed) AS total_units_completed,\n    SUM(units_scrapped) AS total_units_scrapped,\n    SUM(units_reworked) AS total_units_reworked\n  FROM seagate_core.seagate_production_lines lines\n  JOIN seagate_ops.seagate_work_orders wo ON lines.line_id = wo.line_id\n  JOIN seagate_ops.seagate_production_events pe ON wo.work_order_id = pe.work_order_id\n  WHERE wo.ticket_type = 'STANDARD'\n    AND pe.event_date >= '2025-10-01' AND pe.event_date < '2026-01-01'\n  GROUP BY site_id\n),\nregion_summary AS (\n  SELECT\n    CASE\n      WHEN site_id IN ('SGY', 'SGT') THEN 'Tigerline'\n      WHEN site_id IN ('SGW', 'SGN') THEN 'Reef'\n      ELSE NULL\n    END AS region,\n    SUM((total_units_completed - total_units_scrapped - total_units_reworked)) AS numerator_yield,\n    SUM(total_units_completed) AS denominator_yield\n  FROM (\n    SELECT\n      s.site_code AS site_id,\n      es.total_units_completed,\n      es.total_units_scrapped,\n      es.total_units_reworked\n    FROM event_summary es\n    JOIN seagate_core.seagate_sites s ON es.site_id = s.site_id\n  ) sub\n  WHERE site_id IN ('SGY', 'SGT', 'SGW', 'SGN')\n  GROUP BY region\n),\nshipments_summary AS (\n  SELECT\n    CASE\n      WHEN s.site_id IN ('SGY', 'SGT') THEN 'Tigerline'\n      WHEN s.site_id IN ('SGW', 'SGN') THEN 'Reef'\n      ELSE NULL\n    END AS region,\n    SUM(sh.qty_units) AS units_shipped_combo_dinein\n  FROM seagate_ops.seagate_shipments sh\n  JOIN seagate_ops.seagate_work_orders wo ON sh.work_order_id = wo.work_order_id\n  JOIN seagate_core.seagate_production_lines pl ON wo.line_id = pl.line_id\n  JOIN seagate_core.seagate_sites s ON pl.site_id = s.site_id\n  WHERE sh.pallet_type = 'COMBO'\n    AND sh.fulfillment_type = 'DINE_IN'\n    AND sh.ship_date >= '2025-10-01' AND sh.ship_date < '2026-01-01'\n    AND s.site_code IN ('SGY', 'SGT', 'SGW', 'SGN')\n  GROUP BY region\n)\nSELECT\n  rs.region,\n  CASE WHEN denominator_yield = 0 THEN NULL ELSE (numerator_yield::FLOAT / denominator_yield) END AS golden_yield,\n  COALESCE(ss.units_shipped_combo_dinein, 0) AS units_shipped_combo_dinein\nFROM region_summary rs\nLEFT JOIN shipments_summary ss ON rs.region = ss.region\nORDER BY rs.region\nLIMIT 1000",
+    "answer_summary": null,
+    "result_rows": [],
     "result_value": null,
-    "row_count": 2,
+    "row_count": null,
     "wren": {
       "wren_enabled": true,
       "wren_available": false,
@@ -353,7 +329,7 @@
     "level": "L4",
     "question": "Which region had the higher True Pass Rate on Heat Lamp tests in Q4 2025, excluding Short Order tickets \u2014 Tigerline or Reef?",
     "status": "error",
-    "sql": "WITH region_mapping AS (\n    SELECT 'Tigerline' AS region, site_id FROM seagate_core.seagate_sites WHERE site_code IN ('SGY', 'SGT')\n    UNION ALL\n    SELECT 'Reef' AS region, site_id FROM seagate_core.seagate_sites WHERE site_code IN ('SGW', 'SGN')\n),\nvalid_quality_tests AS (\n    SELECT\n        qt.test_id,\n        qt.work_order_id,\n        qt.result,\n        CASE WHEN qt.result = 'FAIL' AND qt.garnish_defect = true THEN 1 ELSE 0 END AS garnish_fail\n    FROM seagate_ops.seagate_quality_tests qt\n    WHERE qt.test_type = 'HEAT_LAMP'\n),\nfiltered_tests AS (\n    -- Exclude tests where garnish_fail = 1 from numerator and denominator\n    SELECT\n        vt.work_order_id,\n        vt.result\n    FROM valid_quality_tests vt\n    WHERE vt.garnish_fail = 0\n),\nwork_orders_standard AS (\n    SELECT wo.work_order_id, pl.site_id\n    FROM seagate_ops.seagate_work_orders wo\n    JOIN seagate_core.seagate_production_lines pl ON wo.line_id = pl.line_id\n    WHERE wo.ticket_type != 'SHORT_ORDER'\n),\njoined_data AS (\n    SELECT\n        rm.region,\n        ft.result\n    FROM filtered_tests ft\n    JOIN work_orders_standard wo ON ft.work_order_id = wo.work_order_id\n    JOIN region_mapping rm ON wo.site_id = rm.site_id\n    JOIN seagate_ops.seagate_quality_tests qt ON ft.work_order_id = qt.work_order_id AND ft.result = qt.result\n    JOIN seagate_ops.seagate_quality_tests qt_date ON qt.test_id = qt_date.test_id\n    WHERE qt.test_type = 'HEAT_LAMP'\n      AND qt.test_type = qt_date.test_type\n      AND qt.test_type IS NOT NULL\n),\nfiltered_by_date AS (\n    SELECT\n        rm.region,\n        qt.work_order_id,\n        qt.result,\n        qt.test_id,\n        qt.test_type,\n        qt.tested_at\n    FROM seagate_ops.seagate_quality_tests qt\n    JOIN work_orders_standard wo ON qt.work_order_id = wo.work_order_id\n    JOIN seagate_core.seagate_production_lines pl ON wo.line_id = pl.line_id\n    JOIN region_mapping rm ON pl.site_id = rm.site_id\n    WHERE qt.test_type = 'HEAT_LAMP'\n      AND qt.tested_at >= '2025-10-01'::date\n      AND qt.tested_at < '2026-01-01'::date\n),\nvalid_tests_filtered AS (\n    -- exclude rows with fail + garnish_defect = true\n    SELECT\n        ftf.region,\n        ftf.result\n    FROM filtered_by_date ftf\n    LEFT JOIN seagate_ops.seagate_quality_tests qtg ON ftf.test_id = qtg.test_id AND qtg.result = 'FAIL' AND qtg.garnish_defect = true\n    WHERE NOT (ftf.result = 'FAIL' AND qtg.garnish_defect = true)\n)\nSELECT\n    region,\n    CASE WHEN COUNT(*) > 0 THEN CAST(COUNT(CASE WHEN result = 'PASS' THEN 1 END) AS float) / COUNT(*) ELSE NULL END AS true_pass_rate\nFROM valid_tests_filtered\nGROUP BY region\nORDER BY true_pass_rate DESC\nLIMIT 2",
+    "sql": "WITH quality_filtered AS (\n    SELECT qt.*, wo.ticket_type, pl.site_id\n    FROM seagate_ops.seagate_quality_tests qt\n    JOIN seagate_ops.seagate_work_orders wo ON qt.work_order_id = wo.work_order_id\n    JOIN seagate_core.seagate_production_lines pl ON wo.line_id = pl.line_id\n    WHERE qt.test_type = 'HEAT_LAMP'\n      AND qt.tested_at >= '2025-10-01' AND qt.tested_at < '2026-01-01'\n      AND wo.ticket_type != 'SHORT_ORDER'\n      AND NOT (qt.result = 'FAIL' AND garnish_defect = true)\n),\npass_fail_counts AS (\n    SELECT\n        site_id,\n        COUNT(CASE WHEN result = 'PASS' THEN 1 END) AS pass_count,\n        COUNT(*) AS total_count\n    FROM quality_filtered\n    GROUP BY site_id\n),\nregions AS (\n    SELECT 'Tigerline' AS region, site_id FROM seagate_core.seagate_sites WHERE site_id IN ('SGY', 'SGT')\n    UNION ALL\n    SELECT 'Reef' AS region, site_id FROM seagate_core.seagate_sites WHERE site_id IN ('SGW', 'SGN')\n),\nregion_pass_fail AS (\n    SELECT r.region, SUM(pfc.pass_count) AS total_pass, SUM(pfc.total_count) AS total_tests\n    FROM pass_fail_counts pfc\n    JOIN regions r ON pfc.site_id = r.site_id\n    GROUP BY r.region\n)\nSELECT region,\n       total_pass * 1.0 / NULLIF(total_tests, 0) AS true_pass_rate\nFROM region_pass_fail\nORDER BY true_pass_rate DESC\nLIMIT 1",
     "answer_summary": null,
     "result_rows": [],
     "result_value": null,
@@ -374,7 +350,7 @@
     "level": "L4",
     "question": "For Nimbus-family shipments that went Dine-In in the last 60 days (2025-11-02 to 2025-12-31), what share of shipped units rode on Combo pallets, by region?",
     "status": "error",
-    "sql": "SELECT\n  CASE\n    WHEN s.site_id IN ('SGY', 'SGT') THEN 'Tigerline'\n    WHEN s.site_id IN ('SGW', 'SGN') THEN 'Reef'\n    ELSE 'Other'\n  END AS region,\n  SUM(CASE WHEN sh.pallet_type = 'COMBO' THEN sh.qty_units ELSE 0 END) * 1.0 / NULLIF(SUM(sh.qty_units), 0) AS combo_pallet_share\nFROM seagate_ops.seagate_shipments sh\nJOIN seagate_ops.seagate_work_orders wo ON sh.work_order_id = wo.work_order_id\nJOIN seagate_core.seagate_drive_skus sk ON wo.sku_id = sk.sku_id\nJOIN seagate_core.seagate_production_lines pl ON wo.line_id = pl.line_id\nJOIN seagate_core.seagate_sites s ON pl.site_id = s.site_id\nWHERE sk.sku_id IN (\n  SELECT sku_id FROM seagate_core.seagate_drive_skus WHERE sku_id IS NOT NULL AND sku_id IN (\n    SELECT sku_id FROM seagate_core.seagate_drive_skus\n    WHERE sku_id IN ('Nimbus-family')\n  )\n) -- Note: Without explicit Nimbus-family sku_id values, assuming filtering needed\nAND sh.fulfillment_type = 'DINE_IN'\nAND sh.ship_date >= DATE '2025-11-02' AND sh.ship_date <= DATE '2025-12-31'\nAND region IN ('Tigerline', 'Reef')\nGROUP BY region\nLIMIT 100",
+    "sql": "WITH NimbusSku AS (\n  SELECT sku_id\n  FROM seagate_core.seagate_drive_skus\n  WHERE family = 'Nimbus'\n),\nDineInShipments AS (\n  SELECT\n    sh.work_order_id,\n    sh.qty_units,\n    sh.pallet_type,\n    CASE\n      WHEN si.site_code IN ('SGY', 'SGT') THEN 'Tigerline'\n      WHEN si.site_code IN ('SGW', 'SGN') THEN 'Reef'\n      ELSE 'Other'\n    END AS region\n  FROM seagate_ops.seagate_shipments sh\n  JOIN seagate_ops.seagate_work_orders wo ON sh.work_order_id = wo.work_order_id\n  JOIN seagate_core.seagate_production_lines pl ON wo.line_id = pl.line_id\n  JOIN seagate_core.seagate_sites si ON pl.site_id = si.site_id\n  WHERE sh.fulfillment_type = 'DINE_IN'\n    AND sh.ship_date BETWEEN '2025-11-02' AND '2025-12-31'\n    AND wo.sku_id IN (SELECT sku_id FROM NimbusSku)\n)\nSELECT\n  region,\n  SUM(CASE WHEN pallet_type = 'COMBO' THEN qty_units ELSE 0 END) * 1.0 / SUM(qty_units) AS share_combo_pallet_units\nFROM DineInShipments\nWHERE region IN ('Tigerline', 'Reef')\nGROUP BY region\nORDER BY region\nLIMIT 100",
     "answer_summary": null,
     "result_rows": [],
     "result_value": null,
@@ -394,12 +370,21 @@
     "id": "Q16",
     "level": "L5",
     "question": "How many patties were plated on WARM lines, company-wide, broken down by drive family?",
-    "status": "error",
-    "sql": "SELECT d.family AS drive_family,\n       SUM(pe.units_completed) AS total_patties_plated\nFROM seagate_ops.seagate_production_events pe\nJOIN seagate_ops.seagate_work_orders wo ON pe.work_order_id = wo.work_order_id\nJOIN seagate_core.seagate_production_lines pl ON wo.line_id = pl.line_id\nJOIN seagate_core.seagate_drive_skus d ON wo.sku_id = d.sku_id\nWHERE pl.status = 'WARM'\nGROUP BY d.family\nORDER BY d.family\nLIMIT 500",
-    "answer_summary": null,
-    "result_rows": [],
+    "status": "ok",
+    "sql": "SELECT dsku.drive_family AS drive_family, SUM(spe.units_completed) AS patties_plated\nFROM seagate_ops.seagate_production_events spe\nJOIN seagate_ops.seagate_work_orders swo ON spe.work_order_id = swo.work_order_id\nJOIN seagate_core.seagate_production_lines spl ON swo.line_id = spl.line_id\nJOIN seagate_core.seagate_drive_skus dsku ON swo.sku_id = dsku.sku_id\nWHERE spl.status = 'WARM'\nGROUP BY dsku.drive_family\nORDER BY dsku.drive_family\nLIMIT 500",
+    "answer_summary": "Vantage has the highest patties plated in the result.",
+    "result_rows": [
+      {
+        "drive_family": "Cobalt",
+        "patties_plated": 1751
+      },
+      {
+        "drive_family": "Vantage",
+        "patties_plated": 3017
+      }
+    ],
     "result_value": null,
-    "row_count": null,
+    "row_count": 2,
     "wren": {
       "wren_enabled": true,
       "wren_available": false,
@@ -416,7 +401,7 @@
     "level": "L5",
     "question": "What was the Golden Yield for the Vantage drive family in Q4 2025 (2025-10-01 to 2025-12-31)?",
     "status": "error",
-    "sql": "SELECT\n  SUM(seagate_ops.seagate_production_events.units_completed - seagate_ops.seagate_production_events.units_scrapped - seagate_ops.seagate_production_events.units_reworked)::FLOAT / NULLIF(SUM(seagate_ops.seagate_production_events.units_completed), 0) AS golden_yield\nFROM seagate_ops.seagate_production_events\nINNER JOIN seagate_ops.seagate_work_orders ON seagate_ops.seagate_production_events.work_order_id = seagate_ops.seagate_work_orders.work_order_id\nINNER JOIN seagate_core.seagate_drive_skus ON seagate_ops.seagate_work_orders.sku_id = seagate_core.seagate_drive_skus.sku_id\nWHERE seagate_core.seagate_drive_skus.sku_id IN (\n    SELECT sku_id\n    FROM seagate_core.seagate_drive_skus\n    WHERE sku_id IS NOT NULL\n      AND sku_id IN (\n         SELECT sku_id\n         FROM seagate_core.seagate_drive_skus\n         WHERE sku_id IS NOT NULL\n      )\n      AND sku_family = 'Vantage'\n) AND seagate_ops.seagate_production_events.event_date >= '2025-10-01'\n  AND seagate_ops.seagate_production_events.event_date < '2026-01-01'\n  AND seagate_ops.seagate_work_orders.ticket_type = 'STANDARD'\nLIMIT 1000",
+    "sql": "SELECT\n  SUM(units_completed - units_scrapped - units_reworked)::FLOAT / NULLIF(SUM(units_completed), 0) AS golden_yield\nFROM\n  seagate_ops.seagate_production_events AS pe\nJOIN\n  seagate_ops.seagate_work_orders AS wo\n  ON pe.work_order_id = wo.work_order_id\nJOIN\n  seagate_core.seagate_drive_skus AS sku\n  ON wo.sku_id = sku.sku_id\nWHERE\n  sku.sku_id IN (\n    SELECT sku_id\n    FROM seagate_core.seagate_drive_skus\n    WHERE sku_name LIKE 'Vantage%'\n  )\n  AND wo.ticket_type = 'STANDARD'\n  AND pe.event_date >= '2025-10-01'\n  AND pe.event_date < '2026-01-01'\nLIMIT 1",
     "answer_summary": null,
     "result_rows": [],
     "result_value": null,
@@ -436,12 +421,12 @@
     "id": "Q18",
     "level": "L5",
     "question": "For the Nimbus family in Q4 2025, how many Combo-pallet Dine-In units did the Tigerline and Reef regions each ship, and what was each region's Golden Yield over the same window?",
-    "status": "error",
-    "sql": "WITH region_sites AS (\n    SELECT 'Tigerline' AS region, site_id\n    FROM seagate_core.seagate_sites\n    WHERE site_code IN ('SGY', 'SGT')\n    UNION ALL\n    SELECT 'Reef' AS region, site_id\n    FROM seagate_core.seagate_sites\n    WHERE site_code IN ('SGW', 'SGN')\n), filtered_skus AS (\n    SELECT sku_id\n    FROM seagate_core.seagate_drive_skus\n    WHERE sku_family = 'Nimbus'\n), filtered_work_orders AS (\n    SELECT wo.work_order_id, pl.site_id, wo.sku_id\n    FROM seagate_ops.seagate_work_orders wo\n    JOIN seagate_core.seagate_production_lines pl ON wo.line_id = pl.line_id\n    WHERE wo.sku_id IN (SELECT sku_id FROM filtered_skus)\n      AND wo.ticket_type = 'STANDARD'\n), filtered_events AS (\n    SELECT pe.work_order_id, pe.units_completed, pe.units_scrapped, pe.units_reworked\n    FROM seagate_ops.seagate_production_events pe\n    JOIN filtered_work_orders wo ON pe.work_order_id = wo.work_order_id\n    WHERE pe.event_date >= '2025-10-01' AND pe.event_date < '2026-01-01'\n), golden_yield_calc AS (\n    SELECT fs.site_id, \n           SUM(pe.units_completed - pe.units_scrapped - pe.units_reworked) AS numerator,\n           SUM(pe.units_completed) AS denominator\n    FROM filtered_events pe\n    JOIN filtered_work_orders fs ON pe.work_order_id = fs.work_order_id\n    GROUP BY fs.site_id\n), shipments_filtered AS (\n    SELECT s.work_order_id, s.qty_units, s.fulfillment_type, s.pallet_type, wo.sku_id, pl.site_id\n    FROM seagate_ops.seagate_shipments s\n    JOIN seagate_ops.seagate_work_orders wo ON s.work_order_id = wo.work_order_id\n    JOIN seagate_core.seagate_production_lines pl ON wo.line_id = pl.line_id\n    WHERE s.ship_date >= '2025-10-01' AND s.ship_date < '2026-01-01'\n      AND s.pallet_type = 'COMBO'\n      AND s.fulfillment_type = 'DINE_IN'\n      AND wo.sku_id IN (SELECT sku_id FROM filtered_skus)\n), region_shipment_units AS (\n    SELECT rs.region, SUM(fs.qty_units) AS combo_dinein_units\n    FROM shipments_filtered fs\n    JOIN region_sites rs ON fs.site_id = rs.site_id\n    GROUP BY rs.region\n), region_golden_yield AS (\n    SELECT rs.region, \n           SUM(gy.numerator) AS numerator,\n           SUM(gy.denominator) AS denominator\n    FROM golden_yield_calc gy\n    JOIN region_sites rs ON gy.site_id = rs.site_id\n    GROUP BY rs.region\n)\nSELECT\n    shu.region,\n    COALESCE(shu.combo_dinein_units, 0) AS combo_dinein_units,\n    CASE WHEN rgy.denominator > 0 THEN ROUND(CAST(rgy.numerator AS NUMERIC) / rgy.denominator, 4) ELSE NULL END AS golden_yield\nFROM region_shipment_units shu\nFULL OUTER JOIN region_golden_yield rgy ON shu.region = rgy.region\nORDER BY shu.region\nLIMIT 1000",
-    "answer_summary": null,
+    "status": "ok",
+    "sql": "WITH regions AS (\n  SELECT 'Tigerline' AS region_name, unnest(array['SGY', 'SGT']) AS site_code\n  UNION ALL\n  SELECT 'Reef' AS region_name, unnest(array['SGW', 'SGN']) AS site_code\n),\nfiltered_sites AS (\n  SELECT s.site_id, s.site_code\n  FROM seagate_core.seagate_sites s\n  JOIN regions r ON s.site_code = r.site_code\n),\nnimbus_skus AS (\n  SELECT sku_id\n  FROM seagate_core.seagate_drive_skus\n  WHERE sku_id IN (\n    SELECT sku_id FROM seagate_core.seagate_drive_skus WHERE lower(sku_id::text) LIKE '%nimbus%'\n  ) OR lower(sku_id::text) LIKE '%nimbus%'\n),\nwork_orders_filtered AS (\n  SELECT wo.work_order_id, wo.line_id, wo.sku_id, wo.ticket_type\n  FROM seagate_ops.seagate_work_orders wo\n  JOIN filtered_sites fs ON EXISTS (\n    SELECT 1 FROM seagate_core.seagate_production_lines pl WHERE pl.line_id = wo.line_id AND pl.site_id = fs.site_id\n  )\n  WHERE wo.sku_id IN (SELECT sku_id FROM nimbus_skus)\n),\nproduction_events_filtered AS (\n  SELECT pe.work_order_id, pe.units_completed, pe.units_scrapped, pe.units_reworked, pe.event_date\n  FROM seagate_ops.seagate_production_events pe\n  WHERE pe.event_date >= '2025-10-01' AND pe.event_date < '2026-01-01'\n),\nshipments_filtered AS (\n  SELECT sh.work_order_id, sh.qty_units, sh.pallet_type, sh.fulfillment_type, sh.ship_date\n  FROM seagate_ops.seagate_shipments sh\n  WHERE sh.ship_date >= '2025-10-01' AND sh.ship_date < '2026-01-01'\n    AND sh.pallet_type = 'COMBO'\n    AND sh.fulfillment_type = 'DINE_IN'\n),\nregion_shipments AS (\n  SELECT r.region_name, SUM(sh.qty_units) AS shipped_units\n  FROM shipments_filtered sh\n  JOIN work_orders_filtered wo ON sh.work_order_id = wo.work_order_id\n  JOIN seagate_core.seagate_production_lines pl ON wo.line_id = pl.line_id\n  JOIN filtered_sites fs ON pl.site_id = fs.site_id\n  JOIN regions r ON fs.site_code = r.site_code\n  GROUP BY r.region_name\n),\nregion_golden_yield AS (\n  SELECT r.region_name,\n    SUM(pe.units_completed - pe.units_scrapped - pe.units_reworked)::float / NULLIF(SUM(pe.units_completed), 0) AS golden_yield\n  FROM production_events_filtered pe\n  JOIN work_orders_filtered wo ON pe.work_order_id = wo.work_order_id\n  JOIN seagate_core.seagate_production_lines pl ON wo.line_id = pl.line_id\n  JOIN filtered_sites fs ON pl.site_id = fs.site_id\n  JOIN regions r ON fs.site_code = r.site_code\n  WHERE wo.ticket_type = 'STANDARD'\n  GROUP BY r.region_name\n)\nSELECT\n  COALESCE(rs.region_name, gy.region_name) AS region_name,\n  COALESCE(rs.shipped_units, 0) AS combo_pallet_dine_in_units_shipped,\n  COALESCE(gy.golden_yield, 0) AS golden_yield\nFROM region_shipments rs\nFULL OUTER JOIN region_golden_yield gy ON rs.region_name = gy.region_name\nORDER BY region_name\nLIMIT 1000",
+    "answer_summary": "No rows were returned for this query.",
     "result_rows": [],
     "result_value": null,
-    "row_count": null,
+    "row_count": 0,
     "wren": {
       "wren_enabled": true,
       "wren_available": false,

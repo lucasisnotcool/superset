@@ -380,6 +380,13 @@ export default function SemanticLayerEditor({
   const [isDuplicating, setIsDuplicating] = useState(false);
   const [isRenaming, setIsRenaming] = useState(false);
   const [showNewProject, setShowNewProject] = useState(false);
+  const [isCreatingProject, setIsCreatingProject] = useState(false);
+  // Delete-project confirmation (parity with Reset): a dialog gates the
+  // destructive delete, and the spinner shows while it is in flight.
+  const [deleteTarget, setDeleteTarget] = useState<SemanticProject | null>(
+    null,
+  );
+  const [isDeletingProject, setIsDeletingProject] = useState(false);
   const [mdlFiles, setMdlFiles] = useState<MdlFile[]>([]);
   const [documents, setDocuments] = useState<SemanticDocument[]>([]);
   const [state, setState] = useState<SemanticLayerState | null>(null);
@@ -737,7 +744,10 @@ export default function SemanticLayerEditor({
       if (chosen.length === 0) {
         return;
       }
-      setShowNewProject(false);
+      // Keep the dialog open with a spinner until the project is created (the
+      // server proves access to every chosen schema, which can take a moment);
+      // close only on success so a failure leaves the form up to retry.
+      setIsCreatingProject(true);
       try {
         const created = await createSemanticProject({
           database_id: databaseId,
@@ -747,6 +757,7 @@ export default function SemanticLayerEditor({
           name: name || undefined,
         });
         reloadProjects();
+        setShowNewProject(false);
         await openProject(created);
         dispatch(addSuccessToast(t('Project created.')));
       } catch (ex) {
@@ -755,6 +766,8 @@ export default function SemanticLayerEditor({
             ex instanceof Error ? ex.message : t('Unable to create project'),
           ),
         );
+      } finally {
+        setIsCreatingProject(false);
       }
     },
     [databaseId, catalogName, openProject, reloadProjects, dispatch],
@@ -807,26 +820,42 @@ export default function SemanticLayerEditor({
     dispatch,
   ]);
 
+  // Delete is destructive (it removes the project and all its MDL), so it is
+  // gated behind a confirmation dialog — parity with Reset. The menu action only
+  // opens the dialog; the dialog's confirm performs the delete with a spinner.
   const handleDeleteProject = useCallback(
-    async (projectId: string) => {
-      try {
-        await deleteSemanticProject(projectId);
-        reloadProjects();
-        if (selectedProjectIdRef.current === projectId) {
-          selectedProjectIdRef.current = null;
-          await refresh();
-        }
-        dispatch(addSuccessToast(t('Project deleted.')));
-      } catch (ex) {
-        dispatch(
-          addDangerToast(
-            ex instanceof Error ? ex.message : t('Unable to delete project'),
-          ),
-        );
+    (projectId: string) => {
+      const target = projects.find(p => p.id === projectId);
+      if (target) {
+        setDeleteTarget(target);
       }
     },
-    [refresh, reloadProjects, dispatch],
+    [projects],
   );
+
+  const handleDeleteConfirm = useCallback(async () => {
+    if (!deleteTarget) return;
+    const target = deleteTarget;
+    setIsDeletingProject(true);
+    try {
+      await deleteSemanticProject(target.id);
+      reloadProjects();
+      if (selectedProjectIdRef.current === target.id) {
+        selectedProjectIdRef.current = null;
+        await refresh();
+      }
+      dispatch(addSuccessToast(t('Project deleted.')));
+      setDeleteTarget(null);
+    } catch (ex) {
+      dispatch(
+        addDangerToast(
+          ex instanceof Error ? ex.message : t('Unable to delete project'),
+        ),
+      );
+    } finally {
+      setIsDeletingProject(false);
+    }
+  }, [deleteTarget, refresh, reloadProjects, dispatch]);
 
   const handleRenameSubmit = useCallback(async () => {
     if (!renameTarget) return;
@@ -1517,7 +1546,11 @@ export default function SemanticLayerEditor({
                                 ? t('Deactivate all')
                                 : t('Activate all')}
                             </Button>
-                            <Flex gap="small" wrap="wrap">
+                            {/* One action per row, each full-width — matching the
+                                block "Activate/Deactivate all" above, so a button
+                                that is alone on its row fills it rather than
+                                hugging the left edge. */}
+                            <Flex vertical gap="small">
                               <input
                                 ref={uploadInputRef}
                                 type="file"
@@ -1537,6 +1570,7 @@ export default function SemanticLayerEditor({
                                 )}
                               >
                                 <Button
+                                  block
                                   buttonStyle="tertiary"
                                   disabled={
                                     !project ||
@@ -1555,6 +1589,7 @@ export default function SemanticLayerEditor({
                                 </Button>
                               </Tooltip>
                               <Button
+                                block
                                 buttonStyle="tertiary"
                                 loading={isResetting}
                                 disabled={
@@ -1775,6 +1810,21 @@ export default function SemanticLayerEditor({
                 <Skeleton active paragraph={{ rows: 8 }} />
               </SkeletonBody>
             </WorkspacePane>
+          ) : isListLoading ? (
+            // The project list is still loading, so nothing can be selected yet:
+            // show a patience state here too rather than the "Select a project"
+            // hint (which would wrongly imply the list is ready and empty).
+            <EmptyWorkspace data-test="mdl-list-loading">
+              <Flex vertical align="center" gap="small">
+                <Icons.LoadingOutlined
+                  iconSize="xl"
+                  aria-label={t('Loading projects')}
+                />
+                <Typography.Text type="secondary">
+                  {t('Loading projects…')}
+                </Typography.Text>
+              </Flex>
+            </EmptyWorkspace>
           ) : (
             <EmptyWorkspace data-test="mdl-empty">
               {t('Select a project to open, or create one.')}
@@ -1825,6 +1875,20 @@ export default function SemanticLayerEditor({
         onClose={() => setShowProvenance(false)}
       />
       <ConfirmModal
+        show={!!deleteTarget}
+        onHide={() => setDeleteTarget(null)}
+        onConfirm={handleDeleteConfirm}
+        loading={isDeletingProject}
+        confirmText={t('Delete')}
+        confirmButtonStyle="danger"
+        title={t('Delete project?')}
+        body={t(
+          'This permanently deletes “%(name)s” — its models, uploaded ' +
+            'documents, and history. This cannot be undone.',
+          { name: deleteTarget?.name ?? '' },
+        )}
+      />
+      <ConfirmModal
         show={showResetConfirm}
         onHide={() => setShowResetConfirm(false)}
         onConfirm={resetProject}
@@ -1864,6 +1928,7 @@ export default function SemanticLayerEditor({
         catalogName={catalogName}
         onSubmit={handleCreateSubmit}
         onCancel={() => setShowNewProject(false)}
+        creating={isCreatingProject}
       />
       <ConfirmModal
         show={!!duplicateTarget}

@@ -5,27 +5,132 @@
     "seagate_ops"
   ],
   "backend": "postgresql",
-  "headline": [
+  "trials": 3,
+  "aggregate": [
     {
       "condition": "basic",
-      "correct_of_18": 2,
-      "cross_schema_only_of_3": 0
+      "trials": 3,
+      "correct_of_18": {
+        "mean": 2.33,
+        "min": 2,
+        "max": 3
+      },
+      "cross_schema_only_of_3": {
+        "mean": 0.0,
+        "min": 0,
+        "max": 0
+      }
     },
     {
       "condition": "context_dump",
-      "correct_of_18": 9,
-      "cross_schema_only_of_3": 1
+      "trials": 3,
+      "correct_of_18": {
+        "mean": 9.0,
+        "min": 9,
+        "max": 9
+      },
+      "cross_schema_only_of_3": {
+        "mean": 1.0,
+        "min": 1,
+        "max": 1
+      }
     },
     {
       "condition": "wren_base",
-      "correct_of_18": 5,
-      "cross_schema_only_of_3": 1
+      "trials": 3,
+      "correct_of_18": {
+        "mean": 4.33,
+        "min": 3,
+        "max": 5
+      },
+      "cross_schema_only_of_3": {
+        "mean": 1.0,
+        "min": 0,
+        "max": 2
+      }
     },
     {
       "condition": "wren_bi",
-      "correct_of_18": 9,
-      "cross_schema_only_of_3": 2
+      "trials": 3,
+      "correct_of_18": {
+        "mean": 5.67,
+        "min": 4,
+        "max": 7
+      },
+      "cross_schema_only_of_3": {
+        "mean": 0.67,
+        "min": 0,
+        "max": 1
+      }
     }
+  ],
+  "per_trial_headlines": [
+    [
+      {
+        "condition": "basic",
+        "correct_of_18": 3,
+        "cross_schema_only_of_3": 0
+      },
+      {
+        "condition": "context_dump",
+        "correct_of_18": 9,
+        "cross_schema_only_of_3": 1
+      },
+      {
+        "condition": "wren_base",
+        "correct_of_18": 5,
+        "cross_schema_only_of_3": 2
+      },
+      {
+        "condition": "wren_bi",
+        "correct_of_18": 7,
+        "cross_schema_only_of_3": 1
+      }
+    ],
+    [
+      {
+        "condition": "basic",
+        "correct_of_18": 2,
+        "cross_schema_only_of_3": 0
+      },
+      {
+        "condition": "context_dump",
+        "correct_of_18": 9,
+        "cross_schema_only_of_3": 1
+      },
+      {
+        "condition": "wren_base",
+        "correct_of_18": 5,
+        "cross_schema_only_of_3": 1
+      },
+      {
+        "condition": "wren_bi",
+        "correct_of_18": 6,
+        "cross_schema_only_of_3": 1
+      }
+    ],
+    [
+      {
+        "condition": "basic",
+        "correct_of_18": 2,
+        "cross_schema_only_of_3": 0
+      },
+      {
+        "condition": "context_dump",
+        "correct_of_18": 9,
+        "cross_schema_only_of_3": 1
+      },
+      {
+        "condition": "wren_base",
+        "correct_of_18": 3,
+        "cross_schema_only_of_3": 0
+      },
+      {
+        "condition": "wren_bi",
+        "correct_of_18": 4,
+        "cross_schema_only_of_3": 0
+      }
+    ]
   ],
   "selection_metrics": {
     "precision": 0.583,

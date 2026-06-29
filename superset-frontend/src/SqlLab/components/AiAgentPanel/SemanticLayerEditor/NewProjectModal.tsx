@@ -36,6 +36,8 @@ export interface NewProjectModalProps {
   /** Called with the chosen name (may be blank) + schema set (first = primary). */
   onSubmit: (params: { name: string; schemaNames: string[] }) => void;
   onCancel: () => void;
+  /** True while the project is being created — spins Create, locks the form. */
+  creating?: boolean;
 }
 
 /**
@@ -50,6 +52,7 @@ export default function NewProjectModal({
   catalogName,
   onSubmit,
   onCancel,
+  creating = false,
 }: NewProjectModalProps) {
   const [name, setName] = useState('');
   const [schemaNames, setSchemaNames] = useState<string[]>([]);
@@ -80,12 +83,17 @@ export default function NewProjectModal({
       title={t('New project')}
       footer={
         <>
-          <Button buttonStyle="secondary" onClick={onCancel}>
+          <Button
+            buttonStyle="secondary"
+            disabled={creating}
+            onClick={onCancel}
+          >
             {t('Cancel')}
           </Button>
           <Button
             buttonStyle="primary"
-            disabled={!canCreate}
+            loading={creating}
+            disabled={!canCreate || creating}
             data-test="new-project-create"
             onClick={() => onSubmit({ name: name.trim(), schemaNames })}
           >

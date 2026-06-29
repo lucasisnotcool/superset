@@ -204,25 +204,46 @@ class AgentClient:
 
     # --- low-level request helpers --------------------------------------- #
 
+    def _request(
+        self, base: str, method: str, path: str, **kwargs: Any
+    ) -> requests.Response:
+        """Send a request; on a 401 (expired JWT), re-login once and retry.
+
+        Long multi-turn runs outlive the Superset access token, so a mid-run call
+        can 401. ``_reauthing`` guards against recursion (``login`` itself calls
+        ``_superset``). Streaming requests are not retried (the body iterator is
+        already consumed) — they re-auth on the next non-stream call.
+        """
+
+        def send() -> requests.Response:
+            headers = {**self.auth_headers, **kwargs.get("headers", {})}
+            return self.session.request(
+                method,
+                f"{base}{path}",
+                headers={**headers},
+                timeout=self.config.request_timeout,
+                **{k: v for k, v in kwargs.items() if k != "headers"},
+            )
+
+        resp = send()
+        if (
+            resp.status_code == 401
+            and not getattr(self, "_reauthing", False)
+            and not kwargs.get("stream")
+        ):
+            self._reauthing = True
+            try:
+                self.login()
+            finally:
+                self._reauthing = False
+            resp = send()
+        return resp
+
     def _agent(self, method: str, path: str, **kwargs: Any) -> requests.Response:
-        headers = {**self.auth_headers, **kwargs.pop("headers", {})}
-        return self.session.request(
-            method,
-            f"{self.config.agent_base_url}{path}",
-            headers=headers,
-            timeout=self.config.request_timeout,
-            **kwargs,
-        )
+        return self._request(self.config.agent_base_url, method, path, **kwargs)
 
     def _superset(self, method: str, path: str, **kwargs: Any) -> requests.Response:
-        headers = {**self.auth_headers, **kwargs.pop("headers", {})}
-        return self.session.request(
-            method,
-            f"{self.config.superset_base_url}{path}",
-            headers=headers,
-            timeout=self.config.request_timeout,
-            **kwargs,
-        )
+        return self._request(self.config.superset_base_url, method, path, **kwargs)
 
     @staticmethod
     def _ok(resp: requests.Response, what: str) -> dict[str, Any]:
@@ -701,7 +722,7 @@ def grade_one(q: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
             "got": result.get("error"),
         }
 
-    answer = (result.get("answer_summary") or "")
+    answer = result.get("answer_summary") or ""
     got_text = f"{answer} {result.get('result_value')} {result.get('result_rows')}"
     got_nums = _numbers(got_text)
 

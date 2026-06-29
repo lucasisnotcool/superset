@@ -944,6 +944,107 @@ test('toggling a file spins only that switch, not the bulk button (G3/G4 keyed s
   );
 });
 
+test('main editor shows a loading state while the project list loads (#4)', async () => {
+  mockBaseRoutes([]);
+  let releaseList: (value: unknown) => void = () => {};
+  fetchMock.get(
+    'begin:http://agent.local/agent/semantic-layer/projects?',
+    new Promise(resolve => {
+      releaseList = resolve;
+    }),
+  );
+
+  render(
+    <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="" />,
+    { useRedux: true },
+  );
+
+  // While the list is loading, the main area shows a patience state — not the
+  // "Select a project" hint (which would imply the list is ready and empty).
+  expect(await screen.findByTestId('mdl-list-loading')).toBeInTheDocument();
+  expect(screen.queryByTestId('mdl-empty')).not.toBeInTheDocument();
+
+  releaseList([]);
+
+  // List resolved with nothing to open → the empty hint takes over.
+  expect(await screen.findByTestId('mdl-empty')).toBeInTheDocument();
+  expect(screen.queryByTestId('mdl-list-loading')).not.toBeInTheDocument();
+});
+
+test('Upload and Reset are full-width block buttons (#2)', async () => {
+  mockBaseRoutes([mdlFile('a', 'models/a.json')]);
+  fetchMock.get(
+    'http://agent.local/agent/semantic-layer/projects/project-1',
+    project,
+  );
+  fetchMock.get(
+    'http://agent.local/agent/semantic-layer/projects/project-1/documents',
+    [],
+  );
+  fetchMock.get('begin:http://agent.local/agent/semantic-layer/projects?', [
+    project,
+  ]);
+
+  render(
+    <SemanticLayerEditor
+      databaseId={1}
+      catalogName="prod"
+      schemaName="main"
+      projectId="project-1"
+    />,
+    { useRedux: true },
+  );
+
+  await screen.findByTestId('mdl-workspace');
+  expect(
+    screen.getByTestId('semantic-upload-document').closest('button'),
+  ).toHaveClass('ant-btn-block');
+  expect(screen.getByRole('button', { name: /Reset/i })).toHaveClass(
+    'ant-btn-block',
+  );
+});
+
+test('deleting a project confirms first, then deletes (#3)', async () => {
+  mockBaseRoutes([]);
+  fetchMock.get('begin:http://agent.local/agent/semantic-layer/projects?', [
+    project,
+  ]);
+  fetchMock.delete(
+    'http://agent.local/agent/semantic-layer/projects/project-1',
+    { deleted: true },
+  );
+
+  render(
+    <SemanticLayerEditor databaseId={1} catalogName="prod" schemaName="" />,
+    { useRedux: true },
+  );
+
+  await screen.findByText('Database 1.prod.main');
+  await userEvent.click(screen.getByTestId('project-actions'));
+  await userEvent.click(await screen.findByTestId('project-delete'));
+
+  // A confirmation dialog appears — the delete is NOT fired immediately.
+  const dialog = await screen.findByRole('dialog');
+  expect(within(dialog).getByText(/Delete project/i)).toBeInTheDocument();
+  expect(
+    fetchMock.callHistory.calls(
+      'http://agent.local/agent/semantic-layer/projects/project-1',
+    ),
+  ).toHaveLength(0);
+
+  // Confirming performs the delete.
+  await userEvent.click(
+    within(dialog).getByRole('button', { name: /^Delete$/i }),
+  );
+  await waitFor(() =>
+    expect(
+      fetchMock.callHistory.calls(
+        'http://agent.local/agent/semantic-layer/projects/project-1',
+      ),
+    ).toHaveLength(1),
+  );
+});
+
 test('deep-link entry shows a workspace skeleton until the project opens (G2)', async () => {
   // The deep-linked Lab tab seeds `isOpening` from `projectId`, so the very first
   // paint is a skeleton — never the `mdl-empty` "Select a project" state, which

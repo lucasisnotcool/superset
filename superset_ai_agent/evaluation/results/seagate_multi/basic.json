@@ -4,11 +4,11 @@
     "level": "L1",
     "question": "How many patties got 86'd on 2025-10-30?",
     "status": "ok",
-    "sql": "SELECT COALESCE(SUM(units_scrapped), 0) AS patties_86d\nFROM seagate_ops.seagate_production_events\nWHERE event_date::date = '2025-10-30'\nLIMIT 1000",
-    "answer_summary": "The result includes 1 row(s) with total patties 86d of 6.",
+    "sql": "SELECT SUM(units_scrapped) AS patties_86d_count\nFROM seagate_ops.seagate_production_events\nWHERE event_date::date = '2025-10-30'\nLIMIT 1000",
+    "answer_summary": "The result includes 1 row(s) with total patties 86d count of 6.",
     "result_rows": [
       {
-        "patties_86d": 6
+        "patties_86d_count": 6
       }
     ],
     "result_value": 6,
@@ -29,11 +29,11 @@
     "level": "L1",
     "question": "How many tickets are currently short order and not yet closed?",
     "status": "ok",
-    "sql": "SELECT COUNT(*) AS count\nFROM seagate_ops.seagate_work_orders\nWHERE ticket_type = 'short order' AND closed_at IS NULL\nLIMIT 1000",
-    "answer_summary": "The result includes 1 row(s) with total count of 0.",
+    "sql": "SELECT COUNT(*) AS short_order_open_tickets_count\nFROM seagate_ops.seagate_work_orders\nWHERE ticket_type = 'short order'\n  AND closed_at IS NULL\nLIMIT 1000",
+    "answer_summary": "The result includes 1 row(s) with total short order open tickets count of 0.",
     "result_rows": [
       {
-        "count": 0
+        "short_order_open_tickets_count": 0
       }
     ],
     "result_value": 0,
@@ -54,7 +54,7 @@
     "level": "L1",
     "question": "How many patties are currently on the griddle, company-wide?",
     "status": "ok",
-    "sql": "SELECT NULL AS patties_on_griddle\nLIMIT 1000",
+    "sql": "SELECT SUM(target_qty) AS patties_on_griddle\nFROM seagate_ops.seagate_work_orders\nWHERE status = 'open'\nLIMIT 1000",
     "answer_summary": "The query returned 1 row(s).",
     "result_rows": [
       {
@@ -103,49 +103,12 @@
     "id": "Q5",
     "level": "L2",
     "question": "Which sites currently have a line that's WARM?",
-    "status": "ok",
-    "sql": "SELECT DISTINCT line_id\nFROM seagate_ops.seagate_iot_sensor_logs\nWHERE temperature_c >= 30 -- Assuming 'WARM' lines have temperature 30\u00b0C or higher\nLIMIT 100",
-    "answer_summary": "The result includes 12 row(s) with total line id of 78.",
-    "result_rows": [
-      {
-        "line_id": 12
-      },
-      {
-        "line_id": 3
-      },
-      {
-        "line_id": 11
-      },
-      {
-        "line_id": 8
-      },
-      {
-        "line_id": 10
-      },
-      {
-        "line_id": 7
-      },
-      {
-        "line_id": 9
-      },
-      {
-        "line_id": 1
-      },
-      {
-        "line_id": 5
-      },
-      {
-        "line_id": 2
-      },
-      {
-        "line_id": 4
-      },
-      {
-        "line_id": 6
-      }
-    ],
+    "status": "error",
+    "sql": "SELECT DISTINCT line_id\nFROM seagate_ops.seagate_iot_sensor_logs\nWHERE sensor_type = 'line'\n  AND temperature_c = 'WARM'\nLIMIT 100",
+    "answer_summary": null,
+    "result_rows": [],
     "result_value": null,
-    "row_count": 12,
+    "row_count": null,
     "wren": {
       "wren_enabled": true,
       "wren_available": false,
@@ -162,14 +125,14 @@
     "level": "L2",
     "question": "How many patties has the Tigerline region plated in total?",
     "status": "ok",
-    "sql": "SELECT COALESCE(SUM(qty_units), 0) AS total_patties_plated\nFROM seagate_ops.seagate_shipments\nWHERE destination_region = 'Tigerline'\nLIMIT 1000",
-    "answer_summary": "The result includes 1 row(s) with total total patties plated of 0.",
+    "sql": "SELECT SUM(qty_units) AS total_patties_plated\nFROM seagate_ops.seagate_shipments\nWHERE destination_region = 'Tigerline'\nLIMIT 1000",
+    "answer_summary": "The query returned 1 row(s).",
     "result_rows": [
       {
-        "total_patties_plated": 0
+        "total_patties_plated": null
       }
     ],
-    "result_value": 0,
+    "result_value": null,
     "row_count": 1,
     "wren": {
       "wren_enabled": true,
@@ -211,8 +174,54 @@
     "id": "Q8",
     "level": "L2",
     "question": "How many patties were plated between 2025-12-25 and 2025-12-31, broken down by drive family?",
+    "status": "ok",
+    "sql": "SELECT wo.line_id AS drive_family, SUM(pe.units_completed) AS patties_plated\nFROM seagate_ops.seagate_production_events pe\nJOIN seagate_ops.seagate_work_orders wo ON pe.work_order_id = wo.work_order_id\nWHERE pe.event_date >= '2025-12-25' AND pe.event_date <= '2025-12-31'\nGROUP BY wo.line_id\nORDER BY wo.line_id\nLIMIT 100",
+    "answer_summary": "The result includes 6 row(s) with total drive family of 32.",
+    "result_rows": [
+      {
+        "drive_family": 1,
+        "patties_plated": 42
+      },
+      {
+        "drive_family": 3,
+        "patties_plated": 22
+      },
+      {
+        "drive_family": 4,
+        "patties_plated": 29
+      },
+      {
+        "drive_family": 5,
+        "patties_plated": 151
+      },
+      {
+        "drive_family": 8,
+        "patties_plated": 11
+      },
+      {
+        "drive_family": 11,
+        "patties_plated": 84
+      }
+    ],
+    "result_value": null,
+    "row_count": 6,
+    "wren": {
+      "wren_enabled": true,
+      "wren_available": false,
+      "matched_models": [],
+      "retrieved_item_count": 0,
+      "warnings": [
+        "No materialized MDL is available for this scope."
+      ]
+    },
+    "error": null
+  },
+  {
+    "id": "Q9",
+    "level": "L3",
+    "question": "What was the Golden Yield for the Cobalt drive family in December 2025?",
     "status": "error",
-    "sql": "SELECT line_id AS drive_family, SUM(units_completed) AS patties_plated\nFROM seagate_ops.seagate_production_events\nWHERE event_date >= '2025-12-25'\n  AND event_date <= '2025-12-31'\nGROUP BY line_id\nORDER BY line_id\nLIMIT 100",
+    "sql": "-- The request is to find the Golden Yield for the Cobalt drive family in December 2025. However, the provided context does not contain any explicit table, column, or metric related to \"Golden Yield\" or \"Cobalt drive family\". Without domain-specific data, definitions, or semantic model details, it is not possible to formulate a meaningful SQL query for this request.",
     "answer_summary": null,
     "result_rows": [],
     "result_value": null,
@@ -229,36 +238,11 @@
     "error": null
   },
   {
-    "id": "Q9",
-    "level": "L3",
-    "question": "What was the Golden Yield for the Cobalt drive family in December 2025?",
-    "status": "ok",
-    "sql": "SELECT NULL AS golden_yield LIMIT 0",
-    "answer_summary": "The query returned 1 row(s).",
-    "result_rows": [
-      {
-        "golden_yield": null
-      }
-    ],
-    "result_value": null,
-    "row_count": 1,
-    "wren": {
-      "wren_enabled": true,
-      "wren_available": false,
-      "matched_models": [],
-      "retrieved_item_count": 0,
-      "warnings": [
-        "No materialized MDL is available for this scope."
-      ]
-    },
-    "error": null
-  },
-  {
     "id": "Q10",
     "level": "L3",
     "question": "What is the True Pass Rate for Plate Spin tests at Tigerline Point?",
     "status": "ok",
-    "sql": "SELECT\n  (SUM(CASE WHEN result = 'Pass' THEN 1 ELSE 0 END)::FLOAT / COUNT(*)) AS true_pass_rate\nFROM seagate_ops.seagate_quality_tests qt\nJOIN seagate_ops.seagate_work_orders wo ON qt.work_order_id = wo.work_order_id\nWHERE qt.test_type = 'Plate Spin'\n  AND wo.line_id = (SELECT line_id FROM seagate_ops.seagate_work_orders WHERE work_order_id = wo.work_order_id AND line_id = wo.line_id LIMIT 1) -- Ensure line_id associated\n  AND wo.line_id IN (SELECT line_id FROM seagate_ops.seagate_work_orders WHERE line_id = wo.line_id AND work_order_id = wo.work_order_id) -- Validate line\n  AND wo.line_id = (SELECT line_id FROM seagate_ops.seagate_work_orders WHERE work_order_id = wo.work_order_id LIMIT 1) -- placeholder condition\n  AND wo.line_id = (SELECT line_id FROM seagate_ops.seagate_work_orders WHERE work_order_id = wo.work_order_id LIMIT 1) -- repeated for placeholder\n  AND wo.line_id = (SELECT line_id FROM seagate_ops.seagate_work_orders WHERE work_order_id = wo.work_order_id LIMIT 1) -- no info on Tigerline Point mapping\n-- Note: Without a direct mapping or column for 'Tigerline Point' in the provided schema, this query calculates True Pass Rate for Plate Spin tests from all work orders.\nLIMIT 100",
+    "sql": "SELECT\n  100.0 * SUM(CASE WHEN sqt.result = 'Pass' THEN 1 ELSE 0 END) / COUNT(*) AS true_pass_rate\nFROM\n  seagate_ops.seagate_quality_tests sqt\nJOIN\n  seagate_ops.seagate_work_orders swo ON sqt.work_order_id = swo.work_order_id\nWHERE\n  sqt.test_type = 'Plate Spin'\n  AND swo.line_id = (\n    SELECT line_id\n    FROM seagate_ops.seagate_work_orders\n    WHERE line_id IN (\n      SELECT line_id FROM seagate_ops.seagate_work_orders WHERE line_id = swo.line_id LIMIT 1\n    )\n    AND line_id = (SELECT line_id FROM seagate_ops.seagate_work_orders WHERE line_id = swo.line_id LIMIT 1) -- no direct Tigerline Point info given\n  )\n  AND swo.line_id = (SELECT line_id FROM seagate_ops.seagate_work_orders WHERE line_id = swo.line_id LIMIT 1)\nLIMIT 1",
     "answer_summary": "The query returned 1 row(s).",
     "result_rows": [
       {
@@ -283,7 +267,7 @@
     "level": "L3",
     "question": "How many patties were plated during the Moonlight shift in the Diner Week of 2025-12-17 to 2025-12-23?",
     "status": "ok",
-    "sql": "SELECT SUM(units_completed) AS patties_plated\nFROM seagate_ops.seagate_production_events\nWHERE shift_code = 'Moonlight'\n  AND event_date >= '2025-12-17'::timestamp\n  AND event_date < '2025-12-24'::timestamp\nLIMIT 1000",
+    "sql": "SELECT SUM(units_completed) AS patties_plated\nFROM seagate_ops.seagate_production_events\nWHERE shift_code = 'Moonlight'\n  AND event_date >= '2025-12-17'\n  AND event_date < '2025-12-24' -- to include whole day of 2025-12-23\nLIMIT 1000",
     "answer_summary": "The query returned 1 row(s).",
     "result_rows": [
       {
@@ -307,12 +291,16 @@
     "id": "Q12",
     "level": "L3",
     "question": "What is the Golden Yield for Short Order tickets at Scotts Valley West?",
-    "status": "error",
-    "sql": "",
-    "answer_summary": null,
-    "result_rows": [],
+    "status": "ok",
+    "sql": "SELECT\n  SUM(CAST(se_production_events.units_completed AS FLOAT)) / NULLIF(SUM(CAST(se_production_events.units_completed + se_production_events.units_reworked + se_production_events.units_scrapped AS FLOAT)), 0) AS golden_yield\nFROM seagate_ops.seagate_work_orders AS se_work_orders\nJOIN seagate_ops.seagate_production_events AS se_production_events\n  ON se_work_orders.work_order_id = se_production_events.work_order_id\nWHERE se_work_orders.ticket_type = 'Short Order'\n  AND se_work_orders.line_id = (SELECT line_id FROM seagate_ops.seagate_work_orders WHERE line_id IS NOT NULL LIMIT 1) -- Scotts Valley West line_id is missing in context, a placeholder is used here\nLIMIT 1000",
+    "answer_summary": "The query returned 1 row(s).",
+    "result_rows": [
+      {
+        "golden_yield": null
+      }
+    ],
     "result_value": null,
-    "row_count": null,
+    "row_count": 1,
     "wren": {
       "wren_enabled": true,
       "wren_available": false,
@@ -329,7 +317,7 @@
     "level": "L4",
     "question": "For Q4 2025 (2025-10-01 to 2025-12-31), compare the Tigerline and Reef regions on both Golden Yield and on units shipped via Combo pallets through Dine-In fulfillment.",
     "status": "ok",
-    "sql": "SELECT\n  s.destination_region AS region,\n  SUM(CASE WHEN f.account = 'Golden Yield' THEN f.amount_usd ELSE 0 END) AS golden_yield,\n  SUM(CASE WHEN s.pallet_type = 'Combo' THEN s.qty_units ELSE 0 END) AS units_shipped_via_combo_pallets\nFROM seagate_ops.seagate_shipments s\nJOIN seagate_ops.seagate_finance_ledger f ON s.work_order_id = f.entry_id\nWHERE\n  s.ship_date >= '2025-10-01' AND s.ship_date <= '2025-12-31'\n  AND s.fulfillment_type = 'Dine-In'\n  AND s.destination_region IN ('Tigerline', 'Reef')\nGROUP BY s.destination_region\nLIMIT 1000",
+    "sql": "SELECT\n  s.destination_region AS region,\n  SUM(CASE\n        WHEN f.account = 'Golden Yield' THEN CAST(f.amount_usd AS FLOAT)\n        ELSE 0\n      END) AS golden_yield,\n  SUM(CASE\n        WHEN s.pallet_type = 'Combo' AND s.fulfillment_type = 'Dine-In' THEN s.qty_units\n        ELSE 0\n      END) AS units_shipped_via_combo_pallets\nFROM\n  seagate_ops.seagate_shipments s\nLEFT JOIN\n  seagate_ops.seagate_finance_ledger f ON s.work_order_id = f.entry_id\nWHERE\n  s.ship_date >= '2025-10-01'::TIMESTAMP\n  AND s.ship_date < '2026-01-01'::TIMESTAMP\n  AND s.destination_region IN ('Tigerline', 'Reef')\nGROUP BY\n  s.destination_region\nLIMIT 100",
     "answer_summary": "No rows were returned for this query.",
     "result_rows": [],
     "result_value": null,
@@ -350,7 +338,7 @@
     "level": "L4",
     "question": "Which region had the higher True Pass Rate on Heat Lamp tests in Q4 2025, excluding Short Order tickets \u2014 Tigerline or Reef?",
     "status": "ok",
-    "sql": "SELECT\n  s.destination_region AS region,\n  SUM(CASE WHEN q.result = 'True Pass' THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS true_pass_rate\nFROM\n  seagate_ops.seagate_quality_tests q\nJOIN\n  seagate_ops.seagate_work_orders w ON q.work_order_id = w.work_order_id\nJOIN\n  seagate_ops.seagate_shipments s ON q.work_order_id = s.work_order_id\nWHERE\n  q.test_type = 'Heat Lamp'\n  AND q.tested_at >= '2025-10-01' AND q.tested_at < '2026-01-01'\n  AND w.ticket_type <> 'Short Order'\n  AND s.destination_region IN ('Tigerline', 'Reef')\nGROUP BY\n  s.destination_region\nORDER BY\n  true_pass_rate DESC\nLIMIT 10",
+    "sql": "SELECT\n  s.destination_region AS region,\n  SUM(CASE WHEN q.result = 'Pass' THEN 1 ELSE 0 END)::FLOAT / COUNT(*) AS true_pass_rate\nFROM seagate_ops.seagate_quality_tests q\nJOIN seagate_ops.seagate_work_orders w ON q.work_order_id = w.work_order_id\nJOIN seagate_ops.seagate_shipments s ON q.work_order_id = s.work_order_id\nWHERE q.test_type = 'Heat Lamp'\n  AND q.tested_at >= '2025-10-01' AND q.tested_at < '2026-01-01'\n  AND w.ticket_type != 'Short Order'\n  AND s.destination_region IN ('Tigerline', 'Reef')\nGROUP BY s.destination_region\nORDER BY true_pass_rate DESC\nLIMIT 2",
     "answer_summary": "No rows were returned for this query.",
     "result_rows": [],
     "result_value": null,
@@ -371,7 +359,7 @@
     "level": "L4",
     "question": "For Nimbus-family shipments that went Dine-In in the last 60 days (2025-11-02 to 2025-12-31), what share of shipped units rode on Combo pallets, by region?",
     "status": "ok",
-    "sql": "SELECT\n  s.destination_region,\n  SUM(CASE WHEN s.pallet_type = 'Combo' THEN s.qty_units ELSE 0 END)::FLOAT / NULLIF(SUM(s.qty_units), 0) AS combo_pallet_units_share\nFROM seagate_ops.seagate_shipments s\nJOIN seagate_ops.seagate_work_orders wo ON s.work_order_id = wo.work_order_id\nWHERE wo.ticket_type LIKE '%Nimbus%'\n  AND s.fulfillment_type = 'Dine-In'\n  AND s.ship_date BETWEEN DATE '2025-11-02' AND DATE '2025-12-31'\nGROUP BY s.destination_region\nORDER BY s.destination_region\nLIMIT 100",
+    "sql": "SELECT\n  s.destination_region,\n  SUM(CASE WHEN s.pallet_type = 'Combo' THEN s.qty_units ELSE 0 END)::FLOAT / NULLIF(SUM(s.qty_units), 0) AS combo_pallet_share\nFROM seagate_ops.seagate_shipments s\nJOIN seagate_ops.seagate_work_orders w ON s.work_order_id = w.work_order_id\nWHERE w.sku_id::TEXT LIKE 'Nimbus%' -- Assuming Nimbus-family items sku_id start with 'Nimbus'\n  AND s.fulfillment_type = 'Dine-In'\n  AND s.ship_date >= DATE '2025-11-02' AND s.ship_date <= DATE '2025-12-31'\nGROUP BY s.destination_region\nORDER BY s.destination_region\nLIMIT 500",
     "answer_summary": "No rows were returned for this query.",
     "result_rows": [],
     "result_value": null,
@@ -392,7 +380,7 @@
     "level": "L5",
     "question": "How many patties were plated on WARM lines, company-wide, broken down by drive family?",
     "status": "ok",
-    "sql": "SELECT 'WARM' AS line_temperature, wo.ticket_type AS drive_family, SUM(wo.target_qty) AS patties_plated\nFROM seagate_ops.seagate_work_orders wo\nWHERE wo.ticket_type LIKE '%drive%'\nGROUP BY wo.ticket_type\nORDER BY wo.ticket_type\nLIMIT 100",
+    "sql": "SELECT wo.ticket_type AS drive_family, SUM(wo.target_qty) AS patties_plated\nFROM seagate_ops.seagate_work_orders wo\nWHERE wo.ticket_type LIKE '%WARM%'\nGROUP BY wo.ticket_type\nORDER BY wo.ticket_type\nLIMIT 100",
     "answer_summary": "No rows were returned for this query.",
     "result_rows": [],
     "result_value": null,
@@ -413,7 +401,7 @@
     "level": "L5",
     "question": "What was the Golden Yield for the Vantage drive family in Q4 2025 (2025-10-01 to 2025-12-31)?",
     "status": "error",
-    "sql": "SELECT\n  (1.0 * SUM(units_completed) / NULLIF(SUM(units_completed + units_reworked + units_scrapped), 0)) AS golden_yield\nFROM\n  seagate_ops.seagate_production_events prod\nJOIN\n  seagate_ops.seagate_work_orders wo ON prod.work_order_id = wo.work_order_id\nWHERE\n  wo.line_id = (SELECT line_id FROM seagate_ops.seagate_work_orders WHERE sku_id IN\n    (SELECT sku_id FROM seagate_ops.seagate_work_orders WHERE SKU_ID IN (\n      SELECT sku_id FROM seagate_ops.seagate_work_orders WHERE status IS NOT NULL\n    ) AND status IS NOT NULL ) AND status IS NOT NULL  AND line_id IN (SELECT line_id FROM seagate_ops.seagate_work_orders WHERE status IS NOT NULL))\n  AND wo.opened_at >= '2025-10-01' AND wo.closed_at <= '2025-12-31'\n  AND wo.sku_id IN (\n    SELECT sku_id FROM seagate_ops.seagate_work_orders\n    WHERE line_id IN (SELECT line_id FROM seagate_ops.seagate_work_orders WHERE line_id IN (SELECT line_id FROM seagate_ops.seagate_work_orders))\n    AND sku_id IS NOT NULL\n  )\nLIMIT 1",
+    "sql": "-- Missing contextual semantic model or columns related to \"Golden Yield\" and \"Vantage drive family\" in the given datasets or semantic layer, so it's not possible to generate a valid query.",
     "answer_summary": null,
     "result_rows": [],
     "result_value": null,
@@ -434,7 +422,7 @@
     "level": "L5",
     "question": "For the Nimbus family in Q4 2025, how many Combo-pallet Dine-In units did the Tigerline and Reef regions each ship, and what was each region's Golden Yield over the same window?",
     "status": "ok",
-    "sql": "SELECT\n  destination_region,\n  SUM(CASE WHEN pallet_type = 'Combo-pallet Dine-In' THEN qty_units ELSE 0 END) AS shipped_combo_pallet_dine_in_units,\n  SUM(CASE WHEN account = 'Golden Yield' THEN amount_usd ELSE 0 END) AS golden_yield\nFROM seagate_ops.seagate_shipments\nLEFT JOIN seagate_ops.seagate_finance_ledger ON seagate_shipments.shipment_id = seagate_finance_ledger.entry_id\nWHERE\n  destination_region IN ('Tigerline', 'Reef')\n  AND pallet_type = 'Combo-pallet Dine-In'\n  AND ship_date >= '2025-10-01'\n  AND ship_date < '2026-01-01'\n  AND fulfillment_type = 'Nimbus'\nGROUP BY destination_region\nLIMIT 100",
+    "sql": "SELECT\n  s.destination_region AS region,\n  SUM(CASE WHEN s.pallet_type = 'Combo-pallet' AND s.fulfillment_type = 'Dine-In' THEN s.qty_units ELSE 0 END) AS combo_pallet_dine_in_units_shipped,\n  SUM(CASE WHEN f.account = 'Golden Yield' THEN CAST(f.amount_usd AS NUMERIC) ELSE 0 END) AS golden_yield_usd\nFROM seagate_ops.seagate_shipments s\nLEFT JOIN seagate_ops.seagate_work_orders wo ON s.work_order_id = wo.work_order_id\nLEFT JOIN seagate_ops.seagate_finance_ledger f ON wo.work_order_id = f.cost_center::BIGINT\nWHERE\n  s.destination_region IN ('Tigerline', 'Reef')\n  AND s.ship_date >= '2025-10-01' AND s.ship_date < '2026-01-01'\n  AND wo.ticket_type = 'Nimbus'\nGROUP BY s.destination_region\nLIMIT 100",
     "answer_summary": "No rows were returned for this query.",
     "result_rows": [],
     "result_value": null,

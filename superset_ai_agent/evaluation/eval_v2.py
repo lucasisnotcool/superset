@@ -177,6 +177,75 @@ def sql_references_tables(sql: str | None, tables: Iterable[str]) -> list[str]:
     return sorted({t for t in tables if t.lower() in lowered})
 
 
+def _item_mdl(item: dict[str, Any]) -> dict[str, Any]:
+    """Parse a changeset item's MDL content (best-effort)."""
+    content = item.get("content") or item.get("proposed_content") or ""
+    if isinstance(content, dict):
+        return content
+    try:
+        return json.loads(content)
+    except (ValueError, TypeError):
+        return {}
+
+
+def _is_relationships_only(item: dict[str, Any]) -> bool:
+    mdl = _item_mdl(item)
+    has_model = any(mdl.get(k) for k in ("models", "views", "metrics", "cubes"))
+    return bool(mdl.get("relationships")) and not has_model
+
+
+def consolidate_relationship_items(
+    items: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Fold relationships-only changeset files into a model file (activation fix).
+
+    The Copilot's ``propose_relationships`` emits ``relationships/*.json`` files that
+    contain *only* relationships. The activation gate (``mdl_files.py`` →
+    ``validate_mdl``) rejects any file with no model/view/metric/cube (``empty_root``),
+    so a Copilot changeset that proposes relationships **cannot be activated** — a real
+    product bug (HEAD). Because the project *compiler* merges all active files into one
+    manifest, moving the relationships into a model file is **semantically identical**
+    (same merged manifest, same joins) but makes every activated file valid. We fold
+    all relationships-only items into the first model item and drop the separate
+    relationship files. Returns ``(new_items, n_relationships_folded)``; a no-op (with
+    0) when there is nothing to fold or no model item to fold into.
+    """
+    model_items = [it for it in items if _item_mdl(it).get("models")]
+    rel_items = [it for it in items if _is_relationships_only(it)]
+    if not rel_items or not model_items:
+        return items, 0
+
+    folded: list[dict[str, Any]] = []
+    for it in rel_items:
+        folded.extend(_item_mdl(it).get("relationships", []))
+
+    target = model_items[0]
+    target_mdl = _item_mdl(target)
+    target_mdl.setdefault("relationships", []).extend(folded)
+    new_target = {**target, "content": json.dumps(target_mdl, indent=2)}
+
+    out: list[dict[str, Any]] = []
+    for it in items:
+        if _is_relationships_only(it):
+            continue
+        out.append(new_target if it is target else it)
+    return out, len(folded)
+
+
+def models_from_changeset(items: list[dict[str, Any]]) -> set[str]:
+    """Model names proposed across a changeset (independent of activation).
+
+    Lets E11 measure which tables the Copilot *chose* even if the changeset can't be
+    activated (the relationships bug). Reads ``models[].name`` from each item.
+    """
+    names: set[str] = set()
+    for item in items:
+        for model in _item_mdl(item).get("models", []) or []:
+            if isinstance(model, dict) and model.get("name"):
+                names.add(model["name"])
+    return names
+
+
 def table_selection_metrics(
     selected: Iterable[str],
     relevant: Iterable[str],
@@ -435,9 +504,14 @@ class AgentClientV2(ec.AgentClient):
         turn = self.copilot_turn(
             project_id, message, attachments=attachments, max_steps=max_steps
         )
-        items = (
+        raw_items = (
             [] if turn.get("error") else (turn.get("changeset") or {}).get("items", [])
         )
+        # Selection metrics come from the RAW changeset so the fold below never hides
+        # what the Copilot actually chose. The fold works around a product bug where
+        # relationships-only files cannot be activated (consolidate_relationship_items).
+        proposed_models = sorted(models_from_changeset(raw_items))
+        items, folded = consolidate_relationship_items(raw_items)
         applied = activated = False
         activate_error: str | None = None
         if items:
@@ -450,7 +524,9 @@ class AgentClientV2(ec.AgentClient):
                 activate_error = str(ex)
         return {
             **turn,
-            "items": len(items),
+            "items": len(raw_items),
+            "proposed_models": proposed_models,
+            "relationships_folded": folded,
             "applied": applied,
             "activated": activated,
             "activate_error": activate_error,

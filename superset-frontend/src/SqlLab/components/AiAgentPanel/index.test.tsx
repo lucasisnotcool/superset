@@ -1147,3 +1147,102 @@ test('lets the user pick among multiple semantic projects and sends the choice',
     'project-b',
   );
 });
+
+test('switching the semantic layer mid-conversation starts a fresh chat', async () => {
+  fetchMock.get('begin:http://agent.local/agent/semantic-layer/projects?', [
+    makeSemanticProject('project-a', 'Sales'),
+    makeSemanticProject('project-b', 'Marketing'),
+  ]);
+  fetchMock.get(
+    'begin:http://agent.local/agent/semantic-layer/projects/project-a/state',
+    {
+      project_id: 'project-a',
+      database_id: 1,
+      schema_name: 'main',
+      dataset_ids: [],
+      document_count: 1,
+      last_error: null,
+    },
+  );
+  fetchMock.get(
+    'begin:http://agent.local/agent/semantic-layer/projects/project-b/state',
+    {
+      project_id: 'project-b',
+      database_id: 1,
+      schema_name: 'main',
+      dataset_ids: [],
+      document_count: 2,
+      last_error: null,
+    },
+  );
+
+  const conversation = {
+    id: 'conversation-1',
+    title: 'New chat',
+    owner_id: 'local',
+    project_id: 'project-a',
+    scope: { database_id: 1, schema_name: 'main', dataset_ids: [] },
+    messages: [],
+    created_at: '2026-06-19T00:00:00Z',
+    updated_at: '2026-06-19T00:00:00Z',
+  };
+  const answered = {
+    ...conversation,
+    messages: [
+      {
+        id: 'm1',
+        role: 'user',
+        content: 'hi',
+        created_at: '2026-06-19T00:00:00Z',
+        artifacts: [],
+      },
+      {
+        id: 'm2',
+        role: 'assistant',
+        content: 'Grounded answer.',
+        created_at: '2026-06-19T00:00:00Z',
+        artifacts: [],
+      },
+    ],
+  };
+  fetchMock.post('http://agent.local/agent/conversations', conversation);
+  fetchMock.post(
+    'http://agent.local/agent/conversations/conversation-1/messages/stream',
+    404,
+  );
+  fetchMock.post(
+    'http://agent.local/agent/conversations/conversation-1/messages',
+    {
+      status: 'ok',
+      conversation_id: 'conversation-1',
+      message: answered.messages[1],
+      artifacts: [],
+      trace: [],
+      conversation: answered,
+    },
+  );
+
+  const store = createStore(stateWithSchema(), reducerIndex);
+  render(<AiAgentPanel />, { store });
+
+  await screen.findByTestId('semantic-project-select');
+  await userEvent.type(
+    screen.getByPlaceholderText('Ask about this database'),
+    'hi',
+  );
+  await userEvent.click(screen.getByRole('button', { name: 'Send' }));
+  // The grounded answer is now in the transcript.
+  expect(await screen.findByText('Grounded answer.')).toBeInTheDocument();
+
+  // Switch the semantic layer — the in-progress transcript must reset because the
+  // new project changes the agent's whole vocabulary.
+  const picker = screen.getByTestId('semantic-project-select');
+  await userEvent.click(
+    picker.querySelector('.ant-select-selector') as Element,
+  );
+  await userEvent.click(await screen.findByText('Marketing'));
+
+  await waitFor(() => {
+    expect(screen.queryByText('Grounded answer.')).not.toBeInTheDocument();
+  });
+});

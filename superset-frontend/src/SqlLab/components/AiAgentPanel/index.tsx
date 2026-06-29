@@ -82,7 +82,6 @@ import {
 import AiChartPreview from './AiChartPreview';
 import AuditInfoPanel from './AuditInfoPanel';
 import ExplainDialog from './ExplainDialog';
-import DatasetSelect from './DatasetSelect';
 import DataPreviewToggle from './DataPreviewToggle';
 import MarkdownCodeBlock from './MarkdownCodeBlock';
 import FollowupQuestions from './FollowupQuestions';
@@ -493,13 +492,15 @@ const getActiveQueryEditor = ({
 const buildConversationScope = (
   queryEditor: Partial<QueryEditor> | undefined,
   databaseId: number,
-  datasetIds: number[],
   projectId: string | null,
 ): ConversationScope => ({
   database_id: databaseId,
   catalog_name: queryEditor?.catalog || null,
   schema_name: queryEditor?.schema || null,
-  dataset_ids: datasetIds,
+  // The agent grounds on the selected semantic-layer project's MDL, which already
+  // scopes the tables in play — so the turn covers all datasets in that project
+  // rather than a hand-picked subset.
+  dataset_ids: [],
   project_id: projectId,
   query_editor_id: queryEditor?.id || null,
   current_sql: queryEditor?.sql || null,
@@ -662,7 +663,6 @@ const AiAgentPanel = () => {
   const transcriptRef = useRef<HTMLDivElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const [composerValue, setComposerValue] = useState('');
-  const [datasetIds, setDatasetIds] = useState<number[]>([]);
   const [executionMode, setExecutionMode] = useState<ExecutionMode>(
     () => loadExecutionMode() ?? 'manual',
   );
@@ -707,14 +707,9 @@ const AiAgentPanel = () => {
   const currentScope = useMemo(
     () =>
       typeof databaseId === 'number'
-        ? buildConversationScope(
-            queryEditor,
-            databaseId,
-            datasetIds,
-            selectedProjectId,
-          )
+        ? buildConversationScope(queryEditor, databaseId, selectedProjectId)
         : null,
-    [databaseId, datasetIds, queryEditor, selectedProjectId],
+    [databaseId, queryEditor, selectedProjectId],
   );
   const canSend =
     Boolean(composerValue.trim()) && typeof databaseId === 'number';
@@ -905,7 +900,6 @@ const AiAgentPanel = () => {
     }
     const createdConversation = await createConversation(scope);
     setConversation(createdConversation);
-    setDatasetIds(createdConversation.scope.dataset_ids);
     // Carry the current default mode onto the freshly created conversation.
     storeExecutionMode(createdConversation.id, executionMode);
     await refreshConversationSummaries();
@@ -1011,15 +1005,47 @@ const AiAgentPanel = () => {
     setConversation(null);
     setComposerValue('');
     setError(null);
-    setDatasetIds([]);
     setExecutionMode(loadExecutionMode() ?? 'manual');
+  };
+
+  // Switching the semantic-layer project changes the agent's entire vocabulary
+  // (model names, relationships, metrics), so an in-progress transcript grounded
+  // on the previous project would feed the model stale references. Treat a switch
+  // as a context boundary: start a fresh chat (the previous one stays in history).
+  // A programmatic default-selection or a reopen-restore goes through
+  // `setSelectedProjectId` directly and never triggers this.
+  const onSelectProject = (nextProjectId: string) => {
+    if (nextProjectId === selectedProjectId) {
+      return;
+    }
+    setSelectedProjectId(nextProjectId);
+    if (!conversation || conversation.messages.length === 0) {
+      // Nothing to preserve — just retarget the (empty) thread silently.
+      return;
+    }
+    const nextName =
+      semanticProjects.find(project => project.id === nextProjectId)?.name ??
+      '';
+    setConversation(null);
+    setComposerValue('');
+    setError(null);
+    setExecutionMode(loadExecutionMode() ?? 'manual');
+    refreshConversationSummaries();
+    dispatch(
+      addInfoToast(
+        t(
+          'Switched semantic layer to %s — started a new chat. Your previous ' +
+            'chat is saved in history.',
+          nextName,
+        ),
+      ),
+    );
   };
 
   const onOpenConversation = async (conversationId: string) => {
     try {
       const result = await getConversation(conversationId);
       setConversation(result);
-      setDatasetIds(result.scope.dataset_ids);
       // Restore the project this thread was pinned to so its grounding stays
       // stable across reopen (the probe preserves a pin that still covers the
       // schema; an out-of-scope pin falls back to the heuristic default).
@@ -1256,7 +1282,7 @@ const AiAgentPanel = () => {
                 label: project.name,
               }))}
               value={selectedProjectId ?? undefined}
-              onChange={value => setSelectedProjectId(value as string)}
+              onChange={value => onSelectProject(value as string)}
               showSearch={false}
               size="small"
               data-test="semantic-project-select"
@@ -1294,12 +1320,6 @@ const AiAgentPanel = () => {
             )}
           />
         )}
-        <DatasetSelect
-          databaseId={databaseId}
-          schema={queryEditor?.schema}
-          value={datasetIds}
-          onChange={setDatasetIds}
-        />
         {isHistoryOpen && (
           <HistoryPanel>
             {conversationSummaries.map(summary => (
