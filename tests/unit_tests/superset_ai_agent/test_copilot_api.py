@@ -290,6 +290,49 @@ def test_copilot_deploy_preview_lists_pending_drafts(tmp_path) -> None:
     assert body["items"][0]["path"] == "models/moves.json"
 
 
+def test_promote_golden_query_creates_draft_and_is_idempotent(tmp_path) -> None:
+    client = _client(tmp_path)
+    pid = _resolve(client)["id"]
+
+    promoted = client.post(
+        f"/agent/semantic-layer/projects/{pid}/golden-queries/promote",
+        json={
+            "question": "who are the top customers?",
+            "semantic_sql": "SELECT * FROM customers",
+        },
+    )
+    assert promoted.status_code == 200, promoted.text
+    file = promoted.json()
+    assert file["path"] == "queries.json"
+    assert file["status"] == "draft"  # promotion lands a reviewable draft
+    body = json.loads(file["content"])
+    assert body["queries"][0]["question"] == "who are the top customers?"
+    assert body["queries"][0]["verified_at"] is not None  # human-asserted
+
+    # Re-promoting the same question refreshes in place (copy-not-move; idempotent).
+    again = client.post(
+        f"/agent/semantic-layer/projects/{pid}/golden-queries/promote",
+        json={
+            "question": "Who are the TOP customers? ",
+            "semantic_sql": "SELECT 2",
+        },
+    )
+    assert again.status_code == 200, again.text
+    body2 = json.loads(again.json()["content"])
+    assert len(body2["queries"]) == 1
+    assert body2["queries"][0]["semantic_sql"] == "SELECT 2"
+
+
+def test_promote_golden_query_requires_question_and_sql(tmp_path) -> None:
+    client = _client(tmp_path)
+    pid = _resolve(client)["id"]
+    resp = client.post(
+        f"/agent/semantic-layer/projects/{pid}/golden-queries/promote",
+        json={"question": "", "semantic_sql": ""},
+    )
+    assert resp.status_code == 400
+
+
 class CoverageModel:
     """Returns claim-extraction JSON, then coverage-judgement JSON."""
 
@@ -1511,6 +1554,32 @@ def test_bulk_activate_is_atomic_when_manifest_is_invalid(tmp_path) -> None:
     )
     assert result.status_code == 422, result.text
 
+    listing = client.get(f"/agent/semantic-layer/projects/{pid}/mdl-files").json()
+    assert all(file["status"] == "draft" for file in listing)
+
+
+def test_bulk_activate_names_offending_view_file(tmp_path) -> None:
+    # R3: when one bad view sinks the atomic activation, the 422 names the
+    # offending file (leave-one-out attribution) so the reviewer can reject just
+    # that one — the two good views are not silently auto-dropped.
+    client = _client(tmp_path)
+    pid = _resolve(client)["id"]
+    _create_draft(client, pid, "models/moves.json", MOVES)
+    good = json.dumps({"views": [{"name": "g1", "statement": "SELECT id FROM moves"}]})
+    good2 = json.dumps({"views": [{"name": "g2", "statement": "SELECT id FROM moves"}]})
+    bad = json.dumps({"views": [{"name": "bad"}]})  # missing statement → invalid
+    _create_draft(client, pid, "views/g1.json", good)
+    _create_draft(client, pid, "views/g2.json", good2)
+    _create_draft(client, pid, "views/bad.json", bad)
+
+    result = client.post(
+        f"/agent/semantic-layer/projects/{pid}/mdl-files/bulk-status",
+        json={"status": "active", "file_ids": None},
+    )
+    assert result.status_code == 422, result.text
+    detail = result.json()["detail"]
+    assert detail["offending_files"] == ["views/bad.json"]
+    # Atomic invariant preserved: nothing activated.
     listing = client.get(f"/agent/semantic-layer/projects/{pid}/mdl-files").json()
     assert all(file["status"] == "draft" for file in listing)
 

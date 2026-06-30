@@ -86,6 +86,7 @@ import {
 import SemanticLayerStateBadge from '../SemanticLayerStateBadge';
 import useDocumentIngestion from '../useDocumentIngestion';
 import InstructionsPanel from './InstructionsPanel';
+import GoldenQueriesPanel from './GoldenQueriesPanel';
 import NewProjectModal from './NewProjectModal';
 import CopilotPanel, { type CopilotKickstart } from './CopilotPanel';
 import OnboardingTablePicker from './OnboardingTablePicker';
@@ -1802,6 +1803,16 @@ export default function SemanticLayerEditor({
                     children: (
                       <InstructionsPanel
                         scope={projectScope}
+                        canWrite={canWrite}
+                      />
+                    ),
+                  },
+                  {
+                    key: 'golden-queries',
+                    label: t('Golden queries'),
+                    children: (
+                      <GoldenQueriesPanel
+                        projectId={project?.id ?? ''}
                         canWrite={canWrite}
                       />
                     ),

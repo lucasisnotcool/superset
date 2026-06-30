@@ -211,3 +211,34 @@ def test_compile_manifest_carries_metrics_and_cubes() -> None:
     engine = manifest.to_engine_manifest()
     assert "metrics" in engine
     assert "cubes" in engine
+
+
+def test_to_engine_manifest_includes_semantic_views_excludes_native() -> None:
+    # Semantic views reach the engine (resolved against models); native views
+    # (carrying a ``dialect``) are kept out so they cannot poison the manifest
+    # load — they live in the readable project files only.
+    content = json.dumps(
+        {
+            "models": [
+                {
+                    "name": "orders",
+                    "tableReference": {"schema": "public", "table": "orders"},
+                    "columns": [{"name": "id", "type": "BIGINT"}],
+                }
+            ],
+            "views": [
+                {"name": "semantic_v", "statement": "SELECT id FROM orders"},
+                {
+                    "name": "native_v",
+                    "statement": "SELECT * FROM public.raw_external",
+                    "dialect": "postgres",
+                },
+            ],
+        }
+    )
+    manifest = compile_manifest(json_contents=[content])
+    # Both views are preserved on the compiled manifest (readable project state).
+    assert {v["name"] for v in manifest.views} == {"semantic_v", "native_v"}
+    # Only the semantic view is handed to the engine.
+    engine = manifest.to_engine_manifest()
+    assert [v["name"] for v in engine["views"]] == ["semantic_v"]

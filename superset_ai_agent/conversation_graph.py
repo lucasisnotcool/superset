@@ -82,8 +82,19 @@ from superset_ai_agent.semantic_layer.engine.planning import (
     plan_semantic_sql_step,
     with_engine_provenance,
 )
+from superset_ai_agent.semantic_layer.golden_queries import (
+    merge_recalled_examples,
+    recall_golden_queries,
+)
 from superset_ai_agent.semantic_layer.mdl_files import MdlFileStore
-from superset_ai_agent.semantic_layer.memory_store import Memory, NullMemory
+from superset_ai_agent.semantic_layer.memory_store import (
+    build_recall_access,
+    load_recall_access,
+    Memory,
+    NullMemory,
+    RecallAccess,
+    refs_from_sql,
+)
 from superset_ai_agent.semantic_layer.projects import SemanticProjectStore
 from superset_ai_agent.semantic_layer.runtime import cap_context_items
 from superset_ai_agent.semantic_layer.schema_retriever import (
@@ -95,7 +106,6 @@ from superset_ai_agent.semantic_layer.schemas import (
     SemanticProject,
     WrenMaterializationResult,
 )
-from superset_ai_agent.semantic_layer.store import scope_hash
 from superset_ai_agent.semantic_layer.wren_runtime import (
     materialize_request_semantic_project,
     resolve_effective_schema,
@@ -170,6 +180,7 @@ class ConversationState(TypedDict, total=False):
     wren_retrieval: WrenRetrievalArtifact | None
     wren_materialization: WrenMaterializationResult | None
     wren_mdl_path: str | None
+    recall_access: RecallAccess | None
     semantic_sql: str | None
     native_sql: str | None
     engine: str | None
@@ -943,6 +954,7 @@ class ConversationGraph:
                 ],
             }
         materialization = None
+        project = None
         project_id = None
         mdl_path = None
         resolve_warnings: list[str] = []
@@ -1025,6 +1037,7 @@ class ConversationGraph:
             "wren_retrieval": retrieval_artifact,
             "wren_materialization": materialization,
             "wren_mdl_path": mdl_path,
+            "recall_access": self._recall_access(request, project),
             "trace": [
                 *state.get("trace", []),
                 TraceEvent(
@@ -1039,6 +1052,38 @@ class ConversationGraph:
                 ),
             ],
         }
+
+    def _recall_access(
+        self, request: ConversationTurnRequest, project: SemanticProject | None
+    ) -> RecallAccess | None:
+        """Build the F2 recall access set across the project's full schema set (R1).
+
+        See ``Graph._recall_access``: lists the user's reachable tables per project
+        schema so a cross-schema golden/memory pair passes the Stage-A access filter.
+        Returns ``None`` when recall is inert so the draft node falls back.
+        """
+
+        scope = request.scope
+        schema_names = (
+            project.schema_names
+            if project is not None and project.schema_names
+            else scope.effective_schema_names
+        )
+        recall_inert = project is None and self.config.wren_memory_store == "none"
+        if recall_inert or not schema_names:
+            return None
+        cap = max(
+            self.config.wren_schema_table_scan_limit,
+            self.config.wren_schema_table_candidate_limit,
+            self.config.max_context_datasets,
+        )
+        return load_recall_access(
+            self.superset_client,
+            database_id=scope.database_id,
+            catalog_name=scope.catalog_name,
+            schema_names=schema_names,
+            limit=cap,
+        )
 
     def _draft_response(self, state: ConversationState) -> ConversationState:
         request = state["request"]
@@ -1065,15 +1110,35 @@ class ConversationGraph:
                 ],
             }
 
-        recalled = state.get("recalled_examples") or [
-            pair.model_dump()
-            for pair in self.memory.recall_examples(
-                request.message,
-                scope_hash=scope_hash(request.scope),
-                owner_id=state.get("owner_id", DEFAULT_OWNER_ID),
-                k=self.config.wren_memory_recall_k,
+        if state.get("recalled_examples"):
+            recalled = state["recalled_examples"]
+        else:
+            k = self.config.wren_memory_recall_k
+            # Prefer the project-wide, access-filtered recall set (R1); fall back to
+            # the single-schema grounding datasets only when it could not be built.
+            access = state.get("recall_access") or build_recall_access(
+                state["context"].datasets
             )
-        ]
+            memory_pairs = self.memory.recall_examples(
+                request.message,
+                database_id=request.scope.database_id,
+                k=k,
+                access=access,
+            )
+            golden_pairs = recall_golden_queries(
+                mdl_file_store=self.mdl_file_store,
+                project_id=getattr(state.get("wren_context"), "project_id", None)
+                or request.scope.project_id,
+                owner_id=state.get("owner_id", DEFAULT_OWNER_ID),
+                question=request.message,
+                k=k,
+                embedder=getattr(self.memory, "embedder", None),
+                access=access,
+            )
+            recalled = [
+                pair.model_dump()
+                for pair in merge_recalled_examples(golden_pairs, memory_pairs, k)
+            ]
         draft = self._call_conversation_model(
             state={**state, "recalled_examples": recalled},
             validation_errors=[],
@@ -1477,13 +1542,17 @@ class ConversationGraph:
         # natural-language question and would pollute recall (RV4).
         if not request.approved_sql:
             try:
+                native_sql = state.get("native_sql") or sql
+                referenced_tables, referenced_schemas = refs_from_sql(native_sql)
                 self.memory.store_confirmed(
                     question=request.message,
                     semantic_sql=state.get("semantic_sql") or sql,
-                    native_sql=state.get("native_sql") or sql,
-                    scope_hash=scope_hash(request.scope),
-                    owner_id=state.get("owner_id", DEFAULT_OWNER_ID),
+                    native_sql=native_sql,
+                    database_id=request.scope.database_id,
+                    created_by=state.get("owner_id", DEFAULT_OWNER_ID),
                     project_id=getattr(state.get("wren_context"), "project_id", None),
+                    referenced_tables=referenced_tables,
+                    referenced_schemas=referenced_schemas,
                     result_meta={"row_count": result.row_count},
                 )
             except Exception as ex:  # pylint: disable=broad-except - best-effort

@@ -1,7 +1,8 @@
 {
-  "_comment": "Machine-readable table manifest for the seagate_multi cross-schema eval. Mirrors superset/examples/seagate_multi/generate_data.py (TABLE_SCHEMA / RELEVANT_TABLES / DISTRACTOR_TABLES / ADVERSARIAL_DISTRACTORS). The eval harness reads this for E9 (distractor discrimination) so it needs no cross-package import.",
+  "_comment": "Machine-readable table manifest for the seagate_multi cross-schema eval. Mirrors superset/examples/seagate_multi/generate_data.py (TABLE_SCHEMA / RELEVANT_TABLES / DISTRACTOR_TABLES / ADVERSARIAL_DISTRACTORS). The eval harness reads this for E9 (distractor discrimination) so it needs no cross-package import. v4 adds the seagate_supply schema (components dimension + sku_components bridge, both relevant) and a seagate_freight_invoices supply distractor.",
   "database_name": "examples",
-  "schemas": ["seagate_core", "seagate_ops", "seagate_ref"],
+  "fixture_version": "v4",
+  "schemas": ["seagate_core", "seagate_ops", "seagate_supply", "seagate_ref"],
   "table_schema": {
     "seagate_sites": "seagate_core",
     "seagate_production_lines": "seagate_core",
@@ -10,11 +11,15 @@
     "seagate_production_events": "seagate_ops",
     "seagate_quality_tests": "seagate_ops",
     "seagate_shipments": "seagate_ops",
+    "seagate_components": "seagate_supply",
+    "seagate_sku_components": "seagate_supply",
+    "seagate_supplier_deliveries": "seagate_supply",
     "seagate_hr_roster": "seagate_core",
     "seagate_vendor_contracts": "seagate_core",
     "seagate_finance_ledger": "seagate_ops",
     "seagate_iot_sensor_logs": "seagate_ops",
     "seagate_maintenance_logs": "seagate_ops",
+    "seagate_freight_invoices": "seagate_supply",
     "seagate_marketing_campaigns": "seagate_ref",
     "seagate_web_sessions": "seagate_ref"
   },
@@ -25,7 +30,10 @@
     "seagate_work_orders",
     "seagate_production_events",
     "seagate_quality_tests",
-    "seagate_shipments"
+    "seagate_shipments",
+    "seagate_components",
+    "seagate_sku_components",
+    "seagate_supplier_deliveries"
   ],
   "distractor_tables": [
     "seagate_hr_roster",
@@ -33,15 +41,18 @@
     "seagate_finance_ledger",
     "seagate_iot_sensor_logs",
     "seagate_maintenance_logs",
+    "seagate_freight_invoices",
     "seagate_marketing_campaigns",
     "seagate_web_sessions"
   ],
   "adversarial_distractors": {
     "seagate_finance_ledger": "column `units` collides with units_completed/units_scrapped jargon",
     "seagate_iot_sensor_logs": "column `temperature_c` evokes 'heat lamp'; shares the line_id FK",
-    "seagate_hr_roster": "column `shift_code` collides with the shift mapping; shares the site_id FK"
+    "seagate_hr_roster": "column `shift_code` collides with the shift mapping; shares the site_id FK",
+    "seagate_freight_invoices": "column `units` decoy in the supply schema; shares the site_id FK"
   },
   "within_schema_control_questions": ["Q5", "Q11"],
-  "cross_schema_questions": ["Q6","Q7","Q8","Q9","Q10","Q12","Q13","Q14","Q15","Q16","Q17","Q18"],
-  "cross_schema_only_questions": ["Q16", "Q17", "Q18"]
+  "cross_schema_questions": ["Q6","Q7","Q8","Q9","Q10","Q12","Q13","Q14","Q15","Q16","Q17","Q18","Q19","Q20","Q21","Q26","Q28","Q30"],
+  "cross_schema_only_questions": ["Q16", "Q17", "Q18"],
+  "three_schema_questions": ["Q19", "Q20", "Q26"]
 }

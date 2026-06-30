@@ -138,3 +138,59 @@ The DB also contains **distractor tables** the glossary never mentions
   Fully **cross-schema and chained**.
 - Answer: **Tigerline** — 175 Nimbus Combo+Dine-In units, region Golden Yield 0.960.
   **Reef** — 151 Nimbus Combo+Dine-In units, region Golden Yield 0.962.
+
+## L6 — v4 extensions (supply schema, negative/temporal/distractor controls)
+
+These add the `seagate_supply` schema (`seagate_components` dimension +
+`seagate_sku_components` bill-of-materials bridge) for 3-schema joins, plus
+negative-result, temporal, and distractor-avoidance controls. Each line notes the
+`capability` it targets (see EVAL_V4_SPEC.md §2). Ground truth is computed and
+printed by `generate_data.py`.
+
+**Q19.** How many platters were consumed plating Vantage drives in Q4 2025 (2025-10-01 to 2025-12-31)? [capability: xschema3, bridge]
+- Fact needed: platters-per-drive lives **only** on `seagate_supply.seagate_sku_components` (component_id 1), reached via `sku_id` to `seagate_core.seagate_drive_skus` and the measure on `seagate_ops.seagate_production_events`. A genuine 3-schema join.
+- Answer: **14,300**.
+
+**Q20.** How many platters were consumed plating each drive family in December 2025? [capability: xschema3, bridge]
+- Same 3-schema bridge join, grouped by family.
+- Answer: **Cobalt 5,124, Vantage 4,380, Tundra 1,878, Nimbus 1,048**.
+
+**Q21.** How many patties were plated on Tundra-family WARM lines? [capability: negative, xschema2]
+- Tundra has no WARM line (its non-HOT line is DARK with no events). The correct answer is **none / 0** — a confident positive number means the agent dropped the family filter or hallucinated rows.
+- Answer: **0 (none)**.
+
+**Q22.** How many patties were plated during the Diner Week of 2025-12-24 to 2025-12-30? [capability: temporal]
+- Diner Week runs Wednesday->Tuesday (glossary). Tests non-standard-calendar handling.
+- Answer: **378**.
+
+**Q23.** How many patties were 86'd company-wide in Q4 2025? [capability: distractor]
+- 86'd = `units_scrapped` on `seagate_ops.seagate_production_events`. **Decoy:** `seagate_ops.seagate_finance_ledger.units` and `seagate_supply.seagate_freight_invoices.units` are unrelated "units" columns the answer must NOT use.
+- Answer: **228**.
+
+**Q24.** At Tigerline Point, what is the True Pass Rate on Taste Test versus Heat Lamp tests? [capability: metric, multihop]
+- True Pass Rate (garnish-exclusion rule) applied to two test types at one site.
+- Answer: **Taste Test 0.922, Heat Lamp 0.935**.
+
+**Q25.** Which drive family has the highest average drive capacity? [capability: slang]
+- Easy single-table control (anchors the low end of difficulty).
+- Answer: **Vantage** (15.0 TB avg).
+
+**Q26.** How many platters were consumed plating STANDARD-ticket Cobalt drives during 2025? [capability: golden, xschema3, bridge]
+- Niche, specific 3-schema + bridge + ticket_type slice — expected to be missed by all grounding modes; used as the **golden-query rescue** target (compare all 5 modes ± a promoted golden).
+- Answer: **32,084**.
+
+**Q28.** Standard report: total plated units by drive family and line status. [capability: viewable, xschema2]
+- A reusable cross-schema pattern best served by a published view; feeds the view-surfacing probe (E14').
+- Answer: **Cobalt HOT 3,704 / WARM 1,751; Vantage HOT 1,513 / WARM 3,017; Nimbus HOT 3,199; Tundra HOT 3,098**.
+
+**Q30.** For the Nimbus family in the last fiscal quarter, how many Combo-pallet Dine-In units did the Tigerline and Reef regions each ship, and what was each region's Golden Yield? [capability: temporal, multihop]
+- Phrasing-robustness: "last fiscal quarter" must resolve to Q4 2025 (glossary: fiscal quarter = calendar quarter). Same underlying answer as Q18.
+- Answer: **Tigerline 175 units, GY 0.960; Reef 151 units, GY 0.962**.
+
+**Q27.** What is the company-wide Supply Reliability for critical components? [capability: metric]
+- Supply Reliability is a glossary-only custom metric = on-time deliveries / total deliveries over `seagate_supply.seagate_supplier_deliveries`, counting only CRITICAL components (per `seagate_supply.seagate_components.criticality`). A brand-new metric (not Golden Yield) → isolates enrichment's ability to capture a freshly-defined metric.
+- Answer: **0.469** (76 of 162 critical-component deliveries on time).
+
+**Q29 (trap).** What is the Supply Reliability of the Firmware Image component? [capability: trap, metric]
+- Firmware Image is a STANDARD component; Supply Reliability is defined for CRITICAL components only, so it is **undefined / not applicable**. A confident number means the agent applied the formula without the criticality exclusion (mirrors the Golden Yield short-order trap, Q12).
+- Correct answer: **undefined / not applicable**.

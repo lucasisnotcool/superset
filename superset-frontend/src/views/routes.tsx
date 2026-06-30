@@ -147,6 +147,10 @@ const RolesList = lazy(
   () => import(/* webpackChunkName: "RolesList" */ 'src/pages/RolesList'),
 );
 
+const AiAgentUsage = lazy(
+  () => import(/* webpackChunkName: "AiAgentUsage" */ 'src/pages/AiAgentUsage'),
+);
+
 const UsersList: LazyExoticComponent<any> = lazy(
   () => import(/* webpackChunkName: "UsersList" */ 'src/pages/UsersList'),
 );
@@ -361,6 +365,10 @@ if (isAdmin) {
     {
       path: '/list_groups/',
       Component: GroupsList,
+    },
+    {
+      path: '/ai-agent/usage/',
+      Component: AiAgentUsage,
     },
   );
 

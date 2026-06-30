@@ -83,7 +83,23 @@ def compact_recalled_examples(recalled: list[Any]) -> list[dict[str, Any]]:
         native_sql = example.get("native_sql")
         if isinstance(native_sql, str) and len(native_sql) > _EXAMPLE_SQL_LIMIT:
             native_sql = native_sql[:_EXAMPLE_SQL_LIMIT].rstrip() + "…"
-        compact.append({"question": question, "native_sql": native_sql})
+        entry: dict[str, Any] = {"question": question, "native_sql": native_sql}
+        # Surface provenance (F3/2C) so the UI can show *where each query came
+        # from*: a curated golden query (verified or not, with its name) vs a
+        # learned runtime example, and whether a learned one came from outside
+        # the active project's onboarded tables (out_of_scope -> not in_scope).
+        meta = example.get("result_meta")
+        meta = meta if isinstance(meta, dict) else {}
+        if meta.get("golden"):
+            entry["source"] = "golden"
+            entry["verified"] = bool(meta.get("verified"))
+            name = meta.get("name")
+            if isinstance(name, str) and name.strip():
+                entry["name"] = name
+        else:
+            entry["source"] = "memory"
+            entry["in_scope"] = not bool(meta.get("out_of_scope"))
+        compact.append(entry)
     return compact
 
 
@@ -299,6 +315,7 @@ def _wren_context_detail(
         project_id=merged.get("project_id"),
         mdl_path=merged.get("mdl_path"),
         matched_models=_str_list(merged.get("matched_models")),
+        matched_views=_str_list(merged.get("matched_views")),
         retrieval_mode=merged.get("retrieval_mode"),
         retrieved_item_count=int(merged.get("retrieved_item_count", 0) or 0),
         context_item_count=len(context_items),

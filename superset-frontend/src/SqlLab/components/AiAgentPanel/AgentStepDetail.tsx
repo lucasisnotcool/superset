@@ -23,8 +23,10 @@ import {
   Button,
   Collapse,
   Icons,
+  InfoTooltip,
   Radio,
   Tag,
+  Tooltip,
 } from '@superset-ui/core/components';
 import type {
   AgentStep,
@@ -325,15 +327,20 @@ const groupChunksByModel = (
 const ChunkRow = ({
   chunk,
   index,
+  used = false,
 }: {
   chunk: RetrievedChunk;
   index: number;
+  // A view chunk surfaced into the prompt ("used") gets a badge so the user sees
+  // which vetted, named query grounded the answer.
+  used?: boolean;
 }) => {
   const score = formatScore(chunk.score);
   return (
     <ChunkCard key={`${chunk.model ?? ''}.${chunk.name ?? index}`}>
       <ChunkHead>
         {chunk.kind ? <Tag>{chunk.kind}</Tag> : null}
+        {used ? <Tag color="success">{t('used')}</Tag> : null}
         {chunk.name || chunk.model}
         {score ? <span>· {t('score %s', score)}</span> : null}
       </ChunkHead>
@@ -350,10 +357,12 @@ const RetrievedChunks = ({
   chunks,
   retriever,
   matchedModels = [],
+  matchedViews = [],
 }: {
   chunks?: RetrievedChunk[] | null;
   retriever?: string | null;
   matchedModels?: string[];
+  matchedViews?: string[];
 }) => {
   if (!chunks || chunks.length === 0) {
     return null;
@@ -362,7 +371,13 @@ const RetrievedChunks = ({
     ? t('Retrieved chunks (%s · %s)', chunks.length, retriever)
     : t('Retrieved chunks (%s)', chunks.length);
   const matched = new Set(matchedModels);
-  const groups = groupChunksByModel(chunks);
+  const usedViews = new Set(matchedViews);
+  // Views are pulled into their own group so a question -> view provenance reads
+  // distinctly from the model/column chunks; the rest keep the model grouping.
+  const viewChunks = chunks.filter(chunk => chunk.kind === 'view');
+  const groups = groupChunksByModel(
+    chunks.filter(chunk => chunk.kind !== 'view'),
+  );
   return (
     <CollapsePanel
       ghost
@@ -392,6 +407,19 @@ const RetrievedChunks = ({
                   ))}
                 </div>
               ))}
+              {viewChunks.length ? (
+                <div key="__views__" data-test="view-chunks">
+                  <ChunkGroupHead>{t('Views')}</ChunkGroupHead>
+                  {viewChunks.map((chunk, index) => (
+                    <ChunkRow
+                      key={`view.${chunk.name ?? index}`}
+                      chunk={chunk}
+                      index={index}
+                      used={usedViews.has(chunk.name ?? '')}
+                    />
+                  ))}
+                </div>
+              ) : null}
             </ChunkList>
           ),
         },
@@ -400,8 +428,63 @@ const RetrievedChunks = ({
   );
 };
 
+const ProvenanceMeta = styled.div`
+  ${({ theme }) => css`
+    margin-bottom: ${theme.sizeUnit / 2}px;
+    color: ${theme.colorTextTertiary};
+    font-size: ${theme.fontSizeSM}px;
+  `}
+`;
+
+type Provenance = { label: string; color?: string; title: string };
+
+// Resolve where a recalled query came from (F3/2C) into a badge + tooltip, so
+// the explain timeline shows provenance, not just the example text.
+const provenanceOf = (example: RecalledExample): Provenance => {
+  if (example.source === 'golden') {
+    return example.verified
+      ? {
+          label: t('Verified'),
+          color: 'success',
+          title: example.name
+            ? t('Curated, human-verified golden query: %s', example.name)
+            : t('Curated, human-verified golden query.'),
+        }
+      : {
+          label: t('Golden'),
+          color: 'processing',
+          title: example.name
+            ? t('Curated golden query: %s', example.name)
+            : t('Curated golden query (not yet verified).'),
+        };
+  }
+  return example.in_scope === false
+    ? {
+        label: t('Learned · broader'),
+        title: t(
+          "Learned from a confirmed query outside this project's onboarded " +
+            'tables — the SQL is reused, but semantic model names are hidden.',
+        ),
+      }
+    : {
+        label: t('Learned'),
+        title: t(
+          'Learned automatically from a past confirmed query on this database.',
+        ),
+      };
+};
+
+// Legend explaining the provenance badges, surfaced on the collapsible header so
+// users can read *where each recalled query came from* at a glance.
+const RECALLED_LEGEND = t(
+  'Where each recalled query came from: Verified/Golden = curated project ' +
+    'golden queries; Learned = auto-captured from past confirmed queries on ' +
+    'this database; “broader” = learned from outside this project’s onboarded tables.',
+);
+
 // Collapsible list of the confirmed NL->SQL examples the memory seam recalled
-// into the prompt (B1). Collapsed by default; the count reads on the header.
+// into the prompt (B1), each badged with its provenance (F3/2C). Collapsed by
+// default; the count reads on the header.
 const RecalledExamples = ({
   examples,
 }: {
@@ -417,17 +500,49 @@ const RecalledExamples = ({
       items={[
         {
           key: 'examples',
-          label: t('Recalled examples (%s)', examples.length),
+          label: (
+            <span>
+              {t('Recalled examples (%s)', examples.length)}
+              <InfoTooltip
+                tooltip={RECALLED_LEGEND}
+                data-test="recalled-legend"
+                css={css`
+                  margin-inline-start: 6px;
+                `}
+              />
+            </span>
+          ),
           children: (
             <ChunkList>
-              {examples.map((example, index) => (
-                <ChunkCard key={`${example.question}-${index}`}>
-                  <ChunkHead>{example.question}</ChunkHead>
-                  {example.native_sql ? (
-                    <Code>{example.native_sql}</Code>
-                  ) : null}
-                </ChunkCard>
-              ))}
+              {examples.map((example, index) => {
+                const prov = provenanceOf(example);
+                return (
+                  <ChunkCard key={`${example.question}-${index}`}>
+                    <ChunkHead>
+                      {example.question}
+                      <Tooltip title={prov.title}>
+                        <Tag
+                          color={prov.color}
+                          data-test="provenance-tag"
+                          css={css`
+                            margin-inline-start: 8px;
+                          `}
+                        >
+                          {prov.label}
+                        </Tag>
+                      </Tooltip>
+                    </ChunkHead>
+                    {example.source === 'golden' && example.name ? (
+                      <ProvenanceMeta data-test="provenance-name">
+                        {t('Golden query · %s', example.name)}
+                      </ProvenanceMeta>
+                    ) : null}
+                    {example.native_sql ? (
+                      <Code>{example.native_sql}</Code>
+                    ) : null}
+                  </ChunkCard>
+                );
+              })}
             </ChunkList>
           ),
         },
@@ -503,6 +618,10 @@ function DetailBody({ detail }: { detail: Detail }) {
               label={t('Matched models')}
               value={detail.matched_models.join(', ')}
             />
+            <Row
+              label={t('Matched views')}
+              value={(detail.matched_views ?? []).join(', ')}
+            />
             <Row label={t('Retriever')} value={detail.retrieval_mode} />
             <Row
               label={t('Retrieved chunks')}
@@ -519,6 +638,7 @@ function DetailBody({ detail }: { detail: Detail }) {
             chunks={detail.retrieved_chunks}
             retriever={detail.retrieval_mode}
             matchedModels={detail.matched_models}
+            matchedViews={detail.matched_views}
           />
           <WarningList
             messages={

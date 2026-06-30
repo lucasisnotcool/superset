@@ -26,7 +26,19 @@ def _rows(*values):
 
 
 def test_expected_covers_q1_through_q18():
-    assert [f"Q{i}" for i in range(1, 19)] == list(sc.EXPECTED)
+    # Q1-Q18 are frozen (byte-identical core data); v4 adds Q19+ (supply schema etc.).
+    assert [f"Q{i}" for i in range(1, 19)] == list(sc.EXPECTED)[:18]
+
+
+def test_v4_questions_have_capability_tags():
+    # Every gradable question carries a capability tag (and vice versa).
+    assert set(sc.EXPECTED) == set(sc.CAPABILITY)
+
+
+def test_zero_spec_grades_negative_result():
+    assert sc.score_result("Q21", [], None) == "correct"  # empty == none
+    assert sc.score_result("Q21", [{"v": 0}], None) == "correct"
+    assert sc.score_result("Q21", [{"v": 1751}], None) == "wrong"
 
 
 def test_cross_schema_only_set_matches_l5_questions():

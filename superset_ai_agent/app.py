@@ -25,6 +25,7 @@ import queue
 import threading
 import time
 from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -76,6 +77,12 @@ from superset_ai_agent.integrations.wren.factory import create_wren_client
 from superset_ai_agent.llm.base import ChatMessage
 from superset_ai_agent.llm.embeddings import create_embedder
 from superset_ai_agent.llm.factory import create_model_client
+from superset_ai_agent.llm.metered import wrap_model_client
+from superset_ai_agent.llm.usage_store import (
+    InMemoryLlmUsageStore,
+    LlmUsageStore,
+    SqlAlchemyLlmUsageStore,
+)
 from superset_ai_agent.persistence.database import (
     create_engine_from_config,
     create_session_factory,
@@ -86,6 +93,7 @@ from superset_ai_agent.schemas import (
     AgentQueryRequest,
     AgentQueryResponse,
     HealthResponse,
+    LlmUsageSummary,
     ModelInfo,
     SqlValidation,
     TraceEvent,
@@ -159,6 +167,13 @@ from superset_ai_agent.semantic_layer.file_storage import (
     DocumentStorage,
     LocalDocumentStorage,
     S3DocumentStorage,
+)
+from superset_ai_agent.semantic_layer.golden_queries import (
+    find_golden_queries_file,
+    GOLDEN_QUERIES_PATH,
+    GoldenQuery,
+    GoldenQueryPromoteRequest,
+    upsert_golden_query,
 )
 from superset_ai_agent.semantic_layer.instructions import (
     create_instruction_store,
@@ -293,6 +308,7 @@ def create_app(  # noqa: C901
     coverage_run_store: CoverageRunStore | None = None,
     schema_snapshot_store: SchemaSnapshotStore | None = None,
     retriever: Any | None = None,
+    llm_call_store: LlmUsageStore | None = None,
 ) -> FastAPI:
     """Create the standalone AI agent API.
 
@@ -321,6 +337,16 @@ def create_app(  # noqa: C901
         if app_config.agent_run_migrations:
             run_migrations(app_config)
         session_factory = create_session_factory(engine)
+    # LLM-call telemetry: wrap the model client at the one chokepoint every call
+    # passes through so counting + timing needs no call-site changes. Durable when
+    # an agent DB is configured; process-local otherwise. Recording is fail-open
+    # inside the wrapper, so this never affects an agent response.
+    active_llm_usage_store = llm_call_store or _create_llm_usage_store(
+        session_factory=session_factory
+    )
+    active_model_client = wrap_model_client(
+        active_model_client, store=active_llm_usage_store, config=app_config
+    )
     active_conversation_store = conversation_store or _create_conversation_store(
         app_config,
         session_factory=session_factory,
@@ -446,6 +472,15 @@ def create_app(  # noqa: C901
         return active_identity_provider.get_identity(request)
 
     identity_dependency = Depends(get_identity)
+
+    def require_admin(request: Request) -> None:
+        # Gate admin-only agent surfaces (LLM usage). Defense-in-depth: the
+        # Superset menu/route are also admin-gated, but the API enforces it too so
+        # a direct call cannot bypass the UI.
+        if not active_identity_provider.is_admin(request):
+            raise HTTPException(status_code=403, detail="Admin access required.")
+
+    admin_dependency = Depends(require_admin)
     scope_form = Form(...)
     upload_file = File(...)
 
@@ -652,6 +687,25 @@ def create_app(  # noqa: C901
             return active_model_client.list_models()
         except Exception as ex:  # pylint: disable=broad-except
             raise HTTPException(status_code=502, detail=str(ex)) from ex
+
+    @api.get("/agent/admin/llm-usage", response_model=LlmUsageSummary)
+    def llm_usage(
+        request: Request,
+        days: int | None = None,
+        _admin: None = admin_dependency,
+    ) -> LlmUsageSummary:
+        """Aggregated LLM-call telemetry (admin only).
+
+        ``days`` optionally limits the window to the last N days; omitted = all
+        retained history. Read-only and gated by :func:`require_admin`.
+        """
+
+        since = (
+            datetime.now(timezone.utc) - timedelta(days=days)
+            if days is not None and days > 0
+            else None
+        )
+        return active_llm_usage_store.summary(since=since)
 
     @api.post("/agent/query", response_model=AgentQueryResponse)
     def query_agent(
@@ -1965,6 +2019,49 @@ def create_app(  # noqa: C901
             )
         return schema_index
 
+    def _offending_activation_targets(
+        *,
+        project: SemanticProject,
+        fastapi_request: Request,
+        active_staying: list[str],
+        targets: list[MdlFile],
+    ) -> list[str]:
+        """Name the target file(s) that make a bulk activation fail (leave-one-out).
+
+        Runs only when the projected manifest is invalid. With one target, that
+        target is the culprit. With several, validate the projected set with each
+        target removed: if the remainder becomes valid, that target is the isolated
+        culprit. Returns the offending file paths; empty when no single file is
+        implicated (a genuine cross-file error) so the caller keeps the
+        manifest-level message. Attribution only — nothing is dropped here (R3:
+        surface the bad view so the reviewer can reject just that one).
+        """
+
+        if not targets:
+            return []
+        if len(targets) == 1:
+            return [targets[0].path]
+        schema_index = _schema_index_for_project(project, fastapi_request)
+        deep = (
+            app_config.wren_core_validation_enabled
+            or app_config.wren_activation_requires_engine
+        )
+        contents_by_id = {target.id: target.content for target in targets}
+        offending: list[str] = []
+        for target in targets:
+            remainder = active_staying + [
+                content for tid, content in contents_by_id.items() if tid != target.id
+            ]
+            result = validate_project_manifest(
+                remainder,
+                schema_index=schema_index,
+                deep_validate=deep,
+                dedup_models=True,
+            )
+            if result.valid:
+                offending.append(target.path)
+        return offending
+
     def _enforce_activation(
         *,
         project: SemanticProject,
@@ -2100,14 +2197,34 @@ def create_app(  # noqa: C901
             # Projected active set = files staying active + the files being
             # activated. Validate it as one manifest so dependency order among the
             # targets never matters (the activated files come last → W4 last-wins).
-            projected = [file.content for file in files if file.status == "active"] + [
+            active_staying = [
+                file.content
+                for file in files
+                if file.status == "active" and file.id not in target_ids
+            ]
+            projected = active_staying + [
                 file.content for file in targets if file.id in target_ids
             ]
-            schema_index = _enforce_activation_manifest(
-                project=project,
-                fastapi_request=fastapi_request,
-                contents=projected,
-            )
+            try:
+                schema_index = _enforce_activation_manifest(
+                    project=project,
+                    fastapi_request=fastapi_request,
+                    contents=projected,
+                )
+            except HTTPException as exc:
+                # R3: name the offending view file(s) so the reviewer can reject
+                # just the bad one instead of losing the whole changeset. The
+                # atomic invariant is preserved — nothing auto-activates.
+                if exc.status_code == 422 and isinstance(exc.detail, dict):
+                    offending = _offending_activation_targets(
+                        project=project,
+                        fastapi_request=fastapi_request,
+                        active_staying=active_staying,
+                        targets=targets,
+                    )
+                    if offending:
+                        exc.detail["offending_files"] = offending
+                raise
 
         try:
             changed = _apply_bulk_status(
@@ -3255,6 +3372,66 @@ def create_app(  # noqa: C901
                 owner_id=identity.owner_id,
             )
         return applied
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/golden-queries/promote",
+        response_model=MdlFile,
+    )
+    def promote_golden_query(
+        project_id: str,
+        request: GoldenQueryPromoteRequest,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> MdlFile:
+        """Promote an NL->SQL pair into the project's ``queries.json`` golden set.
+
+        A copy, never a move — the source runtime-memory pair is left untouched
+        (it stays in the shared, database-scoped pool). Idempotent on the question.
+        Creating a new ``queries.json`` lands a draft; updating an existing file
+        preserves its status (consistent with MDL file edits).
+        """
+
+        _require_copilot_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
+        )
+        semantic_sql = (request.semantic_sql or request.native_sql or "").strip()
+        if not request.question.strip() or not semantic_sql:
+            raise HTTPException(
+                status_code=400,
+                detail="Promote requires a question and semantic_sql (or native_sql).",
+            )
+        entry = GoldenQuery(
+            name=request.name or request.question,
+            question=request.question,
+            semantic_sql=semantic_sql,
+            verified_by=identity.username or identity.email or identity.owner_id,
+            verified_at=int(time.time()),
+            use_as_onboarding=request.use_as_onboarding,
+            usage_guidance=request.usage_guidance,
+        )
+        existing = find_golden_queries_file(
+            active_mdl_file_store.list(project_id, owner_id=identity.owner_id)
+        )
+        try:
+            content = upsert_golden_query(
+                existing.content if existing is not None else None, entry
+            )
+        except (ValueError, TypeError) as ex:
+            raise HTTPException(
+                status_code=400, detail=f"Existing queries.json is invalid: {ex}"
+            ) from ex
+        if existing is None:
+            return active_mdl_file_store.create(
+                project_id,
+                MdlFileCreateRequest(path=GOLDEN_QUERIES_PATH, content=content),
+                owner_id=identity.owner_id,
+            )
+        return active_mdl_file_store.update(
+            existing.id,
+            MdlFileUpdateRequest(content=content),
+            owner_id=identity.owner_id,
+        )
 
     @api.post(
         "/agent/semantic-layer/projects/{project_id}/materialize",
@@ -4544,6 +4721,18 @@ def _create_job_store(
         "Unsupported AI_AGENT_SEMANTIC_LAYER_STORE value "
         f"{config.semantic_layer_store!r}. Expected one of: memory, sqlalchemy."
     )
+
+
+def _create_llm_usage_store(
+    *,
+    session_factory: Any | None = None,
+) -> LlmUsageStore:
+    # Durable when an agent DB is configured; process-local (non-durable) otherwise.
+    # Keyed on the session factory rather than a store-mode knob so metering works
+    # in every persistence mode without an extra config switch.
+    if session_factory is None:
+        return InMemoryLlmUsageStore()
+    return SqlAlchemyLlmUsageStore(session_factory)
 
 
 def _create_coverage_run_store(

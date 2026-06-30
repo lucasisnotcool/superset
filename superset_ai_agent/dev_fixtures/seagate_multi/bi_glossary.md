@@ -150,3 +150,50 @@ Compare Golden Yield between the Tigerline region and the Reef region?
 Show the True Pass Rate for Plate Spin tests at Tigerline Point?
 
 List how many patties were plated on WARM lines, by drive family?
+
+## Supply schema (seagate_supply) — components and the bill of materials
+
+A third schema, **`seagate_supply`**, holds what each drive is built from:
+
+- `seagate_supply.seagate_components` (`component_id`) — the component catalog: a
+  `component_name` (Platter, Spindle Motor, Actuator, Controller Board, Bracket Kit,
+  Firmware Image), a `component_type`, and a `criticality` (`CRITICAL` / `STANDARD`).
+- `seagate_supply.seagate_sku_components` (`sku_id`, `component_id`) — the **bill of
+  materials** bridge: how many of each component go into one drive of a SKU
+  (`qty_per_drive`). It joins **across schemas** to
+  `seagate_core.seagate_drive_skus.sku_id`.
+
+Slang:
+
+- A "platter" is also known as the spinning disk inside a patty — the
+  `component_name = 'Platter'` row. The number of platters in one drive is
+  `qty_per_drive` on `seagate_sku_components` for that SKU's Platter row; it is **not**
+  the drive's capacity and is **only** found in the bridge.
+- A "spinner" is also known as the `Spindle Motor` component.
+- "The brains" is also known as the `Controller Board` component.
+
+To count **components consumed** in production you cross all three schemas: a
+component's `qty_per_drive` (`seagate_supply`) x the SKU's plated units
+(`seagate_ops.seagate_production_events.units_completed`, joined through
+`seagate_ops.seagate_work_orders` to `seagate_core.seagate_drive_skus`). Example:
+"platters consumed plating Vantage drives" sums `units_completed * qty_per_drive`
+(Platter) over Vantage SKUs.
+
+`seagate_supply.seagate_supplier_deliveries` records each component delivery with a
+`promised_on` and `delivered_on` date and an `on_time` flag (delivered on or before
+promised), joined to `seagate_supply.seagate_components` by `component_id`.
+
+## Custom metrics (continued)
+
+Metric **Supply Reliability** = COUNT(on_time) / COUNT(*) over
+`seagate_supply.seagate_supplier_deliveries`, counting **only CRITICAL components**
+(`seagate_components.criticality = 'CRITICAL'` — Platter, Spindle Motor, Actuator,
+Controller Board). STANDARD components (Bracket Kit, Firmware Image) are **excluded
+by definition** — Supply Reliability is undefined for a STANDARD-component-only
+slice, exactly as Golden Yield is undefined for a short-order-only slice.
+
+## Business calendar (continued)
+
+A "fiscal quarter" is the same as the calendar quarter (Q1 = Jan-Mar, ... ,
+**Q4 = Oct-Dec**). "The last fiscal quarter" of 2025 is therefore
+2025-10-01 to 2025-12-31 — the same window as Q4 2025.

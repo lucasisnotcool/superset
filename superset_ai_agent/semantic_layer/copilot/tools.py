@@ -53,6 +53,13 @@ from superset_ai_agent.semantic_layer.document_retriever import (
     DocumentChunkIndex,
     find_exact_duplicate_matches,
 )
+from superset_ai_agent.semantic_layer.golden_queries import (
+    GOLDEN_QUERIES_PATH,
+    GoldenQuery,
+    is_golden_queries_path,
+    upsert_golden_query,
+    validate_golden_queries,
+)
 from superset_ai_agent.semantic_layer.mdl_files import normalize_mdl_path
 from superset_ai_agent.semantic_layer.mdl_merge import (
     merge_manifest_sections,
@@ -239,6 +246,57 @@ class MdlToolset:
                         },
                     },
                     "required": ["path", "overlay"],
+                },
+            ),
+            ToolSpec(
+                name="add_golden_query",
+                description=(
+                    "Add a curated, verified question->SQL example ('golden query') "
+                    "to the project's queries.json. Use when a known-good answer to a "
+                    "recurring business question should steer future SQL generation. "
+                    "Write the SQL against the semantic model's logical (model) names, "
+                    "not physical tables — like a metric or view. Idempotent on the "
+                    "question. Lands as a reviewable draft; a human accepts it."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": (
+                                "Natural-language question, phrased as a user would "
+                                "ask it."
+                            ),
+                        },
+                        "semantic_sql": {
+                            "type": "string",
+                            "description": (
+                                "Known-good SQL answering the question, written "
+                                "against MDL model names."
+                            ),
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": (
+                                "Short descriptive name (defaults to the question)."
+                            ),
+                        },
+                        "usage_guidance": {
+                            "type": "string",
+                            "description": "Optional note on when this applies.",
+                        },
+                        "use_as_onboarding": {
+                            "type": "boolean",
+                            "description": (
+                                "Surface as a project starter question (default false)."
+                            ),
+                        },
+                        "summary": {
+                            "type": "string",
+                            "description": "Short human label for this edit.",
+                        },
+                    },
+                    "required": ["question", "semantic_sql"],
                 },
             ),
             ToolSpec(
@@ -540,6 +598,7 @@ class MdlToolset:
             "read_mdl_file": self._read_mdl_file,
             "write_mdl_file": self._write_mdl_file,
             "patch_mdl_file": self._patch_mdl_file,
+            "add_golden_query": self._add_golden_query,
             "delete_mdl_file": self._delete_mdl_file,
             "remove_mdl_entity": self._remove_mdl_entity,
             "validate_project": self._validate_project,
@@ -634,6 +693,42 @@ class MdlToolset:
             return {"error": "write_mdl_file requires non-empty 'content'."}
         return self._stage_content(path, content, args.get("summary"))
 
+    def _add_golden_query(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Stage a curated golden query into the project's ``queries.json`` (F3).
+
+        Idempotent on the normalized question (re-adding refreshes in place). The
+        SQL must be written against the semantic model's logical names. The staged
+        change lands as a reviewable draft like any other file edit — a human
+        accepts it; activation stays separate.
+        """
+
+        question = args.get("question")
+        semantic_sql = args.get("semantic_sql")
+        name = args.get("name") or question
+        if not isinstance(question, str) or not question.strip():
+            return {"error": "add_golden_query requires a non-empty 'question'."}
+        if not isinstance(semantic_sql, str) or not semantic_sql.strip():
+            return {"error": "add_golden_query requires non-empty 'semantic_sql'."}
+        entry = GoldenQuery(
+            name=str(name),
+            question=question,
+            semantic_sql=semantic_sql,
+            usage_guidance=(
+                str(args["usage_guidance"]) if args.get("usage_guidance") else None
+            ),
+            use_as_onboarding=bool(args.get("use_as_onboarding", False)),
+        )
+        current = self._working.get(GOLDEN_QUERIES_PATH)
+        try:
+            content = upsert_golden_query(current, entry)
+        except (ValueError, TypeError) as ex:
+            return {"error": f"Existing queries.json is invalid: {ex}"}
+        result = self._stage_content(
+            GOLDEN_QUERIES_PATH, content, args.get("summary") or f"Golden: {name}"
+        )
+        result["golden_query"] = entry.name
+        return result
+
     def _stage_content(self, path: str, content: str, summary: Any) -> dict[str, Any]:
         """Stage full file content into the working copy and validate it.
 
@@ -647,6 +742,18 @@ class MdlToolset:
         the merge already preserved them, so this guard is a defensive no-op there.
         """
 
+        # Golden queries (queries.json) are a sibling knowledge artifact, not an MDL
+        # manifest: skip the MDL property-preservation guard and validate as golden.
+        if is_golden_queries_path(path):
+            self._working[path] = content
+            if summary:
+                self._summaries[path] = str(summary)
+            return {
+                "path": path,
+                "validation": validate_golden_queries(content).model_dump(
+                    mode="json"
+                ),
+            }
         prior = self._working.get(path)
         restored = False
         if prior is not None:
@@ -1573,6 +1680,7 @@ def _safe_model_name(table: str) -> str:
 _MUTATING_ACTIONS: dict[str, ToolActionKind] = {
     "write_mdl_file": "write",
     "patch_mdl_file": "write",
+    "add_golden_query": "curate",
     "delete_mdl_file": "delete",
     "remove_mdl_entity": "remove",
     "propose_onboard_table": "onboard",

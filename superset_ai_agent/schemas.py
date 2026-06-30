@@ -205,6 +205,10 @@ class WrenContextArtifact(BaseModel):
     materialized_file_count: int | None = None
     materialized_checksum: str | None = None
     matched_models: list[str] = Field(default_factory=list)
+    #: Names of MDL views surfaced into the prompt for this turn (a view is a
+    #: vetted, named query the agent can select from instead of re-deriving the
+    #: joins). Empty when the project has no views or none match the question.
+    matched_views: list[str] = Field(default_factory=list)
     example_ids: list[str] = Field(default_factory=list)
     document_ids: list[str] = Field(default_factory=list)
     context_items: list[dict[str, Any]] = Field(default_factory=list)
@@ -310,6 +314,10 @@ class LoadWrenContextDetail(BaseModel):
     project_id: str | None = None
     mdl_path: str | None = None
     matched_models: list[str] = Field(default_factory=list)
+    #: Names of MDL views surfaced into the prompt this turn — the view provenance
+    #: shown in the Explain dialog ("which vetted, named query grounded the
+    #: answer"). Only semantic views appear; native views are never surfaced.
+    matched_views: list[str] = Field(default_factory=list)
     retrieval_mode: str | None = None
     retrieved_item_count: int = 0
     context_item_count: int = 0
@@ -325,11 +333,24 @@ class RecalledExample(BaseModel):
     """A confirmed NL->SQL example the memory seam recalled into the prompt (B1).
 
     Surfaced in the explain timeline so users see *which* learned examples
-    grounded the draft, not just how many. ``native_sql`` is truncated for display.
+    grounded the draft, *and where each came from*, not just how many.
+    ``native_sql`` is truncated for display. Provenance (F3/2C):
+
+    - ``source`` — ``"golden"`` (curated project query) or ``"memory"`` (learned
+      runtime example).
+    - ``verified`` — a golden query whose answer was human-verified.
+    - ``name`` — the golden query's curated name, when present.
+    - ``in_scope`` — for a learned example, whether its tables are onboarded in
+      the active project; ``False`` marks one recalled from a broader same-database
+      context (Stage C native-only).
     """
 
     question: str
     native_sql: str | None = None
+    source: Literal["golden", "memory"] = "memory"
+    verified: bool = False
+    name: str | None = None
+    in_scope: bool = True
 
 
 class DraftDetail(BaseModel):
@@ -512,3 +533,38 @@ class HealthResponse(BaseModel):
     #: Effective max upload size for source documents (WREN_MAX_DOCUMENT_BYTES), so
     #: the UI can reject oversized files before the upload round-trip.
     max_document_bytes: int = 10_000_000
+
+
+class LlmUsageBucket(BaseModel):
+    """Aggregated LLM-call metrics for one grouping key (a day, model, provider)."""
+
+    key: str
+    calls: int = 0
+    failures: int = 0
+    total_duration_ms: int = 0
+    avg_duration_ms: float = 0.0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+
+class LlmUsageSummary(BaseModel):
+    """Aggregated LLM-call telemetry surfaced in the admin usage view.
+
+    Totals plus breakdowns by day, model, and provider over an optional time
+    window. Token totals are best-effort (only providers that report usage
+    contribute). ``kinds`` is the set of call classes included ("chat" today; the
+    deferred embedding meter would add "embedding").
+    """
+
+    total_calls: int = 0
+    total_failures: int = 0
+    total_duration_ms: int = 0
+    avg_duration_ms: float = 0.0
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    by_day: list[LlmUsageBucket] = Field(default_factory=list)
+    by_model: list[LlmUsageBucket] = Field(default_factory=list)
+    by_provider: list[LlmUsageBucket] = Field(default_factory=list)
+    kinds: list[str] = Field(default_factory=list)
+    since: datetime | None = None
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

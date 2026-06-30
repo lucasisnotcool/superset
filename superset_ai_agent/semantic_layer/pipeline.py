@@ -44,7 +44,6 @@ from uuid import uuid4
 from pydantic import BaseModel, Field
 
 from superset_ai_agent.config import AgentConfig
-from superset_ai_agent.conversations.schemas import ConversationScope
 from superset_ai_agent.integrations.superset.client import AgentContext, SupersetClient
 from superset_ai_agent.intent import classify_intent, IntentResult
 from superset_ai_agent.llm.base import ModelClient
@@ -64,13 +63,16 @@ from superset_ai_agent.semantic_layer.engine.planning import (
     PlanStepResult,
 )
 from superset_ai_agent.semantic_layer.mdl_files import MdlFileStore
-from superset_ai_agent.semantic_layer.memory_store import Memory, NullMemory
+from superset_ai_agent.semantic_layer.memory_store import (
+    Memory,
+    NullMemory,
+    refs_from_sql,
+)
 from superset_ai_agent.semantic_layer.schema_retriever import (
     create_retriever,
     retrieve_mdl_context,
     Retriever,
 )
-from superset_ai_agent.semantic_layer.store import scope_hash
 from superset_ai_agent.tools.sql import validate_read_only_sql
 
 logger = logging.getLogger(__name__)
@@ -218,20 +220,17 @@ class SemanticPipeline:
         result: ExecutionResult,
     ) -> bool:
         try:
+            native_sql = plan.native_sql or normalized_sql
+            referenced_tables, referenced_schemas = refs_from_sql(native_sql)
             self.memory.store_confirmed(
                 question=request.question,
                 semantic_sql=plan.semantic_sql or normalized_sql,
-                native_sql=plan.native_sql or normalized_sql,
-                scope_hash=scope_hash(
-                    ConversationScope(
-                        database_id=request.database_id,
-                        catalog_name=request.catalog_name,
-                        schema_name=request.schema_name,
-                        dataset_ids=request.dataset_ids,
-                    )
-                ),
-                owner_id=owner_id,
+                native_sql=native_sql,
+                database_id=request.database_id,
+                created_by=owner_id,
                 project_id=project_id,
+                referenced_tables=referenced_tables,
+                referenced_schemas=referenced_schemas,
                 result_meta={"row_count": result.row_count},
             )
             return True

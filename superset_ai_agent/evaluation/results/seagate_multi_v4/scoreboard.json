@@ -1,0 +1,332 @@
+{
+  "meta": {
+    "fixture_version": "v4",
+    "trials": 3,
+    "memory": "off",
+    "model": "gpt-4.1-mini"
+  },
+  "by_config": {
+    "basic": {
+      "total": {
+        "mean": 4.67,
+        "min": 4.0,
+        "max": 5.0
+      },
+      "by_capability": {
+        "bridge": "0.0/3",
+        "distractor": "0.0/1",
+        "golden": "0.0/1",
+        "join1": "1.0/1",
+        "metric": "0.67/10",
+        "multihop": "0.0/7",
+        "negative": "1.0/1",
+        "slang": "2.0/10",
+        "temporal": "0.0/5",
+        "trap": "1.67/2",
+        "viewable": "0.0/1",
+        "xschema2": "1.0/13",
+        "xschema3": "0.0/3"
+      },
+      "trials": 3
+    },
+    "context_dump": {
+      "total": {
+        "mean": 13.67,
+        "min": 12.0,
+        "max": 15.0
+      },
+      "by_capability": {
+        "bridge": "0.67/3",
+        "distractor": "0.33/1",
+        "golden": "0.33/1",
+        "join1": "1.0/1",
+        "metric": "4.0/10",
+        "multihop": "2.0/7",
+        "negative": "1.0/1",
+        "slang": "5.67/10",
+        "temporal": "0.0/5",
+        "trap": "1.67/2",
+        "viewable": "0.33/1",
+        "xschema2": "4.33/13",
+        "xschema3": "0.67/3"
+      },
+      "trials": 3
+    },
+    "wren_base\u00b7manual": {
+      "total": {
+        "mean": 7.33,
+        "min": 7.0,
+        "max": 8.0
+      },
+      "by_capability": {
+        "bridge": "0.0/3",
+        "distractor": "1.0/1",
+        "golden": "0.0/1",
+        "join1": "1.0/1",
+        "metric": "0.33/10",
+        "multihop": "0.0/7",
+        "negative": "1.0/1",
+        "slang": "3.0/10",
+        "temporal": "1.0/5",
+        "trap": "1.33/2",
+        "viewable": "0.0/1",
+        "xschema2": "1.0/13",
+        "xschema3": "0.0/3"
+      },
+      "trials": 3
+    },
+    "wren_bi\u00b7manual": {
+      "total": {
+        "mean": 8.67,
+        "min": 5.0,
+        "max": 12.0
+      },
+      "by_capability": {
+        "bridge": "0.0/3",
+        "distractor": "0.33/1",
+        "golden": "0.0/1",
+        "join1": "1.0/1",
+        "metric": "1.33/10",
+        "multihop": "0.33/7",
+        "negative": "1.0/1",
+        "slang": "4.0/10",
+        "temporal": "1.0/5",
+        "trap": "1.67/2",
+        "viewable": "0.0/1",
+        "xschema2": "1.67/13",
+        "xschema3": "0.0/3"
+      },
+      "trials": 3
+    },
+    "wren_bi_context\u00b7manual": {
+      "total": {
+        "mean": 22.0,
+        "min": 20.0,
+        "max": 23.0
+      },
+      "by_capability": {
+        "bridge": "2.33/3",
+        "distractor": "0.67/1",
+        "golden": "0.67/1",
+        "join1": "1.0/1",
+        "metric": "6.67/10",
+        "multihop": "4.0/7",
+        "negative": "1.0/1",
+        "slang": "8.33/10",
+        "temporal": "2.67/5",
+        "trap": "1.33/2",
+        "viewable": "0.67/1",
+        "xschema2": "9.33/13",
+        "xschema3": "2.33/3"
+      },
+      "trials": 3
+    },
+    "wren_base\u00b7auto": {
+      "total": {
+        "mean": 7.33,
+        "min": 6.0,
+        "max": 8.0
+      },
+      "by_capability": {
+        "bridge": "0.0/3",
+        "distractor": "0.67/1",
+        "golden": "0.0/1",
+        "join1": "1.0/1",
+        "metric": "0.67/10",
+        "multihop": "0.0/7",
+        "negative": "1.0/1",
+        "slang": "3.0/10",
+        "temporal": "1.0/5",
+        "trap": "1.67/2",
+        "viewable": "0.0/1",
+        "xschema2": "1.0/13",
+        "xschema3": "0.0/3"
+      },
+      "trials": 3
+    },
+    "wren_bi\u00b7auto": {
+      "total": {
+        "mean": 9.33,
+        "min": 6.0,
+        "max": 13.0
+      },
+      "by_capability": {
+        "bridge": "0.0/3",
+        "distractor": "1.0/1",
+        "golden": "0.0/1",
+        "join1": "1.0/1",
+        "metric": "0.67/10",
+        "multihop": "0.33/7",
+        "negative": "1.0/1",
+        "slang": "4.67/10",
+        "temporal": "1.0/5",
+        "trap": "1.67/2",
+        "viewable": "0.0/1",
+        "xschema2": "1.67/13",
+        "xschema3": "0.0/3"
+      },
+      "trials": 3
+    },
+    "wren_bi_context\u00b7auto": {
+      "total": {
+        "mean": 21.33,
+        "min": 15.0,
+        "max": 25.0
+      },
+      "by_capability": {
+        "bridge": "2.67/3",
+        "distractor": "1.0/1",
+        "golden": "1.0/1",
+        "join1": "1.0/1",
+        "metric": "7.0/10",
+        "multihop": "3.33/7",
+        "negative": "1.0/1",
+        "slang": "7.0/10",
+        "temporal": "2.33/5",
+        "trap": "1.33/2",
+        "viewable": "0.67/1",
+        "xschema2": "9.0/13",
+        "xschema3": "2.67/3"
+      },
+      "trials": 3
+    }
+  },
+  "by_capability": {
+    "bridge": {
+      "basic": 0.0,
+      "context_dump": 0.67,
+      "wren_base\u00b7manual": 0.0,
+      "wren_bi\u00b7manual": 0.0,
+      "wren_bi_context\u00b7manual": 2.33,
+      "wren_base\u00b7auto": 0.0,
+      "wren_bi\u00b7auto": 0.0,
+      "wren_bi_context\u00b7auto": 2.67
+    },
+    "distractor": {
+      "basic": 0.0,
+      "context_dump": 0.33,
+      "wren_base\u00b7manual": 1.0,
+      "wren_bi\u00b7manual": 0.33,
+      "wren_bi_context\u00b7manual": 0.67,
+      "wren_base\u00b7auto": 0.67,
+      "wren_bi\u00b7auto": 1.0,
+      "wren_bi_context\u00b7auto": 1.0
+    },
+    "golden": {
+      "basic": 0.0,
+      "context_dump": 0.33,
+      "wren_base\u00b7manual": 0.0,
+      "wren_bi\u00b7manual": 0.0,
+      "wren_bi_context\u00b7manual": 0.67,
+      "wren_base\u00b7auto": 0.0,
+      "wren_bi\u00b7auto": 0.0,
+      "wren_bi_context\u00b7auto": 1.0
+    },
+    "join1": {
+      "basic": 1.0,
+      "context_dump": 1.0,
+      "wren_base\u00b7manual": 1.0,
+      "wren_bi\u00b7manual": 1.0,
+      "wren_bi_context\u00b7manual": 1.0,
+      "wren_base\u00b7auto": 1.0,
+      "wren_bi\u00b7auto": 1.0,
+      "wren_bi_context\u00b7auto": 1.0
+    },
+    "metric": {
+      "basic": 0.67,
+      "context_dump": 4.0,
+      "wren_base\u00b7manual": 0.33,
+      "wren_bi\u00b7manual": 1.33,
+      "wren_bi_context\u00b7manual": 6.67,
+      "wren_base\u00b7auto": 0.67,
+      "wren_bi\u00b7auto": 0.67,
+      "wren_bi_context\u00b7auto": 7.0
+    },
+    "multihop": {
+      "basic": 0.0,
+      "context_dump": 2.0,
+      "wren_base\u00b7manual": 0.0,
+      "wren_bi\u00b7manual": 0.33,
+      "wren_bi_context\u00b7manual": 4.0,
+      "wren_base\u00b7auto": 0.0,
+      "wren_bi\u00b7auto": 0.33,
+      "wren_bi_context\u00b7auto": 3.33
+    },
+    "negative": {
+      "basic": 1.0,
+      "context_dump": 1.0,
+      "wren_base\u00b7manual": 1.0,
+      "wren_bi\u00b7manual": 1.0,
+      "wren_bi_context\u00b7manual": 1.0,
+      "wren_base\u00b7auto": 1.0,
+      "wren_bi\u00b7auto": 1.0,
+      "wren_bi_context\u00b7auto": 1.0
+    },
+    "slang": {
+      "basic": 2.0,
+      "context_dump": 5.67,
+      "wren_base\u00b7manual": 3.0,
+      "wren_bi\u00b7manual": 4.0,
+      "wren_bi_context\u00b7manual": 8.33,
+      "wren_base\u00b7auto": 3.0,
+      "wren_bi\u00b7auto": 4.67,
+      "wren_bi_context\u00b7auto": 7.0
+    },
+    "temporal": {
+      "basic": 0.0,
+      "context_dump": 0.0,
+      "wren_base\u00b7manual": 1.0,
+      "wren_bi\u00b7manual": 1.0,
+      "wren_bi_context\u00b7manual": 2.67,
+      "wren_base\u00b7auto": 1.0,
+      "wren_bi\u00b7auto": 1.0,
+      "wren_bi_context\u00b7auto": 2.33
+    },
+    "trap": {
+      "basic": 1.67,
+      "context_dump": 1.67,
+      "wren_base\u00b7manual": 1.33,
+      "wren_bi\u00b7manual": 1.67,
+      "wren_bi_context\u00b7manual": 1.33,
+      "wren_base\u00b7auto": 1.67,
+      "wren_bi\u00b7auto": 1.67,
+      "wren_bi_context\u00b7auto": 1.33
+    },
+    "viewable": {
+      "basic": 0.0,
+      "context_dump": 0.33,
+      "wren_base\u00b7manual": 0.0,
+      "wren_bi\u00b7manual": 0.0,
+      "wren_bi_context\u00b7manual": 0.67,
+      "wren_base\u00b7auto": 0.0,
+      "wren_bi\u00b7auto": 0.0,
+      "wren_bi_context\u00b7auto": 0.67
+    },
+    "xschema2": {
+      "basic": 1.0,
+      "context_dump": 4.33,
+      "wren_base\u00b7manual": 1.0,
+      "wren_bi\u00b7manual": 1.67,
+      "wren_bi_context\u00b7manual": 9.33,
+      "wren_base\u00b7auto": 1.0,
+      "wren_bi\u00b7auto": 1.67,
+      "wren_bi_context\u00b7auto": 9.0
+    },
+    "xschema3": {
+      "basic": 0.0,
+      "context_dump": 0.67,
+      "wren_base\u00b7manual": 0.0,
+      "wren_bi\u00b7manual": 0.0,
+      "wren_bi_context\u00b7manual": 2.33,
+      "wren_base\u00b7auto": 0.0,
+      "wren_bi\u00b7auto": 0.0,
+      "wren_bi_context\u00b7auto": 2.67
+    }
+  },
+  "deltas": {
+    "enrichment (wren_bi\u00b7auto \u2212 wren_base\u00b7auto)": 2.0,
+    "auto vs manual onboard (wren_bi\u00b7auto \u2212 wren_bi\u00b7manual)": 0.66,
+    "context on top of layer (wren_bi_context\u00b7auto \u2212 wren_bi\u00b7auto)": 12.0,
+    "layer vs raw context (wren_bi\u00b7auto \u2212 context_dump)": -4.34
+  }
+}

@@ -45,6 +45,7 @@ from superset_ai_agent.semantic_layer.projects import InMemorySemanticProjectSto
 from superset_ai_agent.semantic_layer.schemas import (
     MdlFileCreateRequest,
     MdlFileUpdateRequest,
+    SemanticProject,
     SemanticProjectResolveRequest,
 )
 from superset_ai_agent.semantic_layer.store import (
@@ -679,3 +680,79 @@ def test_model_selector_built_when_flag_on() -> None:
     selector = graph._model_selector("any question")
     assert selector is not None
     assert selector(["alpha", "beta"]) == ["alpha"]
+
+
+# --- R1: recall access set spans the project's full schema set ----------------
+
+
+class _RecallDatasetClient(FakeSupersetClient):
+    """Per-user access-filtered dataset listing keyed by schema."""
+
+    def __init__(self, by_schema: dict[str, list[str]]) -> None:
+        super().__init__()
+        self.by_schema = by_schema
+        self.list_calls: list[str | None] = []
+
+    def list_datasets(
+        self,
+        *,
+        database_id: int,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        dataset_ids: list[int] | None = None,
+        limit: int = 8,
+    ):
+        self.list_calls.append(schema_name)
+
+        class _DS:
+            def __init__(self, schema: str | None, table: str) -> None:
+                self.schema_name = schema
+                self.table_name = table
+
+        return [_DS(schema_name, t) for t in self.by_schema.get(schema_name or "", [])]
+
+
+def _project(schema_names: list[str]) -> SemanticProject:
+    return SemanticProject(
+        name="p",
+        owner_id="local",
+        database_uri_fingerprint="fp",
+        schema_name=schema_names[0],
+        schema_names=schema_names,
+        default_database_id=1,
+    )
+
+
+def test_recall_access_spans_all_project_schemas() -> None:
+    # R1: the access set must union every project schema (not the request's primary
+    # schema), so a cross-schema golden/memory pair can pass the Stage-A filter.
+    client = _RecallDatasetClient(
+        {"core": ["lines", "skus"], "ops": ["events", "work_orders"]}
+    )
+    graph = TextToSqlGraph(
+        config=AgentConfig(wren_memory_store="lancedb"),
+        model_client=FakeModelClient("SELECT 1"),
+        context_provider=FakeContextProvider(),
+        superset_client=client,
+    )
+    request = AgentQueryRequest(question="x", database_id=1, schema_name="core")
+    access = graph._recall_access(request, _project(["core", "ops"]))
+    assert access is not None
+    assert access.accessible_tables == frozenset(
+        {"core.lines", "core.skus", "ops.events", "ops.work_orders"}
+    )
+    assert client.list_calls == ["core", "ops"]
+
+
+def test_recall_access_is_none_and_skips_loads_when_inert() -> None:
+    # No project + learning off (default store="none") -> inert -> no scan, None.
+    client = _RecallDatasetClient({})
+    graph = TextToSqlGraph(
+        config=AgentConfig(),
+        model_client=FakeModelClient("SELECT 1"),
+        context_provider=FakeContextProvider(),
+        superset_client=client,
+    )
+    request = AgentQueryRequest(question="x", database_id=1, schema_name="core")
+    assert graph._recall_access(request, None) is None
+    assert client.list_calls == []

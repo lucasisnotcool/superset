@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 
 class SchemaItem(BaseModel):
-    """One retrievable MDL chunk (a model, column, or relationship)."""
+    """One retrievable MDL chunk (a model, column, relationship, or view)."""
 
     kind: str
     name: str
@@ -184,6 +184,30 @@ def manifest_to_schema_items(manifest: CompiledManifest) -> list[SchemaItem]:
                 ],
             )
         )
+    items.extend(_view_items(manifest.views))
+    return items
+
+
+def _view_items(views: list[dict[str, Any]]) -> list[SchemaItem]:
+    """Chunk semantic views into retrievable items.
+
+    A view-shaped question pulls the vetted, named query into context (Wren's "a
+    view with a good description becomes a high-quality recall example"). The chunk
+    leads with the description/synonyms — that is what a colloquial question matches.
+    Native (``dialect``) views are skipped: they are not in the engine manifest, so
+    the agent must not be told to select from one.
+    """
+
+    items: list[SchemaItem] = []
+    for view in views:
+        view_name = str(view.get("name") or "")
+        if not view_name or (isinstance(view, dict) and view.get("dialect")):
+            continue
+        view_text = f"view {view_name}"
+        view_terms = _semantic_terms(view)
+        if view_terms:
+            view_text = f"{view_text} — {view_terms}"
+        items.append(SchemaItem(kind="view", name=view_name, text=view_text))
     return items
 
 

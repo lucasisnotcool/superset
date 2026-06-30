@@ -24,6 +24,7 @@ Semantic layer (authoritative business context):
 - Map business terms in the question to the model and column descriptions in the semantic layer.
 - Use the relationships defined in the semantic layer to choose join keys instead of guessing.
 - Prefer metric expressions defined in the semantic layer over ad-hoc aggregations.
+- If `wren_context` lists a view (a `views` item) whose description matches the question, query it directly (`SELECT … FROM <view>`) instead of re-deriving the joins — a view is a vetted, named query that already encodes the correct join.
 - The semantic layer adds meaning only; never use a table or column that is absent from the provided database/dataset context.
 
 Complexity assessment (think before writing):

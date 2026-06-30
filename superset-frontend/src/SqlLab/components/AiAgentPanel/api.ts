@@ -118,6 +118,9 @@ export interface WrenContextArtifact {
   materialized_file_count?: number | null;
   materialized_checksum?: string | null;
   matched_models: string[];
+  // Names of MDL views surfaced into the prompt this turn — view provenance shown
+  // in the Explain dialog. Only semantic views appear (native views never surface).
+  matched_views?: string[];
   example_ids: string[];
   document_ids: string[];
   context_items: Record<string, unknown>[];
@@ -173,6 +176,7 @@ export interface LoadWrenContextDetail {
   project_id?: string | null;
   mdl_path?: string | null;
   matched_models: string[];
+  matched_views?: string[];
   retrieval_mode?: string | null;
   retrieved_item_count: number;
   context_item_count: number;
@@ -183,6 +187,26 @@ export interface LoadWrenContextDetail {
 export interface RecalledExample {
   question: string;
   native_sql?: string | null;
+  // Provenance (F3/2C) — where this recalled query came from.
+  // `golden` = curated project query; `memory` = learned runtime example.
+  source?: 'golden' | 'memory';
+  // A golden query whose answer was human-verified.
+  verified?: boolean;
+  // The golden query's curated name, when present.
+  name?: string | null;
+  // For a learned example: whether its tables are onboarded in the active
+  // project. `false` marks one recalled from a broader same-database context.
+  in_scope?: boolean;
+}
+
+export interface GoldenQuery {
+  name: string;
+  question: string;
+  semantic_sql: string;
+  verified_by?: string | null;
+  verified_at?: number | null;
+  use_as_onboarding?: boolean;
+  usage_guidance?: string | null;
 }
 export interface DraftDetail {
   kind: 'draft';
@@ -2149,4 +2173,20 @@ export const deleteInstruction = (instructionId: string) =>
   requestJson<{ deleted: boolean }>(
     `/agent/semantic-layer/instructions/${instructionId}`,
     { method: 'DELETE' },
+  );
+
+// F3: promote an NL->SQL pair into the project's curated golden queries
+// (queries.json). A copy, never a move — the runtime memory pair is untouched.
+export const promoteGoldenQuery = (
+  projectId: string,
+  body: {
+    question: string;
+    semantic_sql?: string | null;
+    native_sql?: string | null;
+    name?: string;
+  },
+) =>
+  requestJson<MdlFile>(
+    `/agent/semantic-layer/projects/${projectId}/golden-queries/promote`,
+    { method: 'POST', body: JSON.stringify(body) },
   );

@@ -19,6 +19,7 @@
 
 from superset_ai_agent.semantic_layer.engine.base import (
     BACKEND_TO_WREN_DIALECT,
+    extract_qualified_tables,
     extract_referenced_tables,
     PlannedSql,
     resolve_dialect,
@@ -35,6 +36,7 @@ __all__ = [
     "SemanticEngine",
     "WrenCoreEngine",
     "create_semantic_engine",
+    "extract_qualified_tables",
     "extract_referenced_tables",
     "resolve_dialect",
 ]

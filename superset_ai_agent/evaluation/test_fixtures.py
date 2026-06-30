@@ -67,9 +67,11 @@ def test_out_of_scope_schema_excluded_from_project_scope_doc():
 
 
 def test_test_queries_parse_to_q1_through_q18():
+    # Q1-Q18 are the frozen prefix; v4 appends Q19+ (supply/negative/temporal).
     records = ec.parse_test_queries(FIXTURE / "test_queries.md")
     ids = [r["id"] for r in records]
-    assert ids == [f"Q{i}" for i in range(1, 19)]
+    assert ids[:18] == [f"Q{i}" for i in range(1, 19)]
+    assert "Q19" in ids and "Q26" in ids  # v4 supply + golden questions present
 
 
 def test_parsed_questions_have_text_and_trap_flag():

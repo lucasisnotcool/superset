@@ -52,7 +52,7 @@ gen = _load_generator()
 
 def test_core_data_is_byte_identical_to_seagate_fixture():
     core = gen.build_core_tables()
-    assert set(core) == set(gen.RELEVANT_TABLES)
+    assert set(core) == set(gen.CORE_TABLES)
     for name, df in core.items():
         ref = pd.read_parquet(SEAGATE_DATA / f"{name}.parquet")
         pd.testing.assert_frame_equal(

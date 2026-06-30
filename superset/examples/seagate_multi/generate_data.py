@@ -102,6 +102,11 @@ def file_stem(table_name: str) -> str:
 SCHEMA_CORE = "seagate_core"
 SCHEMA_OPS = "seagate_ops"
 SCHEMA_REF = "seagate_ref"
+SCHEMA_SUPPLY = "seagate_supply"  # v4: 3rd relevant schema (3-schema joins + bridge)
+
+#: Bump when the fixture shape changes so a run records which fixture it scored
+#: (frozen core data still guarantees Q1-Q18; v4 only *adds* the supply schema).
+FIXTURE_VERSION = "v4"
 
 TABLE_SCHEMA: dict[str, str] = {
     # --- relevant (R): master/reference ---
@@ -113,10 +118,15 @@ TABLE_SCHEMA: dict[str, str] = {
     "seagate_production_events": SCHEMA_OPS,
     "seagate_quality_tests": SCHEMA_OPS,
     "seagate_shipments": SCHEMA_OPS,
+    # --- relevant (R): supply (v4) — component dim + BOM bridge + deliveries fact ---
+    "seagate_components": SCHEMA_SUPPLY,
+    "seagate_sku_components": SCHEMA_SUPPLY,
+    "seagate_supplier_deliveries": SCHEMA_SUPPLY,
     # --- distractors (D): adversarial (jargon/FK collisions) ---
     "seagate_finance_ledger": SCHEMA_OPS,  # `units` collides with units_completed
     "seagate_iot_sensor_logs": SCHEMA_OPS,  # `temperature_c` vs "heat lamp"; line_id FK
     "seagate_hr_roster": SCHEMA_CORE,  # `shift_code` vs shift map; site_id FK
+    "seagate_freight_invoices": SCHEMA_SUPPLY,  # v4: decoy `units` in the supply schema
     # --- distractors (D): neutral noise ---
     "seagate_maintenance_logs": SCHEMA_OPS,
     "seagate_vendor_contracts": SCHEMA_CORE,
@@ -125,7 +135,8 @@ TABLE_SCHEMA: dict[str, str] = {
     "seagate_web_sessions": SCHEMA_REF,
 }
 
-RELEVANT_TABLES: tuple[str, ...] = (
+# The seven byte-identical-to-seagate_manufacturing tables (parity-guarded).
+CORE_TABLES: tuple[str, ...] = (
     "seagate_sites",
     "seagate_production_lines",
     "seagate_drive_skus",
@@ -134,6 +145,14 @@ RELEVANT_TABLES: tuple[str, ...] = (
     "seagate_quality_tests",
     "seagate_shipments",
 )
+# v4 supply tables — relevant but NOT part of the frozen core parity set.
+SUPPLY_TABLES: tuple[str, ...] = (
+    "seagate_components",
+    "seagate_sku_components",
+    "seagate_supplier_deliveries",
+)
+RELEVANT_TABLES: tuple[str, ...] = CORE_TABLES + SUPPLY_TABLES
+SUPPLY_SEED = 4_242_001  # independent stream for the deliveries fact
 DISTRACTOR_TABLES: tuple[str, ...] = tuple(
     t for t in TABLE_SCHEMA if t not in RELEVANT_TABLES
 )
@@ -153,6 +172,10 @@ DATASET_UUIDS = {
     "seagate_production_events": "346b2b84-393f-47d8-81f3-0eff4640cf74",
     "seagate_quality_tests": "cdee53ca-1577-4b1a-824d-c22b3e8a70ff",
     "seagate_shipments": "52c3da31-4adc-4460-bc14-48389b34b16a",
+    "seagate_components": "a4d1c2e0-1111-4a2b-9c33-0d5e6f7a8b01",
+    "seagate_sku_components": "a4d1c2e0-2222-4a2b-9c33-0d5e6f7a8b02",
+    "seagate_supplier_deliveries": "a4d1c2e0-4444-4a2b-9c33-0d5e6f7a8b04",
+    "seagate_freight_invoices": "a4d1c2e0-3333-4a2b-9c33-0d5e6f7a8b03",
     "seagate_hr_roster": "331c1b4f-15d2-40d8-8e93-d265ec9c6c04",
     "seagate_vendor_contracts": "775f96ca-b556-4441-90ea-00bfcb3d8180",
     "seagate_finance_ledger": "8befade4-c182-490d-b3e2-9ab0e35a1546",
@@ -171,12 +194,15 @@ DTTM_COLUMNS = set(sg.DTTM_COLUMNS) | {
     "session_date",
     "hired_on",
     "contract_start",
+    "promised_on",
+    "delivered_on",
 }
 MAIN_DTTM_COL: dict[str, str] = {
     **sg.MAIN_DTTM_COL,
     "seagate_iot_sensor_logs": "recorded_at",
     "seagate_maintenance_logs": "performed_at",
     "seagate_web_sessions": "session_date",
+    "seagate_supplier_deliveries": "delivered_on",
 }
 
 WINDOW_START = sg.WINDOW_START
@@ -327,6 +353,23 @@ def build_web_sessions(rng: np.random.Generator) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def build_freight_invoices(rng: np.random.Generator) -> pd.DataFrame:
+    """Adversarial (supply schema): decoy `units` column, like finance_ledger."""
+    carriers = ["FastFreight", "SeaHaul", "AeroCargo", "RailLink"]
+    rows = []
+    for inv_id in range(1, 121):
+        rows.append(
+            {
+                "invoice_id": inv_id,
+                "carrier": carriers[int(rng.integers(0, len(carriers)))],
+                "site_id": int(rng.integers(1, 5)),
+                "units": int(rng.integers(1, 400)),  # decoy column name
+                "freight_cost_usd": round(float(rng.uniform(200, 9000)), 2),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 DISTRACTOR_BUILDERS = {
     "seagate_hr_roster": build_hr_roster,
     "seagate_vendor_contracts": build_vendor_contracts,
@@ -335,7 +378,93 @@ DISTRACTOR_BUILDERS = {
     "seagate_maintenance_logs": build_maintenance_logs,
     "seagate_marketing_campaigns": build_marketing_campaigns,
     "seagate_web_sessions": build_web_sessions,
+    "seagate_freight_invoices": build_freight_invoices,
 }
+
+
+# --------------------------------------------------------------------------- #
+# Supply schema (v4) — RELEVANT. Fully deterministic (no RNG): a component
+# dimension + a bill-of-materials bridge. Platters-per-drive is a *bridge-only*
+# fact (not derivable from drive_skus), so a "platters consumed" question forces a
+# genuine 3-schema join supply.sku_components -> core.drive_skus -> ops.events.
+# --------------------------------------------------------------------------- #
+#: Platters per drive, keyed by sku_id. Independent of capacity_tb on purpose.
+PLATTERS_PER_DRIVE: dict[int, int] = {1: 4, 2: 8, 3: 2, 4: 6, 5: 5, 6: 10, 7: 1, 8: 4}
+
+#: (component_id, name, type, criticality) — the component dimension.
+COMPONENTS: tuple[tuple[int, str, str, str], ...] = (
+    (1, "Platter", "Mechanical", "CRITICAL"),
+    (2, "Spindle Motor", "Mechanical", "CRITICAL"),
+    (3, "Actuator", "Mechanical", "CRITICAL"),
+    (4, "Controller Board", "Electronic", "CRITICAL"),
+    (5, "Bracket Kit", "Housing", "STANDARD"),
+    (6, "Firmware Image", "Software", "STANDARD"),
+)
+
+
+def build_components() -> pd.DataFrame:
+    return pd.DataFrame(
+        COMPONENTS,
+        columns=["component_id", "component_name", "component_type", "criticality"],
+    )
+
+
+def build_sku_components() -> pd.DataFrame:
+    """Bridge: every SKU uses all 6 components; Platter qty varies per SKU."""
+    rows = []
+    for sku_id in range(1, 9):
+        for component_id, _name, _type, _crit in COMPONENTS:
+            qty = PLATTERS_PER_DRIVE[sku_id] if component_id == 1 else 1
+            rows.append(
+                {
+                    "sku_id": sku_id,
+                    "component_id": component_id,
+                    "qty_per_drive": qty,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def build_supplier_deliveries(rng: np.random.Generator) -> pd.DataFrame:
+    """Component delivery fact (powers the Supply Reliability metric, Q27/Q29).
+
+    ``on_time`` = delivered on or before the promised date. The metric is defined
+    in the glossary over **CRITICAL** components only (component_id 1-4); STANDARD
+    components (Bracket Kit 5, Firmware Image 6) are excluded by definition — the
+    Q29 trap.
+    """
+    suppliers = ["Acme Components", "BorealParts", "CrestSupply", "DeltaForge"]
+    rows = []
+    for delivery_id in range(1, 241):
+        component_id = int(rng.integers(1, 7))
+        promised = pd.Timestamp(2025, 1, 1) + pd.Timedelta(
+            days=int(rng.integers(0, 360))
+        )
+        # CRITICAL components run a touch later than STANDARD ones (a real signal).
+        slip = int(rng.integers(-4, 6 if component_id <= 4 else 3))
+        delivered = promised + pd.Timedelta(days=slip)
+        rows.append(
+            {
+                "delivery_id": delivery_id,
+                "component_id": component_id,
+                "site_id": int(rng.integers(1, 5)),
+                "supplier_name": suppliers[int(rng.integers(0, len(suppliers)))],
+                "promised_on": promised,
+                "delivered_on": delivered,
+                "qty_delivered": int(rng.integers(10, 500)),
+                "on_time": bool(delivered <= promised),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_supply_tables() -> dict[str, pd.DataFrame]:
+    rng = np.random.default_rng(SUPPLY_SEED)
+    return {
+        "seagate_components": build_components(),
+        "seagate_sku_components": build_sku_components(),
+        "seagate_supplier_deliveries": build_supplier_deliveries(rng),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -449,6 +578,58 @@ def print_cross_schema_ground_truth(core: dict[str, pd.DataFrame]) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Supply (v4) cross-schema ground truth (Q19/Q20/Q26) — 3-schema bridge joins
+# --------------------------------------------------------------------------- #
+def print_supply_ground_truth(
+    core: dict[str, pd.DataFrame], supply: dict[str, pd.DataFrame]
+) -> None:
+    skus = core["seagate_drive_skus"]
+    work_orders = core["seagate_work_orders"]
+    events = core["seagate_production_events"].copy()
+    events["event_date"] = pd.to_datetime(events["event_date"])
+    bridge = supply["seagate_sku_components"]
+    platters = bridge[bridge["component_id"] == 1][["sku_id", "qty_per_drive"]]
+
+    ev = (
+        events.merge(work_orders, on="work_order_id")
+        .merge(skus, on="sku_id")
+        .merge(platters, on="sku_id")
+    )
+    ev["platters_consumed"] = ev["units_completed"] * ev["qty_per_drive"]
+
+    def window(df: pd.DataFrame, lo: str, hi: str) -> pd.DataFrame:
+        return df[
+            (df["event_date"] >= pd.Timestamp(lo)) & (df["event_date"] <= pd.Timestamp(hi))
+        ]
+
+    q19 = window(ev[ev["drive_family"] == "Vantage"], "2025-10-01", "2025-12-31")
+    print("\n=== Q19 (xschema3/bridge): platters plating Vantage drives, Q4 2025 ===")
+    print("  platters_consumed =", int(q19["platters_consumed"].sum()))
+
+    dec = window(ev, "2025-12-01", "2025-12-31")
+    print("\n=== Q20 (xschema3/bridge): platters plating each family, Dec 2025 ===")
+    print(dec.groupby("drive_family")["platters_consumed"].sum().astype(int).to_string())
+
+    cob = window(
+        ev[(ev["drive_family"] == "Cobalt") & (ev["ticket_type"] == "STANDARD")],
+        "2025-01-01",
+        "2025-12-31",
+    )
+    print("\n=== Q26 (golden/xschema3): platters plating STANDARD Cobalt tickets, 2025 ===")
+    print("  platters_consumed =", int(cob["platters_consumed"].sum()))
+
+    # Supply Reliability (Q27) = on-time / total over CRITICAL-component deliveries.
+    comp = supply["seagate_components"]
+    deliv = supply["seagate_supplier_deliveries"].merge(comp, on="component_id")
+    crit = deliv[deliv["criticality"] == "CRITICAL"]
+    sr = round(float(crit["on_time"].sum()) / len(crit), 4) if len(crit) else float("nan")
+    print("\n=== Q27 (metric): Supply Reliability (CRITICAL components) ===")
+    print(f"  on_time={int(crit['on_time'].sum())} / total={len(crit)}  ->  {sr}")
+    print("=== Q29 (trap): Supply Reliability of a STANDARD component (Firmware/Bracket) "
+          "is UNDEFINED by definition ===")
+
+
+# --------------------------------------------------------------------------- #
 # Parity assertion (R7) — core data must equal the single-schema fixture
 # --------------------------------------------------------------------------- #
 def assert_parity(core: dict[str, pd.DataFrame]) -> None:
@@ -543,8 +724,11 @@ def main() -> None:
     assert_parity(core)
     print_cross_schema_ground_truth(core)
 
+    supply = build_supply_tables()
+    print_supply_ground_truth(core, supply)
+
     distractors = build_distractor_tables()
-    tables = {**core, **distractors}
+    tables = {**core, **supply, **distractors}
 
     # Remove any stale non-prefixed artifacts from earlier runs (they would collide
     # with seagate_manufacturing's stems and never load — the very bug the prefix

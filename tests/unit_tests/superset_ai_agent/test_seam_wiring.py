@@ -30,14 +30,12 @@ from superset_ai_agent.conversations.schemas import (
     ConversationScope,
     ConversationTurnRequest,
 )
-from superset_ai_agent.conversations.store import DEFAULT_OWNER_ID
 from superset_ai_agent.llm.base import ChatMessage, ModelResult
 from superset_ai_agent.semantic_layer.memory_store import InMemoryMemory
 from superset_ai_agent.semantic_layer.schema_retriever import (
     KeywordRetriever,
     retrieve_mdl_context,
 )
-from superset_ai_agent.semantic_layer.store import scope_hash
 from tests.unit_tests.superset_ai_agent.test_conversation_graph import (
     FakeContextProvider,
     FakeSupersetClient,
@@ -244,11 +242,10 @@ def test_conversation_memory_writeback_and_recall_round_trip() -> None:
     )
     _run_sql_turn(write_graph, store, scope, "show the most popular names")
 
-    # The confirmed pair was stored for this owner+scope.
+    # The confirmed pair was stored in this database's shared pool.
     recalled = memory.recall_examples(
         "popular names",
-        scope_hash=scope_hash(scope),
-        owner_id=DEFAULT_OWNER_ID,
+        database_id=scope.database_id,
         k=3,
     )
     assert any(pair.question == "show the most popular names" for pair in recalled)

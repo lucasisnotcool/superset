@@ -62,14 +62,22 @@ def wren_core_available() -> bool:
 def validate_with_wren_core(
     models: list[dict[str, Any]],
     relationships: list[dict[str, Any]],
+    views: list[dict[str, Any]] | None = None,
 ) -> MdlValidationResult:
     """Deep-validate a manifest with wren-core, if available.
 
     Returns ``valid=True`` with an informational message when wren-core is not
     installed, so callers can merge this result unconditionally.
+
+    ``views`` are included so a view's statement is engine-validated: wren-core
+    loads the manifest eagerly and rejects a view that references an unknown
+    column or model at load time, surfacing a bad view at the activation gate
+    rather than at query time.
     """
 
-    return validate_engine_manifest(to_wren_core_manifest(models, relationships))
+    return validate_engine_manifest(
+        to_wren_core_manifest(models, relationships, views)
+    )
 
 
 def validate_engine_manifest(engine_manifest: dict[str, Any]) -> MdlValidationResult:
@@ -145,16 +153,26 @@ def _friendly_engine_error(raw: str) -> MdlValidationMessage:
 def to_wren_core_manifest(
     models: list[dict[str, Any]],
     relationships: list[dict[str, Any]],
+    views: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Wrap native models/relationships in the wren-core manifest envelope.
+    """Wrap native models/relationships/views in the wren-core manifest envelope.
 
     MDL is already authored in wren-core's native shape, so this is a pass-through
     that only adds the catalog/schema envelope — no field translation.
+
+    ``views`` is included only when non-empty so the engine eagerly resolves each
+    view statement against the models. A *native* view (one carrying a ``dialect``,
+    referencing physical tables that are not models) must be filtered out by the
+    caller before this point — wren-core resolves view bodies against model names
+    only, so an unmodeled-table view would fail the whole manifest load.
     """
 
-    return {
+    manifest: dict[str, Any] = {
         "catalog": "wren",
         "schema": "public",
         "models": models,
         "relationships": relationships,
     }
+    if views:
+        manifest["views"] = views
+    return manifest

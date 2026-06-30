@@ -28,6 +28,10 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from superset_ai_agent.conversations.store import DEFAULT_OWNER_ID
 from superset_ai_agent.persistence.models import AiAgentSemanticMdlFile
+from superset_ai_agent.semantic_layer.golden_queries import (
+    is_golden_queries_path,
+    validate_golden_queries,
+)
 from superset_ai_agent.semantic_layer.mdl_validation import validate_mdl
 from superset_ai_agent.semantic_layer.schemas import (
     MdlFile,
@@ -51,7 +55,20 @@ class MdlFileExistsError(ValueError):
     """Raised when creating an MDL file whose path already exists (path conflict)."""
 
 
-def _assert_activatable(status: str | None, content: str) -> None:
+def validate_mdl_file(path: str, content: str) -> MdlValidationResult:
+    """Kind-aware validation dispatch (F3/2A).
+
+    The golden-query file (``queries.json``) is a sibling knowledge artifact, not
+    an MDL manifest — ``validate_mdl`` would reject it for having no models. Route
+    it to the golden-query validator instead; everything else is a manifest file.
+    """
+
+    if is_golden_queries_path(path):
+        return validate_golden_queries(content)
+    return validate_mdl(content)
+
+
+def _assert_activatable(status: str | None, path: str, content: str) -> None:
     """Block the draft->active transition when the file has validation errors.
 
     This is a structural defense-in-depth gate. Project-level and physical
@@ -60,7 +77,7 @@ def _assert_activatable(status: str | None, content: str) -> None:
 
     if status != "active":
         return
-    validation = validate_mdl(content)
+    validation = validate_mdl_file(path, content)
     if validation.valid:
         return
     errors = "; ".join(
@@ -242,13 +259,14 @@ class InMemoryMdlFileStore:
                 raise MdlFileExistsError(f"MDL file already exists: {path}")
             updates["path"] = path
             updates["filename"] = PurePosixPath(path).name
+        effective_path = cast(str, updates.get("path", file.path))
         if request.content is not None:
             updates["content"] = request.content
             updates["checksum"] = _checksum(request.content)
             updates["validation"] = (
                 validation
                 if validation is not None
-                else validate_mdl(request.content)
+                else validate_mdl_file(effective_path, request.content)
             )
         elif validation is not None:
             updates["validation"] = validation
@@ -260,6 +278,7 @@ class InMemoryMdlFileStore:
             updates["source_document_id"] = request.source_document_id
         _assert_activatable(
             request.status,
+            effective_path,
             request.content if request.content is not None else file.content,
         )
         updated = file.model_copy(update=updates)
@@ -290,7 +309,7 @@ class InMemoryMdlFileStore:
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> MdlValidationResult:
         file = self.get(file_id, owner_id=owner_id)
-        validation = validate_mdl(file.content)
+        validation = validate_mdl_file(file.path, file.content)
         self.update(
             file_id,
             MdlFileUpdateRequest(content=file.content),
@@ -437,7 +456,7 @@ class SqlAlchemyMdlFileStore:
                 effective = (
                     validation
                     if validation is not None
-                    else validate_mdl(request.content)
+                    else validate_mdl_file(cast(str, model.path), request.content)
                 )
                 model.validation = effective.model_dump(mode="json")
             elif validation is not None:
@@ -448,7 +467,9 @@ class SqlAlchemyMdlFileStore:
                 model.source_type = request.source_type
             if request.source_document_id is not None:
                 model.source_document_id = request.source_document_id
-            _assert_activatable(request.status, model.content)
+            _assert_activatable(
+                request.status, cast(str, model.path), cast(str, model.content)
+            )
             model.updated_by = owner_id
             model.updated_at = _utc_now()
             session.commit()
@@ -476,7 +497,7 @@ class SqlAlchemyMdlFileStore:
     ) -> MdlValidationResult:
         with self.session_factory() as session:
             model = self._get_model(session, file_id, owner_id=owner_id)
-            validation = validate_mdl(model.content)
+            validation = validate_mdl_file(cast(str, model.path), model.content)
             model.validation = validation.model_dump(mode="json")
             model.updated_at = _utc_now()
             model.updated_by = owner_id
@@ -564,7 +585,7 @@ def _new_file(
     validation: MdlValidationResult | None = None,
 ) -> MdlFile:
     if validation is None:
-        validation = validate_mdl(request.content)
+        validation = validate_mdl_file(path, request.content)
     return MdlFile(
         project_id=project_id,
         path=path,

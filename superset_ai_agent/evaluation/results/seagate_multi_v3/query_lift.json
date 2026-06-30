@@ -1,0 +1,103 @@
+{
+  "project": "99c779d7-27e2-465c-8d3c-c2d98bcf617b",
+  "valid_views_activated": [
+    "warm_line_output_by_family",
+    "standard_golden_yield_by_family"
+  ],
+  "without_views": [
+    [
+      {
+        "id": "Q16",
+        "verdict": "wrong",
+        "used_views": [],
+        "recalled": 0,
+        "sql": "SELECT pl.drive_family, SUM(pe.units_completed) AS patties_plated\nFROM seagate_core.seagate_production_lines pl\nJOIN seagate_ops.seagate_production_events pe ON pl.line_code = pe.shift_code  -- Note: Correct join key unclear from provided context, assumed shift_code as proxy\nWHERE pl.status = 'WARM'\nGROUP BY pl.drive_family\nORDER BY pl.drive_family\nLIMIT 500"
+      },
+      {
+        "id": "Q17",
+        "verdict": "wrong",
+        "used_views": [],
+        "recalled": 0,
+        "sql": "SELECT\n  1.0 * SUM(CASE WHEN q.result = 'PASS' THEN 1 ELSE 0 END) / COUNT(*) AS golden_yield\nFROM seagate_ops.seagate_quality_tests q\nJOIN seagate_core.seagate_work_orders w\n  ON q.work_order_id = w.work_order_id\nJOIN seagate_core.seagate_drive_skus s\n  ON w.sku_id = s.sku_id\nWHERE s.drive_family = 'Vantage'\n  AND q.tested_at >= '2025-10-01'\n  AND q.tested_at < '2026-01-01'\nLIMIT 1000"
+      },
+      {
+        "id": "Q18",
+        "verdict": "wrong",
+        "used_views": [],
+        "recalled": 0,
+        "sql": "SELECT\n  shipments.destination_region AS region,\n  SUM(shipments.qty_units) AS total_combo_pallet_dine_in_units_shipped,\n  AVG(ships.golden_yield) AS average_golden_yield\nFROM\n  seagate_ops.seagate_shipments shipments\nJOIN\n  seagate_core.seagate_drive_skus skus\n    ON shipments.work_order_id = skus.sku_id\nJOIN\n  (SELECT shipment_id, 0.85 AS golden_yield FROM seagate_ops.seagate_shipments) ships\n    ON shipments.shipment_id = ships.shipment_id\nWHERE\n  skus.drive_family = 'Nimbus'\n  AND shipments.ship_date >= '2025-10-01'\n  AND shipments.ship_date < '2026-01-01'\n  AND shipments.pallet_type = 'Co"
+      }
+    ],
+    [
+      {
+        "id": "Q16",
+        "verdict": "wrong",
+        "used_views": [],
+        "recalled": 0,
+        "sql": "SELECT spl.drive_family, SUM(spe.units_completed) AS patties_plated\nFROM seagate_core.seagate_production_lines spl\nJOIN seagate_ops.seagate_production_events spe ON spl.line_code = spe.shift_code\nWHERE spl.status = 'WARM'\nGROUP BY spl.drive_family\nLIMIT 500"
+      },
+      {
+        "id": "Q17",
+        "verdict": "wrong",
+        "used_views": [],
+        "recalled": 0,
+        "sql": "SELECT\n  (COUNT(*) FILTER (WHERE result = 'Golden'))::FLOAT / NULLIF(COUNT(*), 0) AS golden_yield\nFROM seagate_ops.seagate_quality_tests q\nJOIN seagate_core.seagate_work_orders w ON q.work_order_id = w.work_order_id\nJOIN seagate_core.seagate_drive_skus s ON w.sku_id = s.sku_id\nWHERE s.drive_family = 'Vantage'\n  AND q.tested_at >= DATE '2025-10-01'\n  AND q.tested_at <= DATE '2025-12-31'\nLIMIT 1000"
+      },
+      {
+        "id": "Q18",
+        "verdict": "wrong",
+        "used_views": [],
+        "recalled": 0,
+        "sql": "SELECT\n  s.destination_region AS region,\n  SUM(CASE WHEN s.pallet_type = 'Combo-pallet Dine-In' THEN s.qty_units ELSE 0 END) AS combo_pallet_dine_in_units_shipped,\n  -- Assuming 'Golden Yield' metric is not directly available in the context; placeholder for it\n  NULL::NUMERIC AS golden_yield\nFROM\n  seagate_ops.seagate_shipments s\nJOIN\n  seagate_core.seagate_drive_skus d ON s.work_order_id = d.sku_id -- Assuming work_order_id relates to sku_id for filtering by drive_family; note: relationship not 100% clear from context\nWHERE\n  d.drive_family = 'Nimbus'\n  AND s.ship_date >= DATE '2025-10-01'\n  "
+      }
+    ]
+  ],
+  "with_views": [
+    [
+      {
+        "id": "Q16",
+        "verdict": "wrong",
+        "used_views": [],
+        "recalled": 0,
+        "sql": "SELECT pl.drive_family, COUNT(pe.units_completed) AS patties_plated\nFROM seagate_core.seagate_production_lines AS pl\nJOIN seagate_ops.seagate_production_events AS pe ON pl.line_id = pe.work_order_id\nWHERE pl.status = 'WARM'\nGROUP BY pl.drive_family\nLIMIT 100"
+      },
+      {
+        "id": "Q17",
+        "verdict": "wrong",
+        "used_views": [],
+        "recalled": 0,
+        "sql": "SELECT\n  CASE\n    WHEN total_tests = 0 THEN NULL\n    ELSE (total_tests - defective_tests)::FLOAT / total_tests\n  END AS golden_yield\nFROM (\n  SELECT\n    COUNT(*) AS total_tests,\n    SUM(CASE WHEN garnish_defect = TRUE THEN 1 ELSE 0 END) AS defective_tests\n  FROM seagate_ops.seagate_quality_tests q\n  JOIN seagate_core.seagate_drive_skus s ON q.work_order_id = s.sku_id\n  WHERE s.drive_family = 'Vantage'\n    AND q.tested_at >= '2025-10-01'::timestamp\n    AND q.tested_at < '2026-01-01'::timestamp\n) sub\nLIMIT 1000"
+      },
+      {
+        "id": "Q18",
+        "verdict": "wrong",
+        "used_views": [],
+        "recalled": 0,
+        "sql": "SELECT\n  ss.destination_region AS region,\n  SUM(ss.qty_units) AS combo_pallet_dinein_units,\n  AVG(golden_yield) AS golden_yield\nFROM seagate_ops.seagate_shipments ss\nJOIN seagate_core.seagate_drive_skus ds ON ss.work_order_id = ds.sku_id /* Assumed join key since no explicit relationship given */\nWHERE ds.drive_family = 'Nimbus'\n  AND ss.pallet_type = 'Combo-pallet Dine-In'\n  AND ss.destination_region IN ('Tigerline', 'Reef')\n  AND ss.ship_date >= '2025-10-01' AND ss.ship_date < '2026-01-01'\nGROUP BY ss.destination_region\nLIMIT 100"
+      }
+    ],
+    [
+      {
+        "id": "Q16",
+        "verdict": "wrong",
+        "used_views": [],
+        "recalled": 0,
+        "sql": "SELECT pl.drive_family, SUM(pe.units_completed) AS patties_plated\nFROM seagate_core.seagate_production_lines pl\nJOIN seagate_ops.seagate_production_events pe ON pl.line_id = pe.work_order_id\nWHERE pl.status = 'WARM'\nGROUP BY pl.drive_family\nLIMIT 100"
+      },
+      {
+        "id": "Q17",
+        "verdict": "wrong",
+        "used_views": [],
+        "recalled": 0,
+        "sql": "SELECT\n  CASE WHEN SUM(CASE WHEN result = 'pass' AND garnish_defect = false THEN 1 ELSE 0 END) = 0 THEN 0\n       ELSE CAST(SUM(CASE WHEN result = 'pass' AND garnish_defect = false THEN 1 ELSE 0 END) AS FLOAT) / COUNT(*) END AS golden_yield\nFROM seagate_drive_skus\nJOIN seagate_ops.seagate_quality_tests ON seagate_drive_skus.sku_id = seagate_ops.seagate_quality_tests.work_order_id\nWHERE seagate_drive_skus.drive_family = 'Vantage'\n  AND seagate_ops.seagate_quality_tests.tested_at >= '2025-10-01'\n  AND seagate_ops.seagate_quality_tests.tested_at < '2026-01-01'\nLIMIT 1000"
+      },
+      {
+        "id": "Q18",
+        "verdict": "wrong",
+        "used_views": [],
+        "recalled": 0,
+        "sql": "SELECT\n  seagate_shipments.destination_region AS region,\n  SUM(CASE WHEN seagate_shipments.pallet_type = 'Combo-pallet Dine-In' THEN seagate_shipments.qty_units ELSE 0 END) AS units_shipped,\n  AVG(CASE WHEN seagate_shipments.destination_region = 'Tigerline' THEN gs.golden_yield\n           WHEN seagate_shipments.destination_region = 'Reef' THEN gs.golden_yield\n           ELSE NULL END) AS golden_yield\nFROM\n  seagate_ops.seagate_shipments\nJOIN\n  seagate_core.seagate_drive_skus ON seagate_drive_skus.sku_id = seagate_shipments.work_order_id\n-- Assuming 'gs' alias for table or logic to get Golden Y"
+      }
+    ]
+  ]
+}

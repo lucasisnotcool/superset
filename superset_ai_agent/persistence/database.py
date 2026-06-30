@@ -21,9 +21,8 @@ from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event, inspect
 from sqlalchemy.engine import Engine, make_url
-from sqlalchemy import inspect
 from sqlalchemy.orm import Session, sessionmaker
 
 from superset_ai_agent.config import AgentConfig
@@ -38,11 +37,36 @@ def create_engine_from_config(config: AgentConfig) -> Engine:
     """Create the SQLAlchemy engine for agent-owned persistence."""
 
     _ensure_sqlite_parent(config.agent_database_url)
-    return create_engine(
+    engine = create_engine(
         config.agent_database_url,
         echo=config.agent_database_echo,
         future=True,
     )
+    _enable_sqlite_wal(engine, config.agent_database_url)
+    return engine
+
+
+def _enable_sqlite_wal(engine: Engine, database_url: str) -> None:
+    """Put the agent SQLite DB in WAL mode so the per-call LLM-usage insert never
+    blocks readers and concurrent writers serialise briefly. No-op for non-SQLite
+    backends and for in-memory databases (where WAL does not apply)."""
+
+    url = make_url(database_url)
+    if url.drivername not in {"sqlite", "sqlite+pysqlite"}:
+        return
+    if not url.database or url.database == ":memory:":
+        return
+
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragmas(dbapi_connection, _connection_record):  # type: ignore[no-untyped-def]
+        cursor = dbapi_connection.cursor()
+        try:
+            # WAL + NORMAL is the standard durable-but-fast SQLite combo: readers
+            # never block the writer, and the writer fsyncs at checkpoints.
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+        finally:
+            cursor.close()
 
 
 def create_session_factory(engine: Engine) -> sessionmaker[Session]:

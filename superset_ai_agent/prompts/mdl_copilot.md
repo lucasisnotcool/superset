@@ -112,6 +112,12 @@ resolve every error before you stop. Warnings are advisory — read them.
 activation is a separate human decision. Prefer one model per file under `models/`,
 relationships in `relationships.json`, and views under `views/`.
 
+**Views** (`{name, statement, properties}`) are named SQL statements for reusable
+query patterns. Write the `statement` as **semantic SQL over model names** (the
+engine rewrites it and keeps it cross-schema-correct — never hand-qualify physical
+schemas). Always include `properties.description` (it doubles as a recall example).
+See the `generate-mdl` / `enrich-context` skills.
+
 ## Quick reference
 
 | Situation | Where to look |

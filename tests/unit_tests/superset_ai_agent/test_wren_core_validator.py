@@ -105,6 +105,21 @@ def test_to_wren_core_manifest_wraps_native_entities() -> None:
     assert manifest["relationships"][0]["joinType"] == "MANY_TO_ONE"
 
 
+def test_to_wren_core_manifest_includes_views_only_when_present() -> None:
+    # Views reach the engine so their statements are resolved against models.
+    with_views = to_wren_core_manifest(
+        [{"name": "deals", "columns": []}],
+        [],
+        [{"name": "big_deals", "statement": "SELECT 1 FROM deals"}],
+    )
+    assert with_views["views"][0]["name"] == "big_deals"
+
+    # Absent/empty views keep the envelope minimal (no behavior change for the
+    # models+relationships-only callers).
+    assert "views" not in to_wren_core_manifest([], [])
+    assert "views" not in to_wren_core_manifest([], [], [])
+
+
 def test_validate_with_wren_core_no_op_when_unavailable() -> None:
     if wren_core_available():
         pytest.skip("wren-core is installed; this asserts the fallback path")
@@ -139,3 +154,107 @@ def test_wren_core_missing_field_is_mapped_friendly() -> None:
         m.code in {"column_without_type", "wren_core_missing_field"}
         for m in result.messages
     )
+
+
+# --- Views in deep validation (G2 Layer A) -------------------------------------
+# wren-core loads a manifest eagerly: a view whose statement references an unknown
+# column or model fails at load, so deep validation catches a bad view at the
+# activation gate instead of at query time. These pin that contract against the
+# installed wheel.
+
+_ORDERS_MODEL = {
+    "name": "orders",
+    "tableReference": {"schema": "public", "table": "orders"},
+    "columns": [
+        {"name": "id", "type": "integer"},
+        {"name": "customer_id", "type": "integer"},
+        {"name": "amount", "type": "double"},
+    ],
+    "primaryKey": "id",
+}
+# A second model in a *different* physical schema — the cross-schema regression
+# guard (spec §5.6): a view joining the two must validate clean.
+_CUSTOMERS_MODEL = {
+    "name": "customers",
+    "tableReference": {"schema": "analytics", "table": "customers"},
+    "columns": [
+        {"name": "id", "type": "integer"},
+        {"name": "region", "type": "varchar"},
+    ],
+    "primaryKey": "id",
+}
+
+
+def _project(*, view: dict) -> str:
+    return json.dumps(
+        {
+            "models": [_ORDERS_MODEL, _CUSTOMERS_MODEL],
+            "relationships": [
+                {
+                    "name": "orders_customers",
+                    "models": ["orders", "customers"],
+                    "joinType": "MANY_TO_ONE",
+                    "condition": "orders.customer_id = customers.id",
+                }
+            ],
+            "views": [view],
+        }
+    )
+
+
+@requires_wren_core
+def test_deep_validation_accepts_valid_semantic_view() -> None:
+    content = _project(
+        view={
+            "name": "big_orders",
+            "statement": "SELECT id, amount FROM orders WHERE amount > 100",
+        }
+    )
+    result = validate_project_manifest([content], deep_validate=True)
+    assert result.valid is True
+
+
+@requires_wren_core
+def test_deep_validation_rejects_view_with_unknown_column() -> None:
+    content = _project(
+        view={
+            "name": "bad_view",
+            "statement": "SELECT id, nonexistent_col FROM orders",
+        }
+    )
+    result = validate_project_manifest([content], deep_validate=True)
+    assert result.valid is False
+    assert any(m.code.startswith("wren_core") for m in result.messages)
+
+
+@requires_wren_core
+def test_deep_validation_accepts_cross_schema_view() -> None:
+    # The view joins two models whose tableReference.schema differ; cross-schema
+    # correctness is inherited from the model layer (spec §5.6).
+    content = _project(
+        view={
+            "name": "order_regions",
+            "statement": (
+                "SELECT o.amount, c.region FROM orders o "
+                "JOIN customers c ON o.customer_id = c.id"
+            ),
+        }
+    )
+    result = validate_project_manifest([content], deep_validate=True)
+    assert result.valid is True
+
+
+@requires_wren_core
+def test_native_view_does_not_poison_deep_validation() -> None:
+    # A native view (carries ``dialect``, references a physical table that is not a
+    # model) is filtered out before the engine load, so it never breaks the
+    # manifest for the real models. R9 guard.
+    content = _project(
+        view={
+            "name": "native_view",
+            "dialect": "postgres",
+            "statement": "SELECT * FROM public.raw_external_table",
+        }
+    )
+    result = validate_project_manifest([content], deep_validate=True)
+    assert result.valid is True

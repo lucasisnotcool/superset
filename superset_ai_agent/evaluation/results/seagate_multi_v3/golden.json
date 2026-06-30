@@ -1,0 +1,186 @@
+{
+  "project": "7a8fd60c-6177-4c0d-865f-5c00243300cf",
+  "repeats": 3,
+  "cases": [
+    {
+      "qid": "Q16",
+      "name": "Warm-line plated output by family",
+      "baseline": {
+        "question": [
+          {
+            "verdict": "wrong",
+            "recalled": 0,
+            "sql_matches_golden": false,
+            "sql": "SELECT l.drive_family, SUM(e.units_completed) AS patties_plated\nFROM seagate_core.seagate_production_lines l\nJOIN seagate_ops.seagate_production_events e ON l.line_id = e.work_order_id\nWHERE l.status = 'WARM'\nGROUP BY l.drive_family\nLIMIT 100"
+          },
+          {
+            "verdict": "wrong",
+            "recalled": 0,
+            "sql_matches_golden": false,
+            "sql": "SELECT pl.drive_family, SUM(se.units_completed) AS total_patties_plated\nFROM seagate_core.seagate_production_lines pl\nJOIN seagate_ops.seagate_production_events se ON pl.line_id = se.work_order_id\nWHERE pl.status = 'WARM'\nGROUP BY pl.drive_family\nORDER BY pl.drive_family\nLIMIT 100"
+          },
+          {
+            "verdict": "wrong",
+            "recalled": 0,
+            "sql_matches_golden": false,
+            "sql": "SELECT seagate_production_lines.drive_family, COUNT(seagate_production_events.event_id) AS patties_plated\nFROM seagate_core.seagate_production_lines\nJOIN seagate_ops.seagate_production_events ON seagate_production_lines.line_id = seagate_production_events.work_order_id\nWHERE seagate_production_lines.status = 'WARM'\nGROUP BY seagate_production_lines.drive_family\nLIMIT 100"
+          }
+        ],
+        "paraphrase": [
+          {
+            "verdict": "wrong",
+            "recalled": 0,
+            "sql_matches_golden": false,
+            "sql": "SELECT pl.drive_family, SUM(pe.units_completed) AS finished_patties_count\nFROM seagate_core.seagate_production_lines pl\nJOIN seagate_ops.seagate_production_events pe ON pl.line_id = pe.work_order_id\nWHERE pl.status = 'WARM'\nGROUP BY pl.drive_family\nLIMIT 500"
+          },
+          {
+            "verdict": "wrong",
+            "recalled": 0,
+            "sql_matches_golden": false,
+            "sql": "SELECT\n  seagate_production_lines.drive_family,\n  COALESCE(SUM(seagate_production_events.units_completed), 0) AS finished_patties_from_idle_lines\nFROM seagate_core.seagate_production_lines\nLEFT JOIN seagate_ops.seagate_production_events\n  ON seagate_production_lines.line_id = seagate_production_events.work_order_id\nWHERE seagate_production_lines.status = 'WARM'\nGROUP BY seagate_production_lines.drive_family\nLIMIT 100"
+          },
+          {
+            "verdict": "wrong",
+            "recalled": 0,
+            "sql_matches_golden": false,
+            "sql": "SELECT pl.drive_family AS drive_family, SUM(pe.units_completed) AS finished_patties_count\nFROM seagate_core.seagate_production_lines pl\nJOIN seagate_ops.seagate_production_events pe ON pl.line_id = pe.work_order_id\nWHERE pl.status = 'WARM'\nGROUP BY pl.drive_family\nLIMIT 100"
+          }
+        ]
+      },
+      "with_golden": {
+        "question": [
+          {
+            "verdict": "wrong",
+            "recalled": 0,
+            "sql_matches_golden": false,
+            "sql": "SELECT pl.drive_family, SUM(pe.units_completed) AS total_patties_plated\nFROM seagate_core.seagate_production_lines pl\nJOIN seagate_ops.seagate_production_events pe ON pl.line_id = pe.work_order_id\nWHERE pl.status = 'WARM'\nGROUP BY pl.drive_family\nORDER BY pl.drive_family\nLIMIT 500"
+          },
+          {
+            "verdict": "wrong",
+            "recalled": 0,
+            "sql_matches_golden": false,
+            "sql": "SELECT pl.drive_family AS drive_family, SUM(pe.units_completed) AS total_patties_plated\nFROM seagate_core.seagate_production_lines pl\nJOIN seagate_ops.seagate_production_events pe ON pe.line_id = pl.line_id\nWHERE pl.status = 'WARM'\nGROUP BY pl.drive_family\nORDER BY pl.drive_family\nLIMIT 100"
+          },
+          {
+            "verdict": "wrong",
+            "recalled": 0,
+            "sql_matches_golden": false,
+            "sql": "SELECT\n  spl.drive_family AS \"Drive Family\",\n  COUNT(spe.units_completed) AS \"Patties Plated\"\nFROM\n  seagate_core.seagate_production_lines spl\nJOIN\n  seagate_ops.seagate_production_events spe ON spl.line_id = spe.work_order_id\nWHERE\n  spl.status = 'WARM'\nGROUP BY\n  spl.drive_family\nLIMIT 100"
+          }
+        ],
+        "paraphrase": [
+          {
+            "verdict": "wrong",
+            "recalled": 0,
+            "sql_matches_golden": false,
+            "sql": "SELECT p.drive_family, SUM(e.units_completed) AS finished_patties_count\nFROM seagate_core.seagate_production_lines p\nJOIN seagate_ops.seagate_production_events e ON p.line_id = e.work_order_id\nWHERE p.status = 'WARM'\nGROUP BY p.drive_family\nLIMIT 100"
+          },
+          {
+            "verdict": "wrong",
+            "recalled": 0,
+            "sql_matches_golden": false,
+            "sql": "SELECT pl.drive_family, SUM(pe.units_completed) AS finished_patties_count\nFROM seagate_core.seagate_production_lines pl\nJOIN seagate_ops.seagate_production_events pe ON pl.line_id = pe.work_order_id\nWHERE pl.status = 'WARM'\nGROUP BY pl.drive_family\nLIMIT 100"
+          },
+          {
+            "verdict": "wrong",
+            "recalled": 0,
+            "sql_matches_golden": false,
+            "sql": "SELECT pl.drive_family, SUM(pe.units_completed) AS finished_patties_count\nFROM seagate_core.seagate_production_lines pl\nJOIN seagate_ops.seagate_production_events pe ON pl.line_id = pe.work_order_id\nWHERE pl.status = 'WARM'\nGROUP BY pl.drive_family\nLIMIT 100"
+          }
+        ]
+      },
+      "golden_status": "active",
+      "golden_entries": 1
+    },
+    {
+      "qid": "Q17",
+      "name": "Golden Yield \u2014 Vantage, Q4 2025",
+      "baseline": {
+        "question": [
+          {
+            "verdict": "wrong",
+            "recalled": 0,
+            "sql_matches_golden": false,
+            "sql": "SELECT\n  (CAST(SUM(CASE WHEN sqt.result = 'PASS' AND sqt.garnish_defect = FALSE THEN 1 ELSE 0 END) AS FLOAT) / COUNT(*)) AS golden_yield\nFROM\n  seagate_ops.seagate_quality_tests AS sqt\n  JOIN seagate_core.seagate_production_lines AS spl ON sqt.work_order_id = spl.line_id\n  JOIN seagate_core.seagate_drive_skus AS sds ON spl.drive_family = sds.drive_family\nWHERE\n  sds.drive_family = 'Vantage'\n  AND sqt.tested_at >= '2025-10-01'\n  AND sqt.tested_at < '2026-01-01'\nLIMIT 1000"
+          },
+          {
+            "verdict": "wrong",
+            "recalled": 0,
+            "sql_matches_golden": false,
+            "sql": "SELECT\n  COUNT(CASE WHEN result = 'Golden Yield' THEN 1 END)::FLOAT / NULLIF(COUNT(*), 0) AS golden_yield\nFROM seagate_ops.seagate_quality_tests q\nJOIN seagate_core.seagate_drive_skus s ON q.work_order_id = s.sku_id\nWHERE s.drive_family = 'Vantage'\n  AND q.tested_at >= '2025-10-01'\n  AND q.tested_at < '2026-01-01'\nLIMIT 1"
+          },
+          {
+            "verdict": "wrong",
+            "recalled": 0,
+            "sql_matches_golden": false,
+            "sql": "SELECT\n  COUNT(CASE WHEN q.result = 'Golden Yield' THEN 1 END)::FLOAT / COUNT(*) AS golden_yield\nFROM\n  seagate_ops.seagate_quality_tests q\nJOIN\n  seagate_core.seagate_drive_skus s ON q.work_order_id = s.sku_id\nWHERE\n  s.drive_family = 'Vantage'\n  AND q.tested_at >= '2025-10-01'\n  AND q.tested_at < '2026-01-01'\nLIMIT 1"
+          }
+        ],
+        "paraphrase": [
+          {
+            "verdict": "correct",
+            "recalled": 0,
+            "sql_matches_golden": false,
+            "sql": "SELECT SUM(COALESCE(pe.units_completed, 0))::FLOAT / SUM(COALESCE(pe.units_completed, 0) + COALESCE(pe.units_reworked, 0) + COALESCE(pe.units_scrapped, 0)) AS golden_yield\nFROM seagate_core.seagate_drive_skus sku\nJOIN seagate_ops.seagate_production_events pe ON sku.sku_id = pe.work_order_id\nWHERE sku.drive_family = 'Vantage'\n  AND pe.event_date >= '2025-10-01'::DATE\n  AND pe.event_date < '2026-01-01'::DATE\nLIMIT 1000"
+          },
+          {
+            "verdict": "wrong",
+            "recalled": 0,
+            "sql_matches_golden": false,
+            "sql": "SELECT\n  COALESCE(SUM(units_completed) * 1.0 / NULLIF(SUM(units_scrapped), 0), 0) AS golden_yield\nFROM seagate_ops.seagate_production_events AS spe\nJOIN seagate_core.seagate_drive_skus AS sds ON spe.work_order_id = sds.sku_id\nWHERE sds.drive_family = 'Vantage'\n  AND spe.event_date >= '2025-10-01'\n  AND spe.event_date < '2026-01-01'\nLIMIT 1000"
+          },
+          {
+            "verdict": "wrong",
+            "recalled": 0,
+            "sql_matches_golden": false,
+            "sql": "SELECT\n  SUM(seagate_production_events.units_completed) * 1.0 / NULLIF(SUM(seagate_production_events.units_scrapped + seagate_production_events.units_reworked), 0) AS golden_yield\nFROM\n  seagate_ops.seagate_production_events\nJOIN\n  seagate_core.seagate_drive_skus\nON\n  seagate_production_events.work_order_id = seagate_drive_skus.sku_id\nWHERE\n  seagate_drive_skus.drive_family LIKE 'Vantage%'\n  AND seagate_production_events.event_date >= '2025-10-01'\n  AND seagate_production_events.event_date < '20"
+          }
+        ]
+      },
+      "with_golden": {
+        "question": [
+          {
+            "verdict": "wrong",
+            "recalled": 0,
+            "sql_matches_golden": false,
+            "sql": "SELECT\n  SUM(CASE WHEN result = 'Golden Yield' THEN 1 ELSE 0 END)::FLOAT / COUNT(*) AS golden_yield\nFROM seagate_ops.seagate_quality_tests\nJOIN seagate_core.seagate_drive_skus ON seagate_quality_tests.work_order_id = seagate_drive_skus.sku_id\nWHERE seagate_drive_skus.drive_family = 'Vantage'\n  AND seagate_quality_tests.tested_at >= '2025-10-01'\n  AND seagate_quality_tests.tested_at < '2026-01-01'\nLIMIT 1000"
+          },
+          {
+            "verdict": "wrong",
+            "recalled": 0,
+            "sql_matches_golden": false,
+            "sql": "SELECT\n  SUM(CASE WHEN sqt.result = 'Golden Yield' THEN 1 ELSE 0 END)::FLOAT / COUNT(*) AS golden_yield\nFROM seagate_ops.seagate_quality_tests sqt\nJOIN seagate_core.seagate_drive_skus sds ON sqt.work_order_id = sds.sku_id\nWHERE sds.drive_family = 'Vantage'\n  AND sqt.tested_at >= '2025-10-01'\n  AND sqt.tested_at < '2026-01-01'\nLIMIT 1000"
+          },
+          {
+            "verdict": "wrong",
+            "recalled": 0,
+            "sql_matches_golden": false,
+            "sql": "SELECT\n  CASE WHEN COUNT(CASE WHEN result = 'Pass' AND garnish_defect = FALSE THEN 1 END) = 0\n       THEN NULL\n       ELSE (COUNT(CASE WHEN result = 'Pass' AND garnish_defect = FALSE THEN 1 END)::DECIMAL / COUNT(*)) * 100\n  END AS golden_yield_percentage\nFROM seagate_ops.seagate_quality_tests qt\nJOIN seagate_core.seagate_work_orders wo ON qt.work_order_id = wo.work_order_id\nJOIN seagate_core.seagate_drive_skus ds ON wo.sku_id = ds.sku_id\nWHERE ds.drive_family = 'Vantage'\n  AND qt.tested_at >= '2"
+          }
+        ],
+        "paraphrase": [
+          {
+            "verdict": "correct",
+            "recalled": 0,
+            "sql_matches_golden": false,
+            "sql": "SELECT\n  SUM(CASE WHEN d.drive_family = 'Vantage' THEN (e.units_completed - COALESCE(e.units_reworked, 0) - COALESCE(e.units_scrapped, 0)) ELSE 0 END)::FLOAT /\n  NULLIF(SUM(CASE WHEN d.drive_family = 'Vantage' THEN e.units_completed ELSE 0 END), 0) AS golden_yield\nFROM seagate_ops.seagate_production_events e\nJOIN seagate_core.seagate_drive_skus d ON e.work_order_id = d.sku_id\nWHERE e.event_date >= '2025-10-01' AND e.event_date < '2026-01-01'\nLIMIT 1000"
+          },
+          {
+            "verdict": "wrong",
+            "recalled": 0,
+            "sql_matches_golden": false,
+            "sql": "SELECT SUM((units_completed - units_reworked - units_scrapped) / NULLIF(units_completed, 0)) AS golden_yield\nFROM seagate_ops.seagate_production_events AS pe\nJOIN seagate_core.seagate_drive_skus AS sku ON pe.work_order_id = sku.sku_id\nWHERE sku.drive_family ILIKE 'Vantage%'\n  AND pe.event_date >= '2025-10-01' AND pe.event_date < '2026-01-01'\nLIMIT 1000"
+          },
+          {
+            "verdict": "correct",
+            "recalled": 0,
+            "sql_matches_golden": false,
+            "sql": "SELECT\n  (SUM(1.0 * (units_completed - units_reworked - units_scrapped)) / SUM(units_completed)) AS golden_yield\nFROM seagate_ops.seagate_production_events AS prod\nJOIN seagate_core.seagate_drive_skus AS skus ON prod.work_order_id = skus.sku_id\nWHERE skus.drive_family LIKE 'Vantage%' -- Vantage-family drives\n  AND prod.event_date >= '2025-10-01' AND prod.event_date < '2026-01-01'\nLIMIT 1000"
+          }
+        ]
+      },
+      "golden_status": "active",
+      "golden_entries": 2
+    }
+  ]
+}

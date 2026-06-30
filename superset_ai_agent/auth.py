@@ -40,6 +40,10 @@ class AgentIdentity(BaseModel):
     username: str | None = None
     email: str | None = None
     source: Literal["static", "signed_header", "superset_session"] = "static"
+    #: Superset role names, when the provider can supply them (signed_header
+    #: payloads carry them; the session provider fetches them lazily for admin
+    #: checks only — see ``IdentityProvider.is_admin``). Empty when unknown.
+    roles: list[str] = Field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -91,6 +95,14 @@ class IdentityProvider(Protocol):
     def get_identity(self, request: Request) -> AgentIdentity:
         """Return the identity for this request."""
 
+    def is_admin(self, request: Request) -> bool:
+        """Whether the caller may access admin-only agent surfaces.
+
+        Kept off the hot path: implementations may make an extra call (e.g. fetch
+        Superset roles) since only admin-gated endpoints invoke this, never the
+        per-request identity resolution.
+        """
+
 
 class StaticIdentityProvider:
     """Development-only identity provider using DEFAULT_OWNER_ID."""
@@ -98,13 +110,29 @@ class StaticIdentityProvider:
     def get_identity(self, request: Request) -> AgentIdentity:
         return AgentIdentity(owner_id=DEFAULT_OWNER_ID, source="static")
 
+    def is_admin(self, request: Request) -> bool:
+        # Static identity is a local-dev convenience (no real auth); treat it as
+        # admin so the usage view is reachable in development.
+        return True
+
 
 class SignedHeaderIdentityProvider:
     """Trust signed internal identity headers from an authenticated proxy."""
 
-    def __init__(self, *, header_name: str, secret: str):
+    def __init__(
+        self,
+        *,
+        header_name: str,
+        secret: str,
+        admin_roles: tuple[str, ...] = ("Admin",),
+    ):
         self.header_name = header_name
         self.secret = secret
+        self.admin_roles = set(admin_roles)
+
+    def is_admin(self, request: Request) -> bool:
+        # The signed payload is trusted; admin follows from the roles it carries.
+        return bool(set(self.get_identity(request).roles) & self.admin_roles)
 
     def get_identity(self, request: Request) -> AgentIdentity:
         header_value = request.headers.get(self.header_name)
@@ -145,6 +173,50 @@ class SupersetSessionIdentityProvider:
         self.base_url = config.superset_base_url.rstrip("/")
         self.transport = transport
         self.timeout = httpx.Timeout(30.0)
+        self.admin_roles = set(config.admin_roles)
+
+    def is_admin(self, request: Request) -> bool:
+        cached = getattr(request.state, "agent_is_admin", None)
+        if isinstance(cached, bool):
+            return cached
+        # Roles live at a separate endpoint from /api/v1/me/; fetch them only here
+        # (admin-gated routes), never on the per-request identity hot path.
+        auth = SupersetRequestAuth.from_request(request)
+        if not auth.has_credentials():
+            raise HTTPException(status_code=401, detail="Missing Superset session.")
+        try:
+            with httpx.Client(
+                cookies=auth.cookies(),
+                headers=auth.headers(),
+                timeout=self.timeout,
+                transport=self.transport,
+            ) as client:
+                response = client.get(self._url("/api/v1/me/roles/"))
+        except httpx.HTTPError as ex:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Could not resolve Superset roles: {ex}",
+            ) from ex
+        if response.status_code in {401, 403}:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail="Superset session is missing, expired, or unauthorized.",
+            )
+        if response.status_code >= 400:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Could not resolve Superset roles: HTTP {response.status_code}",
+            )
+        try:
+            payload = response.json()
+        except ValueError as ex:
+            raise HTTPException(
+                status_code=502,
+                detail="Superset /api/v1/me/roles/ returned invalid JSON.",
+            ) from ex
+        is_admin = bool(_role_names_from_me_roles(payload) & self.admin_roles)
+        request.state.agent_is_admin = is_admin
+        return is_admin
 
     def get_identity(self, request: Request) -> AgentIdentity:
         existing = getattr(request.state, "agent_identity", None)
@@ -181,8 +253,7 @@ class SupersetSessionIdentityProvider:
             raise HTTPException(
                 status_code=502,
                 detail=(
-                    "Could not validate Superset session: "
-                    f"HTTP {response.status_code}"
+                    f"Could not validate Superset session: HTTP {response.status_code}"
                 ),
             )
 
@@ -215,6 +286,7 @@ def create_identity_provider(config: AgentConfig) -> IdentityProvider:
         return SignedHeaderIdentityProvider(
             header_name=config.signed_identity_header,
             secret=config.signed_identity_secret,
+            admin_roles=config.admin_roles,
         )
     if config.identity_provider == "superset_session":
         return SupersetSessionIdentityProvider(config=config)
@@ -278,3 +350,26 @@ def _identity_from_superset_me_payload(payload: object) -> AgentIdentity:
         email=str(email) if email is not None else None,
         source="superset_session",
     )
+
+
+def _role_names_from_me_roles(payload: object) -> set[str]:
+    """Extract role names from a Superset ``/api/v1/me/roles/`` response.
+
+    The endpoint returns ``{"result": {"roles": {"<RoleName>": [...perms...]}}}``
+    (bootstrap_user_data, include_perms). Degrades to an empty set on any
+    unexpected shape so an admin check fails closed (denies access) rather than
+    raising.
+    """
+
+    if not isinstance(payload, dict):
+        return set()
+    data = payload.get("result", payload)
+    if not isinstance(data, dict):
+        return set()
+    roles = data.get("roles")
+    if isinstance(roles, dict):
+        return {str(name) for name in roles}
+    if isinstance(roles, list):
+        # Defensive: some shapes expose a flat list of role names.
+        return {str(name) for name in roles if isinstance(name, str)}
+    return set()

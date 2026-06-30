@@ -130,12 +130,25 @@ class LlmWrenClient:
         ]
         if relationships:
             context_items.append({"type": "relationships", "items": relationships})
+        # Surface views the same way: a view is a vetted, named query the agent can
+        # select from instead of re-deriving the joins. Native (``dialect``) views
+        # are excluded — they are not in the engine manifest, so the agent must not
+        # be told to query one.
+        views = [
+            view
+            for view in mdl.get("views", [])
+            if isinstance(view, dict) and view.get("name") and not view.get("dialect")
+        ]
+        ranked_views = _rank_views(question, views)[: self.config.wren_context_limit]
+        if ranked_views:
+            context_items.append({"type": "views", "items": ranked_views})
         return WrenContextArtifact(
             enabled=True,
             available=True,
             matched_models=[
                 str(model.get("name")) for model in ranked if model.get("name")
             ][: self.config.wren_context_limit],
+            matched_views=[str(view.get("name")) for view in ranked_views],
             context_items=context_items,
         )
 
@@ -353,7 +366,7 @@ class LlmWrenClient:
                 proposed_content = json.dumps(reconciled, indent=2)
                 proposed_path = _safe_relative_path(
                     first.path,
-                    default=f"models/{_safe_name(project.schema_name)}.json",
+                    default=_default_overlay_path(project, overlay),
                 )
             validation = validate_mdl(proposed_content, schema_index=schema_index)
             # C2.1: when structural+physical validation passes, optionally deep-
@@ -711,6 +724,25 @@ def _rank_models(
     return scored
 
 
+def _rank_views(
+    question: str,
+    views: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Rank views by token overlap with the question (mirrors ``_rank_models``).
+
+    Only views that share at least one term with the question are returned, so an
+    unrelated view never crowds the context — a view earns its slot by matching.
+    """
+
+    question_tokens = _tokens(question)
+
+    def score(view: dict[str, Any]) -> int:
+        return len(question_tokens & _tokens(json.dumps(view, default=str)))
+
+    matched = [view for view in views if score(view) > 0]
+    return sorted(matched, key=score, reverse=True)
+
+
 def _trim_to_budget(
     models: list[dict[str, Any]],
     token_budget: int,
@@ -953,6 +985,22 @@ def _safe_name(value: str) -> str:
     chars = [char if char.isalnum() else "_" for char in value.lower()]
     name = "_".join("".join(chars).split("_"))
     return name or "semantic_model"
+
+
+def _default_overlay_path(project: SemanticProject, overlay: dict[str, Any]) -> str:
+    """Fallback file path for an overlay whose own path is unusable.
+
+    A views-only overlay (no models) lands under ``views/<name>.json`` to match
+    Wren's project layout; everything else keeps the model-file default. The store
+    is path-agnostic, so this is a tidiness convention, not a constraint.
+    """
+
+    views = overlay.get("views")
+    if views and not overlay.get("models"):
+        first = views[0]
+        name = first.get("name") if isinstance(first, dict) else None
+        return f"views/{_safe_name(str(name))}.json" if name else "views/view.json"
+    return f"models/{_safe_name(project.schema_name)}.json"
 
 
 def _safe_relative_path(path: str, *, default: str) -> str:

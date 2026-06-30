@@ -1,0 +1,94 @@
+{
+  "E13_glossary_plus_addendum": [
+    {
+      "project": "90407b2b-1327-4e3d-bb2e-a7a52002bf72",
+      "items": 3,
+      "applied": true,
+      "activated": true,
+      "activate_error": null,
+      "copilot_error": null,
+      "active_view_metrics": {
+        "count": 3,
+        "names": [
+          "region_channel_shipments",
+          "standard_golden_yield_by_family",
+          "warm_line_output_by_family"
+        ],
+        "with_description": 3,
+        "description_rate": 1.0,
+        "semantic": 3,
+        "native": 0,
+        "semantic_referencing_physical_schema": 0,
+        "physical_leak_names": []
+      },
+      "proposed_view_metrics": {
+        "count": 3,
+        "names": [
+          "region_channel_shipments",
+          "standard_golden_yield_by_family",
+          "warm_line_output_by_family"
+        ],
+        "with_description": 3,
+        "description_rate": 1.0,
+        "semantic": 3,
+        "native": 0,
+        "semantic_referencing_physical_schema": 0,
+        "physical_leak_names": []
+      },
+      "active_view_names": [
+        "region_channel_shipments",
+        "standard_golden_yield_by_family",
+        "warm_line_output_by_family"
+      ]
+    },
+    {
+      "project": "c0a21ac9-4a89-430b-92fa-abcfe7e88ca5",
+      "items": 3,
+      "applied": true,
+      "activated": true,
+      "activate_error": null,
+      "copilot_error": null,
+      "active_view_metrics": {
+        "count": 3,
+        "names": [
+          "region_channel_shipments",
+          "standard_golden_yield_by_family",
+          "warm_line_output_by_family"
+        ],
+        "with_description": 3,
+        "description_rate": 1.0,
+        "semantic": 3,
+        "native": 0,
+        "semantic_referencing_physical_schema": 0,
+        "physical_leak_names": []
+      },
+      "proposed_view_metrics": {
+        "count": 3,
+        "names": [
+          "region_channel_shipments",
+          "standard_golden_yield_by_family",
+          "warm_line_output_by_family"
+        ],
+        "with_description": 3,
+        "description_rate": 1.0,
+        "semantic": 3,
+        "native": 0,
+        "semantic_referencing_physical_schema": 0,
+        "physical_leak_names": []
+      },
+      "active_view_names": [
+        "region_channel_shipments",
+        "standard_golden_yield_by_family",
+        "warm_line_output_by_family"
+      ]
+    }
+  ],
+  "E15_rawsql_addendum": [
+    {
+      "error": "GET job -> 502: {\"detail\":\"Could not validate Superset session: HTTP 500\"}"
+    },
+    {
+      "error": "GET projects -> 502: {\"detail\":\"Could not validate Superset session: HTTP 500\"}"
+    }
+  ]
+}

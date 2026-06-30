@@ -106,6 +106,39 @@ def test_manifest_chunks_into_models_columns_relationships() -> None:
     assert any(i.kind == "relationship" and i.name == "deal_customer" for i in items)
 
 
+def test_semantic_view_is_indexed_with_its_description_native_excluded() -> None:
+    # A semantic view becomes a retrievable chunk whose text carries the
+    # description (the recall key); a native (dialect) view is not advertised
+    # because it is not in the engine manifest.
+    mdl = json.dumps(
+        {
+            "models": [
+                {
+                    "name": "orders",
+                    "tableReference": {"schema": "public", "table": "orders"},
+                    "columns": [{"name": "amount", "type": "DOUBLE"}],
+                }
+            ],
+            "views": [
+                {
+                    "name": "warm_line_output",
+                    "statement": "SELECT amount FROM orders",
+                    "properties": {"description": "Warm line output by family"},
+                },
+                {
+                    "name": "legacy_rollup",
+                    "statement": "SELECT * FROM public.raw_rollup",
+                    "dialect": "postgres",
+                },
+            ],
+        }
+    )
+    items = manifest_to_schema_items(compile_manifest(json_contents=[mdl]))
+    view_items = [i for i in items if i.kind == "view"]
+    assert [i.name for i in view_items] == ["warm_line_output"]
+    assert "Warm line output by family" in view_items[0].text
+
+
 def test_chunk_text_carries_enriched_semantics_and_join_condition() -> None:
     # CR9: enriched description/alias/synonyms and the relationship condition must be
     # in the chunk *text* — that is what a colloquial question embeds/matches against.

@@ -25,6 +25,25 @@ under the License.
 background-coverage features. Read this first; the planning docs below have the
 blow-by-blow rationale, decisions, and resumable checklists.
 
+> ### ⚠️ Superseded in part (2026-06-30) — coverage was re-architected
+> Three follow-on features changed the coverage model described below. **Where
+> this doc and the specs disagree, the specs win:**
+> - **Coverage is no longer a provenance event.** `coverage_completed` was
+>   **removed** from `PROVENANCE_EVENT_TYPES` and `_PROVENANCE_KIND_BY_EVENT`, so
+>   it no longer renders a `kind="coverage"` timeline row (statements at §2/§3/§7
+>   about a coverage provenance entry are obsolete). Coverage now surfaces as a
+>   **read-only version label** on the version-producing entries (keyed by
+>   `mdl_checksum`). → `plan_coverage_labels_and_progress_spec.md`.
+> - **Live progress + badge-as-viewer + labels** (Features A/B/C) shipped. New:
+>   `coverage_progress` event, `progress` column (migration `0012`),
+>   `…/coverage/scores-by-version`, `mdl_checksum` stamped into version-producing
+>   event detail. → same spec, §12 "as shipped".
+> - **Coverage recovery agent** shipped (flag-gated, off by default): auto-runs an
+>   MDL-Copilot turn on a gappy report to propose gap-closing edits as a reviewable
+>   changeset; migration `0013`, `recovery_*` columns, `…/coverage/runs/{id}/
+>   recovery[/dismiss]`, `recovery_suggestions_ready` event. →
+>   `plan_coverage_recovery_agent_spec.md` §11 "as shipped".
+
 **Companion docs (same dir):**
 - `plan_provenance_and_coverage_spec.md` — feature spec + rationale (the "why").
 - `plan_provenance_and_coverage_impl.md` — Phase 1–2 build checklist + as-built log.

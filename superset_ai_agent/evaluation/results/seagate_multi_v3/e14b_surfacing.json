@@ -1,0 +1,30 @@
+{
+  "baseline_no_surface": [
+    {
+      "verdict": "wrong",
+      "used_view": false
+    },
+    {
+      "verdict": "wrong",
+      "used_view": false
+    },
+    {
+      "verdict": "wrong",
+      "used_view": false
+    }
+  ],
+  "view_surfaced_explicit": [
+    {
+      "verdict": "wrong",
+      "used_view": true
+    },
+    {
+      "verdict": "wrong",
+      "used_view": true
+    },
+    {
+      "verdict": "wrong",
+      "used_view": true
+    }
+  ]
+}

@@ -58,12 +58,23 @@ from superset_ai_agent.semantic_layer.engine.planning import (
     plan_semantic_sql_step,
     with_engine_provenance,
 )
+from superset_ai_agent.semantic_layer.golden_queries import (
+    merge_recalled_examples,
+    recall_golden_queries,
+)
 from superset_ai_agent.semantic_layer.instructions import (
     InstructionStore,
     NullInstructionStore,
 )
 from superset_ai_agent.semantic_layer.mdl_files import MdlFileStore
-from superset_ai_agent.semantic_layer.memory_store import Memory, NullMemory
+from superset_ai_agent.semantic_layer.memory_store import (
+    build_recall_access,
+    load_recall_access,
+    Memory,
+    NullMemory,
+    RecallAccess,
+    refs_from_sql,
+)
 from superset_ai_agent.semantic_layer.projects import SemanticProjectStore
 from superset_ai_agent.semantic_layer.runtime import (
     build_unified_context,
@@ -75,10 +86,12 @@ from superset_ai_agent.semantic_layer.schema_retriever import (
     retrieve_mdl_context,
     Retriever,
 )
-from superset_ai_agent.semantic_layer.schemas import WrenMaterializationResult
+from superset_ai_agent.semantic_layer.schemas import (
+    SemanticProject,
+    WrenMaterializationResult,
+)
 from superset_ai_agent.semantic_layer.store import (
     instruction_scope_hash,
-    scope_hash,
 )
 from superset_ai_agent.semantic_layer.wren_runtime import (
     materialize_request_semantic_project,
@@ -221,6 +234,7 @@ class AgentState(TypedDict, total=False):
     wren_retrieval: WrenRetrievalArtifact | None
     wren_materialization: WrenMaterializationResult | None
     wren_mdl_path: str | None
+    recall_access: RecallAccess | None
     semantic_sql: str | None
     native_sql: str | None
     engine: str | None
@@ -453,6 +467,7 @@ class TextToSqlGraph:
                 ],
             }
         materialization = None
+        project = None
         project_id = None
         mdl_path = None
         resolve_warnings: list[str] = []
@@ -543,6 +558,7 @@ class TextToSqlGraph:
             "wren_retrieval": retrieval_artifact,
             "wren_materialization": materialization,
             "wren_mdl_path": mdl_path,
+            "recall_access": self._recall_access(request, project),
             "trace": [
                 *state.get("trace", []),
                 TraceEvent(
@@ -557,6 +573,39 @@ class TextToSqlGraph:
                 ),
             ],
         }
+
+    def _recall_access(
+        self, request: AgentQueryRequest, project: SemanticProject | None
+    ) -> RecallAccess | None:
+        """Build the F2 recall access set across the project's full schema set (R1).
+
+        Decoupled from grounding ``context.datasets`` (a ranked, single-schema
+        subset): lists the user's reachable tables per project schema so a
+        cross-schema golden/memory pair can pass the Stage-A access filter. Returns
+        ``None`` when recall is inert (no project and learning off) so the draft
+        node falls back to the prior behaviour without an extra scan.
+        """
+
+        schema_names = (
+            project.schema_names
+            if project is not None and project.schema_names
+            else request.effective_schema_names
+        )
+        recall_inert = project is None and self.config.wren_memory_store == "none"
+        if recall_inert or not schema_names:
+            return None
+        cap = max(
+            self.config.wren_schema_table_scan_limit,
+            self.config.wren_schema_table_candidate_limit,
+            self.config.max_context_datasets,
+        )
+        return load_recall_access(
+            self.superset_client,
+            database_id=request.database_id,
+            catalog_name=request.catalog_name,
+            schema_names=schema_names,
+            limit=cap,
+        )
 
     def _model_selector(self, question: str) -> ModelSelector | None:
         """Build the C1.3 LLM model selector when enabled, else ``None`` (heuristic).
@@ -589,25 +638,38 @@ class TextToSqlGraph:
             dataset_ids=request.dataset_ids,
         )
 
-    def _request_scope_hash(self, request: AgentQueryRequest) -> str:
-        return scope_hash(self._request_scope(request))
-
     def _instruction_scope_hash(self, request: AgentQueryRequest) -> str:
         return instruction_scope_hash(self._request_scope(request))
 
     def _draft_sql(self, state: AgentState) -> AgentState:
         request = state["request"]
         context = state["context"]
-        scope_hash_value = self._request_scope_hash(request)
         owner_id = state.get("owner_id", DEFAULT_OWNER_ID)
+        k = self.config.wren_memory_recall_k
+        # Prefer the project-wide, access-filtered recall set (R1); fall back to the
+        # single-schema grounding datasets only when it could not be built.
+        access = state.get("recall_access") or build_recall_access(context.datasets)
+        memory_pairs = self.memory.recall_examples(
+            request.question,
+            database_id=request.database_id,
+            k=k,
+            access=access,
+        )
+        # Project-scoped golden queries lead the few-shot set (priority); runtime
+        # memory fills the rest. Golden are access-filtered identically (F3/2C).
+        golden_pairs = recall_golden_queries(
+            mdl_file_store=self.mdl_file_store,
+            project_id=getattr(state.get("wren_context"), "project_id", None)
+            or request.project_id,
+            owner_id=owner_id,
+            question=request.question,
+            k=k,
+            embedder=getattr(self.memory, "embedder", None),
+            access=access,
+        )
         recalled = [
             pair.model_dump()
-            for pair in self.memory.recall_examples(
-                request.question,
-                scope_hash=scope_hash_value,
-                owner_id=owner_id,
-                k=self.config.wren_memory_recall_k,
-            )
+            for pair in merge_recalled_examples(golden_pairs, memory_pairs, k)
         ]
         instructions = [
             item.instruction
@@ -857,14 +919,19 @@ class TextToSqlGraph:
                 ],
             }
 
-        # Learning loop: store the confirmed NL->SQL pair for future recall.
+        # Learning loop: store the confirmed NL->SQL pair for future recall. Pooled
+        # per database (shared); referenced tables captured for the access filter.
         try:
+            native_sql = state.get("native_sql") or validation.normalized_sql
+            referenced_tables, referenced_schemas = refs_from_sql(native_sql)
             self.memory.store_confirmed(
                 question=request.question,
                 semantic_sql=state.get("semantic_sql") or validation.normalized_sql,
-                native_sql=state.get("native_sql") or validation.normalized_sql,
-                scope_hash=self._request_scope_hash(request),
-                owner_id=state.get("owner_id", DEFAULT_OWNER_ID),
+                native_sql=native_sql,
+                database_id=request.database_id,
+                created_by=state.get("owner_id", DEFAULT_OWNER_ID),
+                referenced_tables=referenced_tables,
+                referenced_schemas=referenced_schemas,
                 result_meta={"row_count": result.row_count},
             )
         except Exception as ex:  # pylint: disable=broad-except - memory is best-effort

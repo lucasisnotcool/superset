@@ -509,6 +509,15 @@ def validate_project_manifest(
     deep = validate_with_wren_core(
         [model for model in merged_models if isinstance(model, dict)],
         [rel for rel in merged_relationships if isinstance(rel, dict)],
+        # Only semantic views reach the engine: wren-core resolves view bodies
+        # against model names, so a native view (one carrying a ``dialect``,
+        # referencing physical tables) would fail the whole manifest load. Native
+        # views are validated off this path (read-only SQL + source dry-run).
+        [
+            view
+            for view in merged_views
+            if isinstance(view, dict) and not view.get("dialect")
+        ],
     )
     merged_messages = [*result.messages, *deep.messages]
     return MdlValidationResult(

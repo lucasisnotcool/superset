@@ -24,6 +24,10 @@ assists people when migrating to a new version.
 
 ## Next
 
+### AI agent NL→SQL memory is now database-scoped and shared (not per-user)
+
+The standalone AI agent's confirmed NL→SQL "memory" (the few-shot learning loop, opt-in via `WREN_MEMORY_STORE`) is now pooled per **database** and shared across all users who can use the agent against that database, instead of being isolated per user. Recall is access-aware: a learned pair is only surfaced to a user who can reach every physical table it references (the references are captured at store time; a pair whose references are unknown or unreachable is dropped — fail closed). Two consequences for operators: (1) a question's text and SQL learned by one user become visible (as a few-shot example, and in the explain trace) to other users with access to the same database — this is intended, bounded by the per-request table-access filter; (2) NL→SQL memory rows written before this change cannot be re-keyed (they carry no `database_id`) and are excluded from recall — the pool re-accumulates from new successful queries. Per-user "instructions" are unchanged (they remain personal by design). Run database migrations (`0015_nl_sql_example_db_scope_and_refs`).
+
 ### Guest-token RLS rules reject unknown fields
 
 The `rls` rules passed to `POST /api/v1/security/guest_token/` are now validated strictly: a rule may only contain `dataset` and `clause`. Previously unknown fields were silently dropped, so a mistyped or legacy scope key (most commonly `datasource` instead of `dataset`) produced a rule with no `dataset`, which is treated as a *global* rule applied to every dataset the embedded resource can reach. Such a request now returns HTTP 400 identifying the offending field instead of issuing a token with an unintended global rule. Integrators that were sending extra fields in RLS rules must remove them; valid dataset-scoped (`{"dataset": 41, "clause": "..."}`) and global (`{"clause": "..."}`) rules are unaffected.

@@ -288,4 +288,67 @@ leave the surface blank.
 - Persisting an explicit MDL "version" entity (the `mdl_checksum` is sufficient as
   the version key; no new versioning model is introduced).
 - Notifications/email on coverage drops (possible later, off the same events).
+
+---
+
+## 12. Implementation status — as shipped (2026-06-30)
+
+**All three phases SHIPPED + tested** (frontend coverage suite green; tsc clean).
+Decisions DP1–DP7 implemented as recommended. Key deltas, files, and gotchas:
+
+### Backend
+- **Migration `0012_coverage_run_progress`** — nullable `progress` JSON column on
+  `ai_agent_coverage_runs`. `CoverageProgress` pydantic model
+  ([copilot/schemas.py](semantic_layer/copilot/schemas.py)); persisted while
+  `running`, **cleared on terminal transition** (complete/fail) in both store
+  impls' `_update`.
+- **`progress_cb`** (NamedTuple `CoverageProgress` + `_report_progress`) threaded
+  through `run_directory_coverage` on the **existing `should_cancel` stage seams**
+  ([copilot/coverage.py](semantic_layer/copilot/coverage.py)); advisory — a
+  throwing callback never breaks the audit. Stages: `building_facts` → `extracting`
+  (per-doc, countable) → `judging` (detail = "N claims vs M facts") →
+  `aggregating`/`checking_overreach`.
+- **`_run_coverage_job`** wires `progress_cb` → `store.report_progress` + emits a
+  throttled non-provenance `coverage_progress` event **only on stage transitions**
+  (≤4/run). `_run_coverage_job` carries `# noqa: C901`.
+- **`/coverage/status`** widened: `progress` (live), plus (Feature B)
+  `scores-by-version` via new store method `scores_by_checksum(project_id)`
+  (latest complete run per `mdl_checksum`). A `latest_complete_bulk` store method
+  also exists (project-list badge enrichment).
+- **Decouple (Feature B):** `coverage_completed` **removed from**
+  `PROVENANCE_EVENT_TYPES` **and** `_PROVENANCE_KIND_BY_EVENT`
+  ([semantic_layer/schemas.py](semantic_layer/schemas.py)) → `provenance_from_event`
+  returns `None` for it (read-path filter, **no data migration**). `mdl_checksum`
+  stamped into version-producing event `detail` at the two central seams
+  (`_emit_mdl_provenance`, `_emit_agent_apply_provenance`) + onboarding.
+- New event types added to the `SemanticLayerEventType` literal: `coverage_progress`,
+  (later) `recovery_suggestions_ready` — both **non-provenance**.
+
+### Frontend
+- **`CoverageBadge`** click → opens `CoveragePanel` (viewer), **never re-runs**;
+  re-run is an explicit button inside the panel. Analysing label mirrors live
+  stage detail.
+- **New components:** `CoveragePanel` (progress/report/empty/stale states),
+  `CoverageProgress` (4-step stepper: Extract→Build→Judge→Aggregate; determinate
+  bar only when countable, indeterminate for the batched Judge).
+- **`MdlProvenanceDialog`** renders a `CoverageChip` per version-producing entry
+  (joins `detail.mdl_checksum` → `scores-by-version`), with a Codecov-style delta
+  (`↓28%`) vs the nearest older *different*-checksum scored entry; chip opens that
+  version's report. Coverage rows no longer appear in the timeline.
+
+### Gotchas / non-obvious
+- **`t('… %s%', n)` sprintf chokes on a trailing literal `%`** — render the percent
+  outside `t()` (e.g. `{t('Coverage')} {pct}%`).
+- The events `/events` SSE is snapshot-style (finite generator); the browser
+  `EventSource` auto-reconnects to re-fetch — that's the "live" mechanism. `coverage_progress`
+  is throttled to stage transitions to avoid bloating that re-streamed list.
+- **Side-effect of decoupling:** `coverage_completed`/`coverage_progress` are no
+  longer purged on MDL reset (they're non-provenance). Harmless/non-rendering, but
+  they linger in the event store — candidate for a future cleanup.
+
+### Known gaps (deferred)
+- Label key is `mdl_checksum` only (DP2) — a score shift driven purely by *document*
+  changes at a constant MDL version isn't distinguished in the chip (docs version is
+  in the run; surface in a tooltip later).
+- Judge is one batched LLM call → no intra-judge "claim 80/142" granularity (Phase 4).
 </content>

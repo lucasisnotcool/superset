@@ -93,6 +93,12 @@ class AgentConfig:
     allow_static_identity_with_persistence: bool = False
     signed_identity_header: str = "X-Superset-Ai-Agent-Identity"
     signed_identity_secret: str | None = None
+    # Superset role names that may view admin-only agent surfaces (LLM usage).
+    # Matched against the caller's Superset roles (/api/v1/me/roles/).
+    admin_roles: tuple[str, ...] = ("Admin",)
+    # Retention window (days) for the append-per-call LLM telemetry table; the
+    # purge script deletes rows older than this. 0 = keep forever.
+    llm_usage_retention_days: int = 90
     agent_database_url: str = "sqlite:///./.data/ai_agent.db"
     agent_database_echo: bool = False
     agent_run_migrations: bool = True
@@ -486,6 +492,13 @@ class AgentConfig:
             signed_identity_secret=(
                 os.getenv("AI_AGENT_SIGNED_IDENTITY_SECRET")
                 or cls.signed_identity_secret
+            ),
+            admin_roles=_env_list("AI_AGENT_ADMIN_ROLES", cls.admin_roles),
+            llm_usage_retention_days=int(
+                os.getenv(
+                    "AI_AGENT_LLM_USAGE_RETENTION_DAYS",
+                    str(cls.llm_usage_retention_days),
+                )
             ),
             agent_database_url=os.getenv(
                 "AI_AGENT_DATABASE_URL",

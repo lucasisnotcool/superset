@@ -392,17 +392,27 @@ class AiAgentSemanticMdlFile(Base):
 
 
 class AiAgentNlSqlExample(Base):
-    """A confirmed NL->SQL pair recalled as few-shot (memory learning loop)."""
+    """A confirmed NL->SQL pair recalled as few-shot (memory learning loop).
+
+    Keyed by ``database_id`` (a shared, database-level pool — see F1); ``owner_id``
+    is retained as authorship metadata only, no longer a scoping key. ``scope_hash``
+    is kept for back-compat / legacy rows. ``referenced_tables`` /
+    ``referenced_schemas`` capture the physical references the pair touches, used
+    to RBAC-filter recall (F2).
+    """
 
     __tablename__ = "ai_agent_nl_sql_examples"
 
     id = Column(String(36), primary_key=True)
     owner_id = Column(String(255), index=True, nullable=False)
     project_id = Column(String(36), index=True, nullable=True)
+    database_id = Column(Integer, index=True, nullable=True)
     scope_hash = Column(String(128), index=True, nullable=False)
     question = Column(Text, nullable=False)
     semantic_sql = Column(Text, nullable=False)
     native_sql = Column(Text, nullable=False)
+    referenced_tables = Column(JSON, nullable=True)
+    referenced_schemas = Column(JSON, nullable=True)
     result_meta = Column(JSON, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False)
 
@@ -458,3 +468,28 @@ class AiAgentCoverageRun(Base):
     error = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), index=True, nullable=False)
     updated_at = Column(DateTime(timezone=True), index=True, nullable=False)
+
+
+class AiAgentLlmCall(Base):
+    """One LLM call, appended per invocation (count + timing telemetry).
+
+    Append-only metering: one row per ``ModelClient.chat`` invocation. The write
+    is fail-open at the call site, so a missing row means a metering hiccup, never
+    a dropped agent response. ``kind`` carries the call class ("chat" today) so a
+    future embedding meter can share this table without a migration. Token columns
+    are nullable — only providers that report usage (e.g. OpenAI) populate them.
+    """
+
+    __tablename__ = "ai_agent_llm_calls"
+
+    id = Column(String(36), primary_key=True)
+    # Indexed: every aggregate read filters/orders on the call time window.
+    created_at = Column(DateTime(timezone=True), index=True, nullable=False)
+    # Call class — "chat" today; the embedding meter seam writes "embedding" later.
+    kind = Column(String(32), index=True, nullable=False, default="chat")
+    provider = Column(String(32), nullable=False)
+    model = Column(String(255), nullable=True)
+    duration_ms = Column(Integer, nullable=False)
+    ok = Column(Boolean, nullable=False)
+    prompt_tokens = Column(Integer, nullable=True)
+    completion_tokens = Column(Integer, nullable=True)

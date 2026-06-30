@@ -64,6 +64,7 @@ def test_specs_expose_the_tool_surface() -> None:
         "read_mdl_file",
         "write_mdl_file",
         "patch_mdl_file",
+        "add_golden_query",
         "delete_mdl_file",
         "remove_mdl_entity",
         "validate_project",
@@ -99,6 +100,47 @@ def test_write_new_file_produces_create_changeset_item() -> None:
     assert item.current_content is None
     assert item.summary == "add orders"
     assert changeset.manifest_validation is not None
+
+
+def test_add_golden_query_stages_queries_json_changeset() -> None:
+    toolset = MdlToolset([], schema_index=SCHEMA)
+
+    result = toolset.dispatch(
+        "add_golden_query",
+        {
+            "question": "who are the top customers?",
+            "semantic_sql": "SELECT * FROM customers ORDER BY revenue DESC",
+            "name": "top customers",
+        },
+    )
+    assert "error" not in result, result
+    assert result["validation"]["valid"] is True
+    assert result["golden_query"] == "top customers"
+
+    changeset = toolset.build_changeset()
+    item = next(i for i in changeset.items if i.path == "queries.json")
+    assert item.op == "create"
+    body = json.loads(item.proposed_content or "{}")
+    assert body["queries"][0]["question"] == "who are the top customers?"
+    # The queries.json change is recorded as a 'curate' action.
+    assert any(
+        call.action == "curate" and call.tool == "add_golden_query"
+        for call in changeset.tool_calls
+    )
+
+
+def test_add_golden_query_is_idempotent_on_question() -> None:
+    toolset = MdlToolset([], schema_index=SCHEMA)
+    args = {"question": "top customers", "semantic_sql": "SELECT 1"}
+    toolset.dispatch("add_golden_query", args)
+    toolset.dispatch(
+        "add_golden_query", {"question": "Top Customers ", "semantic_sql": "SELECT 2"}
+    )
+    changeset = toolset.build_changeset()
+    item = next(i for i in changeset.items if i.path == "queries.json")
+    body = json.loads(item.proposed_content or "{}")
+    assert len(body["queries"]) == 1
+    assert body["queries"][0]["semantic_sql"] == "SELECT 2"
 
 
 def test_propose_onboard_table_generates_a_valid_base_model() -> None:

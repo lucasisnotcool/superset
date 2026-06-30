@@ -173,6 +173,39 @@ def test_carriers_backfill_sparse_steps() -> None:
     assert by_kind["execute_sql"].detail.query_id == 99
 
 
+def test_wren_context_surfaces_matched_views_and_view_chunks() -> None:
+    # View provenance: the explain detail carries matched_views, and a view chunk
+    # (kind="view") flows through as a retrieved chunk so the dialog can attribute
+    # the answer to a vetted, named query.
+    context_items = [
+        {
+            "source": "retriever",
+            "retriever": "embedding",
+            "kind": "view",
+            "name": "warm_line_output",
+            "text": "view warm_line_output — warm line output by family",
+            "score": 0.91,
+        },
+    ]
+    trace = [
+        _event(
+            "load_wren_context",
+            "Loaded Wren semantic context.",
+            available=True,
+            matched_models=["orders"],
+            matched_views=["warm_line_output"],
+            retrieval_mode="embedding",
+            retrieved_item_count=1,
+            context_items=context_items,
+        ),
+    ]
+    detail = build_agent_timeline(trace)[0].detail
+
+    assert detail.matched_views == ["warm_line_output"]
+    view_chunks = [c for c in detail.retrieved_chunks if c.kind == "view"]
+    assert [c.name for c in view_chunks] == ["warm_line_output"]
+
+
 def test_wren_context_surfaces_retrieved_chunks_and_warnings() -> None:
     long_text = "x" * 400
     context_items = [
@@ -257,6 +290,51 @@ def test_draft_surfaces_recalled_examples_bounded() -> None:
     assert detail.recalled_examples[0].question == "patties 86'd?"
     assert detail.recalled_examples[1].native_sql.endswith("…")
     assert len(detail.recalled_examples[1].native_sql) <= 281
+
+
+def test_draft_surfaces_recalled_example_provenance() -> None:
+    trace = [
+        _event(
+            "draft_sql",
+            "Generated an initial SQL draft.",
+            recalled_example_count=4,
+            recalled_examples=[
+                {
+                    "question": "verified golden",
+                    "native_sql": "SELECT 1",
+                    "result_meta": {
+                        "golden": True,
+                        "verified": True,
+                        "name": "Top revenue",
+                    },
+                },
+                {
+                    "question": "draft golden",
+                    "native_sql": "SELECT 2",
+                    "result_meta": {"golden": True, "verified": False},
+                },
+                {"question": "in scope learned", "native_sql": "SELECT 3"},
+                {
+                    "question": "broader learned",
+                    "native_sql": "SELECT 4",
+                    "result_meta": {"out_of_scope": True},
+                },
+            ],
+        ),
+    ]
+    examples = build_agent_timeline(trace)[0].detail.recalled_examples
+    assert len(examples) == 4
+    verified, draft_golden, in_scope, broader = examples
+    assert verified.source == "golden"
+    assert verified.verified is True
+    assert verified.name == "Top revenue"
+    assert draft_golden.source == "golden"
+    assert draft_golden.verified is False
+    assert draft_golden.name is None
+    assert in_scope.source == "memory"
+    assert in_scope.in_scope is True
+    assert broader.source == "memory"
+    assert broader.in_scope is False
 
 
 def test_row_count_parsed_from_summary_when_detail_absent() -> None:

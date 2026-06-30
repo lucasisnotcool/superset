@@ -119,3 +119,28 @@ def extract_referenced_tables(sql: str, *, dialect: str | None = None) -> list[s
     except Exception:  # pylint: disable=broad-except - parser is best-effort
         return []
     return sorted({table.name for table in parsed.find_all(exp.Table) if table.name})
+
+
+def extract_qualified_tables(
+    sql: str, *, dialect: str | None = None
+) -> list[tuple[str | None, str]]:
+    """Schema-qualified physical-table extraction for the access-aware recall gate.
+
+    Returns ``(schema, table)`` pairs (``schema`` is ``None`` when the reference is
+    unqualified). Used to RBAC-filter recalled NL->SQL pairs against the set of
+    tables a user can actually reach: a pair is safe only if *every* table it
+    references is in that set. On a parse failure returns ``[]`` so the caller
+    **fails closed** (an example whose tables we cannot prove is dropped from
+    recall, never surfaced). ``table.db`` is sqlglot's schema component.
+    """
+
+    try:
+        parsed = sqlglot.parse_one(sql, dialect=dialect)
+    except Exception:  # pylint: disable=broad-except - parser is best-effort
+        return []
+    pairs: set[tuple[str | None, str]] = set()
+    for table in parsed.find_all(exp.Table):
+        if not table.name:
+            continue
+        pairs.add((table.db or None, table.name))
+    return sorted(pairs, key=lambda pair: (pair[0] or "", pair[1]))

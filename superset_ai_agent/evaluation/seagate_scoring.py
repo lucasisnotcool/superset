@@ -63,11 +63,52 @@ EXPECTED: dict[str, dict[str, Any]] = {
     "Q16": {"nums": [1751, 3017]},  # patties plated on WARM lines: Cobalt / Vantage
     "Q17": {"nums": [0.951]},  # Golden Yield, Vantage family, Q4 2025 (n=1567)
     "Q18": {"nums": [175, 151, 0.960, 0.962]},  # Nimbus Combo+DineIn units + region GY
+    # --- v4: supply schema (3-schema bridge), negative, temporal, distractor ---
+    "Q19": {"nums": [14300]},  # platters plating Vantage drives, Q4 2025 (bridge)
+    "Q20": {"nums": [5124, 4380, 1878, 1048]},  # platters by family, Dec 2025
+    "Q21": {"zero": True},  # Tundra WARM plated = 0 (no Tundra WARM line)
+    "Q22": {"nums": [378]},  # Diner Week 2025-12-24..12-30 plated
+    "Q23": {"nums": [228]},  # 86'd company-wide Q4 (decoy: NOT freight/finance units)
+    "Q24": {"nums": [0.922, 0.935]},  # Tigerline TPR: Taste Test / Heat Lamp
+    "Q25": {"names": ["Vantage"]},  # highest avg capacity family (easy control)
+    "Q26": {"nums": [32084]},  # platters plating STANDARD Cobalt tickets 2025 (golden)
+    "Q27": {"nums": [0.469]},  # Supply Reliability (CRITICAL components) = 76/162
+    "Q28": {"nums": [3704, 1751, 3199, 3098, 1513, 3017]},  # plated by family x status
+    "Q29": {"trap": True},  # Supply Reliability of a STANDARD component is undefined
+    "Q30": {"nums": [175, 151, 0.960, 0.962]},  # = Q18 via "last fiscal quarter" alias
 }
 
 #: Questions that only exist in the multi-schema fixture (seagate_multi). The
 #: single-schema scoring run keys off ``EXPECTED`` minus these.
 CROSS_SCHEMA_ONLY = ("Q16", "Q17", "Q18")
+
+#: Per-question capability tags (v4) — drives the config x capability scoreboard.
+#: A question may carry several tags. See EVAL_V4_SPEC.md §2 for definitions.
+CAPABILITY: dict[str, tuple[str, ...]] = {
+    "Q1": ("slang",), "Q2": ("slang",), "Q3": ("slang",), "Q4": ("slang",),
+    "Q5": ("slang", "join1"),
+    "Q6": ("slang", "xschema2"), "Q7": ("slang", "xschema2"),
+    "Q8": ("slang", "xschema2"),
+    "Q9": ("metric", "xschema2"), "Q10": ("metric", "xschema2"),
+    "Q11": ("slang", "temporal"),
+    "Q12": ("trap",),
+    "Q13": ("metric", "multihop", "xschema2", "temporal"),
+    "Q14": ("metric", "multihop", "xschema2"),
+    "Q15": ("metric", "multihop", "xschema2", "temporal"),
+    "Q16": ("xschema2", "multihop"), "Q17": ("metric", "xschema2"),
+    "Q18": ("metric", "multihop", "xschema2"),
+    "Q19": ("xschema3", "bridge"), "Q20": ("xschema3", "bridge"),
+    "Q21": ("negative", "xschema2"),
+    "Q22": ("temporal",),
+    "Q23": ("distractor",),
+    "Q24": ("metric", "multihop"),
+    "Q25": ("slang",),
+    "Q26": ("golden", "xschema3", "bridge"),
+    "Q27": ("metric",),
+    "Q28": ("viewable", "xschema2"),
+    "Q29": ("trap", "metric"),
+    "Q30": ("temporal", "multihop"),
+}
 
 
 def _all_numbers(rows: list[dict[str, Any]]) -> list[float]:
@@ -120,6 +161,12 @@ def score_result(
         if not nums:
             return "trap_ok"
         return "trap_fail"
+
+    if spec.get("zero"):
+        # Negative-result question: correct iff the agent returns no positive
+        # quantity (empty result, NULL, or an explicit 0) — never a fabricated row.
+        positive = [n for n in _all_numbers(rows) if abs(n) > 0.5]
+        return "correct" if not positive else "wrong"
 
     if "names" in spec:
         pool = " | ".join(_all_strings(rows)).lower()

@@ -114,12 +114,18 @@ class MdlRelationship(BaseModel):
 
 
 class MdlView(BaseModel):
-    """A named SQL statement that behaves like a stable virtual table."""
+    """A named SQL statement that behaves like a stable virtual table.
+
+    ``statement`` is semantic SQL over model names by default. An optional
+    ``dialect`` marks the statement as native SQL in that dialect (mirrors Wren's
+    view ``dialect`` field); native views are kept off the wren-core manifest path.
+    """
 
     model_config = _NATIVE_CONFIG
 
     name: str
     statement: str
+    dialect: str | None = None
     properties: dict[str, Any] = Field(default_factory=dict)
 
 

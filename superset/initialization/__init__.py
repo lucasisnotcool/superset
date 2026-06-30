@@ -451,6 +451,19 @@ class SupersetAppInitializer:  # pylint: disable=too-many-public-methods
             ),
         )
 
+        appbuilder.add_link(
+            "AI Agent Usage",
+            label=_("AI Agent Usage"),
+            href=f"{app_root}/ai-agent/usage/",
+            icon="fa-line-chart",
+            category="Manage",
+            category_label=_("Manage"),
+            # Admin-only: the page reads global LLM-call telemetry. The agent API
+            # enforces this too (defense-in-depth); this just hides the menu item.
+            # ``add_link`` gates visibility via ``cond`` (``menu_cond`` is add_view).
+            cond=lambda: bool(appbuilder.sm.is_admin()),
+        )
+
         #
         # Setup views with no menu
         #

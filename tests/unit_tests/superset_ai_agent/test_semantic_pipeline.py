@@ -86,14 +86,9 @@ def test_pipeline_rewrites_validates_executes_and_stores() -> None:
     assert "public.birth_names" in superset.executed_sql[0]
     assert result.validation.is_valid
     assert result.execution_result is not None
-    # A confirmed example was stored and is recallable for the same owner+scope.
+    # A confirmed example was stored and is recallable from this database's pool.
     assert result.stored_example is True
-    recalled = memory.recall_examples(
-        "top names",
-        scope_hash=_scope_hash(),
-        owner_id="owner-1",
-        k=3,
-    )
+    recalled = memory.recall_examples("top names", database_id=1, k=3)
     assert any(pair.question == "top names" for pair in recalled)
 
 
@@ -128,12 +123,3 @@ def test_pipeline_classify_intent_defaults_without_model() -> None:
         semantic_engine=_FakeRewriteEngine(),
     )
     assert pipeline.classify_intent("anything").intent == "text_to_sql"
-
-
-def _scope_hash() -> str:
-    from superset_ai_agent.conversations.schemas import ConversationScope
-    from superset_ai_agent.semantic_layer.store import scope_hash
-
-    return scope_hash(
-        ConversationScope(database_id=1, schema_name="public", dataset_ids=[16])
-    )

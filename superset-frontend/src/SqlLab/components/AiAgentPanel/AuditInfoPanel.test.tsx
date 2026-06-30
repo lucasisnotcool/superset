@@ -98,3 +98,26 @@ test('omits the memory badge when nothing was recalled', () => {
   );
   expect(screen.queryByText(/learned example/)).not.toBeInTheDocument();
 });
+
+test('badges surfaced views when a view grounded the answer', () => {
+  render(
+    <AuditInfoPanel
+      audit={{ engine: 'wren_core' }}
+      wrenContext={{
+        ...baseWrenContext,
+        matched_views: ['warm_line_output', 'golden_yield'],
+      }}
+    />,
+  );
+  expect(screen.getByText('Surfaced 2 view(s)')).toBeInTheDocument();
+});
+
+test('omits the view badge when no view was surfaced', () => {
+  render(
+    <AuditInfoPanel
+      audit={{ engine: 'wren_core' }}
+      wrenContext={{ ...baseWrenContext, matched_views: [] }}
+    />,
+  );
+  expect(screen.queryByText(/view\(s\)/)).not.toBeInTheDocument();
+});

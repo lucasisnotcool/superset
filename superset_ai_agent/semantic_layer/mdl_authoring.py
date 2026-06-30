@@ -114,6 +114,25 @@ class AuthoredMetric(BaseModel):
     description: str | None = None
 
 
+class AuthoredView(BaseModel):
+    """A named SQL statement that behaves like a stable virtual table.
+
+    A ``statement`` is **semantic SQL over model names** by default (wren-core
+    resolves and rewrites it, so it is cross-schema-correct via each model's
+    ``tableReference``). Setting ``dialect`` marks the statement as *native* SQL in
+    that dialect, written over physical tables — captured verbatim when the model
+    is more accurate in raw SQL than reverse-engineering a semantic query. Native
+    views are validated and executed off the wren-core path.
+    """
+
+    model_config = _AUTHORING_CONFIG
+
+    name: str
+    statement: str
+    dialect: str | None = None
+    properties: dict[str, Any] = Field(default_factory=dict)
+
+
 class AuthoredManifest(BaseModel):
     """One MDL file's content in native shape."""
 
@@ -121,6 +140,7 @@ class AuthoredManifest(BaseModel):
 
     models: list[AuthoredModel] = Field(default_factory=list)
     relationships: list[AuthoredRelationship] = Field(default_factory=list)
+    views: list[AuthoredView] = Field(default_factory=list)
     metrics: list[AuthoredMetric] = Field(default_factory=list)
 
 

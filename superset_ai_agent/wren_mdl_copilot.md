@@ -34,6 +34,16 @@ clean on new code), **frontend 148 `AiAgentPanel` jest tests / 22 suites**
 off). The **unified onboarding/enrichment lifecycle** (readiness gate, `properties`
 preservation, enrichment-via-Copilot, onboarding-skill parity) is **§AB.10**.
 
+> **Coverage re-architected (2026-06-30) — this log predates it.** Coverage is now
+> **background + decoupled**: it is a read-only *version label* (not a provenance
+> event), has live stage progress, a recovery agent that proposes gap-closing edits,
+> and the **on-demand "Coverage" button + `CoverageDialog` were removed** from the
+> Copilot panel (the `run_coverage_audit` / `CoverageRequest` per-document path and
+> `POST /copilot/coverage` linger as deprecated, unused). Canonical:
+> `MDL_PROVENANCE_AND_COVERAGE.md` (top banner) →
+> `plan_coverage_labels_and_progress_spec.md` §12 and
+> `plan_coverage_recovery_agent_spec.md` §11 ("as shipped").
+
 ## AB.1 How to run / verify
 
 ```bash

@@ -459,6 +459,75 @@ def test_fetch_context_surfaces_materialized_mdl(tmp_path) -> None:
     assert client.model_client.calls == []
 
 
+def test_fetch_context_surfaces_matching_view_excludes_native(tmp_path) -> None:
+    mdl_path = tmp_path / "mdl.json"
+    mdl_path.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {"name": "deals", "columns": [{"name": "amount"}]},
+                ],
+                "views": [
+                    {
+                        "name": "warm_line_output",
+                        "statement": "SELECT amount FROM deals",
+                        "properties": {"description": "warm line output by family"},
+                    },
+                    {
+                        "name": "legacy_rollup",
+                        "statement": "SELECT * FROM public.raw",
+                        "dialect": "postgres",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    client = LlmWrenClient(_config(), FakeModelClient("{}"))
+
+    context = client.fetch_context(
+        question="warm line output by family",
+        superset_context=_agent_context(),
+        mdl_path=str(mdl_path),
+    )
+
+    # The matching semantic view is surfaced; the native view never is.
+    assert context.matched_views == ["warm_line_output"]
+    view_items = [i for i in context.context_items if i.get("type") == "views"]
+    assert view_items
+    surfaced = {v["name"] for v in view_items[0]["items"]}
+    assert surfaced == {"warm_line_output"}
+
+
+def test_fetch_context_omits_views_when_none_match(tmp_path) -> None:
+    mdl_path = tmp_path / "mdl.json"
+    mdl_path.write_text(
+        json.dumps(
+            {
+                "models": [{"name": "deals", "columns": [{"name": "amount"}]}],
+                "views": [
+                    {
+                        "name": "unrelated_view",
+                        "statement": "SELECT 1 FROM deals",
+                        "properties": {"description": "something else entirely"},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    client = LlmWrenClient(_config(), FakeModelClient("{}"))
+
+    context = client.fetch_context(
+        question="gross moves by region",
+        superset_context=_agent_context(),
+        mdl_path=str(mdl_path),
+    )
+    # A view that shares no terms with the question never crowds the context.
+    assert context.matched_views == []
+    assert not any(i.get("type") == "views" for i in context.context_items)
+
+
 def test_fetch_context_unavailable_without_mdl() -> None:
     client = LlmWrenClient(_config(), FakeModelClient("{}"))
 
@@ -477,6 +546,20 @@ def test_llm_client_has_no_execution_methods() -> None:
 
     for forbidden in ("execute", "run_sql", "query", "query_preview"):
         assert not hasattr(client, forbidden)
+
+
+def test_default_overlay_path_routes_view_only_overlay_to_views_dir() -> None:
+    from superset_ai_agent.integrations.wren.llm_client import _default_overlay_path
+
+    view_only = {"views": [{"name": "Big Orders", "statement": "SELECT 1"}]}
+    assert _default_overlay_path(_project(), view_only) == "views/big_orders.json"
+
+    # A mixed overlay (has models) keeps the model-file default.
+    mixed = {"models": [{"name": "orders"}], "views": [{"name": "v"}]}
+    assert _default_overlay_path(_project(), mixed) == "models/sales.json"
+
+    # No views, no models → model-file default.
+    assert _default_overlay_path(_project(), {}) == "models/sales.json"
 
 
 def test_factory_returns_llm_client_with_model_client() -> None:

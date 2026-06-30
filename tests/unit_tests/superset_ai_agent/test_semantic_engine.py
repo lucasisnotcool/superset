@@ -26,6 +26,7 @@ import pytest
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.semantic_layer.engine import (
     create_semantic_engine,
+    extract_qualified_tables,
     extract_referenced_tables,
     PassthroughEngine,
     resolve_dialect,
@@ -68,6 +69,18 @@ def test_extract_referenced_tables_handles_joins_and_bad_sql() -> None:
     )
     assert tables == ["customers", "deals"]
     assert extract_referenced_tables("not valid sql ;;;") == []
+
+
+def test_extract_qualified_tables_keeps_schema_and_fails_closed() -> None:
+    # Multi-schema join keeps each table's schema; unqualified table -> None schema.
+    pairs = extract_qualified_tables(
+        "SELECT * FROM sales.deals d "
+        "JOIN crm.customers c ON d.cid = c.id "
+        "JOIN regions r ON c.region = r.id"
+    )
+    assert pairs == [(None, "regions"), ("crm", "customers"), ("sales", "deals")]
+    # Parse failure -> [] so the recall gate fails closed (drops the pair).
+    assert extract_qualified_tables("not valid sql ;;;") == []
 
 
 def test_factory_defaults_to_wren_core() -> None:

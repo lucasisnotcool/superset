@@ -1,0 +1,42 @@
+{
+  "question": "What is the average drive capacity in TB for each interface type?",
+  "truth": [
+    "('NVMe', 14.0)",
+    "('SAS', 13.0)",
+    "('SATA', 6.5)"
+  ],
+  "baseline": [
+    {
+      "verdict": "correct",
+      "recalled": 2,
+      "sql_match": false
+    },
+    {
+      "verdict": "correct",
+      "recalled": 3,
+      "sql_match": false
+    },
+    {
+      "verdict": "correct",
+      "recalled": 3,
+      "sql_match": false
+    }
+  ],
+  "with_golden": [
+    {
+      "verdict": "correct",
+      "recalled": 3,
+      "sql_match": false
+    },
+    {
+      "verdict": "correct",
+      "recalled": 2,
+      "sql_match": false
+    },
+    {
+      "verdict": "correct",
+      "recalled": 1,
+      "sql_match": false
+    }
+  ]
+}

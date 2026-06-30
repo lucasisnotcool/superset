@@ -166,9 +166,12 @@ When you onboarded from a BI document, **review your own work before handing off
 Call `run_coverage` to audit the staged MDL against the project's documents: it
 returns a score plus the specific claims that are still `missing` or `partial`.
 For each gap, add what's missing (a description, synonym, calculated column,
-relationship, or metric the document specifies) with `write_mdl_file`, then call
-`run_coverage` again to confirm the gap closed. The tool is capped per turn, so
-make each pass count; the authoritative background audit still runs on activation.
+relationship, metric, **or a view** the document specifies) with `write_mdl_file`,
+then call `run_coverage` again to confirm the gap closed. When a document describes
+a reusable query pattern (a recurring JOIN, a named analysis), author a **view**
+(`views/<name>.json`) — semantic SQL over model names. The tool is capped per turn,
+so make each pass count; the authoritative background audit still runs on
+activation.
 
 ## Scaffold / workspace layout
 
@@ -178,7 +181,9 @@ the layout:
 
 - `models/<table>.json` — one base model per physical table (the onboarding seed).
 - `relationships.json` — foreign-key relationships between models.
-- `views/<name>.json` — named SQL views (added later, not in base onboarding).
+- `views/<name>.json` — named SQL views. Not produced by the base schema seed
+  (that step only maps tables → models); added during doc-grounded self-review or
+  enrichment when a document describes a reusable query pattern.
 
 Cross-model business rules (default filters, naming conventions, glossary
 synonyms) belong in the project's **instructions** / uploaded documents, not in

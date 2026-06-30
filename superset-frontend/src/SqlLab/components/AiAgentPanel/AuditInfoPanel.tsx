@@ -105,7 +105,11 @@ export default function AuditInfoPanel({
   const retrievalMode = wrenContext?.retrieval_mode;
   const retrievedCount = wrenContext?.retrieved_item_count ?? 0;
   const recalledCount = wrenContext?.recalled_example_count ?? 0;
-  const hasBadges = Boolean(engine || retrievalMode || recalledCount > 0);
+  // View provenance at a glance: how many vetted, named views grounded the answer.
+  const viewCount = wrenContext?.matched_views?.length ?? 0;
+  const hasBadges = Boolean(
+    engine || retrievalMode || recalledCount > 0 || viewCount > 0,
+  );
   if (entries.length === 0 && !hasBadges) {
     return null;
   }
@@ -124,6 +128,9 @@ export default function AuditInfoPanel({
           ) : null}
           {recalledCount > 0 ? (
             <Badge>{t('Reused %s learned example(s)', recalledCount)}</Badge>
+          ) : null}
+          {viewCount > 0 ? (
+            <Badge>{t('Surfaced %s view(s)', viewCount)}</Badge>
           ) : null}
         </Badges>
       ) : null}

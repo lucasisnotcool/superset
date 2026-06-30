@@ -73,8 +73,18 @@ class CompiledManifest(BaseModel):
             "models": self.models,
             "relationships": self.relationships,
         }
-        if self.views:
-            out["views"] = self.views
+        # Only semantic views reach the engine. wren-core resolves a view body
+        # against model names, so a native view (one carrying a ``dialect``,
+        # referencing physical tables) would fail the whole manifest load. Native
+        # views stay in the readable project files but are kept out of the engine
+        # manifest (their execution path is handled off the wren-core seam).
+        engine_views = [
+            view
+            for view in self.views
+            if not (isinstance(view, dict) and view.get("dialect"))
+        ]
+        if engine_views:
+            out["views"] = engine_views
         if self.metrics:
             out["metrics"] = self.metrics
         if self.cubes:

@@ -313,3 +313,96 @@ all Copilot tools (§4.1), report+instructions as the user message (§4.3).
 - Changing the coverage scoring algorithm.
 - A general notification-center/inbox (single-entity banner suffices now).
 - Inline editing of proposed content (Phase 4).
+
+---
+
+## 11. Implementation status — as shipped (2026-06-30)
+
+**Phases 1–3 SHIPPED + follow-ups + tested** (backend recovery suite green;
+frontend 64 green; tsc + ruff clean). **Off by default** — gated behind
+`wren_coverage_recovery_enabled` (env `WREN_COVERAGE_RECOVERY_ENABLED`), itself
+under `wren_copilot_enabled`. Decisions DP1–DP8 implemented as recommended.
+
+### Backend
+- **`_run_recovery_job(run_id, project, owner_id)`** ([app.py](app.py)) — a
+  **separate chained job** submitted from `_run_coverage_job` after
+  `store.complete(...)` when gaps exist + flag on (`# noqa: C901`). Bails if
+  superseded / not `complete` / already has a `recovery_conversation_id` /
+  no gaps (sets `empty`). Sets `recovery_status="running"`, seeds a
+  **`kind="recovery"`** conversation with `_build_recovery_message(report)`, calls
+  the pure **`run_copilot(...)`** (full `MdlToolset`), commits the `Changeset` as a
+  `"changeset"` artifact, sets `ready`/`empty` + emits non-provenance
+  `recovery_suggestions_ready` (only when ≥1 item).
+- **`_build_recovery_message`** (module-level, unit-tested) serializes
+  missing/partial findings + the judge's hint + source doc, and instructs minimal,
+  source-grounded edits — **removals explicitly allowed when justified**.
+- **Migration `0013_coverage_recovery`** — `recovery_conversation_id`,
+  `recovery_status`, `recovery_dismissed_at` on `ai_agent_coverage_runs` (all
+  nullable). `CoverageRecoveryStatus` literal. Store gains `set_recovery` +
+  `dismiss_recovery` (both impls + Protocol); `_from_model` maps NULL →
+  `"none"` (**back-compat: pre-feature runs read as `none`**).
+- **Endpoints:** `GET …/coverage/runs/{id}/recovery` (returns
+  `{status, conversation_id, suggestion_count, changeset, dismissed, stale}` —
+  changeset read back via `changeset_from_conversation`; `stale` = run checksum ≠
+  current active) and `POST …/recovery/dismiss` (durable `recovery_dismissed_at`).
+  `/coverage/status` widened with `recovery_status`/`recovery_run_id`/
+  `recovery_dismissed`.
+- **Back-fill (the "pick up existing active projects" fix):** `_schedule_coverage`
+  short-circuits on the idempotent `find_complete` path, so a pre-feature / failed
+  run was never recovered. Now it **schedules recovery there** when
+  `recovery_status in ("none","failed")` + gaps. So any trigger — incl. the manual
+  **Re-run** — back-fills recovery for the current active version without a fresh
+  audit. (Still **no proactive sweep** for fully-static projects; coverage is
+  event-driven only — activate/update/delete/onboard/refresh.)
+- **Background + UI-independent:** prod uses `ThreadJobRunner` (daemon thread);
+  scheduling is from backend mutation routes, not from any UI poll. Badge/banner
+  polling is display-only.
+
+### Frontend
+- **`ChangesetReviewPanel`** (new, reusable, self-contained decisions) — per-item
+  diff + approve/reject + apply. **Removals are first-class**: pre-accept unless
+  *invalid* (op-agnostic); deletes only made conspicuous (red tag), never
+  pre-rejected.
+- **`RecoverySuggestionsDialog`** — loads recovery, shows stale notice, applies
+  accepted items as **drafts** (`applyCopilotChangeset`) then dismisses.
+- **`RecoveryBanner`** — persistent, dismissible banner (in `index.tsx`, top of
+  editor) on `recovery_status==="ready" && !dismissed`; durable server-side
+  dismissal; opens the dialog. Second entrypoint: **`CoveragePanel`** report shows
+  Review (ready) + **preparing (running/pending)** + **failed** recovery states.
+- `recovery_suggestions_ready` added to `COVERAGE_EVENT_TYPES`.
+- **Removed the on-demand "Coverage" button** from `CopilotPanel`; **deleted**
+  `CoverageDialog.tsx`/`.test` (coverage is background-only now).
+
+### Gotchas / non-obvious
+- **`Alert` imports from `@apache-superset/core/components`, NOT
+  `@superset-ui/core/components`** — wrong path → `undefined` element at runtime
+  (cost a debugging cycle on the banner).
+- **`run_copilot_loop` swallows chat errors → an empty changeset** (`recovery_status
+  "empty"`), so `failed` is reached only by non-LLM exceptions. Back-fill therefore
+  retries `("none","failed")` but **not `empty`** (an empty run won't differ on retry).
+- Background job has **no live request** → recovery uses **`_cached_schema_index`**
+  (warm cache or `None`) → structural-only validation at suggest time; the **apply
+  route re-validates** against a live schema before persisting.
+- `recovery` conversations use `kind="recovery"` so they stay out of the user's
+  Copilot thread list.
+
+### Known gaps / risks (deferred)
+- `CopilotPanel` not yet refactored to consume `ChangesetReviewPanel` (duplicate
+  render logic remains).
+- Recovery conversations **not cascade-purged** on coverage reset (tied to the
+  durable run row; accumulate).
+- `recovery_status` `pending→running` transitions are **not pushed via SSE**
+  (only the terminal `ready` event is), so the "preparing" state can lag up to the
+  30s fallback poll.
+- Recovery job has **no claim-lease** (minor double-run race under concurrent
+  triggers; mitigated by the `set_recovery("pending")` soft guard + the job's
+  `recovery_conversation_id` idempotency check).
+- Deprecated `runCoverage` API client + `POST /copilot/coverage` route left in
+  place (unused, harmless).
+
+### Tests
+- Backend: `test_copilot_api.py` (auto-run+surface, dismissal durable, flag-off
+  no-run, **back-fill** of an unrecovered run, `_build_recovery_message`),
+  `test_coverage_store.py` (`set_recovery`/`dismiss_recovery`).
+- Frontend: `ChangesetReviewPanel`, `RecoverySuggestionsDialog`, `RecoveryBanner`,
+  `CoveragePanel` (preparing/failed/ready/none states) test files.

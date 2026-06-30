@@ -305,14 +305,36 @@ Print a tight report:
   in this path (see parity notes).
 - Do not skip `validate_project` after a write; never leave the project invalid.
 - In auto-pilot, do not grill or suppress new relationships / metrics / aggregate
-  calculated fields — propose them into the (review-gated) changeset. Only conflicts
-  and routing ambiguity (Rule 8a/8b) interrupt for a question.
+  calculated fields / **views** — propose them into the (review-gated) changeset.
+  Only conflicts and routing ambiguity (Rule 8a/8b) interrupt for a question. A
+  new view is a public, named interface, so flag low-confidence ones in the Step 9
+  audit — but still propose it (the human accept step is the review gate).
+
+## Views (an authoring sink)
+
+When a document describes a **reusable query pattern** — a named analysis, a
+recurring JOIN across models, a windowed/CTE computation — propose a **view**
+(`views/<name>.json`, `{name, statement, properties}`) with `write_mdl_file`.
+Write the `statement` as **semantic SQL over model names** (cross-schema-correct
+via each model's `tableReference`; never hand-qualify physical schemas). Semantic
+views handle JOIN/WINDOW/CTE fine, so translate a raw-SQL pattern by swapping
+physical table names for model names rather than copying it verbatim. **Verify each
+referenced column against the model before writing it** (`read_mdl_file` /
+`get_physical_schema`) — don't infer a column name from prose. Author each view in
+its own `views/<name>.json` so one bad view never blocks the others at activation.
+Always give `properties.description` — it doubles as a recall example. Run
+`validate_project` after writing; the engine rejects a semantic view that references
+an unknown column or model. (Native `dialect` views are reserved for a later phase —
+not enabled yet.)
 
 ## Parity notes (Wren → ours)
 - **instructions.md → instruction store, but agent-read-only.** The agent has no
   tool to write the store; rule-shaped facts are *recommended* in Step 9 for a
   human to add. Synonyms, which Wren routes to instructions.md, go natively into
   `properties.synonyms`.
+- **Views** ARE an authoring sink here (parity with Wren's enrich-context view
+  proposals): semantic views over models, plus an optional native (`dialect`)
+  escape hatch for raw-SQL patterns. Validated by the engine at activation.
 - **Cubes** are schema/validator/merge-supported but not in the authoring
   contract → aggregations map to calculated fields / metrics.
 - **`queries.yml` / `wren memory`** have no enrichment writeback — confirmed

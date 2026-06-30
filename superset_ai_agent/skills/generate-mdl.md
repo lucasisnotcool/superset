@@ -268,10 +268,41 @@ the physical-column check, so it does not need to exist in the table.
   of hand-written `GROUP BY` / `DATE_TRUNC`.
 - **Cubes are not authored here.** wren-core has a cube struct and our validator
   checks it structurally, but the authoring contract the agent fills
-  (`AuthoredManifest`) exposes only `models`, `relationships`, and `metrics`.
+  (`AuthoredManifest`) exposes `models`, `relationships`, `views`, and `metrics`.
   Express aggregation intent as **metrics** (or calculated columns), not cubes.
-- **Views** (`{name, statement}`) are named SQL statements that behave like stable
-  virtual tables; author one only when a query pattern genuinely needs it.
+
+### Views — named SQL statements (`{name, statement, properties}`)
+
+A **view** is a named, stable virtual table written to `views/<name>.json`. Author
+one for a **common query pattern** that is worth naming once — especially one that
+needs a JOIN across models, a window function, or a CTE (adapted from Wren's
+generate-mdl Phase 7). A view with a good `properties.description` doubles as a
+high-quality recall example for downstream text-to-SQL.
+
+**Write the `statement` as semantic SQL over model names** (e.g.
+`SELECT id, amount FROM orders WHERE amount > 100`). The engine resolves and
+rewrites it, so it is governed and **cross-schema-correct** via each model's
+`tableReference` — never hand-qualify physical schemas. Semantic views handle
+JOIN / WINDOW / CTE patterns fine, so a complex analysis still belongs here. The
+only translation from a raw-SQL source is swapping physical table names for the
+model names (both are in your context) — do that rather than copying raw SQL.
+
+**Verify every column before you write the view.** Authoring a view from prose is
+where models hallucinate a plausible-but-wrong column (e.g. `units_shipped` when the
+real column is `qty_units`). Before writing the `statement`, **confirm each
+referenced column exists** — `read_mdl_file` the model (or `get_physical_schema`)
+and copy the exact column name; never infer one from the document's wording. When
+the source gives you SQL, do the **name-substitution** (physical table → model name)
+and keep its real columns rather than re-deriving them.
+
+A view's statement is validated by the engine at activation — a semantic view that
+references an unknown column or model is rejected, so reference only real model
+columns. **Author each view in its own `views/<name>.json` file**: activation
+validates the projected manifest as a unit, so isolating each view means one bad
+view never blocks the others (the failure names the offending file).
+
+> Native (`dialect`) views — raw SQL over physical tables — are reserved for a
+> later phase and are **not enabled yet**. Always write a semantic view.
 
 ## Phase 5 — `properties`: carry forward, add, never strip
 

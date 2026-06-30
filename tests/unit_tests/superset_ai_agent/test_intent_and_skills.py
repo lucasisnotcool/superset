@@ -86,6 +86,16 @@ def test_enrich_skill_lets_autopilot_propose_relationships_and_metrics() -> None
     assert "three escalations" not in body
 
 
+def test_view_authoring_skills_require_column_verification() -> None:
+    # B2: the prose→view authoring path hallucinates columns; the skills must tell
+    # the agent to verify each referenced column against the model before writing.
+    for name in ("generate-mdl", "enrich-context"):
+        body = get_skill(name)
+        assert "views/<name>.json" in body
+        assert "read_mdl_file" in body
+        assert "get_physical_schema" in body
+
+
 def test_skill_text_excludes_license_header() -> None:
     # The ASF license header must stay in the source file but never reach the
     # injected system prompt (it wastes tokens and distracts the agent).

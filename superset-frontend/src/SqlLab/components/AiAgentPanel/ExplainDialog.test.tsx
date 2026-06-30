@@ -351,6 +351,51 @@ test('lists retrieved chunks under a collapsible header and surfaces warnings', 
   ).toBeInTheDocument();
 });
 
+const viewStep: AgentStep[] = [
+  {
+    kind: 'load_wren_context',
+    status: 'ok',
+    summary: 'Loaded Wren semantic context.',
+    started_at: '2026-06-24T12:00:00Z',
+    attempt_index: 0,
+    detail: {
+      kind: 'wren_context',
+      available: true,
+      matched_models: ['production_lines'],
+      matched_views: ['warm_line_output'],
+      retrieval_mode: 'embedding',
+      retrieved_item_count: 1,
+      context_item_count: 1,
+      recalled_example_count: 0,
+      retrieved_chunks: [
+        {
+          kind: 'view',
+          name: 'warm_line_output',
+          text: 'view warm_line_output — warm line output by family',
+          retriever: 'embedding',
+          score: 0.91,
+        },
+      ],
+      warnings: [],
+    },
+  },
+];
+
+test('surfaces view provenance: matched-views row, Views group, used badge', async () => {
+  render(<ExplainDialog open onClose={noop} steps={viewStep} />);
+  // Detail row names which view grounded the answer.
+  expect(screen.getByText('Matched views')).toBeInTheDocument();
+  expect(screen.getByText('warm_line_output')).toBeInTheDocument();
+  // The retrieved chunks reveal a dedicated Views group with a "used" badge and
+  // the view's description (where it came from).
+  await userEvent.click(screen.getByText('Retrieved chunks (1 · embedding)'));
+  expect(screen.getByText('Views')).toBeInTheDocument();
+  expect(screen.getByText('used')).toBeInTheDocument();
+  expect(
+    screen.getByText('view warm_line_output — warm line output by family'),
+  ).toBeInTheDocument();
+});
+
 test('lists recalled examples under a collapsible header', async () => {
   const draft: AgentStep[] = [
     {
@@ -380,6 +425,61 @@ test('lists recalled examples under a collapsible header', async () => {
   expect(
     screen.getByText('SELECT count(*) FROM grill_moves'),
   ).toBeInTheDocument();
+  // A learned (runtime memory) example is the default source — badged "Learned".
+  expect(screen.getByText('Learned')).toBeInTheDocument();
+});
+
+test('badges each recalled example with its provenance', async () => {
+  const draft: AgentStep[] = [
+    {
+      kind: 'draft_sql',
+      status: 'ok',
+      summary: 'Generated an initial SQL draft.',
+      started_at: '2026-06-24T12:00:00Z',
+      attempt_index: 0,
+      detail: {
+        kind: 'draft',
+        response_type: 'sql',
+        model: 'gpt',
+        recalled_example_count: 4,
+        recalled_examples: [
+          {
+            question: 'verified golden q',
+            native_sql: 'SELECT 1',
+            source: 'golden',
+            verified: true,
+            name: 'Top revenue',
+          },
+          {
+            question: 'draft golden q',
+            native_sql: 'SELECT 2',
+            source: 'golden',
+            verified: false,
+          },
+          {
+            question: 'in scope learned q',
+            native_sql: 'SELECT 3',
+            source: 'memory',
+            in_scope: true,
+          },
+          {
+            question: 'broader learned q',
+            native_sql: 'SELECT 4',
+            source: 'memory',
+            in_scope: false,
+          },
+        ],
+      },
+    },
+  ];
+  render(<ExplainDialog open onClose={noop} steps={draft} />);
+  await userEvent.click(screen.getByText('Recalled examples (4)'));
+  expect(screen.getByText('Verified')).toBeInTheDocument();
+  expect(screen.getByText('Golden')).toBeInTheDocument();
+  expect(screen.getByText('Learned')).toBeInTheDocument();
+  expect(screen.getByText('Learned · broader')).toBeInTheDocument();
+  // The verified golden query surfaces its curated name as a provenance subtitle.
+  expect(screen.getByText('Golden query · Top revenue')).toBeInTheDocument();
 });
 
 test('groups chunks by model and badges the matched model', async () => {
