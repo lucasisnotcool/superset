@@ -65,6 +65,7 @@ import {
   getAgentHealth,
   getConversation,
   getProjectSemanticLayerState,
+  getSemanticModeStatus,
   listConversations,
   listSemanticProjects,
   sendConversationMessage,
@@ -78,6 +79,7 @@ import {
   type ConversationTurnResponse,
   type ExecutionMode,
   type SemanticLayerState,
+  type SemanticModeStatus,
   type SemanticProject,
   type SqlClassification,
 } from './api';
@@ -89,6 +91,7 @@ import MarkdownCodeBlock from './MarkdownCodeBlock';
 import FollowupQuestions from './FollowupQuestions';
 import InsightCards from './InsightCards';
 import SemanticLayerStateBadge from './SemanticLayerStateBadge';
+import SemanticModeBadge from './SemanticModeBadge';
 
 const Panel = styled.div`
   ${({ theme }) => css`
@@ -701,6 +704,11 @@ const AiAgentPanel = () => {
   const [feedback, setFeedback] = useState<Record<string, 'up' | 'down'>>({});
   const [semanticLayerState, setSemanticLayerState] =
     useState<SemanticLayerState | null>(null);
+  // Whether the agent will actually apply semantic rewrite in the current scope,
+  // plus the full precondition breakdown. Server-computed (single source of truth)
+  // so the badge can't show a false-green (e.g. on an unsupported dialect).
+  const [semanticModeStatus, setSemanticModeStatus] =
+    useState<SemanticModeStatus | null>(null);
   // The active schema scope can be covered by more than one semantic project.
   // `semanticProjects` is the candidate set (most-recent first, mirroring the
   // backend heuristic); `selectedProjectId` is the user's pin (defaulting to the
@@ -842,6 +850,42 @@ const AiAgentPanel = () => {
       isMounted = false;
     };
   }, [selectedProjectId]);
+
+  // Fetch the semantic-mode status for the current scope. Keyed only on the scope
+  // primitives (db/catalog/schema/project) so it refetches when the grounding
+  // changes, not on every keystroke — avoids a request storm. The runtime factor
+  // (context loaded) is left to the backend's "checked at query time" state.
+  useEffect(() => {
+    if (typeof databaseId !== 'number') {
+      setSemanticModeStatus(null);
+      return undefined;
+    }
+    let isMounted = true;
+    getSemanticModeStatus({
+      databaseId,
+      catalogName: queryEditor?.catalog || null,
+      schemaName: queryEditor?.schema || null,
+      projectId: selectedProjectId,
+    })
+      .then(nextStatus => {
+        if (isMounted) {
+          setSemanticModeStatus(nextStatus);
+        }
+      })
+      .catch(() => {
+        if (isMounted) {
+          setSemanticModeStatus(null);
+        }
+      });
+    return () => {
+      isMounted = false;
+    };
+  }, [
+    databaseId,
+    queryEditor?.catalog,
+    queryEditor?.schema,
+    selectedProjectId,
+  ]);
 
   useEffect(() => {
     if (isPinnedToBottom && transcriptRef.current) {
@@ -1328,6 +1372,9 @@ const AiAgentPanel = () => {
               badge shows. */}
           {semanticProjects.length > 0 ? (
             <Flex align="center" gap={4}>
+              {/* Mode badge sits left of the picker: state at a glance, with the
+                  blocking factors (and how to fix them) on hover/focus. */}
+              <SemanticModeBadge status={semanticModeStatus} />
               <ProjectSelectWrap>
                 <Select
                   ariaLabel={t('Semantic layer project')}
@@ -1354,10 +1401,13 @@ const AiAgentPanel = () => {
               />
             </Flex>
           ) : (
-            <SemanticLayerStateBadge
-              state={semanticLayerState}
-              projectName={null}
-            />
+            <Flex align="center" gap={4}>
+              <SemanticModeBadge status={semanticModeStatus} />
+              <SemanticLayerStateBadge
+                state={semanticLayerState}
+                projectName={null}
+              />
+            </Flex>
           )}
         </ContextChips>
         {health?.semantic_layer_persistent === false && (

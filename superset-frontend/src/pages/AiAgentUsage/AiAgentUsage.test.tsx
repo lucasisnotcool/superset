@@ -76,6 +76,8 @@ test('renders usage totals and breakdown tables', async () => {
   expect((await screen.findAllByText('42')).length).toBeGreaterThan(0);
   // Model breakdown row renders (unique key).
   expect(await screen.findByText('gpt-5.2')).toBeInTheDocument();
+  // The time-window selector renders (guards the Select props).
+  expect(screen.getAllByLabelText('Time window').length).toBeGreaterThan(0);
 });
 
 test('shows a permission error when the API returns 403', async () => {

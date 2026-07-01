@@ -76,6 +76,7 @@ from superset_ai_agent.schemas import (
 )
 from superset_ai_agent.semantic_layer.engine import (
     create_semantic_engine,
+    guidance_enabled,
     SemanticEngine,
 )
 from superset_ai_agent.semantic_layer.engine.planning import (
@@ -1740,10 +1741,9 @@ class ConversationGraph:
         prompt = get_prompt("conversation")
         execution_mode: ExecutionMode = request.resolved_execution_mode()
         wren_context = state.get("wren_context")
-        semantic_sql_mode = (
-            self.config.wren_semantic_sql_enabled
-            and self.semantic_engine.name != "passthrough"
-        )
+        # Authoring-guidance flag (factors 1-2 only); see graph.py for why this is
+        # narrower than the badge's semantic verdict. Shared definition avoids drift.
+        semantic_sql_mode = guidance_enabled(self.config, self.semantic_engine)
         payload = {
             "user_message": request.message,
             "semantic_sql_mode": semantic_sql_mode,

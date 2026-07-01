@@ -43,6 +43,10 @@ from superset_ai_agent.semantic_layer.copilot.schemas import (
 #: Run states that are still in flight (not terminal).
 _ACTIVE_STATES = ("pending", "running")
 
+#: Recovery statuses from which a (re)try is still warranted. ``empty`` (no gaps)
+#: and ``ready`` (suggestions already produced) are terminal for the sweep.
+_RECOVERABLE_STATES = ("none", "failed")
+
 
 class CoverageRunNotFoundError(KeyError):
     """Raised when a coverage run id is unknown."""
@@ -50,6 +54,17 @@ class CoverageRunNotFoundError(KeyError):
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _needs_recovery(run: CoverageRun) -> bool:
+    """A completed run with gaps, no usable suggestions yet, not dismissed."""
+    return (
+        run.status == "complete"
+        and run.report is not None
+        and (run.report.missing + run.report.partial) > 0
+        and run.recovery_status in _RECOVERABLE_STATES
+        and run.recovery_dismissed_at is None
+    )
 
 
 class CoverageRunStore(Protocol):
@@ -100,6 +115,17 @@ class CoverageRunStore(Protocol):
         The coverage-label overlay (Feature B) joins this against each provenance
         entry's resulting ``mdl_checksum`` to annotate a version with its score —
         keyed on the MDL version (not docs), latest run wins per version.
+        """
+        ...
+
+    def iter_recoverable(self) -> list[CoverageRun]:
+        """Latest-complete runs across all projects that still need recovery.
+
+        Drives the autonomous recovery sweep: one run per project (the newest
+        completed one) whose report has gaps (``missing + partial > 0``), whose
+        recovery has not yet produced suggestions (status ``none`` or ``failed``),
+        and which has not been dismissed. Owner-agnostic — each run carries its
+        own ``owner_id`` — so the sweep needs no request identity.
         """
         ...
 
@@ -251,6 +277,19 @@ class InMemoryCoverageRunStore:
         for run in runs:  # newest-first: keep the first seen per checksum
             latest.setdefault(run.mdl_checksum, run)
         return latest
+
+    def iter_recoverable(self) -> list[CoverageRun]:
+        with self._lock:
+            runs = [
+                run.model_copy(deep=True)
+                for run in self._runs.values()
+                if run.status == "complete"
+            ]
+        runs.sort(key=lambda run: run.created_at, reverse=True)
+        latest: dict[str, CoverageRun] = {}
+        for run in runs:  # newest-first: one (newest complete) run per project
+            latest.setdefault(run.project_id, run)
+        return [run for run in latest.values() if _needs_recovery(run)]
 
     def active_run(self, project_id: str) -> CoverageRun | None:
         with self._lock:
@@ -451,6 +490,23 @@ class SqlAlchemyCoverageRunStore:
             if model.mdl_checksum not in latest:
                 latest[model.mdl_checksum] = _from_model(model)
         return latest
+
+    def iter_recoverable(self) -> list[CoverageRun]:
+        with self.session_factory() as session:
+            models = (
+                session.execute(
+                    select(AiAgentCoverageRun)
+                    .where(AiAgentCoverageRun.status == "complete")
+                    .order_by(AiAgentCoverageRun.created_at.desc())
+                )
+                .scalars()
+                .all()
+            )
+        latest: dict[str, CoverageRun] = {}
+        for model in models:  # newest-first: one (newest complete) run per project
+            if model.project_id not in latest:
+                latest[model.project_id] = _from_model(model)
+        return [run for run in latest.values() if _needs_recovery(run)]
 
     def active_run(self, project_id: str) -> CoverageRun | None:
         return self._newest(project_id, statuses=_ACTIVE_STATES)

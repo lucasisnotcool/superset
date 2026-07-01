@@ -406,3 +406,82 @@ under `wren_copilot_enabled`. Decisions DP1–DP8 implemented as recommended.
   `test_coverage_store.py` (`set_recovery`/`dismiss_recovery`).
 - Frontend: `ChangesetReviewPanel`, `RecoverySuggestionsDialog`, `RecoveryBanner`,
   `CoveragePanel` (preparing/failed/ready/none states) test files.
+
+---
+
+## §12 — Post-ship fixes (2026-07-01): forced re-run, flag visibility, decoupled sweep
+
+Three gaps surfaced once the feature ran on a real dev stack (recovery flag was
+off, so the UI looked "missing"; the re-run button no-op'd; existing projects
+were never picked up autonomously). All three are now addressed.
+
+### Fix 1 — "Re-run analysis" forces a fresh audit
+`_schedule_coverage` is idempotent by `(mdl_checksum, docs_checksum)`, so a manual
+refresh on an unchanged MDL silently reused the stored run and the button did
+nothing. Added `force: bool` to `_schedule_coverage` (bypasses the `find_complete`
+short-circuit; still supersedes in-flight + creates a fresh run). `supersede()`
+only touches `pending/running`, so the prior **completed** score label survives
+until the new run finishes — no mid-flight wipe. `POST …/coverage/refresh` now
+defaults `force=True` (the only caller is the explicit button); pass `?force=false`
+for the old idempotent/back-fill behaviour. `_schedule_coverage` now returns
+`bool` (created a run?) so the sweep can count work under a synchronous runner.
+
+### Fix 2 — flag visibility (why the UI looked missing)
+`wren_coverage_recovery_enabled` defaults **False** and was absent from
+`.env.example`, so the dev stack never set it → no recovery jobs → banner/dialog
+never rendered (working as coded, but invisible). `.env.example` now documents
+`WREN_COVERAGE_AUTO_ENABLED`, `WREN_COVERAGE_RECOVERY_ENABLED=true`, and
+`WREN_COVERAGE_SWEEP_INTERVAL_SECONDS`. Operators sync via `superset_ai_agent/
+sync_env.ps1` (Policy 2 copies new example vars into the live `.env`), then
+rebuild the ai-agent image.
+
+### Fix 3 — autonomous, decoupled coverage + recovery sweep
+New config `wren_coverage_sweep_interval_seconds` (default `0` = off, env
+`WREN_COVERAGE_SWEEP_INTERVAL_SECONDS`). When > 0 a daemon thread (`coverage-
+sweep`) runs one tick shortly after startup and every interval. `_run_coverage_
+sweep()` runs **two independent passes**:
+
+1. **Coverage** (gated by `wren_coverage_auto_enabled`): enumerates all projects
+   via the storage layer (`project_store.list()` — db-access visibility is
+   owner-agnostic, `owner_id` is audit) and calls `_schedule_coverage(…,
+   recover_backfill=False)`. Idempotent guards mean only versions lacking a
+   completed report get audited; recovery back-fill is suppressed here.
+2. **Recovery** (gated by `wren_coverage_recovery_enabled`): new store method
+   `CoverageRunStore.iter_recoverable()` returns the latest **completed** run per
+   project that still has gaps, `recovery_status in (none, failed)`, and is not
+   dismissed (helper `_needs_recovery`). Each run carries its own `owner_id`, so
+   the project reloads without a request identity. Schedules `_run_recovery_job`
+   via `functools.partial` (correct loop-variable binding).
+
+**Decoupling:** the recovery pass reads existing completed reports directly — it
+never requires the coverage pass (or any fresh run) to have produced them. The
+inline coverage→recovery chain in `_run_coverage_job` is kept as a low-latency
+fast-path for fresh edits; the sweep is the durable guarantee that already-active
+/ legacy projects get picked up. The two passes are mutually independent and the
+sweep's coverage pass does not trigger recovery.
+
+The tick is exposed as `api.state.run_coverage_sweep()` so tests drive a single
+deterministic tick (no wall-clock wait). The daemon thread is off in tests
+(interval 0).
+
+### Tests
+- `test_coverage_store.py`: `iter_recoverable` selection matrix (eligible vs
+  no-gap/ready/empty/dismissed/in-flight) + "latest run per project wins", both
+  backends.
+- `test_copilot_api.py`: `test_manual_refresh_forces_a_fresh_run`,
+  `test_sweep_recovery_pass_is_decoupled_from_coverage` (auto-coverage off, yet
+  recovery still fires), `test_sweep_coverage_pass_audits_an_uncovered_version`,
+  `test_sweep_is_noop_when_both_passes_disabled`. Existing idempotency + back-fill
+  tests updated to `?force=false` (back-fill is now the non-forced path).
+
+### Known gaps / risks
+- The sweep's recovery scheduling has no claim-lease, so a tick that overlaps the
+  inline chain could double-submit; `_run_recovery_job` is idempotent on
+  `recovery_conversation_id` (second submit returns early), but a tight race could
+  still create two conversations. Low risk at the recommended 15-min cadence;
+  a CAS lease on `recovery_status` pending→running would close it fully.
+- Coverage pass enumerates **db-access-visible** projects only; a non-`db_access`
+  project (not the norm in this model) would be skipped.
+- Sweep interval is fixed; no jitter/backoff. Each tick re-audits nothing already
+  covered (idempotent), so cost is bounded by genuinely uncovered/un-recovered
+  projects.

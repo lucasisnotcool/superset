@@ -52,6 +52,7 @@ from superset_ai_agent.schemas import (
 )
 from superset_ai_agent.semantic_layer.engine import (
     create_semantic_engine,
+    guidance_enabled,
     SemanticEngine,
 )
 from superset_ai_agent.semantic_layer.engine.planning import (
@@ -1067,10 +1068,10 @@ class TextToSqlGraph:
         instructions: list[str] | None = None,
     ) -> SqlDraft:
         prompt = get_prompt("text_to_sql")
-        semantic_sql_mode = (
-            self.config.wren_semantic_sql_enabled
-            and self.semantic_engine.name != "passthrough"
-        )
+        # Authoring-guidance flag (factors 1-2 only). Centralized in the engine
+        # module so the badge's mode evaluator and this call-site share one
+        # definition. Deliberately narrower than the badge's semantic verdict.
+        semantic_sql_mode = guidance_enabled(self.config, self.semantic_engine)
         user_payload = {
             "question": request.question,
             "database": context.database.model_dump(),

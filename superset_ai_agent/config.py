@@ -230,6 +230,14 @@ class AgentConfig:
     # Copilot turn that proposes edits to close them (reviewable changeset, never
     # auto-applied). Off by default until proven; gated behind copilot being on.
     wren_coverage_recovery_enabled: bool = False
+    # Autonomous coverage+recovery sweep cadence (seconds). When > 0, a daemon
+    # thread periodically (and shortly after startup) runs two INDEPENDENT passes
+    # over all projects: (1) schedule coverage for any project whose latest MDL
+    # version has no completed report; (2) schedule the recovery agent for any
+    # project whose latest completed report has gaps but no suggestions yet. The
+    # passes are decoupled — recovery does not require a fresh coverage run. 0
+    # disables the sweep (purely event-driven). Gated behind copilot being on.
+    wren_coverage_sweep_interval_seconds: float = 0.0
     # TTL (seconds) for the per-project physical schema index. Copilot/MDL
     # operations (validate-on-edit, deploy preview, copilot turns) otherwise rebuild
     # it from Superset's dataset API every call — a list + per-dataset N+1, per
@@ -768,6 +776,12 @@ class AgentConfig:
             wren_coverage_recovery_enabled=_env_bool(
                 "WREN_COVERAGE_RECOVERY_ENABLED",
                 cls.wren_coverage_recovery_enabled,
+            ),
+            wren_coverage_sweep_interval_seconds=float(
+                os.getenv(
+                    "WREN_COVERAGE_SWEEP_INTERVAL_SECONDS",
+                    str(cls.wren_coverage_sweep_interval_seconds),
+                )
             ),
             wren_schema_index_cache_ttl_seconds=float(
                 os.getenv(

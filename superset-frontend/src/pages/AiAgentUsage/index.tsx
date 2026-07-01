@@ -26,6 +26,7 @@ import {
   Loading,
   Select,
   Table,
+  TableSize,
   Typography,
 } from '@superset-ui/core/components';
 import { getAgentBaseUrl } from 'src/SqlLab/components/AiAgentPanel/api';
@@ -159,7 +160,7 @@ export default function AiAgentUsage() {
           value={days}
           options={WINDOW_OPTIONS}
           onChange={value => setDays(value as number)}
-          style={{ width: 180 }}
+          css={{ width: 180 }}
           aria-label={t('Time window')}
         />
       </Flex>
@@ -187,19 +188,19 @@ export default function AiAgentUsage() {
           <Typography.Title level={4}>{t('By day')}</Typography.Title>
           <Table
             columns={BUCKET_COLUMNS(t('Day'))}
-            dataSource={summary.by_day}
+            data={summary.by_day}
             rowKey="key"
-            pagination={false}
-            size="small"
+            usePagination={false}
+            size={TableSize.Small}
           />
 
           <Typography.Title level={4}>{t('By model')}</Typography.Title>
           <Table
             columns={BUCKET_COLUMNS(t('Model'))}
-            dataSource={summary.by_model}
+            data={summary.by_model}
             rowKey="key"
-            pagination={false}
-            size="small"
+            usePagination={false}
+            size={TableSize.Small}
           />
         </>
       )}

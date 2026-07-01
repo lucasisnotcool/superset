@@ -9,6 +9,31 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (n
 
 ---
 
+## BUILD STATUS — Phases 1–6 implemented (guidance-flag fast-follow 6.3 deferred)
+
+Shipped in this session:
+- **Phase 1** `semantic_layer/engine/mode.py` (`evaluate_semantic_factors`, `guidance_enabled`)
+  + `SemanticModeStatus`/`SemanticModeFactor`/`SemanticFactorState` in `semantic_layer/schemas.py`
+  + 9 factor-matrix tests (`tests/unit_tests/superset_ai_agent/test_semantic_mode.py`). ✅
+- **Phase 2** both graphs call `guidance_enabled` (behavior-preserving). 252 graph/app tests pass. ✅
+- **Phase 3** `GET /agent/semantic-layer/mode-status` in `app.py` + 2 endpoint tests
+  (`test_semantic_layer_api.py`). ✅
+- **Phase 4** `getSemanticModeStatus` + types in `AiAgentPanel/api.ts`. ✅
+- **Phase 5** `AiAgentPanel/SemanticModeBadge.tsx` (Tag + Popover hover/focus), wired left of
+  the selector in `index.tsx` with a scope-keyed fetch effect. ✅
+- **Phase 6** 5 badge jest tests pass; 17 panel tests still pass; ruff/prettier clean.
+  **6.3 (guidance-flag dialect fix) intentionally deferred** — changes agent behavior, ship
+  separately (see §8 / D-IMPL-4).
+
+Pre-existing unrelated failures (verified by stashing this work — they fail on a clean
+master too): `test_llm_usage_store::test_by_day_buckets_on_utc_date` (date-rollover flake)
+and `test_multi_schema_schema_index::test_bulk_activate_fetches_live_schema_once...`
+(schema-fetch-count). **Not caused by this change.**
+
+Known gaps / risks carried forward → see §13 "Post-build gaps".
+
+---
+
 ## 0. Critical design decision — read before coding
 
 **The badge MUST be driven by the full 8-factor set, NOT the existing 2-factor
@@ -304,6 +329,39 @@ store access), `client.py:163`.
 - `AiAgentPanel/SemanticLayerStateBadge.tsx` — fold/retire (5.4)
 
 ---
+
+## 13. Post-build gaps (expectation ↔ implementation)
+Honest notes for review — where the shipped UI may differ from what the user pictured:
+
+1. **Right-side state badge kept, not folded (D4 deferred).** The user asked to *add* a left
+   mode badge; I did exactly that and left the existing right-side `SemanticLayerStateBadge`
+   (project/doc-count) in place. Result: two chips flank the dropdown. The spec recommended
+   folding doc-count into the new tooltip. **Decision still open** — keep both, or fold. Low
+   effort either way; left as-is to honor the literal ask and minimize churn.
+2. **Factor 7 ("active models") is project-scoped only.** When a *schema* is selected but no
+   project is pinned, the endpoint reports `has_active_models=false` rather than resolving
+   whether the schema maps to a project with active models. Honest (the agent has no pinned
+   models to ground on) but it could read "No active models" where a user expects "a project
+   covers this schema." A follow-up could resolve the schema→project candidate read-only.
+3. **Factor 8 ("context loaded") never turns green in the badge today.** The FE passes
+   `context_loaded=undefined` (always "checked at query time"). The spec's opportunistic
+   hydration from the last query's `wren_context.available` is **not yet wired** — so the
+   runtime row stays informational. Deterministic factors 1–7 fully drive the verdict, so
+   this doesn't cause false-greens; it just means the runtime row is never a ✓.
+4. **No client-side cache beyond effect-dep keying.** R-N2 is satisfied by keying the fetch
+   on scope primitives (one request per scope change, not per keystroke), but there is no
+   explicit scope-keyed memo/TTL. If scope toggles rapidly back and forth it refetches. Add a
+   small cache if telemetry shows churn.
+5. **Popover trigger is hover+focus (not click).** Matches the user's "on hover" ask and is
+   WCAG-1.4.13 compliant (essential state is in the always-visible label). If product wants a
+   click/toggletip instead, it's a one-line `trigger` change.
+6. **Copy is generic by design (R-N4).** Blocking reasons avoid env-var/engine names
+   ("turned off for this deployment", not `WREN_SEMANTIC_SQL_ENABLED=false`). An operator
+   debugging a deployment won't get the exact flag from the badge — intentional; revisit if
+   this panel becomes admin-gated.
+7. **Deepest fix still deferred (6.3).** The badge makes the mode *visible*, but the original
+   incident's mechanism — guidance injected on an unsupported dialect — is only fixed when the
+   guidance flag itself incorporates dialect support. Tracked, not shipped here.
 
 ## 12. Definition of done
 - [ ] Endpoint returns correct `SemanticModeStatus` for: Oracle (native/dialect-blocked),

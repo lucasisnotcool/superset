@@ -661,6 +661,34 @@ export interface SemanticProjectReadiness {
   detail: string;
 }
 
+export type SemanticFactorState =
+  | 'met'
+  | 'blocked'
+  | 'runtime'
+  | 'not_applicable';
+
+export type SemanticFactorFixableBy =
+  | 'operator'
+  | 'database'
+  | 'user'
+  | 'runtime';
+
+export interface SemanticModeFactor {
+  key: string;
+  label: string;
+  state: SemanticFactorState;
+  blocking: boolean;
+  detail: string;
+  fixable_by: SemanticFactorFixableBy;
+}
+
+export interface SemanticModeStatus {
+  mode: 'semantic' | 'native';
+  factors: SemanticModeFactor[];
+  blocking_factors: string[];
+  user_fixable_blocker: boolean;
+}
+
 const trimTrailingSlash = (url: string) => url.replace(/\/+$/, '');
 
 export const getAgentBaseUrl = () =>
@@ -1108,6 +1136,36 @@ export const listSemanticProjects = (
   }
   return requestJson<SemanticProject[]>(
     `/agent/semantic-layer/projects?${params.toString()}`,
+    { method: 'GET' },
+  );
+};
+
+/**
+ * Whether the AI SQL agent will apply semantic rewrite in the given scope, plus
+ * the full precondition breakdown that drives the semantic-mode badge. The
+ * backend is the single source of truth — the badge renders this verbatim and
+ * never recomputes the verdict (so it can't drift from real agent behavior).
+ */
+export const getSemanticModeStatus = (scope: {
+  databaseId: number;
+  catalogName?: string | null;
+  schemaName?: string | null;
+  projectId?: string | null;
+}) => {
+  const params = new URLSearchParams({
+    database_id: String(scope.databaseId),
+  });
+  if (scope.catalogName) {
+    params.set('catalog_name', scope.catalogName);
+  }
+  if (scope.schemaName) {
+    params.set('schema_name', scope.schemaName);
+  }
+  if (scope.projectId) {
+    params.set('project_id', scope.projectId);
+  }
+  return requestJson<SemanticModeStatus>(
+    `/agent/semantic-layer/mode-status?${params.toString()}`,
     { method: 'GET' },
   );
 };

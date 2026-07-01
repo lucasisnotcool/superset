@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import json  # noqa: TID251 - keep the standalone agent independent of Superset
 import logging
@@ -67,6 +68,7 @@ from superset_ai_agent.conversations.sqlalchemy_store import SqlAlchemyConversat
 from superset_ai_agent.conversations.store import (
     ConversationNotFoundError,
     ConversationStore,
+    DEFAULT_OWNER_ID,
 )
 from superset_ai_agent.conversations.turns import ConversationTurnService
 from superset_ai_agent.graph import TextToSqlGraph
@@ -158,6 +160,10 @@ from superset_ai_agent.semantic_layer.documents import (
     register_document,
     reindex_document,
 )
+from superset_ai_agent.semantic_layer.engine import (
+    create_semantic_engine,
+    evaluate_semantic_factors,
+)
 from superset_ai_agent.semantic_layer.events import to_sse
 from superset_ai_agent.semantic_layer.extractors import (
     CompositeDocumentExtractor,
@@ -243,6 +249,7 @@ from superset_ai_agent.semantic_layer.schemas import (
     SemanticLayerEvent,
     SemanticLayerEventType,
     SemanticLayerState,
+    SemanticModeStatus,
     SemanticProject,
     SemanticProjectDuplicateRequest,
     SemanticProjectReadiness,
@@ -425,6 +432,10 @@ def create_app(  # noqa: C901
         model_client=active_model_client,
         mdl_file_store=active_mdl_file_store,
     )
+    # Engine binding for the semantic-mode badge factor evaluation (cheap, stable
+    # per process). Shares the same factory the graphs use so name/availability
+    # match what a query would actually see.
+    app_semantic_engine = create_semantic_engine(app_config)
     app_context_provider = context_provider or (
         SupersetMetadataContextProvider(app_superset_client, config=app_config)
         if app_superset_client is not None
@@ -1472,49 +1483,72 @@ def create_app(  # noqa: C901
             json.dumps(payload, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
 
-    def _schedule_coverage(project: SemanticProject, owner_id: str) -> None:
+    def _schedule_coverage(
+        project: SemanticProject,
+        owner_id: str,
+        *,
+        force: bool = False,
+        recover_backfill: bool = True,
+    ) -> bool:
         """Schedule a debounced directory coverage run on the active MDL set.
 
         Idempotent (skips an identical version already audited), superseding (a new
         change cancels any in-flight run), and a no-op when there is nothing to
         audit (no active MDL or no documents). Best-effort — never blocks the
         triggering write.
+
+        ``force=True`` bypasses the version-idempotency short-circuit: it always
+        supersedes any prior run and creates a fresh audit even when the active
+        ``(mdl_checksum, docs_checksum)`` was already scored. This backs the
+        explicit "Re-run analysis" action, which must recompute on demand rather
+        than silently reuse the last result.
+
+        ``recover_backfill=False`` suppresses the recovery back-fill on the
+        already-audited path. The autonomous sweep uses this so its coverage pass
+        only schedules coverage; recovery is the sole responsibility of the
+        independent recovery pass (the two passes stay decoupled).
+
+        Returns ``True`` when a fresh coverage run was created and submitted, else
+        ``False`` (gated off, nothing to audit, or an idempotent skip). The sweep
+        uses this to count work reliably even under a synchronous job runner.
         """
 
         if not (
             app_config.wren_copilot_enabled and app_config.wren_coverage_auto_enabled
         ):
-            return
+            return False
         try:
             mdl_checksum = _active_mdl_checksum(project.id, owner_id)
             documents = _coverage_documents(project.id, owner_id)
             if not documents or not mdl_checksum:
-                return
+                return False
             docs_checksum = _docs_checksum(documents)
-            existing = active_coverage_run_store.find_complete(
-                project.id, mdl_checksum, docs_checksum
-            )
-            if existing is not None:
-                # The active version was already audited (idempotent — no re-run).
-                # But a run audited before the recovery feature existed (or whose
-                # recovery failed) carries no suggestions, so back-fill recovery for
-                # it: this lets already-active projects pick up recovery on the next
-                # trigger (including a manual refresh) without a fresh audit. The
-                # recovery job re-checks the gate and is idempotent on its
-                # conversation id.
-                if (
-                    app_config.wren_coverage_recovery_enabled
-                    and existing.recovery_status in ("none", "failed")
-                    and existing.report is not None
-                    and (existing.report.missing + existing.report.partial) > 0
-                ):
-                    active_coverage_run_store.set_recovery(
-                        existing.id, status="pending"
-                    )
-                    active_job_runner.submit(
-                        lambda: _run_recovery_job(existing.id, project, owner_id)
-                    )
-                return
+            if not force:
+                existing = active_coverage_run_store.find_complete(
+                    project.id, mdl_checksum, docs_checksum
+                )
+                if existing is not None:
+                    # The active version was already audited (idempotent — no
+                    # re-run). But a run audited before the recovery feature
+                    # existed (or whose recovery failed) carries no suggestions, so
+                    # back-fill recovery for it: this lets already-active projects
+                    # pick up recovery on the next trigger without a fresh audit.
+                    # The recovery job re-checks the gate and is idempotent on its
+                    # conversation id.
+                    if (
+                        recover_backfill
+                        and app_config.wren_coverage_recovery_enabled
+                        and existing.recovery_status in ("none", "failed")
+                        and existing.report is not None
+                        and (existing.report.missing + existing.report.partial) > 0
+                    ):
+                        active_coverage_run_store.set_recovery(
+                            existing.id, status="pending"
+                        )
+                        active_job_runner.submit(
+                            lambda: _run_recovery_job(existing.id, project, owner_id)
+                        )
+                    return False
             active_coverage_run_store.supersede(project.id)
             run = active_coverage_run_store.create(
                 project_id=project.id,
@@ -1525,8 +1559,10 @@ def create_app(  # noqa: C901
             active_job_runner.submit(
                 lambda: _run_coverage_job(run.id, project, owner_id)
             )
+            return True
         except Exception:  # pylint: disable=broad-except
             logger.warning("Failed to schedule coverage run.", exc_info=True)
+            return False
 
     def _run_coverage_job(  # noqa: C901 - debounce/claim/progress/persist seams
         run_id: str, project: SemanticProject, owner_id: str
@@ -1759,6 +1795,97 @@ def create_app(  # noqa: C901
                 )
             except Exception:  # pylint: disable=broad-except
                 logger.warning("Failed to emit recovery event.", exc_info=True)
+
+    def _run_coverage_sweep() -> dict[str, int]:  # noqa: C901 - two gated passes
+        """One sweep tick: two INDEPENDENT passes over all projects.
+
+        Pass 1 (coverage) schedules an audit for any project whose latest MDL
+        version has no completed report — picking up legacy / pre-feature projects
+        that never had a write to trigger the event-driven scheduler. It does not
+        back-fill recovery.
+
+        Pass 2 (recovery) independently schedules the recovery agent for every
+        project whose latest completed report still has gaps and no suggestions.
+        It reads existing completed reports directly, so it never depends on the
+        coverage pass (or any fresh run) having produced them — that is the
+        decoupling guarantee.
+
+        Owner-agnostic: projects are db-access visible (``owner_id`` is audit), and
+        each recoverable run carries its own ``owner_id``, so the sweep needs no
+        request identity. Best-effort — a per-item failure never aborts the tick.
+        Returns per-pass scheduled counts (for logging/tests).
+        """
+
+        counts = {"coverage_scheduled": 0, "recovery_scheduled": 0}
+        if not app_config.wren_copilot_enabled:
+            return counts
+
+        # Pass 1 — coverage (gated by auto-coverage; recovery back-fill suppressed).
+        if app_config.wren_coverage_auto_enabled:
+            try:
+                projects = active_semantic_project_store.list(
+                    owner_id=DEFAULT_OWNER_ID
+                )
+            except Exception:  # pylint: disable=broad-except
+                projects = []
+                logger.warning(
+                    "Coverage sweep: project enumeration failed.", exc_info=True
+                )
+            for project in projects:
+                try:
+                    if _schedule_coverage(
+                        project, DEFAULT_OWNER_ID, recover_backfill=False
+                    ):
+                        counts["coverage_scheduled"] += 1
+                except Exception:  # pylint: disable=broad-except
+                    logger.debug(
+                        "Coverage sweep: schedule failed for %s",
+                        project.id,
+                        exc_info=True,
+                    )
+
+        # Pass 2 — recovery (gated by recovery flag; independent of pass 1).
+        if app_config.wren_coverage_recovery_enabled:
+            try:
+                recoverable = active_coverage_run_store.iter_recoverable()
+            except Exception:  # pylint: disable=broad-except
+                recoverable = []
+                logger.warning(
+                    "Coverage sweep: recoverable enumeration failed.", exc_info=True
+                )
+            for run in recoverable:
+                try:
+                    project = active_semantic_project_store.get(
+                        run.project_id, owner_id=run.owner_id
+                    )
+                except Exception:  # pylint: disable=broad-except
+                    logger.debug(
+                        "Coverage sweep: project %s gone/not visible — skipped.",
+                        run.project_id,
+                        exc_info=True,
+                    )
+                    continue
+                try:
+                    active_coverage_run_store.set_recovery(run.id, status="pending")
+                    # partial (not a closure) binds this iteration's run/project,
+                    # avoiding the late-binding loop-variable trap.
+                    active_job_runner.submit(
+                        functools.partial(
+                            _run_recovery_job, run.id, project, run.owner_id
+                        )
+                    )
+                    counts["recovery_scheduled"] += 1
+                except Exception:  # pylint: disable=broad-except
+                    logger.debug(
+                        "Coverage sweep: recovery schedule failed for run %s",
+                        run.id,
+                        exc_info=True,
+                    )
+        return counts
+
+    # Exposed on the app for the periodic sweeper thread and for tests to invoke a
+    # single tick deterministically (no wall-clock wait).
+    api.state.run_coverage_sweep = _run_coverage_sweep
 
     @api.post(
         "/agent/semantic-layer/projects/{project_id}/mdl-files",
@@ -2812,14 +2939,21 @@ def create_app(  # noqa: C901
         project_id: str,
         fastapi_request: Request,
         identity: AgentIdentity = identity_dependency,
+        force: bool = True,
     ) -> dict[str, bool]:
-        """Manually (re)schedule a directory coverage run on the current MDL."""
+        """Manually (re)schedule a directory coverage run on the current MDL.
+
+        Defaults to ``force=True``: the only caller is the explicit "Re-run
+        analysis" action, which must recompute even when the active MDL version
+        was already scored. Pass ``?force=false`` for idempotent (re)scheduling
+        that reuses an existing score for an unchanged version.
+        """
 
         _require_copilot_enabled()
         project = authorize_semantic_project(
             fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
         )
-        _schedule_coverage(project, identity.owner_id)
+        _schedule_coverage(project, identity.owner_id, force=force)
         return {"scheduled": True}
 
     @api.get(
@@ -4452,6 +4586,68 @@ def create_app(  # noqa: C901
             owner_id=identity.owner_id,
         )
 
+    @api.get(
+        "/agent/semantic-layer/mode-status",
+        response_model=SemanticModeStatus,
+    )
+    def get_semantic_mode_status(
+        fastapi_request: Request,
+        database_id: int,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        project_id: str | None = None,
+        identity: AgentIdentity = identity_dependency,
+    ) -> SemanticModeStatus:
+        """Whether the AI SQL agent will apply semantic rewrite in this scope.
+
+        Drives the semantic-mode badge. Computes the full precondition set from
+        server truth (the same factory + dialect map a query would see) so the
+        badge can never show a false-positive — notably on an unsupported dialect
+        where the narrow authoring-guidance flag is still ``True``. Read-only.
+        """
+
+        scope = _scope_from_query(database_id, catalog_name, schema_name, None)
+        authorize_semantic_scope(
+            fastapi_request,
+            scope,
+            identity=identity,
+            permission=SemanticPermission.READ,
+        )
+
+        # Factor 7 (active models): authoritative only for a pinned project. With
+        # no project pinned the agent has no project-scoped models to ground on,
+        # so this reads False — surfaced as "select/onboard a project".
+        has_active_models = False
+        if project_id:
+            project = authorize_semantic_project(
+                fastapi_request,
+                project_id,
+                owner_id=identity.owner_id,
+                permission="read",
+            )
+            files = active_mdl_file_store.list(project.id, owner_id=identity.owner_id)
+            has_active_models = any(f.status == "active" for f in files)
+
+        # Factor 4 (dialect): resolve the database backend through the governed
+        # per-request client. Best-effort — a lookup failure degrades to "unknown"
+        # backend, which reads as an unsupported dialect rather than erroring.
+        backend: str | None = None
+        try:
+            _, request_superset_client = build_superset_runtime(fastapi_request)
+            backend = request_superset_client.get_database_dialect(database_id)
+        except Exception:  # pylint: disable=broad-except
+            logger.debug("mode-status backend lookup failed", exc_info=True)
+
+        return evaluate_semantic_factors(
+            config=app_config,
+            engine=app_semantic_engine,
+            backend=backend,
+            schema_selected=bool(schema_name),
+            project_selected=bool(project_id),
+            has_active_models=has_active_models,
+            context_loaded=None,
+        )
+
     @api.get("/agent/semantic-layer/mdl-schema")
     def get_mdl_schema(
         identity: AgentIdentity = identity_dependency,
@@ -4617,6 +4813,28 @@ def create_app(  # noqa: C901
             default_limit=request.default_limit or app_config.default_sql_limit,
             policy_mode=app_config.sql_policy_mode,
         )
+
+    # Autonomous coverage + recovery sweep. A daemon thread runs one tick shortly
+    # after startup (so existing/legacy projects get picked up without a write)
+    # and then every ``wren_coverage_sweep_interval_seconds``. 0 (default) leaves
+    # the system purely event-driven. Off in tests (interval 0); tests invoke
+    # ``api.state.run_coverage_sweep()`` directly for a deterministic single tick.
+    sweep_interval = app_config.wren_coverage_sweep_interval_seconds
+    if app_config.wren_copilot_enabled and sweep_interval > 0:
+
+        def _sweep_loop() -> None:
+            # Brief settle so startup/migrations finish before the first tick.
+            time.sleep(min(15.0, sweep_interval))
+            while True:
+                try:
+                    _run_coverage_sweep()
+                except Exception:  # pylint: disable=broad-except
+                    logger.warning("Coverage sweep tick failed.", exc_info=True)
+                time.sleep(sweep_interval)
+
+        threading.Thread(
+            target=_sweep_loop, name="coverage-sweep", daemon=True
+        ).start()
 
     return api
 

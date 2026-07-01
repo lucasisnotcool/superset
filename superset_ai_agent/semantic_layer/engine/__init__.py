@@ -26,6 +26,10 @@ from superset_ai_agent.semantic_layer.engine.base import (
     SemanticEngine,
 )
 from superset_ai_agent.semantic_layer.engine.factory import create_semantic_engine
+from superset_ai_agent.semantic_layer.engine.mode import (
+    evaluate_semantic_factors,
+    guidance_enabled,
+)
 from superset_ai_agent.semantic_layer.engine.passthrough import PassthroughEngine
 from superset_ai_agent.semantic_layer.engine.wren_core_engine import WrenCoreEngine
 
@@ -36,7 +40,9 @@ __all__ = [
     "SemanticEngine",
     "WrenCoreEngine",
     "create_semantic_engine",
+    "evaluate_semantic_factors",
     "extract_qualified_tables",
     "extract_referenced_tables",
+    "guidance_enabled",
     "resolve_dialect",
 ]

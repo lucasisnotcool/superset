@@ -508,12 +508,43 @@ def test_directory_coverage_is_idempotent_for_same_version(tmp_path) -> None:
     )
     _seed_active_model(client, pid)
 
-    # A manual refresh on the unchanged version reuses the stored run (no new one).
+    # Idempotent (re)scheduling on the unchanged version reuses the stored run.
     before = client.get(f"/agent/semantic-layer/projects/{pid}/coverage/latest").json()
-    refresh = client.post(f"/agent/semantic-layer/projects/{pid}/coverage/refresh")
+    refresh = client.post(
+        f"/agent/semantic-layer/projects/{pid}/coverage/refresh?force=false"
+    )
     assert refresh.status_code == 200, refresh.text
     after = client.get(f"/agent/semantic-layer/projects/{pid}/coverage/latest").json()
     assert before["id"] == after["id"]
+
+
+def test_manual_refresh_forces_a_fresh_run(tmp_path) -> None:
+    """The explicit "Re-run analysis" action recomputes even on an unchanged
+    version: the refresh endpoint defaults to force=True so the button is never a
+    silent no-op."""
+
+    client = _client(tmp_path, model_client=CoverageModel())
+    project = _resolve(client)
+    pid = project["id"]
+    client.post(
+        f"/agent/semantic-layer/projects/{pid}/documents/text",
+        json={
+            "filename": "g.md",
+            "text": "id = order id.",
+            "content_type": "text/markdown",
+        },
+    )
+    _seed_active_model(client, pid)
+
+    before = client.get(f"/agent/semantic-layer/projects/{pid}/coverage/latest").json()
+    # Default (force) refresh: a brand-new run is produced for the same version.
+    refresh = client.post(f"/agent/semantic-layer/projects/{pid}/coverage/refresh")
+    assert refresh.status_code == 200, refresh.text
+    after = client.get(f"/agent/semantic-layer/projects/{pid}/coverage/latest").json()
+    assert after["id"] != before["id"], "forced re-run must create a new run"
+    assert after["status"] == "complete"
+    # Same MDL version, freshly recomputed (score label still joins on checksum).
+    assert after["mdl_checksum"] == before["mdl_checksum"]
 
 
 # A second model that maps the known ``moves`` table — the recovery agent's
@@ -815,8 +846,11 @@ def test_recovery_backfills_an_unrecovered_run(tmp_path) -> None:
     )
     assert store.get(legacy.id).recovery_status == "none"
 
-    # A manual refresh on the unchanged version back-fills recovery for it.
-    refresh = client.post(f"/agent/semantic-layer/projects/{pid}/coverage/refresh")
+    # Idempotent (re)scheduling on the unchanged version back-fills recovery for
+    # the existing run instead of re-auditing (force=false → the back-fill path).
+    refresh = client.post(
+        f"/agent/semantic-layer/projects/{pid}/coverage/refresh?force=false"
+    )
     assert refresh.status_code == 200, refresh.text
 
     recovered = store.get(legacy.id)
@@ -844,6 +878,108 @@ def test_recovery_does_not_run_when_flag_disabled(tmp_path) -> None:
     # …but recovery never ran (feature gated off).
     assert latest["recovery_status"] == "none"
     assert latest["recovery_conversation_id"] is None
+
+
+def test_sweep_recovery_pass_is_decoupled_from_coverage(tmp_path) -> None:
+    # The recovery pass must pick up an EXISTING completed report on its own —
+    # auto-coverage is OFF here, so the sweep's coverage pass does nothing, yet
+    # recovery still proposes suggestions for the stored report. This is the
+    # decoupling guarantee: recovery does not require a fresh coverage run.
+    from superset_ai_agent.conversations.store import DEFAULT_OWNER_ID
+    from superset_ai_agent.semantic_layer.copilot.schemas import CoverageReport
+    from superset_ai_agent.semantic_layer.coverage_store import (
+        InMemoryCoverageRunStore,
+    )
+
+    store = InMemoryCoverageRunStore()
+    client = _client(
+        tmp_path,
+        model_client=AlwaysProposesModel(),
+        wren_coverage_recovery_enabled=True,
+        wren_coverage_auto_enabled=False,  # coverage pass is a no-op
+        coverage_run_store=store,
+    )
+    project = _resolve(client)
+    pid = project["id"]
+    client.post(
+        f"/agent/semantic-layer/projects/{pid}/documents/text",
+        json={
+            "filename": "g.md",
+            "text": "id = order id.",
+            "content_type": "text/markdown",
+        },
+    )
+    _seed_active_model(client, pid)  # active MDL, but no coverage (auto off)
+
+    # A completed report with a gap and no recovery yet — the "existing latest
+    # report" the recovery pass is meant to pick up.
+    legacy = store.create(
+        project_id=pid,
+        owner_id=DEFAULT_OWNER_ID,
+        mdl_checksum="v1",
+        docs_checksum="d1",
+    )
+    store.claim(legacy.id)
+    store.complete(legacy.id, CoverageReport(total=1, missing=1, score=0.0), score=0.0)
+    assert store.get(legacy.id).recovery_status == "none"
+
+    counts = client.app.state.run_coverage_sweep()
+    assert counts["coverage_scheduled"] == 0  # auto-coverage off → pass 1 idle
+    assert counts["recovery_scheduled"] == 1
+
+    recovered = store.get(legacy.id)
+    assert recovered.recovery_status == "ready"
+    assert recovered.recovery_conversation_id is not None
+
+
+def test_sweep_coverage_pass_audits_an_uncovered_version(tmp_path) -> None:
+    # The coverage pass must schedule an audit for a project whose latest version
+    # has no completed report. Adding a document changes the docs version but does
+    # NOT trigger coverage (only MDL writes do), leaving the current version
+    # un-audited — exactly the legacy/pre-feature gap the sweep closes.
+    client = _client(tmp_path, model_client=AlwaysProposesModel())
+    project = _resolve(client)
+    pid = project["id"]
+    client.post(
+        f"/agent/semantic-layer/projects/{pid}/documents/text",
+        json={
+            "filename": "g.md",
+            "text": "id = order id.",
+            "content_type": "text/markdown",
+        },
+    )
+    _seed_active_model(client, pid)  # → R1 for version (mdl, docs=g.md)
+    before = client.get(f"/agent/semantic-layer/projects/{pid}/coverage/latest").json()
+
+    # New doc → docs version changes, no coverage triggered.
+    client.post(
+        f"/agent/semantic-layer/projects/{pid}/documents/text",
+        json={
+            "filename": "h.md",
+            "text": "qty = quantity.",
+            "content_type": "text/markdown",
+        },
+    )
+
+    counts = client.app.state.run_coverage_sweep()
+    assert counts["coverage_scheduled"] == 1
+
+    after = client.get(f"/agent/semantic-layer/projects/{pid}/coverage/latest").json()
+    assert after["id"] != before["id"], "sweep must audit the uncovered version"
+    assert after["status"] == "complete"
+    assert after["docs_checksum"] != before["docs_checksum"]
+
+
+def test_sweep_is_noop_when_both_passes_disabled(tmp_path) -> None:
+    # Auto-coverage off + recovery off (default): the sweep schedules nothing.
+    client = _client(
+        tmp_path,
+        model_client=CoverageModel(),
+        wren_coverage_auto_enabled=False,
+    )
+    _resolve(client)
+    counts = client.app.state.run_coverage_sweep()
+    assert counts == {"coverage_scheduled": 0, "recovery_scheduled": 0}
 
 
 def test_copilot_routes_404_when_disabled(tmp_path) -> None:

@@ -670,6 +670,45 @@ class SemanticProjectReadiness(BaseModel):
     detail: str = ""
 
 
+#: One precondition that contributes to whether the agent runs in semantic-SQL
+#: mode. ``met`` — satisfied; ``blocked`` — unsatisfied and required; ``runtime``
+#: — only knowable when a query runs (not asserted ahead of time); ``not_applicable``
+#: — moot given another unmet factor (e.g. active models when no project is picked).
+SemanticFactorState = Literal["met", "blocked", "runtime", "not_applicable"]
+
+#: Who can clear a blocking factor — drives the UI's remediation copy and whether
+#: the badge shows a user-actionable warning (``user``) versus a factual,
+#: not-here-fixable note (``operator``/``database``).
+SemanticFactorFixableBy = Literal["operator", "database", "user", "runtime"]
+
+
+class SemanticModeFactor(BaseModel):
+    """A single named precondition for semantic-SQL mode, with its current state."""
+
+    key: str
+    label: str
+    state: SemanticFactorState
+    blocking: bool
+    detail: str
+    fixable_by: SemanticFactorFixableBy
+
+
+class SemanticModeStatus(BaseModel):
+    """Whether the AI SQL agent will apply semantic rewrite in the current scope.
+
+    ``mode`` reflects what the user actually experiences — ``semantic`` only when
+    every deterministic precondition (factors 1-7) is met — rather than the narrow
+    authoring-guidance flag, which is ``True`` even on an unsupported dialect and
+    would mislead the badge. The runtime factor (semantic context loaded) is
+    advisory and never blocks the ``semantic`` verdict ahead of a query.
+    """
+
+    mode: Literal["semantic", "native"]
+    factors: list[SemanticModeFactor]
+    blocking_factors: list[str] = Field(default_factory=list)
+    user_fixable_blocker: bool = False
+
+
 class SemanticDocumentTextRequest(BaseModel):
     """Create a semantic source document from pasted text."""
 

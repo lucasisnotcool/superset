@@ -1172,3 +1172,59 @@ def test_project_events_stream_replays_backlog_and_heartbeats(
     assert "event: mdl_created" in body
     # At least one heartbeat kept the connection alive before the lifetime cap.
     assert ": keep-alive" in body
+
+
+def test_semantic_mode_status_reports_native_with_blocking_factors(tmp_path) -> None:
+    # The badge endpoint computes the full precondition set from server truth. The
+    # test harness runs the pass-through engine, so the verdict must be native and
+    # the rewrite-engine factor must be flagged as blocking — never a false-green.
+    client, _ = _client(tmp_path)
+
+    response = client.get("/agent/semantic-layer/mode-status?database_id=1")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["mode"] == "native"
+    keys = [factor["key"] for factor in body["factors"]]
+    # All eight factors are always present, in a stable order, so the UI can render
+    # a complete checklist.
+    assert keys == [
+        "semantic_sql_enabled",
+        "engine_wren_core",
+        "engine_installed",
+        "dialect_supported",
+        "wren_enabled",
+        "scope_selected",
+        "active_models",
+        "context_loaded",
+    ]
+    assert "engine_wren_core" in body["blocking_factors"]
+    # No schema/project selected → scope is a user-fixable blocker.
+    assert body["user_fixable_blocker"] is True
+    scope_factor = next(f for f in body["factors"] if f["key"] == "scope_selected")
+    assert scope_factor["blocking"] is True
+    assert scope_factor["fixable_by"] == "user"
+    # The runtime factor is advisory ahead of a query.
+    ctx_factor = next(f for f in body["factors"] if f["key"] == "context_loaded")
+    assert ctx_factor["state"] == "runtime"
+    assert ctx_factor["blocking"] is False
+
+
+def test_semantic_mode_status_honors_scope_authorization(tmp_path) -> None:
+    # The badge must not leak mode/factor state across a failed scope auth.
+    app = create_app(
+        config=_local_config(agent_storage_dir=str(tmp_path)),
+        model_client=FakeModelClient(),
+        text_to_sql_graph=object(),
+        conversation_graph=object(),
+        conversation_store=InMemoryConversationStore(),
+        semantic_layer_store=InMemorySemanticLayerStore(),
+        document_storage=LocalDocumentStorage(str(tmp_path)),
+        context_provider=AuthRaisingContextProvider(),
+    )
+    client = TestClient(app)
+
+    response = client.get("/agent/semantic-layer/mode-status?database_id=1")
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Superset session expired."

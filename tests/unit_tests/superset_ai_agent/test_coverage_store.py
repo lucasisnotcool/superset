@@ -173,7 +173,8 @@ def test_active_run_returns_newest_inflight(store) -> None:
         project_id="p1", owner_id="u1", mdl_checksum="c1", docs_checksum="d1"
     )
     active = store.active_run("p1")
-    assert active is not None and active.id == run.id
+    assert active is not None
+    assert active.id == run.id
     store.fail(run.id, "boom")
     assert store.active_run("p1") is None
 
@@ -194,7 +195,8 @@ def test_report_progress_records_live_stage(store) -> None:
     assert persisted.progress.total == 5
     # Live progress surfaces through the active-run lookup the badge reads.
     active = store.active_run("p1")
-    assert active is not None and active.progress is not None
+    assert active is not None
+    assert active.progress is not None
     assert active.progress.detail == "orders.pdf"
 
 
@@ -229,7 +231,8 @@ def test_set_recovery_status_and_conversation(store) -> None:
     assert persisted.recovery_status == "ready"
     assert persisted.recovery_conversation_id == "conv-1"
     # The completed report is preserved across recovery updates.
-    assert persisted.report is not None and persisted.score == 0.5
+    assert persisted.report is not None
+    assert persisted.score == 0.5
 
 
 def test_dismiss_recovery_is_durable_and_status_preserving(store) -> None:
@@ -246,3 +249,60 @@ def test_dismiss_recovery_is_durable_and_status_preserving(store) -> None:
     # Dismissal hides the notification but keeps the suggestions reachable.
     assert persisted.recovery_status == "ready"
     assert persisted.recovery_conversation_id == "conv-1"
+
+
+def _complete(store, project_id, *, missing=0, recovery=None, dismissed=False):
+    run = store.create(
+        project_id=project_id, owner_id="u1", mdl_checksum="c1", docs_checksum="d1"
+    )
+    store.claim(run.id)
+    store.complete(
+        run.id,
+        CoverageReport(total=missing, missing=missing, score=0.0),
+        score=0.0,
+    )
+    if recovery is not None:
+        store.set_recovery(run.id, status=recovery)
+    if dismissed:
+        store.dismiss_recovery(run.id)
+    return run
+
+
+def test_iter_recoverable_selects_only_runs_that_need_recovery(store) -> None:
+    # Eligible: completed, has a gap, recovery not started/failed, not dismissed.
+    needs = _complete(store, "needs", missing=1)
+    failed = _complete(store, "failed", missing=2, recovery="failed")
+    # Ineligible cases:
+    _complete(store, "no_gap", missing=0)  # fully covered → nothing to recover
+    _complete(store, "ready", missing=1, recovery="ready")  # already has suggestions
+    _complete(store, "empty", missing=1, recovery="empty")  # judged: no work
+    _complete(store, "dismissed", missing=1, recovery="ready", dismissed=True)
+    # In-flight (no complete run) → not recoverable.
+    pending = store.create(
+        project_id="pending", owner_id="u1", mdl_checksum="c1", docs_checksum="d1"
+    )
+    store.claim(pending.id)
+
+    recoverable = {run.project_id for run in store.iter_recoverable()}
+    assert recoverable == {"needs", "failed"}
+    # owner_id rides along so the sweep can reload the project without an identity.
+    assert all(run.owner_id == "u1" for run in store.iter_recoverable())
+    del needs, failed
+
+
+def test_iter_recoverable_returns_only_latest_complete_run_per_project(store) -> None:
+    # An older complete run with a gap, then a newer complete run that is already
+    # recovered: the project must NOT be returned (newest run wins, and it is done).
+    old = store.create(
+        project_id="p1", owner_id="u1", mdl_checksum="c1", docs_checksum="d1"
+    )
+    store.claim(old.id)
+    store.complete(old.id, CoverageReport(total=1, missing=1, score=0.0), score=0.0)
+    new = store.create(
+        project_id="p1", owner_id="u1", mdl_checksum="c2", docs_checksum="d1"
+    )
+    store.claim(new.id)
+    store.complete(new.id, CoverageReport(total=1, missing=1, score=0.0), score=0.0)
+    store.set_recovery(new.id, status="ready")
+
+    assert store.iter_recoverable() == []
