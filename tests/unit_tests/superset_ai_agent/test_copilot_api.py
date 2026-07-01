@@ -710,6 +710,93 @@ def test_coverage_recovery_auto_runs_and_surfaces_suggestions(tmp_path) -> None:
     assert status["recovery_dismissed"] is False
 
 
+def test_apply_recovery_changeset_accepts_the_recovery_conversation(tmp_path) -> None:
+    # Regression: applying the recovery suggestions 404'd with "Conversation not
+    # found" because /copilot/apply only accepted kind="copilot" threads, but the
+    # recovery changeset is persisted on a kind="recovery" thread. The apply must
+    # succeed and record the assistant turn on the recovery conversation.
+    client = _client(
+        tmp_path,
+        model_client=CoverageThenRecoveryModel(),
+        wren_coverage_recovery_enabled=True,
+    )
+    project = _resolve(client)
+    pid = project["id"]
+    client.post(
+        f"/agent/semantic-layer/projects/{pid}/documents/text",
+        json={
+            "filename": "glossary.md",
+            "text": "id = order id.",
+            "content_type": "text/markdown",
+        },
+    )
+    _seed_active_model(client, pid)
+    run_id = client.get(f"/agent/semantic-layer/projects/{pid}/coverage/latest").json()[
+        "id"
+    ]
+    rec = client.get(
+        f"/agent/semantic-layer/projects/{pid}/coverage/runs/{run_id}/recovery"
+    ).json()
+    assert rec["status"] == "ready"
+    conversation_id = rec["conversation_id"]
+    items = rec["changeset"]["items"]
+
+    apply = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot/apply",
+        json={"items": items, "conversation_id": conversation_id},
+    )
+    assert apply.status_code == 200, apply.text
+    applied = apply.json()
+    assert applied[0]["path"] == "models/recovery.json"
+    assert applied[0]["status"] == "draft"
+    # The apply committed an assistant turn on the recovery thread (no 404), so the
+    # thread is resumable and shows the proposal was applied.
+    convo = client.get(f"/agent/conversations/{conversation_id}").json()
+    assert any(
+        "Applied 1 draft" in m.get("content", "") for m in convo.get("messages", [])
+    )
+
+
+def test_apply_reschedules_coverage_when_active_mdl_changes(tmp_path) -> None:
+    # Applying an update/delete to an ACTIVE file moves the active-set version,
+    # which invalidates the coverage score. The apply must re-schedule coverage
+    # (visible re-analysis) rather than leave the report silently "stale".
+    client = _client(tmp_path, model_client=AlwaysProposesModel())
+    project = _resolve(client)
+    pid = project["id"]
+    client.post(
+        f"/agent/semantic-layer/projects/{pid}/documents/text",
+        json={
+            "filename": "g.md",
+            "text": "id = order id.",
+            "content_type": "text/markdown",
+        },
+    )
+    _seed_active_model(client, pid)
+    before = client.get(f"/agent/semantic-layer/projects/{pid}/coverage/latest").json()
+
+    files = client.get(f"/agent/semantic-layer/projects/{pid}/mdl-files").json()
+    active = next(f for f in files if f["status"] == "active")
+    apply = client.post(
+        f"/agent/semantic-layer/projects/{pid}/copilot/apply",
+        json={
+            "items": [
+                {
+                    "op": "update",
+                    "path": active["path"],
+                    "file_id": active["id"],
+                    "proposed_content": RECOVERY_MDL,
+                }
+            ]
+        },
+    )
+    assert apply.status_code == 200, apply.text
+
+    after = client.get(f"/agent/semantic-layer/projects/{pid}/coverage/latest").json()
+    assert after["id"] != before["id"], "apply that changed active MDL must re-analyse"
+    assert after["mdl_checksum"] != before["mdl_checksum"]
+
+
 def test_recovery_dismissal_is_durable_and_keeps_suggestions(tmp_path) -> None:
     client = _client(
         tmp_path,

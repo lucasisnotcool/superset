@@ -18,7 +18,7 @@
  */
 import fetchMock from 'fetch-mock';
 import userEvent from '@testing-library/user-event';
-import { render, screen, waitFor } from 'spec/helpers/testing-library';
+import { render, screen } from 'spec/helpers/testing-library';
 import RecoverySuggestionsDialog from './RecoverySuggestionsDialog';
 
 const base = 'http://agent.local/agent/semantic-layer/projects/p1';
@@ -79,13 +79,12 @@ test('loads and renders recovery suggestions with the closed-claim rationale', a
   ).toBeInTheDocument();
 });
 
-test('applying posts accepted items, dismisses, and closes', async () => {
+test('applying posts accepted items, dismisses, and confirms success', async () => {
   fetchMock.get(RECOVERY, READY);
   fetchMock.post(APPLY, [
     { id: 'f1', path: 'models/fix.json', status: 'draft' },
   ]);
   fetchMock.post(DISMISS, { dismissed: true });
-  const onClose = jest.fn();
   const onApplied = jest.fn();
 
   render(
@@ -93,18 +92,40 @@ test('applying posts accepted items, dismisses, and closes', async () => {
       projectId="p1"
       runId="run-1"
       open
-      onClose={onClose}
+      onClose={jest.fn()}
       onApplied={onApplied}
     />,
   );
 
   await userEvent.click(await screen.findByTestId('changeset-apply'));
 
-  await waitFor(() => expect(onClose).toHaveBeenCalled());
+  // Visibility of system status: an explicit success confirmation, not a silent
+  // close. The user is told the edits landed and what to do next.
+  expect(await screen.findByTestId('recovery-applied')).toBeInTheDocument();
   expect(fetchMock.callHistory.calls(APPLY)).toHaveLength(1);
   // Applying resolves the notification for this run.
   expect(fetchMock.callHistory.calls(DISMISS)).toHaveLength(1);
   expect(onApplied).toHaveBeenCalled();
+});
+
+test('surfaces a friendly, non-technical error when apply fails', async () => {
+  fetchMock.get(RECOVERY, READY);
+  fetchMock.post(APPLY, { status: 500, body: { message: 'boom' } });
+
+  render(
+    <RecoverySuggestionsDialog
+      projectId="p1"
+      runId="run-1"
+      open
+      onClose={jest.fn()}
+    />,
+  );
+
+  await userEvent.click(await screen.findByTestId('changeset-apply'));
+
+  expect(await screen.findByTestId('recovery-error')).toHaveTextContent(
+    'Could not apply the suggestions. Please try again.',
+  );
 });
 
 test('shows a preparing state while the agent is still running', async () => {
@@ -145,24 +166,19 @@ test('flags stale suggestions when the MDL moved on', async () => {
   expect(await screen.findByText(/MDL has changed/)).toBeInTheDocument();
 });
 
-test('Dismiss button dismisses without applying', async () => {
+test('offers only Close in the footer (no Dismiss)', async () => {
   fetchMock.get(RECOVERY, READY);
-  fetchMock.post(DISMISS, { dismissed: true });
-  const onClose = jest.fn();
 
   render(
     <RecoverySuggestionsDialog
       projectId="p1"
       runId="run-1"
       open
-      onClose={onClose}
+      onClose={jest.fn()}
     />,
   );
 
   await screen.findByTestId('changeset-review');
-  await userEvent.click(screen.getByTestId('recovery-dismiss'));
-
-  await waitFor(() => expect(onClose).toHaveBeenCalled());
-  expect(fetchMock.callHistory.calls(DISMISS)).toHaveLength(1);
-  expect(fetchMock.callHistory.calls(APPLY)).toHaveLength(0);
+  expect(screen.getByTestId('recovery-close')).toBeInTheDocument();
+  expect(screen.queryByTestId('recovery-dismiss')).not.toBeInTheDocument();
 });

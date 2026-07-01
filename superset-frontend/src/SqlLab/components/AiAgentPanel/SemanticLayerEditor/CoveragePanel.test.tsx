@@ -17,12 +17,15 @@
  * under the License.
  */
 import fetchMock from 'fetch-mock';
+import userEvent from '@testing-library/user-event';
 import { render, screen } from 'spec/helpers/testing-library';
 import { CoverageStatusInfo } from '../api';
 import CoveragePanel from './CoveragePanel';
 
 const LATEST =
   'http://agent.local/agent/semantic-layer/projects/p1/coverage/latest';
+const RECOVERY =
+  'http://agent.local/agent/semantic-layer/projects/p1/coverage/runs/run-1/recovery';
 
 const RUN = {
   id: 'run-1',
@@ -129,6 +132,61 @@ test('offers the Review entrypoint when suggestions are ready', async () => {
   expect(
     await screen.findByTestId('coverage-review-suggestions'),
   ).toBeInTheDocument();
+});
+
+test('reviewing suggestions extends the same dialog into a second pane', async () => {
+  fetchMock.get(RECOVERY, {
+    run_id: 'run-1',
+    status: 'ready',
+    conversation_id: 'c1',
+    suggestion_count: 1,
+    dismissed: false,
+    stale: false,
+    changeset: {
+      items: [
+        {
+          op: 'create',
+          path: 'models/fix.json',
+          current_content: '',
+          proposed_content: '{"a":1}',
+          summary: 'Closes a gap',
+          validation: { valid: true },
+        },
+      ],
+      warnings: [],
+      steps: [],
+      message: 'fix',
+    },
+  });
+
+  render(
+    <CoveragePanel
+      projectId="p1"
+      open
+      onClose={jest.fn()}
+      onRerun={jest.fn()}
+      info={{
+        ...baseInfo,
+        recovery_status: 'ready',
+        recovery_run_id: 'run-1',
+        recovery_dismissed: false,
+      }}
+    />,
+  );
+
+  await userEvent.click(
+    await screen.findByTestId('coverage-review-suggestions'),
+  );
+
+  // The suggestions render INLINE in the same coverage dialog (second pane); the
+  // report stays visible beside them and no second modal is opened.
+  expect(
+    await screen.findByTestId('coverage-suggestions-pane'),
+  ).toBeInTheDocument();
+  expect(screen.getByTestId('coverage-report')).toBeInTheDocument();
+  expect(await screen.findByTestId('changeset-review')).toBeInTheDocument();
+  // Exactly one dialog is present — no double-dialogging.
+  expect(screen.getAllByTestId('coverage-panel')).toHaveLength(1);
 });
 
 test('shows no recovery callout when there is nothing to recover', async () => {

@@ -3193,9 +3193,20 @@ def create_app(  # noqa: C901
         return {"deleted": True}
 
     def _require_copilot_conversation(
-        project_id: str, conversation_id: str, owner_id: str
+        project_id: str,
+        conversation_id: str,
+        owner_id: str,
+        *,
+        kinds: tuple[str, ...] = ("copilot",),
     ) -> Conversation:
-        """Load a thread and assert it is this project's Copilot thread (else 404)."""
+        """Load a thread and assert it belongs to this project (else 404).
+
+        ``kinds`` whitelists the acceptable conversation kinds. The interactive
+        Copilot turn only accepts ``copilot`` threads; the apply route also accepts
+        ``recovery`` threads so a user can apply the coverage recovery agent's
+        suggestions (the recovery changeset is persisted on a ``recovery`` thread,
+        not a ``copilot`` one).
+        """
 
         try:
             conversation = active_conversation_store.get(
@@ -3205,7 +3216,7 @@ def create_app(  # noqa: C901
             raise HTTPException(
                 status_code=404, detail="Conversation not found."
             ) from ex
-        if conversation.kind != "copilot" or conversation.project_id != project_id:
+        if conversation.kind not in kinds or conversation.project_id != project_id:
             raise HTTPException(status_code=404, detail="Conversation not found.")
         return conversation
 
@@ -3493,10 +3504,15 @@ def create_app(  # noqa: C901
         )
 
         # Record the apply as an assistant turn so a resumed thread shows that the
-        # proposal was applied (parity with the SQL agent's execute-sql turn).
+        # proposal was applied (parity with the SQL agent's execute-sql turn). The
+        # recovery agent persists its changeset on a ``recovery`` thread, so the
+        # apply route accepts that kind too (not just interactive ``copilot``).
         if request.conversation_id:
             _require_copilot_conversation(
-                project_id, request.conversation_id, identity.owner_id
+                project_id,
+                request.conversation_id,
+                identity.owner_id,
+                kinds=("copilot", "recovery"),
             )
             count = len(applied)
             noun = "draft" if count == 1 else "drafts"
@@ -3505,6 +3521,13 @@ def create_app(  # noqa: C901
                 assistant_content=f"Applied {count} {noun}.",
                 owner_id=identity.owner_id,
             )
+
+        # An apply that touched active files (update/delete of an active file, or a
+        # create the user later activates) moves the active-set version, which
+        # invalidates the current coverage score. Re-schedule coverage so the badge
+        # re-analyses instead of silently going stale. Idempotent: a no-op when the
+        # active checksum is unchanged (e.g. only drafts were created).
+        _schedule_coverage(project, identity.owner_id)
         return applied
 
     @api.post(

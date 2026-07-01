@@ -54,6 +54,8 @@ export interface CoverageBadgeProps {
   projectId?: string | null;
   /** Bump to force a re-fetch (e.g. after the MDL directory changes). */
   refreshSignal?: unknown;
+  /** Gates applying the recovery agent's suggestions from the viewer. */
+  canWrite?: boolean;
 }
 
 /**
@@ -63,7 +65,11 @@ export interface CoverageBadgeProps {
  * coverage viewer (progress or stored report); it never re-runs analysis —
  * re-run is an explicit action inside the viewer.
  */
-const CoverageBadge = ({ projectId, refreshSignal }: CoverageBadgeProps) => {
+const CoverageBadge = ({
+  projectId,
+  refreshSignal,
+  canWrite = true,
+}: CoverageBadgeProps) => {
   const [info, setInfo] = useState<CoverageStatusInfo | null>(null);
   // Distinguishes "first status not fetched yet" (show a placeholder) from
   // "fetched, genuinely nothing to show" (render nothing) — so the badge does
@@ -145,6 +151,8 @@ const CoverageBadge = ({ projectId, refreshSignal }: CoverageBadgeProps) => {
         open={panelOpen}
         onClose={() => setPanelOpen(false)}
         onRerun={onRerun}
+        canWrite={canWrite}
+        onRefresh={poll}
       />
     </>
   );

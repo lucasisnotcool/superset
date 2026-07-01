@@ -22,6 +22,7 @@ import { useTheme } from '@apache-superset/core/theme';
 import { Alert } from '@apache-superset/core/components';
 import {
   Button,
+  Divider,
   Empty,
   Flex,
   Modal,
@@ -31,7 +32,7 @@ import { Icons } from '@superset-ui/core/components/Icons';
 import { CoverageReport, CoverageStatusInfo, getLatestCoverage } from '../api';
 import { CoverageReportBody } from './CoverageReportModal';
 import CoverageProgress from './CoverageProgress';
-import RecoverySuggestionsDialog from './RecoverySuggestionsDialog';
+import RecoverySuggestionsContent from './RecoverySuggestionsContent';
 
 export interface CoveragePanelProps {
   projectId: string;
@@ -41,6 +42,10 @@ export interface CoveragePanelProps {
   onClose: () => void;
   /** Schedule a fresh run (explicit action, never the badge click itself). */
   onRerun: () => void;
+  /** Gates applying the recovery agent's suggestions from the second pane. */
+  canWrite?: boolean;
+  /** Re-poll live status (e.g. after suggestions apply → coverage re-analyses). */
+  onRefresh?: () => void;
 }
 
 const formatTimestamp = (iso?: string | null): string => {
@@ -62,6 +67,8 @@ const CoveragePanel = ({
   open,
   onClose,
   onRerun,
+  canWrite = true,
+  onRefresh,
 }: CoveragePanelProps) => {
   const theme = useTheme();
   const [report, setReport] = useState<CoverageReport | null>(null);
@@ -112,6 +119,7 @@ const CoveragePanel = ({
     if (!open) {
       setReport(null);
       setError(null);
+      setSuggestionsOpen(false);
     }
   }, [open, hasReport, info?.run_id, loadReport]);
 
@@ -202,12 +210,18 @@ const CoveragePanel = ({
     );
   }
 
+  // When the user chooses to review suggestions, the report dialog extends into a
+  // second pane instead of stacking a nested modal (recenters via the wider
+  // width). Both panes live in one dialog with one set of footer actions.
+  const showSuggestions = suggestionsOpen && Boolean(recoveryRunId);
+
   return (
     <Modal
       title={t('Coverage')}
       show={open}
       onHide={onClose}
       centered
+      width={showSuggestions ? '960px' : undefined}
       footer={
         <Flex justify="end" gap={theme.sizeUnit * 2}>
           <Button onClick={onClose} data-test="coverage-panel-close">
@@ -230,13 +244,41 @@ const CoveragePanel = ({
       }
       data-test="coverage-panel"
     >
-      {body}
-      <RecoverySuggestionsDialog
-        projectId={projectId}
-        runId={recoveryRunId}
-        open={suggestionsOpen}
-        onClose={() => setSuggestionsOpen(false)}
-      />
+      {showSuggestions ? (
+        <Flex gap={theme.sizeUnit * 4} align="stretch">
+          <div style={{ flex: '1 1 0', minWidth: 0 }}>{body}</div>
+          <Divider type="vertical" style={{ height: 'auto' }} />
+          <Flex
+            vertical
+            gap={theme.sizeUnit * 2}
+            style={{ flex: '1 1 0', minWidth: 0 }}
+            data-test="coverage-suggestions-pane"
+          >
+            <Flex justify="space-between" align="center">
+              <Typography.Title level={5} style={{ margin: 0 }}>
+                {t('Coverage suggestions')}
+              </Typography.Title>
+              <Button
+                buttonStyle="link"
+                buttonSize="small"
+                onClick={() => setSuggestionsOpen(false)}
+                data-test="coverage-suggestions-hide"
+              >
+                {t('Hide')}
+              </Button>
+            </Flex>
+            <RecoverySuggestionsContent
+              projectId={projectId}
+              runId={recoveryRunId}
+              active={showSuggestions}
+              canWrite={canWrite}
+              onApplied={onRefresh}
+            />
+          </Flex>
+        </Flex>
+      ) : (
+        body
+      )}
     </Modal>
   );
 };

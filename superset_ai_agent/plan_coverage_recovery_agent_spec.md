@@ -485,3 +485,57 @@ deterministic tick (no wall-clock wait). The daemon thread is off in tests
 - Sweep interval is fixed; no jitter/backoff. Each tick re-audits nothing already
   covered (idempotent), so cost is bounded by genuinely uncovered/un-recovered
   projects.
+
+---
+
+## §13 — Apply-flow fix + dialog UX (2026-07-01)
+
+Reported: clicking **Apply suggestions** errored with "Conversation not found", the
+report then showed **Stale** with no re-analysis, and the suggestions opened as a
+second stacked dialog with a redundant **Dismiss** button.
+
+### Backend
+- **"Conversation not found" (root cause).** `/copilot/apply` recorded the apply as
+  an assistant turn via `_require_copilot_conversation`, which asserted
+  `kind == "copilot"`. The recovery changeset lives on a `kind="recovery"` thread,
+  so the check 404'd. `apply_changeset_items` runs *before* that check, so the
+  drafts were actually created — the user saw an error for an apply that partly
+  succeeded. Fix: `_require_copilot_conversation` gained a `kinds` whitelist
+  (default `("copilot",)`); the apply route passes `("copilot", "recovery")`.
+- **Stale with no re-analysis (root cause).** `store.update`/`delete` preserve a
+  file's `active` status (status only changes when explicitly set), so applying an
+  update/delete of an active file moves the active-set checksum → the report goes
+  stale. But `/copilot/apply` never re-scheduled coverage (unlike the direct
+  mdl-file endpoints). Fix: the apply route now calls `_schedule_coverage(project,
+  owner)` after a successful apply. Idempotent — a no-op when only drafts were
+  created (active unchanged), a fresh audit when the active MDL moved. This is the
+  "visibility of system status" feedback: the badge re-analyses instead of
+  silently going stale.
+- Tests: `test_apply_recovery_changeset_accepts_the_recovery_conversation`,
+  `test_apply_reschedules_coverage_when_active_mdl_changes`.
+
+### Frontend
+- **No more double-dialog.** The suggestions were a nested `RecoverySuggestionsDialog`
+  Modal rendered *inside* the CoveragePanel Modal. Extracted the modal-free body
+  into `RecoverySuggestionsContent`. CoveragePanel now renders it as a **second
+  pane** inline (widens to 960px + re-centers via `centered`, vertical `Divider`
+  between report and suggestions, a "Hide" control to collapse). The standalone
+  `RecoverySuggestionsDialog` (banner entrypoint, when the report dialog is not
+  open) reuses the same content.
+- **Close only.** Removed the redundant **Dismiss** from the suggestions footer
+  (dismissal remains on the banner and is implicit on apply).
+- **Feedback (NN/g visibility of system status + form-error guidelines).** Apply
+  now resolves to an explicit **success Alert** ("Applied N suggestion(s)… coverage
+  re-analyses automatically") instead of a silent close, and failures show a
+  **human-readable** message ("Could not apply the suggestions. Please try again.")
+  with the raw detail in parentheses — never a bare backend string. `onApplied`
+  bubbles to the badge's `poll` so re-analysis shows immediately.
+- `canWrite` threaded editor → CoverageBadge → CoveragePanel → content so apply is
+  gated in the UI (backend still authoritative).
+- Tests: CoveragePanel "extends the same dialog into a second pane" (asserts one
+  modal, report + suggestions coexist); RecoverySuggestionsDialog success-confirm,
+  friendly-error, and "Close only (no Dismiss)".
+
+Sources for the feedback design: NN/g *Visibility of System Status*
+(nngroup.com/articles/visibility-system-status), NN/g *Error-Message Guidelines*
+(nngroup.com/articles/errors-forms-design-guidelines).

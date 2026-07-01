@@ -1450,6 +1450,7 @@ export default function SemanticLayerEditor({
                       .filter(file => file.status === 'active')
                       .map(file => `${file.id}:${file.checksum}`)
                       .join(',')}
+                    canWrite={canWrite}
                   />
                   <Tooltip title={t('Provenance')}>
                     <Button
