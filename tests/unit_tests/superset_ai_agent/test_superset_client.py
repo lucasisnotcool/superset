@@ -867,6 +867,6 @@ def test_local_adapter_runs_read_only_and_pushes_limit(monkeypatch) -> None:
 
     result = client.execute_sql(database_id=1, sql="SELECT a FROM t", limit=50)
 
-    assert database.queried == ["SELECT a FROM t\nLIMIT 50"]
+    assert database.queried == ["SELECT a FROM t LIMIT 50"]
     assert result.audit is not None
-    assert result.audit.executed_sql == "SELECT a FROM t\nLIMIT 50"
+    assert result.audit.executed_sql == "SELECT a FROM t LIMIT 50"

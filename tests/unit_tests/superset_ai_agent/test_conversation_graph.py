@@ -496,7 +496,7 @@ def test_conversation_graph_updates_approved_sql_artifact_in_manual_mode() -> No
     assert response.conversation.messages[-1].content == (
         "The approved query returned Michael."
     )
-    assert superset_client.executed_sql == ["SELECT name FROM birth_names\nLIMIT 25"]
+    assert superset_client.executed_sql == ["SELECT name FROM birth_names LIMIT 25"]
     assert len(model_client.messages) == 1
     assert [event.step for event in response.trace] == [
         "load_conversation",
@@ -845,7 +845,7 @@ def test_approved_sql_can_return_retry_artifact_in_manual_mode() -> None:
     assert response.artifacts[0].execution_result is not None
     assert response.artifacts[0].execution_result.row_count == 0
     assert superset_client.executed_sql == [
-        "SELECT name FROM birth_names WHERE name = 'Nope'\nLIMIT 25"
+        "SELECT name FROM birth_names WHERE name = 'Nope' LIMIT 25"
     ]
 
 

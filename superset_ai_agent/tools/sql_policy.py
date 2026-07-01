@@ -37,6 +37,7 @@ The two concerns are intentionally separated:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Literal
 
@@ -316,14 +317,52 @@ def _has_top_level_limit(sql: str, engine: str | None) -> bool:
     return root.args.get("limit") is not None
 
 
-def apply_limit(sql: str, *, engine: str | None, default_limit: int) -> str:
-    """Append a conservative ``LIMIT`` only when the top-level query lacks one.
+#: C0/C1 control characters except tab, newline and carriage return (ordinary SQL
+#: whitespace). Stray control bytes from copy-paste / LLM output are a documented
+#: ORA-00911 "invalid character" trigger, so they are removed before execution.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+#: The terminating run of semicolons/whitespace (mirrors WrenAI's per-connector
+#: helper). Only the trailing terminator is removed, so a ``;`` inside a string
+#: literal is preserved.
+_TRAILING_TERMINATORS = re.compile(r"[;\s]+\Z")
 
-    Mutates the SQL text minimally (a trailing ``LIMIT`` line) to preserve the
-    user-visible query, while using the AST to *decide* whether a cap is needed.
+
+def sanitize_sql(sql: str) -> str:
+    """Strip stray control characters and the trailing statement terminator.
+
+    Programmatic single-statement execution rejects a trailing ``;`` on Oracle and
+    Trino (Oracle raises ORA-00911), and non-printable characters trigger the same
+    Oracle error regardless of engine. This removes both defensively. Safe for the
+    agent, which only ever executes ONE read-only statement — never a PL/SQL block
+    whose closing ``END;`` must be kept.
     """
 
-    stripped = sql.strip().rstrip(";").strip()
+    if not sql:
+        return sql
+    cleaned = _CONTROL_CHARS.sub("", sql)
+    return _TRAILING_TERMINATORS.sub("", cleaned).strip()
+
+
+def apply_limit(sql: str, *, engine: str | None, default_limit: int) -> str:
+    """Cap a top-level query that lacks a limit, in the engine's own dialect.
+
+    Sanitizes first (:func:`sanitize_sql`), then — only when the single top-level
+    query has no limit — appends the cap via the AST so the emitted clause is
+    dialect-correct: ``FETCH FIRST n ROWS ONLY`` for Oracle, ``TOP n`` for T-SQL,
+    ``LIMIT n`` elsewhere. Regenerating from the AST also guarantees no stray
+    newline/terminator reaches the driver. Degrades to the sanitized SQL (no cap)
+    when the query is already limited, unparseable, or not a SELECT/UNION — the
+    executor's fetch cap still bounds rows in that case.
+    """
+
+    stripped = sanitize_sql(sql)
     if not stripped or _has_top_level_limit(stripped, engine):
         return stripped
-    return f"{stripped}\nLIMIT {default_limit}"
+    dialect = SQLGLOT_DIALECTS.get(engine or "base")
+    try:
+        # _has_top_level_limit returned False, so this parses as a single
+        # SELECT/UNION; append the cap on the AST and render in the target dialect.
+        root = sqlglot.parse_one(stripped, dialect=dialect)
+        return root.limit(default_limit).sql(dialect=dialect)
+    except Exception:  # pylint: disable=broad-except
+        return stripped

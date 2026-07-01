@@ -499,7 +499,10 @@ class ConversationGraph:
             owner_id=owner_id,
         )
         try:
-            return self.graph.invoke(initial_state)
+            return self.graph.invoke(
+                initial_state,
+                {"recursion_limit": self.config.agent_graph_recursion_limit},
+            )
         except SupersetAuthError:
             raise
         except Exception as ex:  # pylint: disable=broad-except

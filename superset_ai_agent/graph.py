@@ -354,7 +354,10 @@ class TextToSqlGraph:
             "wren_mdl_path": None,
             "error": None,
         }
-        state = self.graph.invoke(initial_state)
+        state = self.graph.invoke(
+            initial_state,
+            {"recursion_limit": self.config.agent_graph_recursion_limit},
+        )
         validation = state.get(
             "validation",
             SqlValidation(

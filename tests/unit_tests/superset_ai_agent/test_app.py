@@ -408,7 +408,7 @@ def test_validate_sql_endpoint_adds_limit() -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["is_valid"] is True
-    assert body["normalized_sql"] == "select * from birth_names\nLIMIT 25"
+    assert body["normalized_sql"] == "SELECT * FROM birth_names LIMIT 25"
 
 
 def test_conversation_endpoints_create_list_message_and_delete() -> None:

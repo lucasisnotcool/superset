@@ -219,10 +219,10 @@ def test_auto_tier_never_executes_non_read_only(kind: SqlClassificationKind) -> 
 
 # --- apply_limit ----------------------------------------------------------
 def test_apply_limit_appends_when_missing() -> None:
-    assert (
-        apply_limit("SELECT a FROM t", engine="postgresql", default_limit=20)
-        == "SELECT a FROM t\nLIMIT 20"
-    )
+    # Dialect-correct append, rendered from the AST (no stray newline).
+    out = apply_limit("SELECT a FROM t", engine="postgresql", default_limit=20)
+    assert out == "SELECT a FROM t LIMIT 20"
+    assert "\n" not in out
 
 
 def test_apply_limit_keeps_existing_top_level_limit() -> None:
@@ -233,20 +233,56 @@ def test_apply_limit_keeps_existing_top_level_limit() -> None:
 
 
 def test_apply_limit_ignores_subquery_limit_and_caps_outer() -> None:
-    # A LIMIT buried in a subquery must NOT suppress the outer cap (§2.3) —
-    # the old substring check failed this.
+    # A LIMIT buried in a subquery must NOT suppress the outer cap (§2.3).
     sql = "SELECT a FROM (SELECT a FROM t LIMIT 5) s"
     out = apply_limit(sql, engine="postgresql", default_limit=20)
-    assert out == f"{sql}\nLIMIT 20"
+    assert out == "SELECT a FROM (SELECT a FROM t LIMIT 5) AS s LIMIT 20"
 
 
 def test_apply_limit_strips_trailing_semicolon() -> None:
-    assert (
-        apply_limit("SELECT a FROM t;", engine="postgresql", default_limit=20)
-        == "SELECT a FROM t\nLIMIT 20"
-    )
+    out = apply_limit("SELECT a FROM t;", engine="postgresql", default_limit=20)
+    assert out == "SELECT a FROM t LIMIT 20"
+    assert ";" not in out
 
 
 def test_apply_limit_caps_union() -> None:
-    sql = "SELECT 1 UNION SELECT 2"
-    assert apply_limit(sql, engine="postgresql", default_limit=20) == f"{sql}\nLIMIT 20"
+    out = apply_limit("SELECT 1 UNION SELECT 2", engine="postgresql", default_limit=20)
+    assert out == "SELECT 1 UNION SELECT 2 LIMIT 20"
+
+
+def test_apply_limit_is_dialect_correct_for_oracle() -> None:
+    # The ORA-00911 fix: Oracle gets FETCH FIRST, never a bare LIMIT, and no
+    # stray newline reaches the driver.
+    out = apply_limit("SELECT a FROM t", engine="oracle", default_limit=20)
+    assert out == "SELECT a FROM t FETCH FIRST 20 ROWS ONLY"
+    assert "LIMIT" not in out.upper()
+    assert "\n" not in out
+
+
+def test_apply_limit_is_dialect_correct_for_tsql() -> None:
+    out = apply_limit("SELECT a FROM t", engine="mssql", default_limit=20)
+    assert out == "SELECT TOP 20 a FROM t"
+    assert "LIMIT" not in out.upper()
+
+
+def test_apply_limit_strips_trailing_newline_and_semicolon_for_oracle() -> None:
+    # Regression for the reported ORA-00911: a trailing newline/semicolon must
+    # never reach Oracle.
+    out = apply_limit("SELECT a FROM t ;\n", engine="oracle", default_limit=20)
+    assert out == "SELECT a FROM t FETCH FIRST 20 ROWS ONLY"
+    assert "\n" not in out and ";" not in out
+
+
+def test_apply_limit_degrades_to_sanitized_sql_when_unparseable() -> None:
+    # Unparseable input: no cap guessed, but still sanitized (no trailing junk).
+    out = apply_limit("NOT SQL AT ALL ;\n", engine="oracle", default_limit=20)
+    assert out == "NOT SQL AT ALL"
+
+
+def test_sanitize_sql_strips_control_chars_and_trailing_terminators() -> None:
+    from superset_ai_agent.tools.sql_policy import sanitize_sql
+
+    assert sanitize_sql("SELECT a\x00 FROM t\x07 ;\n") == "SELECT a FROM t"
+    # Internal semicolons (stacked-query separators) are preserved for the
+    # multi-statement classifier — only the TRAILING terminator run is removed.
+    assert sanitize_sql("SELECT 1; SELECT 2;") == "SELECT 1; SELECT 2"

@@ -36,7 +36,7 @@ def test_validate_read_only_sql_accepts_select_and_adds_limit() -> None:
     assert validation.is_valid is True
     assert validation.is_read_only is True
     assert validation.classification == "read_only"
-    assert validation.normalized_sql == "select name from birth_names\nLIMIT 20"
+    assert validation.normalized_sql == "SELECT name FROM birth_names LIMIT 20"
 
 
 def test_validate_read_only_sql_keeps_existing_limit() -> None:
@@ -93,7 +93,7 @@ def test_validate_read_only_sql_passes_engine_through_as_dialect() -> None:
 
     assert validation.is_valid is True
     assert validation.dialect == "postgresql"
-    assert validation.normalized_sql == "select name from birth_names\nLIMIT 20"
+    assert validation.normalized_sql == "SELECT name FROM birth_names LIMIT 20"
 
 
 def test_validate_read_only_sql_falls_back_for_unknown_dialect() -> None:
@@ -105,7 +105,7 @@ def test_validate_read_only_sql_falls_back_for_unknown_dialect() -> None:
 
     assert validation.is_valid is True
     assert validation.dialect == "not_a_sqlglot_dialect"
-    assert validation.normalized_sql == "select name from birth_names\nLIMIT 20"
+    assert validation.normalized_sql == "SELECT name FROM birth_names LIMIT 20"
 
 
 def test_validate_read_only_sql_permissive_allows_multi_read_only() -> None:

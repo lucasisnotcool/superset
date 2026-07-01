@@ -112,6 +112,12 @@ class AgentConfig:
     max_history_messages: int = 12
     max_prompt_result_rows: int = 5
     max_agent_sql_iterations: int = 3
+    # LangGraph per-run step budget (recursion_limit). Each node visit counts as a
+    # step; the draft->plan->validate->repair/reflect->execute loops multiply with
+    # the retry knobs above, so raising max_agent_sql_iterations/max_repair_attempts
+    # may require raising this too or the run aborts with GraphRecursionError.
+    # LangGraph's own default is 25.
+    agent_graph_recursion_limit: int = 50
     wren_enabled: bool = True
     wren_adapter: WrenAdapterMode = "llm"
     wren_base_url: str | None = None
@@ -572,6 +578,12 @@ class AgentConfig:
                 os.getenv(
                     "AI_AGENT_MAX_SQL_ITERATIONS",
                     str(cls.max_agent_sql_iterations),
+                )
+            ),
+            agent_graph_recursion_limit=int(
+                os.getenv(
+                    "AI_AGENT_GRAPH_RECURSION_LIMIT",
+                    str(cls.agent_graph_recursion_limit),
                 )
             ),
             wren_enabled=_env_bool("WREN_ENABLED", cls.wren_enabled),
