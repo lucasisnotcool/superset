@@ -707,6 +707,11 @@ class SemanticModeStatus(BaseModel):
     factors: list[SemanticModeFactor]
     blocking_factors: list[str] = Field(default_factory=list)
     user_fixable_blocker: bool = False
+    #: When set, this backend's dialect is supported via a downstream transpile
+    #: (dialect finalization) of the engine's output — e.g. ``"oracle"``. The badge
+    #: discloses this so the transpile is never a silent behavior. ``None`` for
+    #: wren-native backends.
+    dialect_finalized_by: str | None = None
 
 
 class SemanticDocumentTextRequest(BaseModel):

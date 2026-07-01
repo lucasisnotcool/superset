@@ -25,6 +25,12 @@ from superset_ai_agent.semantic_layer.engine.base import (
     resolve_dialect,
     SemanticEngine,
 )
+from superset_ai_agent.semantic_layer.engine.dialect_finalize import (
+    finalization_guidance,
+    finalize_native_sql,
+    needs_finalization,
+    POST_TRANSPILE_DIALECTS,
+)
 from superset_ai_agent.semantic_layer.engine.factory import create_semantic_engine
 from superset_ai_agent.semantic_layer.engine.mode import (
     evaluate_semantic_factors,
@@ -39,10 +45,14 @@ __all__ = [
     "PlannedSql",
     "SemanticEngine",
     "WrenCoreEngine",
+    "POST_TRANSPILE_DIALECTS",
     "create_semantic_engine",
     "evaluate_semantic_factors",
     "extract_qualified_tables",
     "extract_referenced_tables",
+    "finalization_guidance",
+    "finalize_native_sql",
     "guidance_enabled",
+    "needs_finalization",
     "resolve_dialect",
 ]

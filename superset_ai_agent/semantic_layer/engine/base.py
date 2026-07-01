@@ -44,6 +44,11 @@ from superset_ai_agent.semantic_layer.schemas import (
 #: Superset DB backend -> wren-core source/dialect token. Unknown backends fall
 #: back to passthrough planning with a warning (wren_full.md R-B). Re-verify the
 #: token set against the installed wren-core version on upgrade (R-A/R16).
+#:
+#: ``oracle`` is supported only in tandem with the dialect-finalization stage
+#: (:mod:`dialect_finalize`): wren-core's Oracle output still emits ``LIMIT`` (which
+#: Oracle rejects), so the sqlglot transpile pass is REQUIRED. ``mssql`` shares that
+#: gap — both must stay in ``POST_TRANSPILE_DIALECTS``.
 BACKEND_TO_WREN_DIALECT: dict[str, str] = {
     "postgresql": "postgres",
     "postgres": "postgres",
@@ -56,6 +61,7 @@ BACKEND_TO_WREN_DIALECT: dict[str, str] = {
     "presto": "trino",
     "mssql": "mssql",
     "redshift": "redshift",
+    "oracle": "oracle",
 }
 
 

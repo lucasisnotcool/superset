@@ -66,11 +66,12 @@ def test_happy_path_is_semantic() -> None:
     assert _factor(status, "context_loaded").state == "runtime"
 
 
-def test_oracle_dialect_blocks_even_when_flags_enabled() -> None:
-    """The incident case: flags on + wren_core engine, but Oracle is unsupported.
+def test_oracle_is_supported_via_dialect_finalization() -> None:
+    """Oracle is now supported through the dialect-finalization (transpile) stage.
 
-    The narrow guidance flag is True, yet the badge verdict must be native so it
-    never shows a false-green on Oracle.
+    Adding ``oracle`` to the wren-dialect map (which requires the transpile pass to
+    ship in tandem) flips the ``dialect_supported`` factor to met, so the verdict is
+    semantic — with the badge disclosing the transpile (see the endpoint/badge tests).
     """
 
     config = _enabled_config()
@@ -83,14 +84,27 @@ def test_oracle_dialect_blocks_even_when_flags_enabled() -> None:
         project_selected=True,
         has_active_models=True,
     )
+    assert status.mode == "semantic"
+    assert status.blocking_factors == []
+    assert _factor(status, "dialect_supported").state == "met"
+    assert guidance_enabled(config, engine) is True
+
+
+def test_unsupported_dialect_still_blocks() -> None:
+    """A dialect absent from the map (e.g. sqlite) still blocks — no false-green."""
+
+    config = _enabled_config()
+    status = evaluate_semantic_factors(
+        config=config,
+        engine=_FakeEngine(name="wren_core", available=True),
+        backend="sqlite",
+        schema_selected=True,
+        project_selected=True,
+        has_active_models=True,
+    )
     assert status.mode == "native"
     assert status.blocking_factors == ["dialect_supported"]
-    # Not user-fixable here — it is a database property, so no actionable warning.
-    assert status.user_fixable_blocker is False
     assert _factor(status, "dialect_supported").fixable_by == "database"
-    # Guidance flag (factors 1+2 only) is still True — proving why the badge must
-    # not mirror it.
-    assert guidance_enabled(config, engine) is True
 
 
 def test_flag_off_is_native() -> None:
@@ -211,3 +225,30 @@ def test_always_eight_factors_in_stable_order() -> None:
         "active_models",
         "context_loaded",
     ]
+
+
+def test_oracle_discloses_dialect_finalization() -> None:
+    status = evaluate_semantic_factors(
+        config=_enabled_config(),
+        engine=_FakeEngine(name="wren_core", available=True),
+        backend="oracle",
+        schema_selected=True,
+        project_selected=True,
+        has_active_models=True,
+    )
+    assert status.mode == "semantic"
+    assert status.dialect_finalized_by == "oracle"
+    assert "transpil" in _factor(status, "dialect_supported").detail.lower()
+
+
+def test_native_backend_has_no_finalization_disclosure() -> None:
+    status = evaluate_semantic_factors(
+        config=_enabled_config(),
+        engine=_FakeEngine(name="wren_core", available=True),
+        backend="postgresql",
+        schema_selected=True,
+        project_selected=True,
+        has_active_models=True,
+    )
+    assert status.mode == "semantic"
+    assert status.dialect_finalized_by is None

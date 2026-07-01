@@ -143,6 +143,14 @@ export default function SemanticModeBadge({ status }: SemanticModeBadgeProps) {
                 'calculated columns are not used.',
             )}
       </Subhead>
+      {isSemantic && status.dialect_finalized_by && (
+        <Subhead data-test="semantic-mode-transpile-note">
+          {t(
+            'Native SQL is transpiled to %s for this database.',
+            status.dialect_finalized_by,
+          )}
+        </Subhead>
+      )}
       <FactorList>
         {status.factors.map(factor => (
           <li key={factor.key}>

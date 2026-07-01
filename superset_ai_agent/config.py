@@ -266,6 +266,11 @@ class AgentConfig:
     # sqlalchemy), enforced at startup.
     wren_engine: WrenEngineMode = "wren_core"
     wren_semantic_sql_enabled: bool = False
+    # Kill-switch for the dialect-finalization stage (sqlglot transpile of
+    # wren-core's canonical output into a target dialect the engine does not fully
+    # render — e.g. Oracle LIMIT -> FETCH FIRST). Gated per-backend by
+    # POST_TRANSPILE_DIALECTS; this flag turns the whole stage off for rollback.
+    wren_dialect_finalize_enabled: bool = True
     # Engine-feedback correction loop (1.4): when > 0 and the semantic engine
     # flags a hallucinated model/table the draft SQL cannot resolve, re-draft up
     # to this many times before executing. Default 0 (off) — the hallucination
@@ -814,6 +819,10 @@ class AgentConfig:
             wren_semantic_sql_enabled=_env_bool(
                 "WREN_SEMANTIC_SQL_ENABLED",
                 cls.wren_semantic_sql_enabled,
+            ),
+            wren_dialect_finalize_enabled=_env_bool(
+                "WREN_DIALECT_FINALIZE_ENABLED",
+                cls.wren_dialect_finalize_enabled,
             ),
             wren_engine_max_correction_retries=int(
                 os.getenv(

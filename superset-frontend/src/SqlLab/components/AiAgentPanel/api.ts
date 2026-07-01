@@ -687,6 +687,9 @@ export interface SemanticModeStatus {
   factors: SemanticModeFactor[];
   blocking_factors: string[];
   user_fixable_blocker: boolean;
+  /** Set when this backend is supported via a downstream SQL transpile (dialect
+   * finalization), e.g. "oracle" — disclosed in the badge so it isn't silent. */
+  dialect_finalized_by?: string | null;
 }
 
 const trimTrailingSlash = (url: string) => url.replace(/\/+$/, '');

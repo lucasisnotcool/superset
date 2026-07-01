@@ -122,3 +122,24 @@ test('the badge trigger is keyboard-focusable and reveals the factor checklist',
     await screen.findByText(/dialect is not supported by the semantic engine/i),
   ).toBeInTheDocument();
 });
+
+test('semantic mode on a transpiled backend discloses the transpile in the popover', async () => {
+  const status: SemanticModeStatus = {
+    mode: 'semantic',
+    factors: [
+      factor({
+        key: 'dialect_supported',
+        label: 'Database dialect supported',
+        detail: 'Supported via transpilation to oracle SQL.',
+      }),
+    ],
+    blocking_factors: [],
+    user_fixable_blocker: false,
+    dialect_finalized_by: 'oracle',
+  };
+  render(<SemanticModeBadge status={status} />);
+  const badge = screen.getByTestId('semantic-mode-badge');
+  expect(badge).toHaveTextContent('Semantic');
+  await userEvent.tab();
+  expect(await screen.findByText(/transpiled to oracle/i)).toBeInTheDocument();
+});

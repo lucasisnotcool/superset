@@ -36,6 +36,9 @@ from superset_ai_agent.semantic_layer.engine.base import (
     resolve_dialect,
     SemanticEngine,
 )
+from superset_ai_agent.semantic_layer.engine.dialect_finalize import (
+    needs_finalization,
+)
 from superset_ai_agent.semantic_layer.schemas import (
     SemanticFactorState,
     SemanticModeFactor,
@@ -125,21 +128,26 @@ def evaluate_semantic_factors(
     )
 
     # Factor 4 — this database's backend maps to a supported wren-core dialect.
+    # Some backends (e.g. Oracle) are supported via a downstream transpile of the
+    # engine's output rather than natively — disclosed here so the badge is truthful.
     dialect_supported = resolve_dialect(backend) is not None
+    finalized_by = needs_finalization(backend)
+    if not dialect_supported:
+        dialect_detail = (
+            "This database's dialect is not supported by the semantic "
+            "engine; queries run as native SQL."
+        )
+    elif finalized_by:
+        dialect_detail = f"Supported via transpilation to {finalized_by} SQL."
+    else:
+        dialect_detail = "This database's dialect is supported by the semantic engine."
     factors.append(
         SemanticModeFactor(
             key="dialect_supported",
             label="Database dialect supported",
             state="met" if dialect_supported else "blocked",
             blocking=not dialect_supported,
-            detail=(
-                "This database's dialect is supported by the semantic engine."
-                if dialect_supported
-                else (
-                    "This database's dialect is not supported by the semantic "
-                    "engine; queries run as native SQL."
-                )
-            ),
+            detail=dialect_detail,
             fixable_by="database",
         )
     )
@@ -246,4 +254,7 @@ def evaluate_semantic_factors(
         factors=factors,
         blocking_factors=blocking_factors,
         user_fixable_blocker=user_fixable_blocker,
+        # Only disclose the transpile when semantic mode is actually active — a
+        # native verdict (e.g. flag off) shouldn't imply a transpile is in play.
+        dialect_finalized_by=finalized_by if mode == "semantic" else None,
     )

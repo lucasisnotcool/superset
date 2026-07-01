@@ -76,6 +76,7 @@ from superset_ai_agent.schemas import (
 )
 from superset_ai_agent.semantic_layer.engine import (
     create_semantic_engine,
+    finalization_guidance,
     guidance_enabled,
     SemanticEngine,
 )
@@ -126,6 +127,26 @@ _SEMANTIC_SQL_GUIDANCE = (
     "rewrites your query into native SQL. Never reference tables or columns "
     "absent from the provided semantic context."
 )
+
+
+def _compose_semantic_guidance(
+    semantic_sql_mode: bool,
+    *,
+    backend: str | None,
+    finalize_enabled: bool,
+) -> str | None:
+    """Base semantic guidance plus a per-dialect finalization addendum (D3).
+
+    ``None`` when semantic mode is off. When the backend's SQL is finalized by a
+    transpile pass (e.g. Oracle), the agent is told so it prefers portable SQL.
+    """
+
+    if not semantic_sql_mode:
+        return None
+    addendum = finalization_guidance(backend, enabled=finalize_enabled)
+    if addendum:
+        return f"{_SEMANTIC_SQL_GUIDANCE} {addendum}"
+    return _SEMANTIC_SQL_GUIDANCE
 
 
 class ConversationDraft(BaseModel):
@@ -1240,6 +1261,7 @@ class ConversationGraph:
             owner_id=state.get("owner_id", DEFAULT_OWNER_ID),
             project_id=getattr(state.get("wren_context"), "project_id", None),
             mdl_file_store=self.mdl_file_store,
+            finalize_enabled=self.config.wren_dialect_finalize_enabled,
         )
         status: Literal["ok", "warning", "error"] = (
             "warning" if result.warnings else "ok"
@@ -1744,12 +1766,15 @@ class ConversationGraph:
         # Authoring-guidance flag (factors 1-2 only); see graph.py for why this is
         # narrower than the badge's semantic verdict. Shared definition avoids drift.
         semantic_sql_mode = guidance_enabled(self.config, self.semantic_engine)
+        semantic_sql_instructions = _compose_semantic_guidance(
+            semantic_sql_mode,
+            backend=context.database.backend,
+            finalize_enabled=self.config.wren_dialect_finalize_enabled,
+        )
         payload = {
             "user_message": request.message,
             "semantic_sql_mode": semantic_sql_mode,
-            "semantic_sql_instructions": (
-                _SEMANTIC_SQL_GUIDANCE if semantic_sql_mode else None
-            ),
+            "semantic_sql_instructions": semantic_sql_instructions,
             "execution_mode": execution_mode,
             "execute": execution_mode != "manual",
             "max_sql_iterations": self.config.max_agent_sql_iterations,

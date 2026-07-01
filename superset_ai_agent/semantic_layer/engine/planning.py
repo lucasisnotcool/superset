@@ -32,6 +32,9 @@ from superset_ai_agent.semantic_layer.engine.base import (
     resolve_dialect,
     SemanticEngine,
 )
+from superset_ai_agent.semantic_layer.engine.dialect_finalize import (
+    finalize_native_sql,
+)
 from superset_ai_agent.semantic_layer.mdl_files import MdlFileStore
 
 
@@ -49,6 +52,14 @@ class PlanStepResult(BaseModel):
     #: are excluded — re-drafting cannot fix those, so they never drive the
     #: engine-correction loop (1.4).
     correctable_warnings: list[str] = Field(default_factory=list)
+    #: When set, ``native_sql`` was transpiled from wren-core's canonical output
+    #: into this target dialect (e.g. ``"oracle"``). ``None`` for wren-native
+    #: backends. Provenance for auditing and the semantic-mode badge disclosure.
+    finalized_dialect: str | None = None
+    #: wren-core's canonical output BEFORE dialect finalization, kept for debugging
+    #: (compare canonical vs the executed dialect SQL). Equals ``native_sql`` when
+    #: no finalization ran.
+    canonical_native_sql: str | None = None
 
 
 def plan_semantic_sql_step(
@@ -59,10 +70,14 @@ def plan_semantic_sql_step(
     owner_id: str,
     project_id: str | None,
     mdl_file_store: MdlFileStore | None,
+    finalize_enabled: bool = True,
 ) -> PlanStepResult:
     """Rewrite semantic SQL to native SQL and run the soft hallucination gate.
 
-    The passthrough engine returns SQL unchanged. Never executes.
+    The passthrough engine returns SQL unchanged. Never executes. For backends the
+    engine does not fully render (e.g. Oracle), ``native_sql`` is finalized by a
+    sqlglot transpile pass (:func:`finalize_native_sql`), gated per-backend and by
+    ``finalize_enabled``; any transpile gap surfaces as a non-correctable warning.
     """
 
     if engine.name == "passthrough":
@@ -84,11 +99,24 @@ def plan_semantic_sql_step(
         except Exception:  # pylint: disable=broad-except
             active_files = []
     manifest = engine.compile(active_files)
-    dialect = resolve_dialect(getattr(context.database, "backend", None))
+    backend = getattr(context.database, "backend", None)
+    dialect = resolve_dialect(backend)
     planned = engine.plan_sql(sql, manifest, dialect=dialect)
 
     warnings = list(planned.warnings)
     correctable_warnings: list[str] = []
+
+    # Dialect finalization: transpile wren-core's canonical output into the
+    # backend's dialect where the engine does not render clause-level specifics
+    # (e.g. Oracle LIMIT -> FETCH FIRST). No-op for wren-native backends. A
+    # transpile gap is non-correctable — a semantic re-draft cannot fix it — so it
+    # goes to ``warnings`` (engine_warnings -> repair/reflection) but never to
+    # ``correctable_warnings`` (which drives the hallucination re-draft loop).
+    finalized = finalize_native_sql(
+        planned.native_sql, backend=backend, enabled=finalize_enabled
+    )
+    native_sql = finalized.sql
+    warnings.extend(finalized.warnings)
     if manifest.model_names:
         known = {name.lower() for name in manifest.model_names}
         known.update(dataset.table_name.lower() for dataset in context.datasets)
@@ -107,12 +135,14 @@ def plan_semantic_sql_step(
 
     return PlanStepResult(
         semantic_sql=sql,
-        native_sql=planned.native_sql,
+        native_sql=native_sql,
         engine=planned.engine,
         rewritten=planned.rewritten,
         referenced_tables=planned.referenced_tables,
         warnings=warnings,
         correctable_warnings=correctable_warnings,
+        finalized_dialect=finalized.target_dialect if finalized.transpiled else None,
+        canonical_native_sql=planned.native_sql,
     )
 
 
