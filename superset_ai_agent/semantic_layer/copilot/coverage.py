@@ -113,21 +113,51 @@ def _tokens(text: str) -> set[str]:
 # -- Stage A: claim extraction ---------------------------------------------
 
 
+#: Max chars of a provider/parse error surfaced to the user — enough to name the
+#: cause (timeout, 401, rate limit, connection refused) without dumping a payload.
+_REASON_MAX_CHARS = 240
+
+
+def _short(text: str, limit: int = _REASON_MAX_CHARS) -> str:
+    """Collapse whitespace and truncate so a reason stays one readable line."""
+    flat = " ".join(str(text).split())
+    return flat if len(flat) <= limit else f"{flat[: limit - 1]}…"
+
+
+class ExtractionOutcome(NamedTuple):
+    """Result of claim extraction: ``claims`` is ``None`` only on failure, and
+    ``error`` then carries a human-readable reason to surface to the user."""
+
+    claims: list[CoverageClaim] | None
+    error: str | None = None
+
+
 def extract_claims(
     model_client: ModelClient,
     *,
     document_text: str,
     model: str | None = None,
-) -> list[CoverageClaim] | None:
-    """Extract atomic claims from a document. ``None`` on provider/parse failure."""
+) -> ExtractionOutcome:
+    """Extract atomic claims from a document.
+
+    Returns an :class:`ExtractionOutcome`: ``claims`` is a (possibly empty) list on
+    success, or ``None`` on failure with ``error`` set to a categorized,
+    user-facing reason (prompt unavailable / provider error / unparseable
+    response) so the coverage report can explain *why* extraction failed instead
+    of only that it did.
+    """
 
     if not document_text.strip():
-        return []
+        return ExtractionOutcome([])
     try:
         prompt = get_prompt("coverage_extract")
     except OSError:
         logger.warning("coverage_extract prompt missing.")
-        return None
+        return ExtractionOutcome(
+            None,
+            "the coverage extraction prompt is unavailable on the server "
+            "(deployment issue)",
+        )
     try:
         result = model_client.chat(
             [
@@ -137,11 +167,23 @@ def extract_claims(
             model=model,
             format_schema=_ClaimExtraction.model_json_schema(),
         )
-        data = json.loads(result.content)
-        return _ClaimExtraction.model_validate(data).claims
     except Exception as ex:  # pylint: disable=broad-except
-        logger.warning("Coverage claim extraction failed: %s", ex)
-        return None
+        logger.warning("Coverage claim extraction failed (provider): %s", ex)
+        return ExtractionOutcome(
+            None,
+            f"the model provider could not be reached or returned an error "
+            f"({type(ex).__name__}: {_short(str(ex))})",
+        )
+    try:
+        data = json.loads(result.content)
+        return ExtractionOutcome(_ClaimExtraction.model_validate(data).claims)
+    except Exception as ex:  # pylint: disable=broad-except
+        logger.warning("Coverage claim extraction failed (parse): %s", ex)
+        return ExtractionOutcome(
+            None,
+            "the model returned a response that could not be read as claims "
+            f"({type(ex).__name__})",
+        )
 
 
 # -- Stage B: MDL fact index -----------------------------------------------
@@ -687,15 +729,20 @@ def run_coverage_audit(
             return cached
 
     _raise_if_cancelled(should_cancel)
-    claims = extract_claims(model_client, document_text=document_text, model=model)
-    if claims is None:
-        # A provider failure is transient — do not cache it.
+    outcome = extract_claims(model_client, document_text=document_text, model=model)
+    if outcome.claims is None:
+        # A provider failure is transient — do not cache it. Surface the reason so
+        # the user can tell a deployment issue from a provider outage from bad output.
         return aggregate_report(
             [],
             document_id=document_id,
             document_filename=document_filename,
-            warnings=["Claim extraction failed; no coverage could be computed."],
+            warnings=[
+                f"Claim extraction failed, so no coverage could be computed: "
+                f"{outcome.error}."
+            ],
         )
+    claims = outcome.claims
     if not claims:
         report = aggregate_report(
             [],
@@ -778,6 +825,7 @@ def run_directory_coverage(
     # tagged back to the document its claim came from).
     sources: list[CoverageDocument] = []
     warnings: list[str] = []
+    failed_docs = 0
     total_docs = len(documents)
     for index, document in enumerate(documents):
         _raise_if_cancelled(should_cancel)
@@ -788,15 +836,30 @@ def run_directory_coverage(
             current=index + 1,
             total=total_docs,
         )
-        claims = extract_claims(model_client, document_text=document.text, model=model)
-        if claims is None:
-            warnings.append(f"Claim extraction failed for {document.filename}.")
+        outcome = extract_claims(
+            model_client, document_text=document.text, model=model
+        )
+        if outcome.claims is None:
+            failed_docs += 1
+            # Name the document AND the reason so the user can act (retry a
+            # provider blip vs. fix a deployment/config issue).
+            warnings.append(
+                f"Claim extraction failed for {document.filename}: {outcome.error}."
+            )
             continue
-        all_claims.extend(claims)
-        sources.extend([document] * len(claims))
+        all_claims.extend(outcome.claims)
+        sources.extend([document] * len(outcome.claims))
 
     if not all_claims:
-        warnings.append("No modelable claims were found across the documents.")
+        # Distinguish "nothing to model" from "extraction never succeeded" — the
+        # latter is a failure to explain, not a clean 0-claim document set.
+        if failed_docs == total_docs:
+            warnings.append(
+                f"Claim extraction failed for all {total_docs} document(s); "
+                "coverage could not be computed. See the reasons above."
+            )
+        else:
+            warnings.append("No modelable claims were found across the documents.")
         return aggregate_report([], warnings=warnings)
 
     _raise_if_cancelled(should_cancel)

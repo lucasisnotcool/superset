@@ -352,3 +352,33 @@ Decisions DP1–DP7 implemented as recommended. Key deltas, files, and gotchas:
   in the run; surface in a tooltip later).
 - Judge is one batched LLM call → no intra-judge "claim 80/142" granularity (Phase 4).
 </content>
+
+---
+
+## §13 — Extraction-failure diagnostics (2026-07-01)
+
+Users saw a bare "Claim extraction failed" in the coverage report with no reason.
+`extract_claims` collapsed three distinct failure modes to `None` and only logged
+the cause server-side. Now it returns an `ExtractionOutcome(claims, error)` with a
+categorized, user-facing reason:
+- prompt unavailable → "the coverage extraction prompt is unavailable on the server
+  (deployment issue)";
+- provider error → "the model provider could not be reached or returned an error
+  (`<ExcType>`: `<message>`)" (message flattened + truncated to 240 chars — enough to
+  name a timeout / 401 / rate-limit / connection-refused without dumping a payload);
+- unparseable output → "the model returned a response that could not be read as
+  claims (`<ExcType>`)".
+
+`audit_document` and `run_directory_coverage` thread the reason into `report.warnings`
+(rendered as-is by CoverageReportModal). The directory path also names each failed
+document and, when **every** document fails, emits an explicit "failed for all N
+document(s)" summary instead of the misleading "No modelable claims were found".
+
+Tests: `test_extract_claims_reports_provider_error_reason`,
+`test_extract_claims_reports_unparseable_response_reason`,
+`test_run_directory_coverage_surfaces_extraction_failure_reason`.
+
+Known follow-up (not done): a *total* extraction failure still aggregates to
+`score = 1.0` (vacuous) so the badge can read 100% next to the failure warning.
+Fixing that cleanly needs a structured "analysis incomplete" signal on
+`CoverageReport` (schema + badge + status endpoint), out of scope for this pass.

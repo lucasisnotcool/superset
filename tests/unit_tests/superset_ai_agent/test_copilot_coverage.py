@@ -236,17 +236,52 @@ JUDGE_JSON = json.dumps(
 def test_extract_claims_parses_structured_output() -> None:
     model = ScriptedModel([CLAIMS_JSON])
 
-    claims = extract_claims(model, document_text="some doc")
+    outcome = extract_claims(model, document_text="some doc")
 
-    assert claims is not None
-    assert len(claims) == 2
-    assert claims[0].kind == "definition"
-    assert claims[1].subject == "drive_unit"
+    assert outcome.error is None
+    assert outcome.claims is not None
+    assert len(outcome.claims) == 2
+    assert outcome.claims[0].kind == "definition"
+    assert outcome.claims[1].subject == "drive_unit"
 
 
 def test_extract_claims_empty_for_blank_document() -> None:
     model = ScriptedModel([])
-    assert extract_claims(model, document_text="   ") == []
+    outcome = extract_claims(model, document_text="   ")
+    assert outcome.claims == []
+    assert outcome.error is None
+
+
+def test_extract_claims_reports_provider_error_reason() -> None:
+    class BoomModel:
+        def is_reachable(self) -> bool:
+            return True
+
+        def list_models(self):
+            return []
+
+        def chat(self, *args, **kwargs):
+            raise TimeoutError("read timed out after 30s")
+
+    outcome = extract_claims(BoomModel(), document_text="some doc")
+
+    # No claims, and a categorized, human-readable reason naming the cause so the
+    # coverage report can explain *why* extraction failed (not just that it did).
+    assert outcome.claims is None
+    assert outcome.error is not None
+    assert "provider" in outcome.error
+    assert "TimeoutError" in outcome.error
+    assert "read timed out" in outcome.error
+
+
+def test_extract_claims_reports_unparseable_response_reason() -> None:
+    model = ScriptedModel(["this is not json"])
+
+    outcome = extract_claims(model, document_text="some doc")
+
+    assert outcome.claims is None
+    assert outcome.error is not None
+    assert "could not be read as claims" in outcome.error
 
 
 def test_judge_coverage_maps_findings_by_claim_id() -> None:
@@ -496,6 +531,31 @@ def test_run_directory_coverage_unions_claims_across_documents() -> None:
     assert by_doc["a.md"].document_id == "d1"
     assert by_doc["b.md"].status == "missing"
     assert by_doc["b.md"].document_id == "d2"
+
+
+def test_run_directory_coverage_surfaces_extraction_failure_reason() -> None:
+    # When the provider fails, every document's extraction fails: the report names
+    # each document AND the reason, plus an explicit "all failed" summary — instead
+    # of a bare "no claims found" that hides the failure.
+    report = run_directory_coverage(
+        RaisingModel([]),
+        documents=[
+            CoverageDocument("d1", "a.md", "doc a"),
+            CoverageDocument("d2", "b.md", "doc b"),
+        ],
+        files=[_file()],
+    )
+
+    joined = " ".join(report.warnings)
+    assert "Claim extraction failed for a.md" in joined
+    assert "Claim extraction failed for b.md" in joined
+    # The provider error class + message surface so the user can tell a transient
+    # blip from a configuration/deployment bug.
+    assert "RuntimeError" in joined
+    assert "provider down" in joined
+    # All docs failed → an explicit summary, not the misleading "no claims" line.
+    assert "failed for all 2 document(s)" in joined
+    assert "No modelable claims were found" not in joined
 
 
 def test_run_directory_coverage_emits_stage_progress() -> None:
