@@ -14,10 +14,23 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-from . import (  # noqa: F401
-    core,
-    database_grant,
-    dynamic_plugins,
-    sql_lab,
-    user_attributes,
-)
+from flask_babel import lazy_gettext as _
+
+from superset.commands.exceptions import CommandInvalidError, ObjectNotFoundError
+
+
+class DatabaseGrantNotFoundError(ObjectNotFoundError):
+    def __init__(self) -> None:
+        super().__init__("Database access grant")
+
+
+class DatabaseGrantDatabaseNotFoundError(CommandInvalidError):
+    message = _("Database does not exist or is not accessible")
+
+
+class DatabaseGrantNoUsernamesError(CommandInvalidError):
+    message = _("At least one username is required")
+
+
+class DatabaseGrantTooManyUsernamesError(CommandInvalidError):
+    message = _("Too many usernames in one request (maximum is 500)")

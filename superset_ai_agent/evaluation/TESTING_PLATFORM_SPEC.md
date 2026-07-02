@@ -18,6 +18,19 @@ vs "a thin bridge we build," not "built native." OSS selection facts are VERIFIE
 Phoenix (ELv2, Postgres-only) self-hosted UI + Promptfoo (MIT) optional in CI.
 Langfuse ruled out (v3 mandates ClickHouse, violating postgres-only). Our Postgres
 stays the system of record for eval data.
+
+REVISION 2 (July 2026, re-verified research pass): §12-§17 below. Adds the two
+features the original spec missed — F11 Project Benchmarks (the primary "test MY
+MDL project" user flow, Genie-style, in MDL Lab) and F12 Scientist agent (writes
+tests, interprets results, hands failure analyses to MDL Copilot as reviewable
+changesets, built on the shipped coverage-recovery precedent). Refreshes all OSS
+facts (Langfuse→ClickHouse acquisition; Promptfoo→OpenAI acquisition; MLflow 3.x
+newly scored; OTel gen_ai.evaluation.result event). Re-opens ONE decision (DP-16):
+Phoenix as the *product* UI vs native product surfaces + Phoenix as optional
+internal-eng sidecar — new evidence (category precedent: Genie/Omni/Power BI all
+built native; none embed a third-party eval UI) recommends the split. Upgrades the
+scoring methodology (§16) to BIRD/Genie-grade comparison + pass^k + paired-delta
+statistics. Re-orders phasing: Project Benchmarks before the prompt registry.
 -->
 
 # Superset AI Agent — Testing & Evaluation Platform
@@ -472,4 +485,150 @@ The mapping is 1:1 because our harness already uses the standard vocabulary — 
 - **Residual unverified:** Langfuse iframe/embedding (likely deep-link-out only); Phoenix runtime prompt-fetch-by-label maturity at load (see DP-15); exact Phoenix image tag features at deploy time.
 - **Codebase grounding:** `evaluation/` (harness), `prompts/registry.py` (prompt seam), `app.py` + `initialization/__init__.py` + `src/pages/AiAgentUsage/` (admin-surface pattern), `persistence/models.py` (`ai_agent_*` schema), `llm/` (client factory + metering).
 
-**Status: PROPOSED.** Awaiting sign-off on the build-native recommendation (§5) and DP-11/DP-12 before P0 scoping.
+---
+
+# REVISION 2 (July 2026) — verification refresh, competitive analogues, Project Benchmarks, Scientist agent
+
+Everything below was produced from a fresh research pass (official docs/repos/pricing fetched July 2026) plus a full codebase re-survey. §12 refreshes facts; §13 adds the competitive-analogue evidence the original spec lacked; §14-§15 add the two missing features (F11, F12); §16 upgrades the scoring methodology; §17 consolidates revised decisions and phasing.
+
+---
+
+## 12. Verification refresh (July 2026)
+
+### 12.1 Market events since the Jan 2026 verification
+
+| Event | Impact on this spec |
+|---|---|
+| **Langfuse acquired by ClickHouse** (Jan 16 2026; part of ClickHouse's $400M raise). All product features confirmed MIT (datasets, experiments, prompt mgmt, annotation queues); only SCIM/audit/retention are EE. | Disqualification **stands** — v3 still mandates ClickHouse+Redis+S3. The acquisition makes a future "Postgres-only Langfuse" *less* likely, not more. |
+| **Promptfoo acquired by OpenAI** (announced Mar 2026; $18.4M Series A Jul 2025 prior). | Risk flag on the "Promptfoo in CI" leg (§5-REVISED item 3). Neutrality/roadmap now OpenAI-controlled. **Mitigation:** make DeepEval's pytest gating (`assert_test` + `deepeval test run`) the primary CI mechanism; keep Promptfoo strictly optional. |
+| **Braintrust** $80M Series B (ICONIQ, Feb 2026, ~$800M valuation; Notion/Stripe/Zapier/Vercel/Ramp). Control plane (UI+auth) **cannot** be self-hosted even hybrid. | Still out. |
+| **LangSmith** — LangChain $125M Series B at $1.25B (Oct 2025). Self-host remains Enterprise-only (license key, K8s+ClickHouse). | Still out. |
+| **Weave** — self-managed requires commercial W&B license + ClickHouse operator. **Opik** — Apache-2.0, ~20k stars, but ~10-service stack (ClickHouse+ZooKeeper+MySQL+Redis+MinIO) and OSS ships **zero user management**. | Both still out. |
+
+### 12.2 Confirmed picks (unchanged)
+
+- **Phoenix** re-verified: ELv2 (internal self-host free, full features, air-gap OK; prohibited only as a hosted/managed service to third parties); **single container, SQLite/Postgres only** (`PHOENIX_SQL_DATABASE_URL`); OSS OAuth2/OIDC + RBAC; full REST (OpenAPI-generated Python/TS clients) + GraphQL; OpenInference/OTLP native; ~10.4k stars.
+- **DeepEval** re-verified: Apache-2.0, ~16.6k stars, fully offline without Confident AI; G-Eval + DAG metric (decomposed binary micro-judgments) + tool-correctness/task-completion; pytest CI gating documented. Claimed in CI at BCG, AstraZeneca, AXA, Microsoft.
+- **Ragas** (new addition to the engine layer): Apache-2.0, ~14.6k stars, ships the exact SQL metrics we need — **`DataCompyScore` (execution result-DataFrame comparison) and `LLMSQLEquivalence`** — plus agent metrics (tool-call accuracy, goal accuracy). Use as metric definitions/reference implementation alongside DeepEval; our comparator (§16) remains our own code.
+
+### 12.3 Newly scored candidate: MLflow 3.x GenAI
+
+Apache-2.0 (~26.8k stars, Linux Foundation), pure Python library + Flask tracking server over SQLAlchemy (SQLite/Postgres) — the lightest self-host and the most architecturally adjacent to Superset. Ships `mlflow.genai.evaluate(data, predict_fn, scorers)`, 50+ scorers incl. guidelines-based judges, versioned Evaluation Datasets, Prompt Registry (immutable versions + aliases + lineage), OTel GenAI-semconv tracing (ingest *and* export). **Why it doesn't displace the picks:** OSS auth is experimental basic-auth only (no RBAC/SSO without a proxy), the human-review Review App and production monitoring are **Databricks-exclusive**, and its generic experiment UI would still need all our NL→SQL-specific surfaces built around it. **Verdict:** treat MLflow as *schema/API inspiration* (its prompt-registry alias model and evaluate() interface) and the Apache-2.0-clean fallback if the ELv2 posture on Phoenix ever hardens. No change to picks.
+
+### 12.4 Standards updates
+
+- **OTel GenAI semconv now includes evaluation results**: the `gen_ai.evaluation.result` event (semconv v1.39.0, merged Aug 2025) with `gen_ai.evaluation.name`, `.score.value`, `.score.label`, `.explanation`. → **Action:** name the columns of `ai_agent_eval_score` to map 1:1 onto these attributes (name, value numeric, label categorical, explanation text). Cheap future-proofing for F8.
+- LLM client spans are stable/near-stable; agent spans (`invoke_agent` → `chat`/`execute_tool`) still experimental but converged in practice. OpenInference remains the richer LLM/RAG vocabulary; both ride OTLP, so emitting OTLP keeps us portable either way.
+- **Consensus data model re-confirmed** across Langfuse/LangSmith/Braintrust/Phoenix/Opik/Weave/MLflow/OpenAI-Evals — §3's vocabulary is still exactly right. Two refinements worth adopting: (a) **Score object** = name + typed value (numeric|categorical|boolean) + `source` enum (CODE | LLM_JUDGE | HUMAN | API) + comment/rationale — the Langfuse shape, interoperable with all; (b) **dataset versioning with experiments pinned to a dataset version** is now universal (Phoenix versions on every mutation; Langfuse added versioned-dataset experiments Feb 2026) — §3's design rule holds.
+- **LLM-judge practice** (for F4's judge layer): binary pass/fail + written critique beats Likert scales (Hamel Husain "critique shadowing"); explicit `evaluation_steps`/rubrics beat judge-invented criteria; a **panel of 3 small judges from disjoint model families beats a single GPT-4-class judge at ~1/7 cost** (PoLL, arXiv:2404.18796); calibrate judges against a small human-labeled set before trusting them; keep the judge's rationale in the score's comment field. And for SQL the doctrine is unambiguous: **execute and compare result sets; judges are diagnostic/tie-break only** (§16).
+
+---
+
+## 13. Competitive analogues — in-product NL→SQL testing (new evidence)
+
+The original spec's landscape (§2) covered *eval platforms*. This section covers the *product category we're actually building in*: NL-to-data products letting users test **their** semantic model. Key finding: **every vendor that shipped in-product evals built the surface natively — none embedded a third-party eval platform's UI.** External platforms (Langfuse etc.) appear only as internal engineering tools (e.g., Wren's OSS eval traces to Langfuse).
+
+### 13.1 The two shipped scored-eval harnesses
+
+**Databricks AI/BI Genie — Benchmarks** (docs.databricks.com/aws/en/genie/benchmarks) — the validated product shape:
+- Per-Genie-space **Benchmarks tab**; up to **500 questions per space**.
+- Item = question + mode: **Chat** (optional ground-truth **SQL answer**; UC SQL functions usable as gold) or **Agent** (optional free-text **evaluation note** guiding an LLM judge).
+- Chat-mode scoring is **data comparison with a published rubric** — *Good:* exact SQL, exact result set, same data different sort order, or numerics rounding to the **same 4 significant digits**. *Bad:* empty result, errors, **extra columns**, mismatched cells. *Manual review needed:* undecidable. (Three-way verdict — adopt this; never force binary.)
+- Async runs (navigate away, keep running); **Evaluations tab** = timestamped run history with overall accuracy % and per-question "Model output vs Ground truth" drill-down.
+- Feedback loop: instructions + example SQL + **trusted assets** (answers from trusted assets get a "verified" badge); no automated repair loop.
+
+**Wren AI Cloud — Evaluation + AI Advisor** (docs.getwren.ai/cp/guide/evaluation/) — the closest analogue to our whole plan, on our own MDL substrate:
+- Test scenario = NL question + **ground-truth SQL** (Wren SQL, with AI "Generate" assist and "Preview data" validation) + AI-generated, author-editable **expected output** (expected answer / tables / conditions).
+- Runs produce per-question **Pass/Fail with named score reasons** (e.g., "Column count mismatch: generated is missing 1 column(s)"), SQL diffs, data-preview comparisons, AI thinking steps, and **manual verdict override**.
+- **AI Advisor** — the shipped Scientist-agent precedent: analyzes Failed questions → stages suggestions (schema-metadata edits + global/question-matched instructions) → **verifies against the originally failed questions** → **runs full-benchmark regression** → only then "Apply to AI system."
+- Runtime levers: Question-SQL pairs (verified answers reused for similar questions) + Instructions (global / question-matching) — mirrors our golden-queries + instructions stores exactly.
+- The OSS repo's eval framework (`wren-ai-service/eval`, legacy branch) is curate→predict→eval with execution-based "Accuracy" + LLM judges (`SqlSemanticsJudge` etc.), traced to Langfuse — engineering tool, not product.
+
+**Omni — AI Evals** (docs.omni.co/ai/evals): reusable prompt sets (≤25 questions/set), optional free-text "expected behavior" reference, **fixed built-in LLM judge** returning binary pass/fail + confidence + evidence-anchored rationale with explicit critical-error checks (hallucination, date/off-by-one filters, row-limit, mental-math). Distinctive: runs target a **model branch**, so authors measure a semantic-model change **before promoting to main**; side-by-side run comparison with per-prompt regressed/improved and cost/duration.
+
+### 13.2 Everyone else: levers without a harness
+
+- **Snowflake Cortex Analyst** — **Verified Query Repository**: `verified_queries` in the semantic-model YAML (`name, question, sql, verified_at, verified_by, use_as_onboarding_question`); SQL must use **logical semantic-model names, not physical** — verified queries are semantic-layer artifacts. Used at inference as retrieval/few-shot; API exposes `verified_query_used` in the confidence field; Snowsight **suggests new verified queries from observed usage** (production traffic mined into candidate exemplars/tests). Their engineering blog "Agentic Semantic Model Improvement" describes a multi-agent loop (Model Creation / Relationships / Semantic Model Editor / Custom Instruction Editor / Evaluator agents, two-step validation: column comparison then LLM semantic-equivalence) lifting BIRD-domain EX **57%→78% average** — published research, **not shipped product**.
+- **Power BI / Fabric "Prep data for AI"** — verified answers = **trigger phrases** (5-7 rec., max 15/answer) + pinned visual + ≤3 filters, **max 250/model**, verified checkmark + provenance ("How Copilot arrived at this"); AI instructions (10k chars); testing is manual chat-pane iteration; docs explicitly warn Copilot is nondeterministic. No scoring.
+- **Looker Conversational Analytics** — "golden queries" as question/query pairs *inside instruction text*; preview pane; thumbs feedback goes to Google; no harness. **ThoughtSpot Spotter** — richest human loop: 4-way failure taxonomy at thumbs-down (incorrect data / lost context / poor viz / incomplete), Coach Spotter token-mapping console, Conversations Liveboard monitoring; no batch eval. **dbt/MetricFlow** — parsing/semantic/data-platform validations (`mf validate-configs`, `dbt sl validate`), CI-friendly, but config-level only; their separate `dbt-llm-sl-bench` repo (execute-and-compare vs gold) found **semantic layer ≥98% vs 84-90% raw text-to-SQL** — evidence for the MDL premise itself. **QuickSight Q** — verified-answers tab, human review only. **Tableau/Zenlytic** — trust markers, no evals.
+
+### 13.3 What this means for us
+
+1. **The product shape is validated three times over** (Genie, Wren, Omni): project-scoped test sets of question+gold-SQL, async scored runs, run history with per-question output-vs-truth drill-down, three-way verdicts.
+2. **The differentiator is the closed loop.** Only Wren Cloud ships eval→advisor→regression→apply. Nobody ships it wired to a *reviewable changeset* UX (our coverage-recovery pattern) or with our capability × config diagnostics. Genie has scale but no repair loop; Omni has branches but no SQL ground truth; Snowflake published the method but not the product.
+3. **Dual-use is the flywheel every vendor converged on**: verified/golden Q-SQL pairs are simultaneously *eval ground truth* and *retrieval few-shot assets*. We already have the retrieval half shipped (`ai_agent_nl_sql_examples` golden store + recall). F11 must make the two sides of the flywheel one artifact, not two.
+4. **Native UI is the category norm** — feeds DP-16 (§17).
+
+---
+
+## 14. F11 — Project Benchmarks (the primary user flow; NEW)
+
+- **What:** a **Benchmarks tab in MDL Lab** (SemanticLayerEditor detail pane, sibling of CoveragePanel/GoldenQueriesPanel): per-project test sets of NL question + typed ground truth; async scored runs against the *current* (or a chosen) state of the project + agent; run history with per-question drill-down. This is the Genie/Wren shape, project-scoped — distinct from the admin-side Experiments surface (F5), which sweeps configs; F11 is "score MY project," F5 is "compare configurations."
+- **User intent:** *"I curated this MDL project — is the agent right about my data, and did my last MDL change help?"* This is the headline use case of the request and the daily loop for the MDL-curator persona. It is deliberately **not admin-gated** — it belongs to whoever can edit the project.
+- **Data model** (slots into §3): a Benchmark is a **project-scoped Dataset**; item = `{question, answer_spec}` where `answer_spec` is one of:
+  - `gold_sql` — ground-truth SQL **written against MDL logical names** (Snowflake's rule; survives physical schema changes and keeps the artifact semantic-layer-native). Authoring assists: "Generate with AI" + "Preview data" (Wren), or "promote from a conversation" (save a correct answer as a benchmark item — the Snowsight suggestion pattern, mineable from `ai_agent_conversations`).
+  - `typed expected values` — our existing `{nums (±tolerance) | names+absent | trap | zero}` spec (`seagate_scoring` semantics; our differentiator — Genie/Wren have nothing like trap/zero/absent assertions).
+  - `eval_note` — free-text rubric for an LLM judge (Genie Agent-mode / Omni pattern; for open-ended questions with no single gold query).
+  Plus per-item: capability tags, `verified_by/verified_at`, `use_as_example` (see flywheel), soft cap ~500 items/project (Genie-validated scale).
+- **The flywheel (dual-use with golden queries):** one artifact, two roles. A benchmark item with `gold_sql` and `use_as_example=true` is *also* recallable as a few-shot exemplar (feeds the existing `ai_agent_nl_sql_examples`/golden-query recall); conversely a golden query can be imported as a benchmark item in one click. **Leakage control:** runs execute with example-recall **excluding the item under test** (or with recall off), else the agent is handed the answer — report "with/without exemplar recall" as an explicit run config instead. This subsumes part of the golden-queries-shared-memory spec's scope; reconcile there.
+- **Runs:** an F11 run is an `ai_agent_jobs` job (DP-6 unchanged) emitting progress over the project events SSE; per-item execution = the existing `TextToSqlGraph.run()` with the project pinned; results/scores persist to `ai_agent_eval_*` (F1 tables — F11 is their first consumer, ahead of F5). Verdicts are **three-way** (pass / fail / needs-review) per §16, with **manual override** stored as a HUMAN-source score (Wren precedent).
+- **UI:** Benchmarks tab → items table (typed answer-spec editor + dry-run preview per DP-4/F3) → "Run all / Run subset" → run banner with live progress → **Evaluations history** (timestamped, overall score + per-capability) → per-question view: agent SQL vs gold SQL diff, result-rows vs expected side-by-side, trace/timeline link, verdict + override. Comparison view: run A vs B joined on item (improved/regressed coloring — Braintrust/Omni pattern), annotated with the MDL version (files checksum) each ran against — the "did my MDL edit help" answer.
+- **Authz:** project routes already pass `authorize_semantic_project(...)`; benchmark CRUD/runs ride the same gate. **SQL execution uses the caller's fingerprint-proved connection** (BYO-credentials pattern) — gold SQL runs with the runner's own DB rights, so a benchmark author cannot exfiltrate data beyond what they can already query. Runs record which connection/owner executed them.
+- **Pros:** the request's core ask; validated shape (§13.1); nearly all machinery exists (graph run primitive, jobs+SSE, scorer, MDL Lab surface, golden store); non-admin personas get value without touching prompts. **Cons:** the typed answer-spec editor and the diff/compare views are real frontend work; result-set comparator needs the §16 upgrade to be trustworthy on arbitrary user data.
+- **Risks / mitigations:** *R:* gold SQL authored against physical tables silently diverges from the MDL → *M:* validate references against project logical names at save (reject or warn). *R:* eval-vs-exemplar leakage inflates scores → *M:* exclusion rule above + run-config transparency. *R:* users run 500 questions × trials and burn tokens → *M:* pre-run cost estimate from `MeteredModelClient` history + confirmable cap (same as F5). *R:* gold SQL is wrong/ambiguous (a top failure bucket in BIRD/Spider audits) → *M:* "needs review" verdict class + F12's "the test is wrong" diagnosis + verified_by provenance.
+- **DP-16..DP-18: see §17.**
+- **Recommendation: build first after F1 — this replaces F2 as the P1 headline** (see §17 phasing rationale).
+
+## 15. F12 — Scientist agent (NEW)
+
+- **What:** an agent (conversation `kind="scientist"`, reusing the shipped recovery-agent architecture end-to-end) that operates the testing platform for the user: **(a) writes tests** — proposes benchmark items from the MDL, documents, golden queries, and real conversation history (each with draft gold SQL + preview, saved only on user approval); **(b) interprets results** — turns a run (or run-pair) into a findings narrative with statistical honesty (§16): what regressed, which capability, paired deltas with CIs, "this movement is within noise"; **(c) diagnoses failures** using a fixed error taxonomy, each class wired to an MDL fix type: schema-linking → synonyms/descriptions; join-path → relationships; aggregation/GROUP BY → metric definitions; filter/value → sample values/enums; time semantics → time-dimension config; **plus the mandatory verdict "the test is wrong/ambiguous"**; **(d) proposes fixes** — hands its failure analysis to the **MDL Copilot** as a seeded conversation producing a staged, reviewable **changeset artifact** (never auto-applied), exactly like `_run_recovery_job`: coverage report → recovery conversation → changeset → persist-until-dismissed notification → ChangesetReviewPanel diff dialog. F10 (report generation) folds into (b).
+- **User intent:** *"Don't make me be the eval scientist — tell me why it failed, what to change, and prove the change helps."*
+- **Why this shape is right (evidence):** Wren's **AI Advisor** ships this loop today (analyze fails → stage suggestions → verify against fails → **full regression** → apply) — the regression-before-apply discipline is the part to copy verbatim. Snowflake's agentic semantic-model improvement validated the method (BIRD domains EX 57%→78%) with the same two-step evaluator (columns, then LLM equivalence). GEPA (arXiv:2507.19457) shows *reflective* failure analysis beats brute-force search at ~35× fewer rollouts — the Scientist is GEPA's reflect-and-mutate loop with "MDL patch" replacing "prompt patch." And per §13.2, nobody in the category ships this wired to a reviewable-changeset UX — it's the differentiator.
+- **Tools (extends `MdlToolset` pattern):** `list_benchmark_items / read_run / read_result(item)` (needs F1+F11), `propose_benchmark_item`, `diagnose_failure` (structured taxonomy output), `compare_runs` (paired stats), `read_document / find_tables / get_physical_schema` (existing), `handoff_to_copilot(failure_report)` → seeds the copilot conversation; **no direct MDL mutation tools** — all changes go through the Copilot changeset gate.
+- **Verification loop (the Wren discipline):** after a Copilot changeset from a Scientist handoff is applied, the platform offers (later: auto-runs, flag-gated) a **verification run** — failed items first, then full benchmark — and the comparison annotates the changeset with measured effect. A proposal is only ever *validated* by re-measurement, never by assertion.
+- **Pros:** converts the platform from dashboard to closed loop; ~80% of the architecture is shipped (recovery agent, copilot toolset, changeset review, jobs/SSE, conversations); consumes exactly what F1/F11 produce. **Cons:** LLM cost (an analysis pass over N failures + copilot session + verification run); depends on F1+F11 existing; diagnosis quality needs the trace/timeline data to be complete per-run.
+- **Risks / mitigations:** *R:* Scientist chases noise (proposes MDL churn off a within-variance delta) → *M:* the statistical gate in §16 is a **hard precondition** for `handoff_to_copilot` (paired delta must clear the CI), and prompts instruct "insufficient evidence" as a first-class conclusion. *R:* runaway cost → *M:* user-triggered at launch (a "Analyze this run" button on a completed run), budget cap, `MeteredModelClient` metering; auto-run mode ships later behind a flag (mirror `wren_coverage_recovery_enabled`, off by default). *R:* bad proposed tests pollute the benchmark → *M:* proposals land as drafts requiring approval + dry-run preview (F3/F11 rule); provenance records `proposed_by=scientist`. *R:* self-review bias (agent judging the agent) → *M:* diagnosis uses a separately configured judge model where available (F4 judge-model separation; PoLL-style small-judge panel is the cheap upgrade path).
+- **Phasing:** **v1 (read-only Scientist):** interpret + diagnose + draft tests — no Copilot handoff. **v2:** `handoff_to_copilot` + verification run + changeset annotation. **v3:** auto-run after benchmark completion, flag-gated off by default (recovery-agent parity).
+- **Recommendation:** P3, immediately after F11 has produced real run data; v1 is small (a system prompt + read tools + the run schema).
+
+## 16. Scoring & statistics methodology (upgrades F4's comparator; normative)
+
+**Result-set comparator v2** (replaces "scan cells for expected values" as the general-purpose scorer; `seagate_scoring`'s typed semantics remain the *assertion* layer on top):
+1. Compare rows as **multisets** (bag semantics); sets only when gold SQL has DISTINCT.
+2. **Row order invariant**, unless gold has a top-level ORDER BY — then compare ordered but treat **tie-groups as unordered** (BIRD sorts before compare for `ORDER BY … LIMIT` ties).
+3. **Column order/name invariant**: align columns by best value-alignment (BIRD soft-F1 method), never by generated alias.
+4. **Numeric tolerance**: match at **4 significant digits** by default (Genie's shipped rule), configurable relative tolerance; canonicalize types before compare (numeric strings→numbers, canonical date format, NULL vs empty-string policy).
+5. **Extra columns are a policy knob**: strict mode = fail (Genie); soft mode = partial credit. Emit **both** scores per item: binary **EX** (three-way verdict) *and* **soft-F1** (matched cells TP / extra predicted FP / missing gold FN) so users see "80% right," not just "fail."
+6. Run gold and predicted SQL **in the same engine/session** (we do — the caller's connection), with runtime caps; flag **empty-vs-empty matches as low-confidence passes** (classic EX false positive); optionally support a second data snapshot to kill coincidental passes (test-suite-accuracy idea, cheap version).
+7. LLM judge only where deterministic comparison can't decide (`eval_note` items, "needs review" escalation, divergence *explanation*) — never as the primary correctness signal for SQL.
+
+**Statistics (normative for every comparison surface, and F12's gate):**
+- Default **3 trials** per item (existing pattern); report **pass^k** ("all k trials passed" — reliability, per tau-bench) alongside mean pass-rate, with per-trial visibility. Agents that look fine at pass@1 collapse at pass^k; a BI product sells reliability.
+- Run-vs-run banners must show **paired deltas on the shared item set with a CI** (bootstrap over per-item paired differences works at n≈50-200; cluster by table/topic where items are correlated — Anthropic "Adding Error Bars to Evals" recs 1-4). **Never render a bare "72%→78%" without significance**; the UI marks within-noise deltas as such, and F12 refuses to act on them.
+- Cache scoring by `(item_id, mdl_checksum, agent_config_hash, prompt_version, data_snapshot_id)`; store the gold result fingerprint once per MDL/data version; offer a fixed smoke-subset for cheap pre-checks (full suite for releases).
+
+## 17. Revised decisions & phasing
+
+### 17.1 New/changed decision points
+
+| # | Decision | Recommendation |
+|---|---|---|
+| **DP-16** | **Phoenix as the *product* UI (per §11) vs native product surfaces + Phoenix as optional internal-eng sidecar** — re-opened with new evidence: (a) category precedent is unanimous — Genie/Wren/Omni/Power BI all built native, none embed a third-party eval UI; (b) the primary flow (F11) is project-scoped inside MDL Lab and cannot render inside Phoenix, nor can Phoenix drive `TextToSqlGraph`, fingerprint authz, or Copilot changesets; (c) ELv2 constrains any future multi-tenant/customer-facing exposure of the surface; (d) the auth bridge (§11.3) was always the hardest integration piece — spent on a generic UI that knows nothing of capability × config, MDL projects, or changesets. | **Split the roles.** Product surfaces (F11 Benchmarks in MDL Lab; F5 experiments/compare; F2 prompt editor) = **native**, on our tables, per the §6.2 flows. **Phoenix stays as an optional, admin-only, OTLP-fed internal-engineering sidecar** (trace drill-down, playground) — P3, config-gated, never the product dependency. DeepEval/Ragas as in-process engine and the §3 schema/OTel standards **unchanged** — this preserves the "prefer OSS" intent where OSS genuinely saves work (engine, standards, eng observability) and follows the category norm where it doesn't (the user-facing surface). Downstream effects: DP-14 moot for F11 (project authz, not admin); DP-15 resolves to the minimal `ai_agent_prompt`/`_version` tables (§11.4 option b). **Needs sign-off — supersedes §11.4/§11.7-§11.8 scope if accepted.** |
+| **DP-17** | F11 answer-spec forms at launch | All three (`gold_sql` + typed values + `eval_note`); `gold_sql` is the primary authored path, typed values the migration target for `seagate_scoring.EXPECTED`, `eval_note` the judge escape hatch. |
+| **DP-18** | Benchmark ↔ golden-query relationship | **One artifact, two roles** (`use_as_example` flag + leakage exclusion at run time), not two synced stores. Reconcile with the golden-queries-shared-memory spec (project-scoped, nothing user-scoped — consistent with its directive). |
+| **DP-19** | Scientist autonomy at launch | User-triggered analysis on a completed run (v1); Copilot handoff v2; auto-run v3 flag-gated off (recovery parity). Statistical gate is non-negotiable in all versions. |
+| **DP-20** | CI gating mechanism (updates §5-REVISED item 3) | **DeepEval pytest** as primary (Apache-2.0, already the engine); Promptfoo optional/at-risk post-OpenAI-acquisition. Gate on paired deltas with tolerance bands (F9 unchanged otherwise). |
+| **DP-21** | Comparator implementation | Own code implementing §16 (it must run inside our execution/authz path), using Ragas `DataCompyScore`/BIRD soft-F1 as the reference definitions; DeepEval G-Eval/DAG for the judge layer. |
+
+### 17.2 Revised phasing (supersedes §11.8)
+
+Rationale for the re-order: the request's stated main use case is F11, its persona is the project curator (not admin), and it needs no prompt registry — while F2 without run data can't attribute scores to prompt versions anyway. Prompts move to P2.
+
+| Phase | Work | Outcome |
+|---|---|---|
+| **P0 — Foundation** | `ai_agent_eval_*` tables (§3 vocabulary, scores OTel-shaped per §12.4); comparator v2 + stats module (§16, pure functions + offline tests); `run_eval_v4.py` writes DB rows alongside JSON | History + trustworthy scoring exist; CLI unchanged |
+| **P1 — Project Benchmarks (F11)** | Benchmark CRUD API + MDL Lab Benchmarks tab; typed answer-spec editor + dry-run; async runs (jobs+SSE) via `TextToSqlGraph`; Evaluations history + per-question drill-down + run-vs-run compare; golden-query flywheel (DP-18) | **The headline use case ships**: users test their MDL project in-product |
+| **P2 — Prompts & experiments** | F2 prompt registry (minimal own tables per DP-16/DP-15, file-seeded, candidate→promote) + editor; F4 evaluator registry formalized (judge layer: rubric + PoLL-style panel option); F5 admin Experiments surface (config matrix over datasets incl. benchmarks; capability × config scoreboard) | Tuners sweep prompts/configs and attribute scores to prompt versions |
+| **P3 — Scientist & depth** | F12 v1→v2 (analysis, diagnosis, test drafting; Copilot handoff + verification runs); F7 model sweeps; F9 CI gating (DP-20); F8 OTLP export + optional Phoenix eng-sidecar; F12 v3 auto-run (flag-gated) | The closed loop: fail → diagnose → propose → review → re-measure |
+
+**Status: PROPOSED, Revision 2.** Sign-off needed on **DP-16** (native product surfaces vs Phoenix-as-product-UI — supersedes parts of §11 if accepted), **DP-17..DP-21**, and the P1 re-order (Benchmarks before prompts). Research provenance: July 2026 pass — official docs/repos for Langfuse (+ClickHouse acquisition), LangSmith, Braintrust, Phoenix, Opik, Weave, MLflow 3.x, DeepEval, Ragas, Promptfoo (+OpenAI acquisition), OpenAI Evals API, OTel GenAI semconv; Genie Benchmarks, Snowflake VQR + agentic-improvement blog, Wren AI Cloud Evaluation/AI Advisor, Omni AI Evals, Power BI Prep-data-for-AI, Looker CA, ThoughtSpot Spotter, dbt/MetricFlow + dbt-llm-sl-bench; BIRD/mini-dev (soft-F1, R-VES), Spider test-suite eval, Spider 2.0, tau-bench (pass^k), GEPA, Anthropic error-bars.

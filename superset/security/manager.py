@@ -744,6 +744,12 @@ class SupersetSecurityManager(  # pylint: disable=too-many-public-methods
         "UserGroupModelView",
         "Row Level Security",
         "Row Level Security Filters",
+        # Admin pre-approval of usernames for database access. Managing grants
+        # is Admin-only; the self-scoped endpoints (can_mine/can_acknowledge)
+        # are granted separately to non-admin roles that should receive grants
+        # (see BuilderSecurityManager.GRANT_SELF_PERMS).
+        "DatabaseAccessGrant",
+        "Database Access Grants",
         "Security",
         "SQL Lab",
         "User Registrations",

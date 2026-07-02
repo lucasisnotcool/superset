@@ -106,6 +106,14 @@ test('lists the project documents and shows the upload dropzone', async () => {
   expect(mockList).toHaveBeenCalledWith('project-1');
 });
 
+test('warns that uploaded documents are shared by database access', async () => {
+  // D1b: documents are DB-tied — the point-of-authoring note must say so where
+  // a user introduces content others will read.
+  setup();
+  const note = await screen.findByTestId('attach-document-shared-note');
+  expect(note).toHaveTextContent(/shared with everyone who can connect/i);
+});
+
 test('pre-checks already-attached documents and reflects the count', async () => {
   setup({ attachedDocs: [doc()] });
   await screen.findByTestId('attach-doc-d1');

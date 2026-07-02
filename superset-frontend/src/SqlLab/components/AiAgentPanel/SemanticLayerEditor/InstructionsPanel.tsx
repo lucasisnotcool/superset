@@ -155,23 +155,29 @@ export default function InstructionsPanel({
   return (
     <PanelRoot data-test="semantic-layer-instructions">
       {/*
-        DP-NEW: a project's documents, models, and history are shared with everyone
-        who has access to its database, but instructions are deliberately personal
-        (like the agent's SQL memory). Say so plainly so a shared-project user is
-        never surprised that teammates can't see — or aren't steered by — these.
+        Instructions are DB-tied (shared with everyone who can connect to this
+        database), like the project's documents, models, golden queries, and the
+        agent's learned SQL — only chat conversations stay private. Say so plainly
+        at the point of authoring so a user never assumes these are personal and
+        puts sensitive steering text where teammates will see (and be steered by)
+        it. The canonical sharing signal is the "Shared" badge in the workspace
+        strip; this note reinforces it where content is actually typed.
       */}
       <Alert
         type="info"
         showIcon
-        data-test="instructions-personal-note"
+        data-test="instructions-shared-note"
         message={t(
-          'Your instructions are personal. They steer SQL generation for this ' +
-            'schema for you only — other users with access to this database ' +
-            "don't see or share them (unlike the project's documents and models).",
+          'Instructions are shared with everyone who can connect to this ' +
+            'database. They steer SQL generation for this schema for all of ' +
+            "them — don't add anything you wouldn't share.",
         )}
       />
       <Typography.Paragraph type="secondary" style={{ margin: 0 }}>
-        {t('Only your own instructions are listed below.')}
+        {t(
+          'All instructions for this database and schema are listed below, ' +
+            'whoever added them.',
+        )}
       </Typography.Paragraph>
       {canWrite && (
         <Flex vertical gap="small">

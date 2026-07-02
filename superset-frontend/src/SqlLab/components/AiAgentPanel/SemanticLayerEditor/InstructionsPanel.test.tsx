@@ -77,14 +77,15 @@ test('lists existing instructions for the scope', async () => {
   ).toBeInTheDocument();
 });
 
-test('shows a clear note that instructions are personal, not shared', async () => {
-  // DP-NEW: the rest of a shared project is visible to all DB-authorized users,
-  // but instructions are personal — the UI must say so explicitly.
+test('shows a clear note that instructions are shared by database access', async () => {
+  // D1b: instructions are DB-tied — shared with everyone who can connect to the
+  // database, like the project's documents/models. The UI must say so at the
+  // point of authoring so a user never assumes they are personal.
   fetchMock.get(LIST_URL, []);
   renderPanel();
-  const note = await screen.findByTestId('instructions-personal-note');
-  expect(note).toHaveTextContent(/personal/i);
-  expect(note).toHaveTextContent(/other users with access to this database/i);
+  const note = await screen.findByTestId('instructions-shared-note');
+  expect(note).toHaveTextContent(/shared with everyone who can connect/i);
+  expect(note).not.toHaveTextContent(/personal/i);
 });
 
 test('renders an empty state when there are no instructions', async () => {
@@ -191,6 +192,6 @@ test('surfaces a load error without crashing', async () => {
   renderPanel();
   // The panel renders its static help copy even when the list load fails.
   expect(
-    await screen.findByText(/Only your own instructions are listed/),
+    await screen.findByText(/All instructions for this database and schema/),
   ).toBeInTheDocument();
 });

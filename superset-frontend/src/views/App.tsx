@@ -32,6 +32,7 @@ import { ErrorBoundary } from 'src/components';
 import Menu from 'src/features/home/Menu';
 import getBootstrapData, { applicationRoot } from 'src/utils/getBootstrapData';
 import ToastContainer from 'src/components/MessageToasts/ToastContainer';
+import DatabaseGrantNotice from 'src/features/databaseGrants/DatabaseGrantNotice';
 import setupApp from 'src/setup/setupApp';
 import setupPlugins from 'src/setup/setupPlugins';
 import { routes, isFrontendRoute } from 'src/views/routes';
@@ -116,6 +117,7 @@ const App = () => (
         </Switch>
       </ExtensionsStartup>
       <ToastContainer />
+      <DatabaseGrantNotice />
     </RootContextProviders>
   </Router>
 );

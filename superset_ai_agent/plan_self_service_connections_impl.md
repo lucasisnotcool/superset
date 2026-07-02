@@ -39,9 +39,21 @@
 7. **Phase 4 open:** SSRF host deny-list (DP-D), audit logging, SECRET_KEY-from-secrets-manager runbook, `_auth_context_cache` TTL review for de-share latency.
 
 ### UI-expectation gaps (user intent vs current UI)
-- **Connection modal:** Builders now see "+ Database" and only their own rows — no UI change needed; but there is **no "shared with everyone who can reach this DB" affordance** anywhere. Users may not realize MDL projects/docs/instructions they author are visible to other holders of connections to the same DB. Recommend a small "Shared via database access" badge in MDL Lab (Phase 4 UX).
+- **Connection modal:** Builders now see "+ Database" and only their own rows — no UI change needed.
+- ~~**No "shared" affordance**~~ — **CLOSED (2026-07-02, P1–P3 below).**
 - **Instruction delete:** now requires an active scope (schema selected). The panel already guards on scope, so no visible change; deleting from a stale panel after switching schema will 404/403 — acceptable, surfaced via existing toast.
 - **`superset init` required** after deploy for the Builder role to exist; self-registration flows 500 on a missing role otherwise (deployment runbook note).
+
+### UI sharing-affordance closure (P1–P3, 2026-07-02) — SHIPPED
+- **P1 (correctness bug fixed):** `InstructionsPanel.tsx` previously asserted instructions were **personal/private** (`instructions-personal-note`, "Only your own instructions are listed") — written for the pre-D1b design, made **false** by the D1b re-keying. Replaced with accurate DB-tied copy (`instructions-shared-note`, "…shared with everyone who can connect to this database… don't add anything you wouldn't share"). Tests updated.
+- **P2 (canonical affordance):** new `DatabaseSharedBadge.tsx` (Tag+Popover, neutral/blue, `Icons.UsergroupAddOutlined`, keyboard-focusable per WCAG 1.4.1/2.1.1) in the MDL Lab workspace-strip badge cluster (`index.tsx` beside `SemanticLayerStateBadge`/`CoverageBadge`). Popover names the database and enumerates what's shared (models/docs/instructions/goldens/learned SQL) vs private (chat). 4 new tests.
+- **P3 (point-of-authoring hints):** shared-note Alert on `AttachDocumentDialog.tsx` (document upload) + the corrected P1 note on instructions — the two surfaces where a user *types content others will read*. Goldens (promoted, not typed) and memory (passive) rely on the P2 badge only. Freeform `uploadSemanticDocument` scope path has **no FE caller**, so no other upload surface to cover.
+- **Verification:** full AiAgentPanel jest suite 360 passed (was 355; +5), editor index suite green (badge mounts), tsc clean, prettier-formatted.
+- **Residual UI gaps after P1–P3:**
+  1. The badge lives **only in MDL Lab**, not the SQL-agent query panel. Correct (authoring happens in MDL Lab) but a user who only ever uses the AI SQL agent + instructions never sees the badge — the P1 inline note is their only cue. Acceptable; revisit if instructions get authored outside MDL Lab.
+  2. **"Always apply" (global) instructions** are shared *and* unconditionally injected for every user on the DB — higher blast radius than a scoped one. Per D1a decision, kept to the neutral badge + P1 note; no extra per-toggle warning (a scary warning on a normal collaboration feature would be noise). Flag if support reports confusion.
+  3. Badge copy is **static** — it doesn't enumerate *who* currently shares the DB (no member list). Intentional (privacy + no cheap API for it); "everyone who can connect" is the honest, stable statement.
+  4. **`databaseLabel` may be null** for a freshly-resolved project; badge degrades to "this database" (tested). Cosmetic.
 
 ---
 

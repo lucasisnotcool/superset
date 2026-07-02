@@ -25,11 +25,21 @@ Alpha/Admin-only grant): connection visibility for Builders is owner-scoped
 by ``DatabaseFilter``, which privileged principals bypass. Granting
 ``all_database_access`` to Builder would silently disable that scoping.
 
+This manager also hosts the claim triggers for admin pre-approved database
+access grants (see ``superset.commands.database_grants.claim``): grants are
+claimed on every successful login (``on_user_login``, which FAB invokes from
+all auth paths) and at user creation (``add_user``, which covers SSO
+auto-registration). Both claims are idempotent — required because OAuth's
+``AUTH_ROLES_SYNC_AT_LOGIN`` overwrites ``user.roles`` from the IdP mapping
+on each login — and fail-soft, so they can never break authentication.
+
 Wire via ``CUSTOM_SECURITY_MANAGER = BuilderSecurityManager`` in
 ``superset_config.py``. The role is (re)computed on every
 ``sync_role_definitions`` (``superset init``), so grants must live here, not
 in ad-hoc Roles-UI edits, which a sync would overwrite.
 """
+
+from typing import Any
 
 from flask_appbuilder.security.sqla.models import PermissionView
 
@@ -50,15 +60,23 @@ class BuilderSecurityManager(SupersetSecurityManager):
     #: Alpha-only.
     DATABASE_WRITE_PERMS = {"can_write", "can_export"}
 
+    #: Self-scoped grant endpoints every Builder needs: ``mine`` (list + lazily
+    #: claim your own grants, drives the notification dialog) and
+    #: ``acknowledge`` (dismiss the dialog). The ``DatabaseAccessGrant`` view
+    #: menu is otherwise Admin-only (``ADMIN_ONLY_VIEW_MENUS``), which keeps
+    #: grant management — list/create/revoke — away from Builders.
+    GRANT_SELF_PERMS = {"can_mine", "can_acknowledge"}
+
     def _is_builder_pvm(self, pvm: PermissionView) -> bool:
         """
         Return True if the FAB permission/view belongs to the Builder role.
 
-        Builder = Gamma ∪ sql_lab ∪ {write perms on Database}. None of these
-        branches include ``all_database_access`` / ``all_datasource_access``
-        (both are Alpha-only), which owner-scoping of connections depends on;
-        the explicit guard makes that invariant hold even if a subclass
-        loosens a branch.
+        Builder = Gamma ∪ sql_lab ∪ {write perms on Database} ∪ {self-scoped
+        grant endpoints}. None of these branches include
+        ``all_database_access`` / ``all_datasource_access`` (both are
+        Alpha-only), which owner-scoping of connections depends on; the
+        explicit guard makes that invariant hold even if a subclass loosens a
+        branch.
 
         :param pvm: The FAB permission/view
         :returns: Whether the FAB object is Builder related
@@ -72,6 +90,10 @@ class BuilderSecurityManager(SupersetSecurityManager):
                 pvm.view_menu.name == "Database"
                 and pvm.permission.name in self.DATABASE_WRITE_PERMS
             )
+            or (
+                pvm.view_menu.name == "DatabaseAccessGrant"
+                and pvm.permission.name in self.GRANT_SELF_PERMS
+            )
         )
 
     def sync_role_definitions(self) -> None:
@@ -79,3 +101,33 @@ class BuilderSecurityManager(SupersetSecurityManager):
         super().sync_role_definitions()
         self.set_role(BUILDER_ROLE_NAME, self._is_builder_pvm, self._get_all_pvms())
         self.session.commit()
+
+    def on_user_login(self, user: Any) -> None:
+        """Claim pre-approved database grants on every successful login.
+
+        FAB invokes this hook from ``update_user_auth_stat`` on all auth
+        paths (DB, LDAP, OAuth, remote-user, SAML), after any
+        ``AUTH_ROLES_SYNC_AT_LOGIN`` roles overwrite — so re-claiming here
+        also re-attaches grant roles the IdP sync stripped.
+        """
+        super().on_user_login(user)
+        # pylint: disable=import-outside-toplevel
+        from superset.commands.database_grants.claim import claim_database_grants
+
+        claim_database_grants(user)
+
+    def add_user(self, *args: Any, **kwargs: Any) -> Any:
+        """Claim pre-approved database grants at user creation.
+
+        Covers SSO auto-registration (``auth_user_oauth`` /
+        ``auth_user_remote_user`` with ``AUTH_USER_REGISTRATION``) and manual
+        self-registration, so a pre-approved user has access from their very
+        first session.
+        """
+        user = super().add_user(*args, **kwargs)
+        if user:
+            # pylint: disable=import-outside-toplevel
+            from superset.commands.database_grants.claim import claim_database_grants
+
+            claim_database_grants(user)
+        return user

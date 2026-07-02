@@ -139,6 +139,13 @@ const RowLevelSecurityList = lazy(
     ),
 );
 
+const DatabaseAccessGrantsList = lazy(
+  () =>
+    import(
+      /* webpackChunkName: "DatabaseAccessGrantsList" */ 'src/pages/DatabaseAccessGrantsList'
+    ),
+);
+
 const TaskList = lazy(
   () => import(/* webpackChunkName: "TaskList" */ 'src/pages/TaskList'),
 );
@@ -316,6 +323,10 @@ export const routes: Routes = [
   {
     path: '/rowlevelsecurity/list',
     Component: RowLevelSecurityList,
+  },
+  {
+    path: '/databaseaccessgrants/list',
+    Component: DatabaseAccessGrantsList,
   },
   {
     path: '/tasks/list/',

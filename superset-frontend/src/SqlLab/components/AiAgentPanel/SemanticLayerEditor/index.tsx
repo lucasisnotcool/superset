@@ -93,6 +93,7 @@ import OnboardingTablePicker from './OnboardingTablePicker';
 import AutoOnboardModal from './AutoOnboardModal';
 import MdlProvenanceDialog from './MdlProvenanceDialog';
 import CoverageBadge from './CoverageBadge';
+import DatabaseSharedBadge from './DatabaseSharedBadge';
 import RecoveryBanner from './RecoveryBanner';
 import SchemaSetControl from './SchemaSetControl';
 import DocumentDetailPane from './DocumentDetailPane';
@@ -1443,6 +1444,7 @@ export default function SemanticLayerEditor({
                   onAddSchema={addSchema}
                 />
                 <Flex align="center" gap="small" wrap="wrap">
+                  <DatabaseSharedBadge databaseLabel={project.database_label} />
                   <SemanticLayerStateBadge state={state} />
                   <CoverageBadge
                     projectId={project.id}

@@ -316,6 +316,20 @@ const AttachDocumentDialog = ({
       destroyOnHidden
     >
       <Flex vertical gap={theme.sizeUnit * 3}>
+        {/* Point-of-authoring reminder that uploaded documents are DB-tied:
+            visible to everyone who can connect to this project's database, not
+            just the uploader. Reinforces the canonical "Shared" badge in the
+            MDL Lab workspace strip, shown here because upload is where a user
+            introduces content others will read. */}
+        <Alert
+          type="info"
+          showIcon
+          data-test="attach-document-shared-note"
+          message={t(
+            'Documents you upload are shared with everyone who can connect to ' +
+              'this database.',
+          )}
+        />
         {/* The file input is a SIBLING of the dropzone (not a child): a click on
             it from `openPicker` must not bubble back into the dropzone's onClick
             and re-trigger the picker. */}

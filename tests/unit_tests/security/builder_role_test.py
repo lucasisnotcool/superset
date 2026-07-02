@@ -19,8 +19,10 @@
 from unittest.mock import MagicMock
 
 import pytest
+from pytest_mock import MockerFixture
 
 from superset.security.builder import BuilderSecurityManager
+from superset.security.manager import SupersetSecurityManager
 
 
 def make_pvm(permission: str, view_menu: str) -> MagicMock:
@@ -54,6 +56,9 @@ def sm() -> BuilderSecurityManager:
         ("menu_access", "SQL Lab"),
         ("can_read", "SavedQuery"),
         ("can_write", "SavedQuery"),
+        # Self-scoped database-grant endpoints (notification dialog)
+        ("can_mine", "DatabaseAccessGrant"),
+        ("can_acknowledge", "DatabaseAccessGrant"),
     ],
 )
 def test_builder_includes(
@@ -81,6 +86,11 @@ def test_builder_includes(
         ("database_access", "[my_db].(id:42)"),
         ("datasource_access", "[my_db].[table](id:1)"),
         ("schema_access", "[my_db].[public]"),
+        # Grant MANAGEMENT stays Admin-only: only the self-scoped
+        # mine/acknowledge endpoints are Builder-accessible.
+        ("can_read", "DatabaseAccessGrant"),
+        ("can_write", "DatabaseAccessGrant"),
+        ("menu_access", "Database Access Grants"),
     ],
 )
 def test_builder_excludes(
@@ -96,6 +106,57 @@ def test_builder_never_gets_alpha_only_permissions(
     for permission in sm.ALPHA_ONLY_PERMISSIONS:
         assert sm._is_builder_pvm(make_pvm(permission, "Database")) is False
         assert sm._is_builder_pvm(make_pvm(permission, permission)) is False
+
+
+def test_gamma_never_gets_grant_endpoints(sm: BuilderSecurityManager) -> None:
+    """DatabaseAccessGrant is in ADMIN_ONLY_VIEW_MENUS, so the Gamma
+    predicate must reject ALL perms on it — otherwise every Gamma user would
+    inherit grant management. Builder re-adds only mine/acknowledge."""
+    for permission in ("can_read", "can_write", "can_mine", "can_acknowledge"):
+        assert sm._is_gamma_pvm(make_pvm(permission, "DatabaseAccessGrant")) is False
+    assert sm._is_gamma_pvm(make_pvm("menu_access", "Database Access Grants")) is False
+
+
+def test_on_user_login_chains_super_then_claims(
+    sm: BuilderSecurityManager, mocker: MockerFixture
+) -> None:
+    super_hook = mocker.patch.object(SupersetSecurityManager, "on_user_login")
+    claim = mocker.patch(
+        "superset.commands.database_grants.claim.claim_database_grants"
+    )
+    user = MagicMock()
+
+    sm.on_user_login(user)
+
+    super_hook.assert_called_once_with(user)
+    claim.assert_called_once_with(user)
+
+
+def test_add_user_claims_grants_for_created_user(
+    sm: BuilderSecurityManager, mocker: MockerFixture
+) -> None:
+    created = MagicMock()
+    mocker.patch.object(SupersetSecurityManager, "add_user", return_value=created)
+    claim = mocker.patch(
+        "superset.commands.database_grants.claim.claim_database_grants"
+    )
+
+    result = sm.add_user("alice@example.com", "Alice", "Doe", "alice@example.com")
+
+    assert result is created
+    claim.assert_called_once_with(created)
+
+
+def test_add_user_skips_claim_when_creation_fails(
+    sm: BuilderSecurityManager, mocker: MockerFixture
+) -> None:
+    mocker.patch.object(SupersetSecurityManager, "add_user", return_value=None)
+    claim = mocker.patch(
+        "superset.commands.database_grants.claim.claim_database_grants"
+    )
+
+    assert sm.add_user("alice@example.com", "Alice", "Doe", "x@y.z") is None
+    claim.assert_not_called()
 
 
 def test_builder_is_superset_of_gamma_and_sql_lab(

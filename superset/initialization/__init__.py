@@ -173,6 +173,7 @@ class SupersetAppInitializer:  # pylint: disable=too-many-public-methods
         from superset.dashboards.api import DashboardRestApi
         from superset.dashboards.filter_state.api import DashboardFilterStateRestApi
         from superset.dashboards.permalink.api import DashboardPermalinkRestApi
+        from superset.database_grants.api import DatabaseGrantRestApi
         from superset.databases.api import DatabaseRestApi
         from superset.datasets.api import DatasetRestApi
         from superset.datasets.columns.api import DatasetColumnsRestApi
@@ -218,6 +219,7 @@ class SupersetAppInitializer:  # pylint: disable=too-many-public-methods
         from superset.views.groups import GroupsListView
         from superset.views.log.api import LogRestApi
         from superset.views.logs import ActionLogView
+        from superset.views.database_grants import DatabaseAccessGrantsView
         from superset.views.redirect import RedirectView
         from superset.views.roles import RolesListView
         from superset.views.sql_lab.views import (
@@ -265,6 +267,7 @@ class SupersetAppInitializer:  # pylint: disable=too-many-public-methods
         appbuilder.add_api(DashboardFilterStateRestApi)
         appbuilder.add_api(DashboardPermalinkRestApi)
         appbuilder.add_api(DashboardRestApi)
+        appbuilder.add_api(DatabaseGrantRestApi)
         appbuilder.add_api(DatabaseRestApi)
         appbuilder.add_api(DatasetRestApi)
         appbuilder.add_api(DatasetColumnsRestApi)
@@ -571,6 +574,16 @@ class SupersetAppInitializer:  # pylint: disable=too-many-public-methods
             category="Security",
             category_label=_("Security"),
             icon="fa-lock",
+        )
+
+        appbuilder.add_view(
+            DatabaseAccessGrantsView,
+            "Database Access Grants",
+            href="DatabaseAccessGrantsView.list",
+            label=_("Database Access Grants"),
+            category="Security",
+            category_label=_("Security"),
+            icon="fa-key",
         )
 
     def init_core_dependencies(self) -> None:
