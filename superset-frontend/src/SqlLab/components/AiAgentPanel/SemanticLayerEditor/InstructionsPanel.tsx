@@ -132,7 +132,7 @@ export default function InstructionsPanel({
 
   const removeInstruction = async (instruction: Instruction) => {
     try {
-      await deleteInstruction(instruction.id);
+      await deleteInstruction(scope, instruction.id);
       dispatch(addSuccessToast(t('Instruction deleted.')));
       await refresh();
     } catch (ex) {

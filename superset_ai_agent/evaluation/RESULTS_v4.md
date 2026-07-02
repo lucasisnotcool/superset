@@ -8,6 +8,14 @@ frozen from v3, Q19–Q30 new) · **Run:** matrix completed 2026-06-30, no error
 Raw data: `results/seagate_multi_v4/{scoreboard.json,trials.json}`. Plan/design:
 [EVAL_V4_SPEC.md](EVAL_V4_SPEC.md). Runner: `run_eval_v4.py`.
 
+> **Update (2026-07-01):** §7 now includes a **post-fix re-run** of the two R1/R2
+> feature probes against a rebuilt image (current `master`, commit `91f104256b`+).
+> **R1 (cross-schema golden recall) is confirmed fixed** — full reversal, 0/3→3/3 on
+> both held-out questions. **R2 (view surfacing) is partially fixed** — views are now
+> occasionally selected organically for the first time, but correctness lift is still
+> unproven. Sections 1–6 (the 8-config matrix) are unchanged and require no re-run —
+> see §7.4 for why the matrix result is provably unaffected by either fix.
+
 ---
 
 ## 1. The matrix
@@ -170,73 +178,114 @@ dead end.
 
 **Benchmark (for this eval platform):**
 
-4. **Re-probe after R1/R2 fixes** (baseline-now-then-re-probe, per plan): pre-fix
-   feature probes captured below; rerun `wren_bi`/`wren_bi_context` post-fix and the
-   §2 delta is the success metric.
+4. **Re-probe after R1/R2 fixes — done, see §7.** R1 is fully fixed (confirmed live,
+   3/3 vs 0/3 reversal). R2 is partially fixed (organic view selection now happens,
+   correctness lift still unproven). Neither fix touches the 8-config matrix itself
+   (§7.4) — the next step is a v5 matrix variant whose enrich flow also authors
+   views, to finally measure whether R2 narrows the §2 −12 gap in practice.
 5. **Add a high-distractor variant** to give auto-onboard's precision something to
    earn (§3) — currently auto vs manual is a wash because over-selection is unpunished.
 6. **Keep the deterministic-onboard track as the stable benchmark substrate**
    (auto-onboard adds variance, §5).
+7. **Follow up on the paraphrase-recall gap (§7.2)** — a promoted golden's *exact*
+   phrasing now recalls and lifts accuracy every time, but a reworded version of the
+   same question doesn't reliably benefit even when recall fires. Worth an
+   E17-style dedicated probe once R1's headline result has been socialized.
 
 ---
 
-## 7. Pre-fix feature probes (R1/R2 baseline)
+## 7. Feature probes — R1/R2, pre-fix and post-fix
 
-Captured to anchor the "re-probe after fixes" comparison. Both probes confirm the
-v3 product bugs still bite and now have a hard pre-fix baseline. Memory regime per
-probe noted inline. Raw: `results/seagate_multi_v3/{query_lift,e14b_surfacing,golden,golden_singleschema_lift}.json`.
+Two confirmed product bugs from the pre-fix baseline (§7.1 original capture, memory
+regime per probe noted inline). **A fix for both landed in commit `91f104256b`
+("Add eval v4, add queries, views, api cost ui, autorecovery", 2026-06-30 20:46)** —
+after every pre-fix capture below. The stack was rebuilt from current `master`
+(`make up-ai`) and both probes were **re-run live against the patched image** to
+confirm. Raw: `results/seagate_multi_v3/{query_lift,e14b_surfacing,golden,golden_singleschema_lift}.json`
+(overwritten in place by the post-fix run; pre-fix numbers are preserved below since
+they were already transcribed here before the re-run).
 
-### 7.1 View authoring works — but views are invisible at query time (R2)
+### 7.1 R2 — views: authoring is clean; surfacing is now partially fixed, correctness lift unproven
 
-**Authoring (E13, memory OFF, 2 trials, fresh this run):** clean.
-`proposed=3 active=3 semantic=3 native=0 description_rate=1.0 phys_leak=0
-activate_error=False` — the Copilot reliably authors well-formed semantic views.
+**Authoring (E13, memory OFF):** clean both pre- and post-fix, no regression.
+Pre-fix: `proposed=3 active=3 semantic=3 description_rate=1.0 phys_leak=0`. Post-fix
+(2 fresh trials): `proposed=3 active=3` and `proposed=2 active=2` (E15 variant),
+same `semantic=N native=0 desc=N phys_leak=0` shape both times — the Copilot
+reliably authors well-formed semantic views regardless of the fix.
 
-**Query-time surfacing (E14, memory OFF):** the bug.
+**Query-time surfacing (E14, memory OFF) — before vs after:**
 
-| Condition | Q16/Q17/Q18 verdict | view selected? |
+| Condition | Pre-fix | Post-fix |
 |---|---|---|
-| views deactivated | wrong (×2) | — |
-| **views active** | **wrong (×2)** | **`used_views=[]` — never selected** |
-| view force-surfaced (e14b) | wrong (×3) | `used_view=true` (used, no lift) |
+| views deactivated | wrong ×6, n/a | wrong ×6, `used_views=[]` |
+| **views active (organic retrieval)** | wrong ×6, **`used_views=[]` on all 6/6** | wrong ×5 / **correct ×1** (Q17), **`used_views` non-empty on 1/6** (Q18 pass 1 → `['standard_golden_yield_by_family']`, still graded wrong) |
+| view force-surfaced (e14b) | wrong ×3, `used_view=true` (used, no lift) | not re-run (mechanism already proven pre-fix; not the fix's target) |
 
-With the views **active on the project**, the agent never retrieves them
-(`used_views=[]` across every repeat); accuracy is identical to no-views. Even when a
-view is *explicitly* surfaced into context (e14b), it gets used but does **not** lift
-the answer. **R2 confirmed:** the enrichment→retrieval gap from §2 is not abstract —
-authored views simply never reach the retriever, and forcing them in doesn't fix
-correctness. This is the surfacing half of the §2 headline, isolated.
+**Read:** the fix (`schema_retriever.py`, `_view_items`) is real and live — for the
+first time ever in this eval, the retriever **organically selected an authored view**
+without forcing (0/6 → 1/6). That confirms the surfacing gap is now partially
+closed. But it isn't reliable yet (5/6 selections still empty) and, critically, the
+one case where a view *was* selected still produced a wrong answer — echoing the
+force-surfaced finding (used ≠ correct). **Verdict: R2 partially fixed at the
+retrieval layer; the "using a view correctly" gap is untouched.** Not yet enough
+signal to re-measure the §2 −12 gap-closure KPI — that needs a live `wren_bi` vs
+`wren_bi_context` re-run once view authoring is wired into the matrix's enrich flow
+(it currently isn't; see §7.4).
 
-### 7.2 Golden-query recall is fail-closed across schemas (R1)
+### 7.2 R1 — cross-schema golden recall: fixed, and it flips both test questions to 3/3
 
-**E16 golden recall, memory ON (lancedb).**
+**E16 golden recall, memory ON (lancedb) — before vs after:**
 
-| Question | scope | golden status | recalled (with golden) | lift |
-|---|---|---|---|---|
-| Q16 warm-line output by family | cross-schema | active | **[0, 0, 0]** | none |
-| Q17 Golden Yield Vantage Q4 | cross-schema | active | **[0, 0, 0]** | none |
-| single-schema control (avg capacity/interface) | single-schema | active | **[2, 3, 3]** | recall works |
+| Question | scope | Pre-fix `recalled` (w/ golden) | Post-fix `recalled` | Pre-fix verdict | Post-fix verdict |
+|---|---|---|---|---|---|
+| Q16 warm-line output | cross-schema | **[0, 0, 0]** | **[1, 1, 1]** | wrong ×3 | **correct ×3** |
+| Q17 Golden Yield Q4 | cross-schema | **[0, 0, 0]** | **[2, 2, 2]** | wrong ×3 | **correct ×3** |
+| single-schema control | single-schema | [2, 3, 3] | not re-run (already working; not the fix's target) | correct | — |
 
-A promoted, **active** cross-schema golden query is **never recalled** at query time
-(`recalled=0` every repeat), so it gives zero accuracy lift — while a single-schema
-golden recalls 2–3 examples normally. **R1 confirmed:** recall is fail-closed
-specifically on the cross-schema path (single-schema access scope at
-`build_recall_access`, `graph.py:608`), exactly as v3 diagnosed.
+**Read: full reversal.** A promoted cross-schema golden is now recalled every time
+(non-zero, growing as more goldens get promoted — 1 then 2 — exactly matching
+`golden_entries`), and both cross-schema questions flip from **0/3 correct to 3/3
+correct** with the golden active. This is a clean, complete fix of the fail-closed
+recall bug, reproduced across 3 repeats each.
 
-### 7.3 Success metric for the re-probe (after R1/R2 land)
+**One residual, separate signal (not the R1 bug):** the **paraphrase** arm is mixed.
+Q16's paraphrase stays wrong ×3 even though recall now fires (`recalled=[2,2,2]`) —
+recall retrieves something, but doesn't help a differently-worded question. Q17's
+paraphrase was already correct at baseline, so no lift is measurable there either
+way. This looks like a distinct, smaller gap (recall → applying a recalled example to
+a reworded question) worth a dedicated follow-up probe, not evidence against the R1
+fix itself.
 
-- **R2 fixed** ⇒ E14 shows `used_views` non-empty when views are active, and
-  `wren_bi` (no raw context) closes a meaningful part of the **−12** gap to
-  `wren_bi_context` (§2). That delta is the headline KPI for the fix.
-- **R1 fixed** ⇒ E16 cross-schema `recalled > 0` with golden active, and the
-  `golden`/`viewable` capability rows in the §4 scoreboard rise above their current
-  ~0.7/1 ceiling.
+### 7.3 Net verdict against the pre-registered success KPIs (§7.3 original)
 
-> **Live re-probe blocked at capture time.** The Docker stack was recreated
-> mid-session and now crash-loops on Superset `init_views` due to **unrelated
-> uncommitted WIP** — a new "AI Agent Usage" admin menu link in
-> `superset/initialization/__init__.py` passes `menu_cond=` to
-> `appbuilder.add_link()`, whose real kwarg is `cond` (FAB rejects `menu_cond`). This
-> 500s `/login` and blocks live agent calls. The §7 baselines above are from the
-> recent v3 captures (same fixture, same agent build) and are unaffected. Re-probe
-> once that menu regression is resolved.
+| KPI (as pre-registered) | Result |
+|---|---|
+| R2: `used_views` non-empty when active | **Partially met** — 1/6 organic selections (was 0/6), still no correctness lift |
+| R2: `wren_bi` closes part of the −12 gap to `wren_bi_context` | **Not yet measurable** — the 8-config matrix's enrich flow never authors views (§7.4), so this KPI needs a new run, not a re-read of existing data |
+| R1: cross-schema `recalled > 0` with golden active | **Met — fully** — 1,1,1 and 2,2,2, both non-zero every repeat |
+| R1: `golden` capability score rises above its ~0.7/1 ceiling | **Directionally confirmed** by the underlying mechanism (0/3→3/3 correct on both held-out golden questions), though the §4 matrix number itself wasn't re-collected (golden queries aren't part of the 8-config matrix's grading path either — same caveat as R2 above) |
+
+### 7.4 Why the 8-config matrix (§1–§5) was correctly left as-is
+
+Confirmed by reading the fix diffs directly and the v4 runner: **R1 is inert unless
+memory is ON**, and the matrix ran with `WREN_MEMORY_STORE=none` throughout (by
+design, for a fair grounding ablation) — so R1 could not have altered any matrix
+number. **R2's `_view_items` is purely additive** (no-op when `manifest.views` is
+empty), and `run_eval_v4.py`'s onboard/enrich flow (`manual_enrich`,
+`copilot_enrich_pass` / `COPILOT_ENRICH_MESSAGE`) never authors a view — only
+definitions, synonyms, metrics, rollups, and calendar mappings. So no manifest in
+the 8×30×3 matrix ever contained a view, and R2 could not have altered a matrix
+number either. **The §1–§5 scoreboard and headline findings stand unchanged** — the
+re-run was correctly scoped to the two feature probes only, not the full matrix.
+
+The §2 headline finding — enrichment not reaching the retrieved layer — is therefore
+still open. R2's fix addresses one *channel* into that gap (authored views can now
+occasionally surface) but the matrix's own enrichment path (definitions/synonyms/
+metrics) was never broken in the same way and still underperforms raw context. A
+future v5 matrix run that has the enrich flow also author views, post-fix, is the
+natural next step to see whether §2's −12 gap narrows in practice.
+
+**Mandatory restore applied:** memory was toggled `none` → run E13/E14 → `lancedb`
+(and the agent container recreated each time) → run E16 in the correct regime. The
+stack is left with `WREN_MEMORY_STORE=lancedb` / `WREN_MEMORY_LEARNING_ENABLED=true`,
+its standard operating state.

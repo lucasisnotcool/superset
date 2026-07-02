@@ -214,10 +214,17 @@ def scope_hash(scope: ConversationScope) -> str:
     (``schema_name`` only), so existing NL→SQL memory and instruction recall keyed by
     this hash are preserved. A multi-schema scope adds a sorted ``schema_names`` key,
     giving it a distinct, order-independent identity (R5).
+
+    When the scope carries a ``database_uri_fingerprint``, it substitutes for
+    ``database_id`` in the payload: two users with separate self-service
+    connections to the same physical database then hash to the same scope, so
+    DB-tied artifacts keyed by this hash are shared between them. Scopes
+    without a fingerprint keep the legacy ``database_id`` payload (per-
+    connection); use :func:`scope_hashes` where reads must match both.
     """
 
     payload = {
-        "database_id": scope.database_id,
+        "database_id": scope.database_uri_fingerprint or scope.database_id,
         "catalog_name": scope.catalog_name,
         "schema_name": scope.schema_name,
         "dataset_ids": sorted(scope.dataset_ids),
@@ -228,6 +235,22 @@ def scope_hash(scope: ConversationScope) -> str:
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def scope_hashes(scope: ConversationScope) -> list[str]:
+    """All hashes a read should match for this scope, preferred first.
+
+    A fingerprinted scope matches both its DB-tied hash and the legacy
+    per-connection (``database_id``) hash, so rows written before fingerprints
+    existed — or while one could not be resolved — stay recallable.
+    """
+
+    hashes = [scope_hash(scope)]
+    if scope.database_uri_fingerprint is not None:
+        legacy = scope_hash(scope.model_copy(update={"database_uri_fingerprint": None}))
+        if legacy not in hashes:
+            hashes.append(legacy)
+    return hashes
 
 
 def instruction_scope_hash(scope: ConversationScope) -> str:
@@ -251,10 +274,25 @@ def instruction_scope_hash(scope: ConversationScope) -> str:
 
 
 def scope_matches(left: ConversationScope, right: ConversationScope) -> bool:
-    """Return whether two scopes identify the same semantic context."""
+    """Return whether two scopes identify the same semantic context.
 
+    The database matches when the connection ids agree, or when both scopes
+    carry the same ``database_uri_fingerprint`` — two users' separate
+    self-service connections to one physical database are the same semantic
+    context even though their ``database_id`` differ (DB-tied artifacts).
+    """
+
+    if (
+        left.database_uri_fingerprint is not None
+        and right.database_uri_fingerprint is not None
+    ):
+        # Both physical identities known → they decide, even over an equal
+        # connection id (differing fingerprints are different databases).
+        same_database = left.database_uri_fingerprint == right.database_uri_fingerprint
+    else:
+        same_database = left.database_id == right.database_id
     return (
-        left.database_id == right.database_id
+        same_database
         and left.catalog_name == right.catalog_name
         and left.schema_name == right.schema_name
         and sorted(left.effective_schema_names) == sorted(right.effective_schema_names)

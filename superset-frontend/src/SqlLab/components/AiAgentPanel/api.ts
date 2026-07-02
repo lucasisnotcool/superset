@@ -2230,9 +2230,17 @@ export const createInstruction = (
     body: JSON.stringify({ scope, instruction, is_global: isGlobal }),
   });
 
-export const deleteInstruction = (instructionId: string) =>
+// Instructions are DB-tied (shared by everyone who can reach the database),
+// so deletion is authorized by write access to the scope — the backend needs
+// the scope to prove it, not just the id.
+export const deleteInstruction = (
+  scope: ConversationScope,
+  instructionId: string,
+) =>
   requestJson<{ deleted: boolean }>(
-    `/agent/semantic-layer/instructions/${instructionId}`,
+    `/agent/semantic-layer/instructions/${instructionId}?${semanticScopeParams(
+      scope,
+    )}`,
     { method: 'DELETE' },
   );
 

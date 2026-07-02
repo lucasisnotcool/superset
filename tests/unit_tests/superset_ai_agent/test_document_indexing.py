@@ -185,19 +185,29 @@ def test_delete_document_cascade_removes_everything() -> None:
         store.get_document(document.id, owner_id="user-1")
 
 
-def test_delete_cascade_rejects_wrong_owner() -> None:
+def test_delete_cascade_is_db_tied_not_owner_gated() -> None:
+    # DB-tied (D1b): the cascade no longer owner-gates — object-level
+    # authorization happens at the route (scope proof, with fingerprint
+    # translation onto the caller's own connection). Any authorized caller
+    # deletes the shared document; a missing id still raises.
     store = InMemorySemanticLayerStore()
     storage = _RecordingStorage()
     document = _create(
         store, storage, config=AgentConfig(wren_document_indexing_enabled=True)
     )
+    delete_document_cascade(
+        document.id,
+        owner_id="another-authorized-user",
+        store=store,
+        storage=storage,
+    )
+    assert storage.deleted == [document.storage_uri]
+    with pytest.raises(SemanticDocumentNotFoundError):
+        store.get_document(document.id, owner_id="user-1")
     with pytest.raises(SemanticDocumentNotFoundError):
         delete_document_cascade(
-            document.id, owner_id="intruder", store=store, storage=storage
+            document.id, owner_id="user-1", store=store, storage=storage
         )
-    # Nothing mutated on the rejected delete.
-    assert storage.deleted == []
-    assert store.get_document(document.id, owner_id="user-1").id == document.id
 
 
 def test_reindex_is_idempotent() -> None:

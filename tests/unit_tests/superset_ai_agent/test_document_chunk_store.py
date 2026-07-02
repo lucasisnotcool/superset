@@ -87,8 +87,12 @@ def test_save_and_list_chunks_round_trip(store) -> None:
     assert [chunk.chunk_index for chunk in saved] == [0, 1, 2]
     listed = store.list_chunks(document.id, owner_id="user-1")
     assert [chunk.text for chunk in listed] == ["alpha", "beta", "gamma"]
-    # Owner isolation.
-    assert store.list_chunks(document.id, owner_id="other") == []
+    # DB-tied (D1b): chunks belong to the document, shared by every user who
+    # can reach its database — a different caller sees the same set (route-level
+    # scope authorization is the access gate, not the store).
+    assert [
+        chunk.text for chunk in store.list_chunks(document.id, owner_id="other")
+    ] == ["alpha", "beta", "gamma"]
 
 
 @pytest.mark.parametrize("store", _stores())
@@ -144,10 +148,17 @@ def test_delete_document_cascades_to_chunks(store) -> None:
 
 
 @pytest.mark.parametrize("store", _stores())
-def test_delete_document_rejects_wrong_owner(store) -> None:
+def test_delete_document_is_db_tied_not_owner_gated(store) -> None:
+    # DB-tied (D1b): the store no longer owner-gates deletion — object-level
+    # authorization happens at the route (scope proof, with fingerprint
+    # translation onto the caller's own connection). Any authorized caller can
+    # delete the shared document; a missing id still raises.
     document = _save_document(store)
+    store.delete_document(document.id, owner_id="another-authorized-user")
     with pytest.raises(SemanticDocumentNotFoundError):
-        store.delete_document(document.id, owner_id="intruder")
+        store.get_document(document.id, owner_id="user-1")
+    with pytest.raises(SemanticDocumentNotFoundError):
+        store.delete_document(document.id, owner_id="user-1")
 
 
 @pytest.mark.parametrize("store", _stores())

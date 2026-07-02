@@ -77,6 +77,11 @@ class AgentQueryRequest(BaseModel):
     #: Explicit semantic-layer project to ground on; honored only after the
     #: backend re-checks access + schema coverage (see ``ConversationScope``).
     project_id: str | None = None
+    #: Credential-free physical-database identity (see
+    #: ``ConversationScope.database_uri_fingerprint``). Resolved server-side by
+    #: the graph from ``database_id``; never trusted from the client for
+    #: authorization.
+    database_uri_fingerprint: str | None = None
     execute: bool = False
     model: str | None = None
     max_steps: int = Field(default=6, ge=2, le=12)

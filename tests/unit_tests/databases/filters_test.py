@@ -121,3 +121,90 @@ def test_database_filter(mocker: MockerFixture) -> None:
         str(compiled_query)
         == "SELECT dbs.uuid, dbs.created_on, dbs.changed_on, dbs.id, dbs.verbose_name, dbs.database_name, dbs.sqlalchemy_uri, dbs.password, dbs.cache_timeout, dbs.select_as_create_table_as, dbs.expose_in_sqllab, dbs.configuration_method, dbs.allow_run_async, dbs.allow_file_upload, dbs.allow_ctas, dbs.allow_cvas, dbs.allow_dml, dbs.force_ctas_schema, dbs.extra, dbs.encrypted_extra, dbs.impersonate_user, dbs.server_cert, dbs.is_managed_externally, dbs.external_url, dbs.created_by_fk, dbs.changed_by_fk, ssh_tunnels_1.uuid AS uuid_1, ssh_tunnels_1.created_on AS created_on_1, ssh_tunnels_1.changed_on AS changed_on_1, ssh_tunnels_1.extra_json, ssh_tunnels_1.id AS id_1, ssh_tunnels_1.database_id, ssh_tunnels_1.server_address, ssh_tunnels_1.server_port, ssh_tunnels_1.username, ssh_tunnels_1.password AS password_1, ssh_tunnels_1.private_key, ssh_tunnels_1.private_key_password, ssh_tunnels_1.server_host_key, ssh_tunnels_1.created_by_fk AS created_by_fk_1, ssh_tunnels_1.changed_by_fk AS changed_by_fk_1 \nFROM dbs LEFT OUTER JOIN ssh_tunnels AS ssh_tunnels_1 ON dbs.id = ssh_tunnels_1.database_id \nWHERE '[' || dbs.database_name || '].(id:' || CAST(dbs.id AS VARCHAR) || ')' IN ('[my_db].(id:42)', '[my_other_db].(id:43)') OR dbs.database_name IN ('my_db', 'my_other_db', 'third_db')"  # noqa: E501
     )
+
+
+def test_database_filter_owner_scoped(mocker: MockerFixture) -> None:
+    """
+    Test that `DatabaseFilter` lets a user see connections they created.
+
+    Self-service connections: the creator branch (`created_by_fk == user`)
+    must appear alongside the permission branches so a Builder sees their own
+    connections without holding any database_access PVM — and nothing else.
+    """
+    from superset.models.core import Database
+
+    mocker.patch("flask.current_app.config", {"EXTRA_DYNAMIC_QUERY_FILTERS": False})
+    mocker.patch.object(
+        security_manager,
+        "can_access_all_databases",
+        return_value=False,
+    )
+    # No permission-based grants at all: visibility must come only from
+    # the ownership branch.
+    mocker.patch.object(
+        security_manager,
+        "user_view_menu_names",
+        side_effect=[[], [], [], []],
+    )
+    mocker.patch("superset.databases.filters.get_user_id", return_value=7)
+
+    engine = create_engine("sqlite://")
+    Session = sessionmaker(bind=engine)  # noqa: N806
+    session = Session()
+    query = session.query(Database)
+
+    filter_ = DatabaseFilter("id", SQLAInterface(Database))
+    filtered_query = filter_.apply(query, None)
+
+    compiled_query = str(
+        filtered_query.statement.compile(
+            engine,
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+    assert "dbs.created_by_fk = 7" in compiled_query
+    # The ownership branch is OR-ed with the permission branches, never AND-ed
+    # (an explicitly granted database must stay visible to non-creators).
+    assert " AND dbs.created_by_fk" not in compiled_query
+
+
+def test_database_filter_anonymous_no_ownership_branch(
+    mocker: MockerFixture,
+) -> None:
+    """
+    Test that `DatabaseFilter` adds no ownership branch without a user.
+
+    Fail-closed: an anonymous request (no user id) must not emit a
+    `created_by_fk` clause at all, so it can never match rows whose
+    `created_by_fk` is NULL.
+    """
+    from superset.models.core import Database
+
+    mocker.patch("flask.current_app.config", {"EXTRA_DYNAMIC_QUERY_FILTERS": False})
+    mocker.patch.object(
+        security_manager,
+        "can_access_all_databases",
+        return_value=False,
+    )
+    mocker.patch.object(
+        security_manager,
+        "user_view_menu_names",
+        side_effect=[[], [], [], []],
+    )
+    mocker.patch("superset.databases.filters.get_user_id", return_value=None)
+
+    engine = create_engine("sqlite://")
+    Session = sessionmaker(bind=engine)  # noqa: N806
+    session = Session()
+    query = session.query(Database)
+
+    filter_ = DatabaseFilter("id", SQLAInterface(Database))
+    filtered_query = filter_.apply(query, None)
+
+    compiled_query = str(
+        filtered_query.statement.compile(
+            engine,
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+    assert "created_by_fk =" not in compiled_query

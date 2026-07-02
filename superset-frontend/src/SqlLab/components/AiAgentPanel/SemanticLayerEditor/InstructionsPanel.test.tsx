@@ -31,8 +31,10 @@ const originalAgentUrl = process.env.SUPERSET_AI_AGENT_URL;
 const LIST_URL =
   'http://agent.local/agent/semantic-layer/instructions?database_id=1&schema_name=public';
 const CREATE_URL = 'http://agent.local/agent/semantic-layer/instructions';
+// Instructions are DB-tied: deletion is authorized by write access to the
+// scope, so the scope rides along as query params.
 const DELETE_URL =
-  'http://agent.local/agent/semantic-layer/instructions/inst-1';
+  'http://agent.local/agent/semantic-layer/instructions/inst-1?database_id=1&schema_name=public';
 
 const scope: ConversationScope = {
   database_id: 1,

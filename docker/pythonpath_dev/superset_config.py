@@ -302,6 +302,18 @@ FEATURE_FLAGS = {
     "ENABLE_EXTENSIONS": True,
     "SEMANTIC_LAYERS": True,
 }
+
+# Self-service connections: adds the "Builder" role (Gamma + SQL Lab +
+# Database connection CRUD, never all_database_access) and makes it the
+# default role for self-registered users. Connection visibility for
+# non-privileged users is owner-scoped by DatabaseFilter; see
+# superset/security/builder.py and
+# superset_ai_agent/plan_self_service_connections_spec.md.
+from superset.security.builder import BuilderSecurityManager  # noqa: E402
+
+CUSTOM_SECURITY_MANAGER = BuilderSecurityManager
+AUTH_USER_REGISTRATION_ROLE = "Builder"
+
 EXTENSIONS_PATH = "/app/docker/extensions"
 ALERT_REPORTS_NOTIFICATION_DRY_RUN = True
 WEBDRIVER_BASEURL = f"http://superset_app{os.environ.get('SUPERSET_APP_ROOT', '/')}/"  # When using docker compose baseurl should be http://superset_nginx{ENV{BASEPATH}}/  # noqa: E501

@@ -20,7 +20,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import datetime
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -92,12 +92,59 @@ class SemanticAccessService:
         ) = None,
         semantic_access_mode: SemanticAccessMode = "superset_or_uri",
         semantic_full_access_grants_write: bool = False,
+        list_databases: Callable[[], list[Any]] | None = None,
     ) -> None:
         self.project_store = project_store
         self.load_context = load_context
         self.get_database_identity = get_database_identity
         self.semantic_access_mode = semantic_access_mode
         self.semantic_full_access_grants_write = semantic_full_access_grants_write
+        #: Caller-session database listing, used to translate a project's URI
+        #: fingerprint onto one of the *caller's own* connections when the
+        #: project's ``default_database_id`` (its author's connection) is not
+        #: visible to them — the BYO-credentials sharing path (D1).
+        self.list_databases = list_databases
+        self._fingerprint_database_ids: dict[str, int | None] = {}
+
+    def caller_database_id_for_fingerprint(
+        self,
+        database_uri_fingerprint: str | None,
+    ) -> int | None:
+        """The caller's own connection id for a physical database, if any.
+
+        Enumerates only the caller's *visible* connections (the listing runs
+        under their session, so Superset's owner-scoping applies) and matches
+        by URI fingerprint. This is how "bring your own credentials" proves
+        access: possession of a working connection to the same physical DB —
+        never a live credential re-test. Memoized per request-scoped service.
+        Returns ``None`` when unresolvable (callers fail closed).
+        """
+
+        if (
+            database_uri_fingerprint is None
+            or self.list_databases is None
+            or self.get_database_identity is None
+        ):
+            return None
+        if database_uri_fingerprint in self._fingerprint_database_ids:
+            return self._fingerprint_database_ids[database_uri_fingerprint]
+        resolved: int | None = None
+        try:
+            for database in self.list_databases():
+                database_id = getattr(database, "id", None)
+                if database_id is None:
+                    continue
+                try:
+                    identity = self.get_database_identity(database_id, None)
+                except Exception:  # pylint: disable=broad-except
+                    continue
+                if identity.uri_fingerprint == database_uri_fingerprint:
+                    resolved = database_id
+                    break
+        except Exception:  # pylint: disable=broad-except - fail closed
+            resolved = None
+        self._fingerprint_database_ids[database_uri_fingerprint] = resolved
+        return resolved
 
     def require_scope_permission(
         self,
@@ -264,13 +311,36 @@ class SemanticAccessService:
     ) -> SemanticProject:
         context = None
         if project.default_database_id is not None:
-            context = self.require_schema_set_permission(
-                identity=identity,
-                database_id=project.default_database_id,
-                catalog_name=project.catalog_name,
-                schema_names=project.schema_names,
-                permission=permission,
-            )
+            try:
+                context = self.require_schema_set_permission(
+                    identity=identity,
+                    database_id=project.default_database_id,
+                    catalog_name=project.catalog_name,
+                    schema_names=project.schema_names,
+                    permission=permission,
+                )
+            except Exception:
+                # ``default_database_id`` is the *author's* connection; under
+                # self-service connections the caller may not see that row at
+                # all (owner-scoped), even though they can reach the same
+                # physical database through their own. Translate the project's
+                # URI fingerprint onto one of the caller's own connections and
+                # re-prove; anyone with no connection to that database stays
+                # denied (fail closed, R6).
+                translated_id = self.caller_database_id_for_fingerprint(
+                    project.database_uri_fingerprint
+                )
+                if translated_id is None or translated_id == (
+                    project.default_database_id
+                ):
+                    raise
+                context = self.require_schema_set_permission(
+                    identity=identity,
+                    database_id=translated_id,
+                    catalog_name=project.catalog_name,
+                    schema_names=project.schema_names,
+                    permission=permission,
+                )
         resolved = self._project_with_permission(
             identity=identity,
             project=project,

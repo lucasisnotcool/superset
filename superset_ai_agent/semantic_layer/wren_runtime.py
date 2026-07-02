@@ -43,6 +43,7 @@ def resolve_effective_schema(
     database_id: int,
     schema_name: str | None,
     project_id: str | None,
+    database_uri_fingerprint: str | None = None,
 ) -> tuple[str | None, list[str]]:
     """Resolve the schema scope for a query, **project-wins** over the tab schema.
 
@@ -72,10 +73,16 @@ def resolve_effective_schema(
     if project is None:
         return passthrough
     # DB guard: a project pinned for a different database must not infer its schema
-    # onto this request (avoid grounding on the wrong DB).
+    # onto this request (avoid grounding on the wrong DB). Same *physical*
+    # database counts as same DB: under self-service connections each user has
+    # their own ``database_id`` for it, so a fingerprint match passes the guard.
     if (
         project.default_database_id is not None
         and project.default_database_id != database_id
+        and not (
+            database_uri_fingerprint is not None
+            and project.database_uri_fingerprint == database_uri_fingerprint
+        )
     ):
         return passthrough
     return project.schema_name, normalize_schema_names(
@@ -93,6 +100,7 @@ def materialize_request_semantic_project(
     catalog_name: str | None,
     schema_name: str | None,
     project_id: str | None = None,
+    database_uri_fingerprint: str | None = None,
 ) -> tuple[SemanticProject, WrenMaterializationResult, list[str]] | None:
     """Materialize the semantic project that grounds an agent request.
 
@@ -120,12 +128,17 @@ def materialize_request_semantic_project(
             database_id=database_id,
             schema_name=None,
             project_id=project_id,
+            database_uri_fingerprint=database_uri_fingerprint,
         )
         if schema_name is None:
             return None
+    # DB-tied matching: when the physical-database fingerprint is known, list
+    # by it (a project authored under another user's connection to the same DB
+    # still matches); ``database_id`` remains the legacy/per-connection filter.
     projects = semantic_project_store.list(
         owner_id=owner_id,
-        database_id=database_id,
+        database_id=None if database_uri_fingerprint is not None else database_id,
+        database_uri_fingerprint=database_uri_fingerprint,
         catalog_name=catalog_name,
         schema_name=schema_name,
     )

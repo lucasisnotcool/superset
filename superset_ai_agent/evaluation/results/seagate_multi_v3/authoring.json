@@ -1,7 +1,7 @@
 {
   "E13_glossary_plus_addendum": [
     {
-      "project": "90407b2b-1327-4e3d-bb2e-a7a52002bf72",
+      "project": "11502ea8-7497-40f2-b693-5b8dca8672f5",
       "items": 3,
       "applied": true,
       "activated": true,
@@ -42,7 +42,7 @@
       ]
     },
     {
-      "project": "c0a21ac9-4a89-430b-92fa-abcfe7e88ca5",
+      "project": "d24e6c5f-48f3-4c12-954a-fae8d2890070",
       "items": 3,
       "applied": true,
       "activated": true,
@@ -85,10 +85,80 @@
   ],
   "E15_rawsql_addendum": [
     {
-      "error": "GET job -> 502: {\"detail\":\"Could not validate Superset session: HTTP 500\"}"
+      "project": "42eba545-75c2-4bee-93b4-b7e5551bea9e",
+      "items": 2,
+      "applied": true,
+      "activated": true,
+      "activate_error": null,
+      "copilot_error": null,
+      "active_view_metrics": {
+        "count": 2,
+        "names": [
+          "standard_golden_yield_by_family",
+          "warm_line_output_by_family"
+        ],
+        "with_description": 2,
+        "description_rate": 1.0,
+        "semantic": 2,
+        "native": 0,
+        "semantic_referencing_physical_schema": 0,
+        "physical_leak_names": []
+      },
+      "proposed_view_metrics": {
+        "count": 2,
+        "names": [
+          "standard_golden_yield_by_family",
+          "warm_line_output_by_family"
+        ],
+        "with_description": 2,
+        "description_rate": 1.0,
+        "semantic": 2,
+        "native": 0,
+        "semantic_referencing_physical_schema": 0,
+        "physical_leak_names": []
+      },
+      "active_view_names": [
+        "standard_golden_yield_by_family",
+        "warm_line_output_by_family"
+      ]
     },
     {
-      "error": "GET projects -> 502: {\"detail\":\"Could not validate Superset session: HTTP 500\"}"
+      "project": "eeef5dfc-0a7e-48cc-a3bb-549472dfc415",
+      "items": 2,
+      "applied": true,
+      "activated": true,
+      "activate_error": null,
+      "copilot_error": null,
+      "active_view_metrics": {
+        "count": 2,
+        "names": [
+          "standard_golden_yield_by_family",
+          "warm_line_output_by_family"
+        ],
+        "with_description": 2,
+        "description_rate": 1.0,
+        "semantic": 2,
+        "native": 0,
+        "semantic_referencing_physical_schema": 0,
+        "physical_leak_names": []
+      },
+      "proposed_view_metrics": {
+        "count": 2,
+        "names": [
+          "standard_golden_yield_by_family",
+          "warm_line_output_by_family"
+        ],
+        "with_description": 2,
+        "description_rate": 1.0,
+        "semantic": 2,
+        "native": 0,
+        "semantic_referencing_physical_schema": 0,
+        "physical_leak_names": []
+      },
+      "active_view_names": [
+        "standard_golden_yield_by_family",
+        "warm_line_output_by_family"
+      ]
     }
   ]
 }

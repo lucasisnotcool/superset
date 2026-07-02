@@ -1029,7 +1029,13 @@ def test_instructions_crud_roundtrip(tmp_path) -> None:
     assert listed.status_code == 200
     assert [item["id"] for item in listed.json()] == [instruction_id]
 
-    deleted = client.delete(f"/agent/semantic-layer/instructions/{instruction_id}")
+    # DB-tied (D1b): deletion is authorized by write access to the scope, so
+    # the scope rides along as query params.
+    scope_params = {"database_id": 1, "schema_name": "pipeline"}
+    deleted = client.delete(
+        f"/agent/semantic-layer/instructions/{instruction_id}",
+        params=scope_params,
+    )
     assert deleted.status_code == 200
     assert deleted.json() == {"deleted": True}
 
@@ -1037,15 +1043,24 @@ def test_instructions_crud_roundtrip(tmp_path) -> None:
     assert (
         client.get(
             "/agent/semantic-layer/instructions",
-            params={"database_id": 1, "schema_name": "pipeline"},
+            params=scope_params,
         ).json()
         == []
     )
     assert (
         client.delete(
-            f"/agent/semantic-layer/instructions/{instruction_id}"
+            f"/agent/semantic-layer/instructions/{instruction_id}",
+            params=scope_params,
         ).status_code
         == 404
+    )
+    # A scope the instruction does not belong to cannot delete it (had it
+    # still existed) — and a scope-less delete is a 422, never a bypass.
+    assert (
+        client.delete(
+            f"/agent/semantic-layer/instructions/{instruction_id}"
+        ).status_code
+        == 422
     )
 
 

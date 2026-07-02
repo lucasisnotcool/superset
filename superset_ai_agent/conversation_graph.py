@@ -88,6 +88,10 @@ from superset_ai_agent.semantic_layer.golden_queries import (
     merge_recalled_examples,
     recall_golden_queries,
 )
+from superset_ai_agent.semantic_layer.instructions import (
+    InstructionStore,
+    NullInstructionStore,
+)
 from superset_ai_agent.semantic_layer.mdl_files import MdlFileStore
 from superset_ai_agent.semantic_layer.memory_store import (
     build_recall_access,
@@ -108,6 +112,7 @@ from superset_ai_agent.semantic_layer.schemas import (
     SemanticProject,
     WrenMaterializationResult,
 )
+from superset_ai_agent.semantic_layer.store import scope_hashes
 from superset_ai_agent.semantic_layer.wren_runtime import (
     materialize_request_semantic_project,
     resolve_effective_schema,
@@ -238,6 +243,7 @@ class ConversationGraph:
         semantic_engine: SemanticEngine | None = None,
         memory: Memory | None = None,
         retriever: Retriever | None = None,
+        instruction_store: InstructionStore | None = None,
     ):
         self.config = config
         self.model_client = model_client
@@ -250,7 +256,54 @@ class ConversationGraph:
         self.semantic_engine = semantic_engine or create_semantic_engine(config)
         self.memory = memory or NullMemory()
         self.retriever = retriever or create_retriever(config, create_embedder(config))
+        # Identical-behavior parity (D1b): the Copilot recalls the same DB-tied
+        # instruction set the AI SQL agent does at draft time.
+        self.instruction_store = instruction_store or NullInstructionStore()
         self.graph = self._compile_graph()
+
+    def _scope_fingerprint(self, scope: ConversationScope) -> str | None:
+        """Resolve the physical-database fingerprint (DB-tied sharing key).
+
+        Mirrors ``TextToSqlGraph._scope_fingerprint``: resolved through the
+        caller's own Superset client, memoized per (request-scoped) graph
+        instance, fail-open to ``None`` (stores fall back to per-connection
+        ``database_id`` behavior).
+        """
+
+        if scope.database_uri_fingerprint is not None:
+            return scope.database_uri_fingerprint
+        key = (scope.database_id, scope.catalog_name)
+        cache = getattr(self, "_fingerprint_cache", None)
+        if cache is None:
+            cache = {}
+            self._fingerprint_cache = cache
+        if key not in cache:
+            fingerprint: str | None = None
+            try:
+                identity = self.superset_client.get_database_identity(
+                    database_id=scope.database_id,
+                    catalog_name=scope.catalog_name,
+                )
+                fingerprint = getattr(identity, "uri_fingerprint", None) or None
+            except Exception:  # pylint: disable=broad-except - best-effort key
+                fingerprint = None
+            cache[key] = fingerprint
+        return cache[key]
+
+    def _instruction_scope_hashes(self, scope: ConversationScope) -> list[str]:
+        """DB-tied hash first, legacy per-connection hash second (back-compat).
+
+        Instructions are schema-scoped (dataset selection ignored), mirroring
+        ``instruction_scope_hash``.
+        """
+
+        resolved = scope.model_copy(
+            update={
+                "database_uri_fingerprint": self._scope_fingerprint(scope),
+                "dataset_ids": [],
+            }
+        )
+        return scope_hashes(resolved)
 
     def run(
         self,
@@ -856,6 +909,7 @@ class ConversationGraph:
             database_id=scope.database_id,
             schema_name=scope.schema_name,
             project_id=project_id,
+            database_uri_fingerprint=self._scope_fingerprint(scope),
         )
         if (
             schema_name == scope.schema_name
@@ -941,6 +995,7 @@ class ConversationGraph:
             catalog_name=request.scope.catalog_name,
             schema_name=request.scope.schema_name,
             project_id=requested_project_id,
+            database_uri_fingerprint=self._scope_fingerprint(request.scope),
         )
         if materialized is None:
             return None
@@ -1149,6 +1204,9 @@ class ConversationGraph:
                 database_id=request.scope.database_id,
                 k=k,
                 access=access,
+                # DB-tied pool: shared across every user's own connection to
+                # the same physical database.
+                database_uri_fingerprint=self._scope_fingerprint(request.scope),
             )
             golden_pairs = recall_golden_queries(
                 mdl_file_store=self.mdl_file_store,
@@ -1164,8 +1222,24 @@ class ConversationGraph:
                 pair.model_dump()
                 for pair in merge_recalled_examples(golden_pairs, memory_pairs, k)
             ]
+        # Identical-behavior parity (D1b): recall the same DB-tied instruction
+        # set the AI SQL agent injects at draft time (schema-scoped, dataset
+        # selection ignored; DB-tied hash first, legacy hash second).
+        recalled_instructions = [
+            item.instruction
+            for item in self.instruction_store.recall(
+                request.message,
+                scope_hashes=self._instruction_scope_hashes(request.scope),
+                owner_id=state.get("owner_id", DEFAULT_OWNER_ID),
+                k=self.config.wren_instruction_recall_k,
+            )
+        ]
         draft = self._call_conversation_model(
-            state={**state, "recalled_examples": recalled},
+            state={
+                **state,
+                "recalled_examples": recalled,
+                "recalled_instructions": recalled_instructions,
+            },
             validation_errors=[],
         )
         # Stamp how many learned examples were recalled so the UI can badge it.
@@ -1580,6 +1654,7 @@ class ConversationGraph:
                     referenced_tables=referenced_tables,
                     referenced_schemas=referenced_schemas,
                     result_meta={"row_count": result.row_count},
+                    database_uri_fingerprint=self._scope_fingerprint(request.scope),
                 )
             except Exception as ex:  # pylint: disable=broad-except - best-effort
                 logger.warning("Failed to store learning-loop example: %s", ex)
@@ -1778,6 +1853,9 @@ class ConversationGraph:
             "user_message": request.message,
             "semantic_sql_mode": semantic_sql_mode,
             "semantic_sql_instructions": semantic_sql_instructions,
+            # User-authored guidance (Wren `instructions`) — same DB-tied set
+            # the AI SQL agent injects (identical-behavior parity, D1b).
+            "instructions": state.get("recalled_instructions", []),
             "execution_mode": execution_mode,
             "execute": execution_mode != "manual",
             "max_sql_iterations": self.config.max_agent_sql_iterations,

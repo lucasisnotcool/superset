@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from superset_ai_agent.config import AgentConfig
@@ -408,6 +408,18 @@ def _tier_and_present(
     return presented
 
 
+def _pool_key(database_id: int, database_uri_fingerprint: str | None) -> str:
+    """The memory pool identity: the physical DB when known, else the connection.
+
+    DB-tied (D1b): the fingerprint is the sharing key, so two users' separate
+    self-service connections to the same physical database pool together;
+    ``database_id`` is only the legacy fallback while a fingerprint cannot be
+    resolved.
+    """
+
+    return database_uri_fingerprint or f"db:{database_id}"
+
+
 class Memory(Protocol):
     def recall_examples(
         self,
@@ -416,12 +428,15 @@ class Memory(Protocol):
         database_id: int,
         k: int,
         access: RecallAccess | None = None,
+        database_uri_fingerprint: str | None = None,
     ) -> list[NlSqlPair]:
         """Return up to k confirmed examples relevant to the question.
 
-        Pairs are pooled per **database** (shared across users and projects). When
-        ``access`` is supplied the access filter (F2) is applied; production call
-        sites always supply it.
+        Pairs are pooled per **physical database** — keyed by
+        ``database_uri_fingerprint`` when resolvable, falling back to
+        ``database_id`` (shared across users and projects). When ``access`` is
+        supplied the access filter (F2) is applied; production call sites
+        always supply it.
         """
 
     def store_confirmed(
@@ -436,6 +451,7 @@ class Memory(Protocol):
         referenced_tables: list[str] | None = None,
         referenced_schemas: list[str] | None = None,
         result_meta: dict[str, Any] | None = None,
+        database_uri_fingerprint: str | None = None,
     ) -> None:
         """Persist a confirmed NL->SQL pair for future recall."""
 
@@ -450,6 +466,7 @@ class NullMemory:
         database_id: int,
         k: int,
         access: RecallAccess | None = None,
+        database_uri_fingerprint: str | None = None,
     ) -> list[NlSqlPair]:
         return []
 
@@ -458,13 +475,13 @@ class NullMemory:
 
 
 class InMemoryMemory:
-    """Process-local memory store (tests/dev). Keyed by ``database_id``."""
+    """Process-local memory store (tests/dev). Pooled per physical database."""
 
     def __init__(
         self, max_examples: int = 0, *, embedder: Embedder | None = None
     ) -> None:
-        # keyed by database_id (the shared, database-level pool)
-        self._pairs: dict[int, list[NlSqlPair]] = {}
+        # keyed by _pool_key (fingerprint when known, else the connection id)
+        self._pairs: dict[str, list[NlSqlPair]] = {}
         self.max_examples = max_examples
         self.embedder = embedder
 
@@ -475,8 +492,9 @@ class InMemoryMemory:
         database_id: int,
         k: int,
         access: RecallAccess | None = None,
+        database_uri_fingerprint: str | None = None,
     ) -> list[NlSqlPair]:
-        pairs = self._pairs.get(database_id, [])
+        pairs = self._pairs.get(_pool_key(database_id, database_uri_fingerprint), [])
         return _access_filter_and_rank(question, pairs, k, self.embedder, access)
 
     def store_confirmed(
@@ -491,6 +509,7 @@ class InMemoryMemory:
         referenced_tables: list[str] | None = None,
         referenced_schemas: list[str] | None = None,
         result_meta: dict[str, Any] | None = None,
+        database_uri_fingerprint: str | None = None,
     ) -> None:
         pair = NlSqlPair(
             question=question,
@@ -500,7 +519,9 @@ class InMemoryMemory:
             referenced_schemas=referenced_schemas or [],
             result_meta=result_meta or {},
         )
-        bucket = self._pairs.setdefault(database_id, [])
+        bucket = self._pairs.setdefault(
+            _pool_key(database_id, database_uri_fingerprint), []
+        )
         key = _dedup_key(question, native_sql)
         for index, existing in enumerate(bucket):
             if _dedup_key(existing.question, existing.native_sql) == key:
@@ -526,7 +547,34 @@ class SqlAlchemyMemory:
         self.max_examples = max_examples
         self.embedder = embedder
 
-    def load_candidates(self, *, database_id: int) -> list[NlSqlPair]:
+    @staticmethod
+    def _pool_predicate(
+        database_id: int,
+        database_uri_fingerprint: str | None,
+    ) -> Any:
+        """SQL predicate for one physical-database pool.
+
+        Fingerprint rows match the fingerprint; legacy rows (NULL fingerprint)
+        stay reachable through the connection id, so the pool never loses
+        history when fingerprints start resolving.
+        """
+
+        if database_uri_fingerprint is None:
+            return AiAgentNlSqlExample.database_id == database_id
+        return or_(
+            AiAgentNlSqlExample.database_uri_fingerprint == database_uri_fingerprint,
+            and_(
+                AiAgentNlSqlExample.database_uri_fingerprint.is_(None),
+                AiAgentNlSqlExample.database_id == database_id,
+            ),
+        )
+
+    def load_candidates(
+        self,
+        *,
+        database_id: int,
+        database_uri_fingerprint: str | None = None,
+    ) -> list[NlSqlPair]:
         """The bounded recall window for a database pool, unranked (no embed).
 
         Exposed so a vector-cache wrapper can rank by ANN id lookup instead of
@@ -536,7 +584,7 @@ class SqlAlchemyMemory:
         with self.session_factory() as session:
             rows = session.scalars(
                 select(AiAgentNlSqlExample)
-                .where(AiAgentNlSqlExample.database_id == database_id)
+                .where(self._pool_predicate(database_id, database_uri_fingerprint))
                 .order_by(AiAgentNlSqlExample.created_at.desc())
                 .limit(200)
             ).all()
@@ -560,8 +608,12 @@ class SqlAlchemyMemory:
         database_id: int,
         k: int,
         access: RecallAccess | None = None,
+        database_uri_fingerprint: str | None = None,
     ) -> list[NlSqlPair]:
-        pairs = self.load_candidates(database_id=database_id)
+        pairs = self.load_candidates(
+            database_id=database_id,
+            database_uri_fingerprint=database_uri_fingerprint,
+        )
         return _access_filter_and_rank(question, pairs, k, self.embedder, access)
 
     def store_confirmed(
@@ -576,14 +628,15 @@ class SqlAlchemyMemory:
         referenced_tables: list[str] | None = None,
         referenced_schemas: list[str] | None = None,
         result_meta: dict[str, Any] | None = None,
+        database_uri_fingerprint: str | None = None,
     ) -> None:
         key = _dedup_key(question, native_sql)
         with self.session_factory() as session:
-            # Dedup against recent examples for this database pool (RV4a). The scan
-            # is bounded; the store is single-worker-scale (see R-C).
+            # Dedup against recent examples for this pool (RV4a). The scan is
+            # bounded; the store is single-worker-scale (see R-C).
             recent = session.scalars(
                 select(AiAgentNlSqlExample)
-                .where(AiAgentNlSqlExample.database_id == database_id)
+                .where(self._pool_predicate(database_id, database_uri_fingerprint))
                 .order_by(AiAgentNlSqlExample.created_at.desc())
                 .limit(500)
             ).all()
@@ -595,6 +648,10 @@ class SqlAlchemyMemory:
                     row.referenced_tables = referenced_tables or []
                     row.referenced_schemas = referenced_schemas or []
                     row.result_meta = result_meta or {}
+                    # Converge-on-update: a legacy row touched under a resolved
+                    # fingerprint joins the DB-tied pool.
+                    if database_uri_fingerprint is not None:
+                        row.database_uri_fingerprint = database_uri_fingerprint
                     session.commit()
                     return
             session.add(
@@ -604,6 +661,7 @@ class SqlAlchemyMemory:
                     owner_id=created_by or "",
                     project_id=project_id,
                     database_id=database_id,
+                    database_uri_fingerprint=database_uri_fingerprint,
                     # scope_hash retained NOT NULL for back-compat; unused as a key.
                     scope_hash="",
                     question=question,
@@ -616,16 +674,21 @@ class SqlAlchemyMemory:
                 )
             )
             session.commit()
-            self._evict_old(session, database_id)
+            self._evict_old(session, database_id, database_uri_fingerprint)
 
-    def _evict_old(self, session: Session, database_id: int) -> None:
+    def _evict_old(
+        self,
+        session: Session,
+        database_id: int,
+        database_uri_fingerprint: str | None = None,
+    ) -> None:
         """Decay: delete examples for this database pool past ``max_examples``."""
 
         if self.max_examples <= 0:
             return
         stale = session.scalars(
             select(AiAgentNlSqlExample)
-            .where(AiAgentNlSqlExample.database_id == database_id)
+            .where(self._pool_predicate(database_id, database_uri_fingerprint))
             .order_by(AiAgentNlSqlExample.created_at.desc())
             .offset(self.max_examples)
         ).all()
@@ -653,8 +716,13 @@ class LanceDbMemory:
         self.cache = cache
 
     @staticmethod
-    def _scope_key(database_id: int) -> str:
-        return f"db:{database_id}"
+    def _scope_key(database_id: int, database_uri_fingerprint: str | None) -> str:
+        # DB-tied (D1b): pool the cache by physical database when the
+        # fingerprint is known — the same key the SQL pool uses — so two
+        # users' separate connections share one ANN partition. Pre-fingerprint
+        # rows under ``db:{id}`` stay reachable for unresolved scopes and are
+        # otherwise inert (recall degrades closed to the inner store).
+        return _pool_key(database_id, database_uri_fingerprint)
 
     def store_confirmed(
         self,
@@ -668,6 +736,7 @@ class LanceDbMemory:
         referenced_tables: list[str] | None = None,
         referenced_schemas: list[str] | None = None,
         result_meta: dict[str, Any] | None = None,
+        database_uri_fingerprint: str | None = None,
     ) -> None:
         self.inner.store_confirmed(
             question=question,
@@ -679,9 +748,10 @@ class LanceDbMemory:
             referenced_tables=referenced_tables,
             referenced_schemas=referenced_schemas,
             result_meta=result_meta,
+            database_uri_fingerprint=database_uri_fingerprint,
         )
         self.cache.upsert(
-            scope_key=self._scope_key(database_id),
+            scope_key=self._scope_key(database_id, database_uri_fingerprint),
             row_id=_cache_id(question, native_sql),
             text=question,
         )
@@ -693,14 +763,18 @@ class LanceDbMemory:
         database_id: int,
         k: int,
         access: RecallAccess | None = None,
+        database_uri_fingerprint: str | None = None,
     ) -> list[NlSqlPair]:
-        candidates = self.inner.load_candidates(database_id=database_id)
+        candidates = self.inner.load_candidates(
+            database_id=database_id,
+            database_uri_fingerprint=database_uri_fingerprint,
+        )
         # Stage A (access filter) is applied regardless of the cache path, so a pair
         # the user cannot reach is never surfaced — fail closed.
         if access is not None:
             candidates = [c for c in candidates if _pair_is_accessible(c, access)]
         ids = self.cache.search(
-            scope_key=self._scope_key(database_id),
+            scope_key=self._scope_key(database_id, database_uri_fingerprint),
             query=question,
             k=len(candidates) or k,
         )

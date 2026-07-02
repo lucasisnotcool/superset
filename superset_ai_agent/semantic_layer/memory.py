@@ -39,8 +39,9 @@ class InMemorySemanticLayerStore:
     def __init__(self) -> None:
         self._documents: dict[str, tuple[str, SemanticDocument]] = {}
         self._events: list[tuple[str, SemanticLayerEvent]] = []
-        # owner_id -> document_id -> ordered chunks
-        self._chunks: dict[str, dict[str, list[DocumentChunk]]] = {}
+        # document_id -> ordered chunks (DB-tied: chunks belong to the document,
+        # shared by every user who can reach its database — never per-uploader)
+        self._chunks: dict[str, list[DocumentChunk]] = {}
         # document_id -> project_id (for cross-document project scans)
         self._chunk_projects: dict[str, str | None] = {}
 
@@ -59,10 +60,14 @@ class InMemorySemanticLayerStore:
         *,
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> list[SemanticDocument]:
+        # DB-tied (D1b) — parity with the SQLAlchemy store: documents belong to
+        # the physical database (scope_matches is fingerprint-aware), not the
+        # uploader.
+        del owner_id
         return [
             document.model_copy(deep=True)
-            for stored_owner_id, document in self._documents.values()
-            if stored_owner_id == owner_id and scope_matches(document.scope, scope)
+            for _stored_owner_id, document in self._documents.values()
+            if scope_matches(document.scope, scope)
         ]
 
     def list_project_documents(
@@ -105,8 +110,11 @@ class InMemorySemanticLayerStore:
         *,
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> SemanticDocument:
+        # DB-tied (D1b): no owner gate — parity with the SQLAlchemy store.
+        # Object-level authorization happens at the route.
+        del owner_id
         item = self._documents.get(document_id)
-        if item is None or item[0] != owner_id:
+        if item is None:
             raise SemanticDocumentNotFoundError(document_id)
         return item[1].model_copy(deep=True)
 
@@ -116,8 +124,11 @@ class InMemorySemanticLayerStore:
         *,
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> SemanticDocument:
-        self.get_document(document.id, owner_id=owner_id)
-        self._documents[document.id] = (owner_id, document.model_copy(deep=True))
+        existing = self._documents.get(document.id)
+        if existing is None:
+            raise SemanticDocumentNotFoundError(document.id)
+        # Preserve the original uploader audit stamp across shared updates.
+        self._documents[document.id] = (existing[0], document.model_copy(deep=True))
         return document.model_copy(deep=True)
 
     def delete_document(
@@ -126,9 +137,11 @@ class InMemorySemanticLayerStore:
         *,
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> None:
-        self.get_document(document_id, owner_id=owner_id)
+        del owner_id
+        if document_id not in self._documents:
+            raise SemanticDocumentNotFoundError(document_id)
         self._documents.pop(document_id, None)
-        self._chunks.get(owner_id, {}).pop(document_id, None)
+        self._chunks.pop(document_id, None)
         self._chunk_projects.pop(document_id, None)
 
     def save_chunks(
@@ -139,10 +152,11 @@ class InMemorySemanticLayerStore:
         owner_id: str = DEFAULT_OWNER_ID,
         project_id: str | None = None,
     ) -> list[DocumentChunk]:
-        owned = self._chunks.setdefault(owner_id, {})
-        owned[document_id] = [chunk.model_copy(deep=True) for chunk in chunks]
+        # Chunks are keyed by document (DB-tied), not uploader.
+        del owner_id
+        self._chunks[document_id] = [chunk.model_copy(deep=True) for chunk in chunks]
         self._chunk_projects[document_id] = project_id
-        return self.list_chunks(document_id, owner_id=owner_id)
+        return self.list_chunks(document_id)
 
     def list_chunks(
         self,
@@ -150,7 +164,8 @@ class InMemorySemanticLayerStore:
         *,
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> list[DocumentChunk]:
-        chunks = self._chunks.get(owner_id, {}).get(document_id, [])
+        del owner_id
+        chunks = self._chunks.get(document_id, [])
         return [
             chunk.model_copy(deep=True)
             for chunk in sorted(chunks, key=lambda chunk: chunk.chunk_index)
@@ -162,7 +177,8 @@ class InMemorySemanticLayerStore:
         *,
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> None:
-        self._chunks.get(owner_id, {}).pop(document_id, None)
+        del owner_id
+        self._chunks.pop(document_id, None)
 
     def list_project_chunks(
         self,
@@ -174,11 +190,10 @@ class InMemorySemanticLayerStore:
         # the SQLAlchemy store.
         del owner_id
         result: list[DocumentChunk] = []
-        for owner_chunks in self._chunks.values():
-            for document_id, chunks in owner_chunks.items():
-                if self._chunk_projects.get(document_id) != project_id:
-                    continue
-                result.extend(chunk.model_copy(deep=True) for chunk in chunks)
+        for document_id, chunks in self._chunks.items():
+            if self._chunk_projects.get(document_id) != project_id:
+                continue
+            result.extend(chunk.model_copy(deep=True) for chunk in chunks)
         return sorted(result, key=lambda chunk: (chunk.document_id, chunk.chunk_index))
 
     def duplicate_documents(

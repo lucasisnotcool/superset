@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from typing import cast
 from uuid import uuid4
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from superset_ai_agent.conversations.schemas import ConversationScope
@@ -67,13 +67,25 @@ class SqlAlchemySemanticLayerStore:
         *,
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> list[SemanticDocument]:
+        # DB-tied (D1b): documents belong to the physical database, not the
+        # uploader — anyone whose scope resolves to the same URI fingerprint
+        # sees the same set. ``owner_id`` stays a write-side audit stamp only.
+        # Fingerprint match ORs with the connection-id match so legacy rows
+        # (NULL fingerprint) and unresolved scopes keep working.
+        del owner_id
+        database_match = AiAgentSemanticDocument.database_id == scope.database_id
+        if scope.database_uri_fingerprint is not None:
+            database_match = or_(
+                AiAgentSemanticDocument.database_uri_fingerprint
+                == scope.database_uri_fingerprint,
+                database_match,
+            )
         with self.session_factory() as session:
             models = (
                 session.execute(
                     select(AiAgentSemanticDocument)
                     .where(
-                        AiAgentSemanticDocument.owner_id == owner_id,
-                        AiAgentSemanticDocument.database_id == scope.database_id,
+                        database_match,
                         AiAgentSemanticDocument.catalog_name == scope.catalog_name,
                         AiAgentSemanticDocument.schema_name == scope.schema_name,
                     )
@@ -217,6 +229,12 @@ class SqlAlchemySemanticLayerStore:
             )
             model.project_id = document.project_id
             model.database_id = document.scope.database_id
+            # Converge-on-update: legacy rows gain their fingerprint the next
+            # time any authorized user updates them; never null one out.
+            if document.scope.database_uri_fingerprint is not None:
+                model.database_uri_fingerprint = (
+                    document.scope.database_uri_fingerprint
+                )
             model.catalog_name = document.scope.catalog_name
             model.schema_name = document.scope.schema_name
             model.dataset_ids = document.scope.dataset_ids
@@ -248,11 +266,12 @@ class SqlAlchemySemanticLayerStore:
                 owner_id=owner_id,
             )
             # Cascade-in-code: drop the document's chunks in the same transaction
-            # so a deleted document never leaves orphan chunk rows.
+            # so a deleted document never leaves orphan chunk rows. Chunks are
+            # keyed by document, not uploader (DB-tied) — deleting a shared
+            # document removes every uploader's chunk rows for it.
             session.execute(
                 delete(AiAgentDocumentChunk).where(
                     AiAgentDocumentChunk.document_id == document_id,
-                    AiAgentDocumentChunk.owner_id == owner_id,
                 )
             )
             session.delete(model)
@@ -268,11 +287,12 @@ class SqlAlchemySemanticLayerStore:
     ) -> list[DocumentChunk]:
         with self.session_factory() as session:
             # Replace-on-write: a reindex regenerates the full chunk set, so clear
-            # the prior rows first (idempotent per document).
+            # the prior rows first (idempotent per document). Document-keyed, not
+            # uploader-keyed (DB-tied) — a reindex by any authorized user
+            # replaces the shared set, never forks a per-user copy.
             session.execute(
                 delete(AiAgentDocumentChunk).where(
                     AiAgentDocumentChunk.document_id == document_id,
-                    AiAgentDocumentChunk.owner_id == owner_id,
                 )
             )
             for chunk in chunks:
@@ -292,14 +312,14 @@ class SqlAlchemySemanticLayerStore:
         *,
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> list[DocumentChunk]:
+        # DB-tied (D1b): chunks are keyed by document; route-level scope
+        # authorization on the parent document is the access gate.
+        del owner_id
         with self.session_factory() as session:
             models = (
                 session.execute(
                     select(AiAgentDocumentChunk)
-                    .where(
-                        AiAgentDocumentChunk.owner_id == owner_id,
-                        AiAgentDocumentChunk.document_id == document_id,
-                    )
+                    .where(AiAgentDocumentChunk.document_id == document_id)
                     .order_by(AiAgentDocumentChunk.chunk_index.asc())
                 )
                 .scalars()
@@ -313,11 +333,11 @@ class SqlAlchemySemanticLayerStore:
         *,
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> None:
+        del owner_id
         with self.session_factory() as session:
             session.execute(
                 delete(AiAgentDocumentChunk).where(
                     AiAgentDocumentChunk.document_id == document_id,
-                    AiAgentDocumentChunk.owner_id == owner_id,
                 )
             )
             session.commit()
@@ -485,8 +505,14 @@ class SqlAlchemySemanticLayerStore:
         *,
         owner_id: str,
     ) -> AiAgentSemanticDocument:
+        # DB-tied (D1b): no owner gate — object-level authorization happens at
+        # the route (``_load_authorized_document`` proves the caller can reach
+        # the document's database, translating the fingerprint onto the
+        # caller's own connection when ids differ). ``owner_id`` kept for
+        # signature compat; it remains the write-side audit stamp.
+        del owner_id
         model = session.get(AiAgentSemanticDocument, document_id)
-        if model is None or model.owner_id != owner_id:
+        if model is None:
             raise SemanticDocumentNotFoundError(document_id)
         return model
 
@@ -501,6 +527,7 @@ def _document_to_model(
         project_id=document.project_id,
         owner_id=owner_id,
         database_id=document.scope.database_id,
+        database_uri_fingerprint=document.scope.database_uri_fingerprint,
         catalog_name=document.scope.catalog_name,
         schema_name=document.scope.schema_name,
         dataset_ids=document.scope.dataset_ids,
@@ -535,6 +562,7 @@ def _document_from_model(
             catalog_name=model.catalog_name,
             schema_name=model.schema_name,
             dataset_ids=model.dataset_ids,
+            database_uri_fingerprint=model.database_uri_fingerprint,
         ),
         checksum=model.checksum,
         storage_uri=model.storage_uri,

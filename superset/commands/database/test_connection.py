@@ -71,6 +71,17 @@ class TestConnectionDatabaseCommand(BaseCommand):
 
         if (database_name := self._properties.get("database_name")) is not None:
             self._model = DatabaseDAO.get_database_by_name(database_name)
+            # Only reuse the stored model's secrets (decrypted URI, encrypted
+            # extra, SSH tunnel passwords) when the caller can actually see
+            # that database through the owner-scoped base filter. Resolution
+            # is by *name*, so without this check any user with test-connection
+            # rights could probe another user's connection by guessing its
+            # name and sending the masked URI back (object-level authorization
+            # bypass).
+            if self._model is not None and (
+                DatabaseDAO.find_by_id(self._model.id) is None
+            ):
+                self._model = None
 
         uri = self._properties.get("sqlalchemy_uri", "")
         if self._model and uri == self._model.safe_sqlalchemy_uri():

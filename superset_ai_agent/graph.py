@@ -93,7 +93,7 @@ from superset_ai_agent.semantic_layer.schemas import (
     WrenMaterializationResult,
 )
 from superset_ai_agent.semantic_layer.store import (
-    instruction_scope_hash,
+    scope_hashes,
 )
 from superset_ai_agent.semantic_layer.wren_runtime import (
     materialize_request_semantic_project,
@@ -318,6 +318,9 @@ class TextToSqlGraph:
             database_id=request.database_id,
             schema_name=request.schema_name,
             project_id=request.project_id,
+            database_uri_fingerprint=self._scope_fingerprint(
+                request.database_id, request.catalog_name
+            ),
         )
         if (
             schema_name == request.schema_name
@@ -506,6 +509,9 @@ class TextToSqlGraph:
                 catalog_name=request.catalog_name,
                 schema_name=request.schema_name,
                 project_id=request.project_id,
+                database_uri_fingerprint=self._scope_fingerprint(
+                    request.database_id, request.catalog_name
+                ),
             )
             if materialized is not None:
                 project, materialization, resolve_warnings = materialized
@@ -661,10 +667,56 @@ class TextToSqlGraph:
             # project scope, not just the primary schema.
             schema_names=request.schema_names,
             dataset_ids=request.dataset_ids,
+            database_uri_fingerprint=(
+                request.database_uri_fingerprint
+                or self._scope_fingerprint(request.database_id, request.catalog_name)
+            ),
         )
 
-    def _instruction_scope_hash(self, request: AgentQueryRequest) -> str:
-        return instruction_scope_hash(self._request_scope(request))
+    def _scope_fingerprint(
+        self,
+        database_id: int,
+        catalog_name: str | None,
+    ) -> str | None:
+        """Resolve the physical-database fingerprint (DB-tied sharing key).
+
+        Resolved through the caller's own Superset client (so it is
+        access-gated server-side, never trusted from the request payload) and
+        memoized per graph instance — graphs are request-scoped, so one lookup
+        serves every node in a run. Fail-open to ``None``: stores then fall
+        back to per-connection ``database_id`` behavior rather than losing the
+        turn.
+        """
+
+        key = (database_id, catalog_name)
+        cache = getattr(self, "_fingerprint_cache", None)
+        if cache is None:
+            cache = {}
+            self._fingerprint_cache = cache
+        if key not in cache:
+            fingerprint: str | None = None
+            try:
+                identity = self.superset_client.get_database_identity(
+                    database_id=database_id,
+                    catalog_name=catalog_name,
+                )
+                fingerprint = getattr(identity, "uri_fingerprint", None) or None
+            except Exception:  # pylint: disable=broad-except - best-effort key
+                fingerprint = None
+            cache[key] = fingerprint
+        return cache[key]
+
+    def _instruction_scope_hashes(self, request: AgentQueryRequest) -> list[str]:
+        """DB-tied hash first, legacy per-connection hash second (back-compat).
+
+        Instructions are schema-scoped (dataset selection ignored), mirroring
+        ``instruction_scope_hash``.
+        """
+
+        scope = self._request_scope(request)
+        if scope.dataset_ids:
+            scope = scope.model_copy(update={"dataset_ids": []})
+        return scope_hashes(scope)
 
     def _draft_sql(self, state: AgentState) -> AgentState:
         request = state["request"]
@@ -679,6 +731,11 @@ class TextToSqlGraph:
             database_id=request.database_id,
             k=k,
             access=access,
+            # DB-tied pool: shared across every user's own connection to the
+            # same physical database.
+            database_uri_fingerprint=self._scope_fingerprint(
+                request.database_id, request.catalog_name
+            ),
         )
         # Project-scoped golden queries lead the few-shot set (priority); runtime
         # memory fills the rest. Golden are access-filtered identically (F3/2C).
@@ -703,7 +760,8 @@ class TextToSqlGraph:
                 # Instructions are schema-scoped (dataset selection ignored) so an
                 # editor-authored instruction is recalled regardless of the query's
                 # selected datasets (C5.1 fix); memory recall above stays query-scoped.
-                scope_hash=self._instruction_scope_hash(request),
+                # DB-tied hash first, legacy per-connection hash second.
+                scope_hashes=self._instruction_scope_hashes(request),
                 owner_id=owner_id,
                 k=self.config.wren_instruction_recall_k,
             )
@@ -959,6 +1017,9 @@ class TextToSqlGraph:
                 referenced_tables=referenced_tables,
                 referenced_schemas=referenced_schemas,
                 result_meta={"row_count": result.row_count},
+                database_uri_fingerprint=self._scope_fingerprint(
+                    request.database_id, request.catalog_name
+                ),
             )
         except Exception as ex:  # pylint: disable=broad-except - memory is best-effort
             logger.warning("Failed to store learning-loop example: %s", ex)

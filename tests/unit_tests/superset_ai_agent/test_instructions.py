@@ -76,11 +76,18 @@ def test_add_list_delete_roundtrip() -> None:
     assert store.delete(created.id, owner_id="u1") is False
 
 
-def test_delete_is_owner_scoped() -> None:
+def test_delete_is_scope_gated_not_owner_gated() -> None:
+    # DB-tied (D1b): deletion is gated by scope-hash membership (the caller
+    # must have proven the scope at the route), never by ownership — any
+    # authorized user manages the shared set.
     store = InMemoryInstructionStore()
     created = store.add(instruction="x", scope_hash="s1", owner_id="u1")
-    assert store.delete(created.id, owner_id="other") is False
+    # Wrong scope: not deletable.
+    assert store.delete(created.id, owner_id="other", scope_hashes=["s2"]) is False
     assert store.list_instructions(scope_hash="s1", owner_id="u1")  # still present
+    # Right scope, different (authorized) user: deletable.
+    assert store.delete(created.id, owner_id="other", scope_hashes=["s1"]) is True
+    assert store.list_instructions(scope_hash="s1", owner_id="u1") == []
 
 
 def test_recall_returns_globals_plus_relevant_non_global() -> None:
@@ -136,7 +143,8 @@ def test_create_instruction_store_durable_roundtrip(tmp_path) -> None:
     store2 = create_instruction_store(config, session_factory=session_factory)
     recalled = store2.recall("anything", scope_hash="s1", owner_id="u1", k=3)
     assert [item.instruction for item in recalled] == ["durable rule"]
-    assert store2.delete(created.id, owner_id="u1") is True
+    # DB-tied (D1b): delete is scope-gated, not owner-gated.
+    assert store2.delete(created.id, owner_id="u1", scope_hashes=["s1"]) is True
 
 
 def test_create_instruction_store_in_memory_without_db() -> None:

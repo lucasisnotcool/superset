@@ -25,6 +25,7 @@ from sqlalchemy.sql.sqltypes import JSON
 
 from superset import security_manager
 from superset.models.core import Database
+from superset.utils.core import get_user_id
 from superset.views.base import BaseFilter
 
 
@@ -68,10 +69,22 @@ class DatabaseFilter(BaseFilter):  # pylint: disable=too-few-public-methods
             | datasource_access_databases
         )
 
+        # Self-service connections: a user always sees the connections they
+        # created (owner-scoped), in addition to anything explicitly granted
+        # via database/catalog/schema/datasource access. Privileged users
+        # (all_database_access) bypass this filter above, so the creator
+        # branch never widens their view; for everyone else it is what keeps
+        # one user's connection invisible to another (object-level
+        # authorization, OWASP API1).
+        ownership_filters = []
+        if user_id := get_user_id():
+            ownership_filters.append(self.model.created_by_fk == user_id)
+
         return query.filter(
             or_(
                 self.model.perm.in_(database_perms),
                 self.model.database_name.in_(database_names),
+                *ownership_filters,
             )
         )
 

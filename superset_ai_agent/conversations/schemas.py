@@ -66,6 +66,15 @@ class ConversationScope(BaseModel):
     #: coverage, falling back to the heuristic otherwise. ``None`` means "let the
     #: backend resolve" (pinned-conversation project, then most-recent match).
     project_id: str | None = None
+    #: Credential-free identity of the scope's physical database
+    #: (``fingerprint_database_uri``). ``database_id`` identifies one Superset
+    #: *connection* row — two users with separate self-service connections to
+    #: the same physical database have different ids but the same fingerprint,
+    #: so DB-tied artifacts (documents, instructions, NL→SQL memory, projects)
+    #: key on this instead. Resolved server-side (never trusted from the
+    #: client for authorization); ``None`` when unresolved, in which case
+    #: stores fall back to ``database_id`` (legacy, per-connection behavior).
+    database_uri_fingerprint: str | None = None
     query_editor_id: str | None = None
     current_sql: str | None = None
     selected_text: str | None = None

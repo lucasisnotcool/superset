@@ -17,11 +17,17 @@
 
 """Instructions seam — user-authored prompt guidance (Wren `instructions`).
 
-Instructions are scoped by ``owner_id`` + ``scope_hash`` (governance: they are
-*context*, never permission sources). ``is_global`` instructions always apply for
-the scope; non-global ones are retrieved by similarity to the question (embedding
-cosine, degrade-closed to keyword overlap). Injected into the SQL prompt at draft
-time so an operator can steer generation without code changes.
+Instructions are **DB-tied**: scoped by ``scope_hash`` alone (computed with the
+database URI fingerprint substituted for ``database_id`` when resolvable — see
+``scope_hash``/``scope_hashes`` in ``semantic_layer.store``), so every user who
+can reach the physical database shares one instruction set; ``owner_id`` is an
+authorship audit stamp only (governance: instructions are *context*, never
+permission sources — route-level scope authorization is the access gate).
+Reads accept a list of scope hashes so fingerprinted scopes also match legacy
+per-connection rows. ``is_global`` instructions always apply for the scope;
+non-global ones are retrieved by similarity to the question (embedding cosine,
+degrade-closed to keyword overlap). Injected into the SQL prompt at draft time
+so an operator can steer generation without code changes.
 """
 
 from __future__ import annotations
@@ -123,6 +129,18 @@ def _recall(
     return [*globals_, *_rank_non_global(question, non_global, k, embedder)]
 
 
+def _as_scope_hashes(
+    scope_hash: str | None,
+    scope_hashes: list[str] | None,
+) -> list[str]:
+    """Normalize the single-hash (legacy) and hash-list read keys."""
+
+    hashes = list(scope_hashes or [])
+    if scope_hash is not None and scope_hash not in hashes:
+        hashes.insert(0, scope_hash)
+    return hashes
+
+
 class InstructionStore(Protocol):
     def add(
         self,
@@ -132,17 +150,36 @@ class InstructionStore(Protocol):
         owner_id: str,
         is_global: bool = False,
         project_id: str | None = None,
+        database_uri_fingerprint: str | None = None,
     ) -> Instruction:
-        """Persist a new instruction."""
+        """Persist a new instruction (``owner_id`` is an audit stamp only)."""
 
-    def list_instructions(self, *, scope_hash: str, owner_id: str) -> list[Instruction]:
-        """List instructions for an owner+scope (newest first)."""
+    def list_instructions(
+        self,
+        *,
+        scope_hash: str | None = None,
+        owner_id: str = "",
+        scope_hashes: list[str] | None = None,
+    ) -> list[Instruction]:
+        """List the scope's instructions (newest first), matching any hash."""
 
-    def delete(self, instruction_id: str, *, owner_id: str) -> bool:
-        """Delete one instruction; returns whether it existed."""
+    def delete(
+        self,
+        instruction_id: str,
+        *,
+        owner_id: str = "",
+        scope_hashes: list[str] | None = None,
+    ) -> bool:
+        """Delete one instruction; gated by scope membership, not ownership."""
 
     def recall(
-        self, question: str, *, scope_hash: str, owner_id: str, k: int
+        self,
+        question: str,
+        *,
+        scope_hash: str | None = None,
+        owner_id: str = "",
+        k: int,
+        scope_hashes: list[str] | None = None,
     ) -> list[Instruction]:
         """Global + top-k relevant non-global instructions for a question."""
 
@@ -167,7 +204,8 @@ class InMemoryInstructionStore:
     """Process-local instruction store (tests/dev)."""
 
     def __init__(self, *, embedder: Embedder | None = None) -> None:
-        self._items: dict[tuple[str, str], list[Instruction]] = {}
+        # DB-tied: keyed by scope_hash alone; owner is audit metadata only.
+        self._items: dict[str, list[Instruction]] = {}
         self.embedder = embedder
 
     def add(
@@ -178,21 +216,45 @@ class InMemoryInstructionStore:
         owner_id: str,
         is_global: bool = False,
         project_id: str | None = None,
+        database_uri_fingerprint: str | None = None,
     ) -> Instruction:
+        del owner_id, database_uri_fingerprint
         item = Instruction(
             instruction=instruction, is_global=is_global, project_id=project_id
         )
-        self._items.setdefault((owner_id, scope_hash), []).append(item)
+        self._items.setdefault(scope_hash, []).append(item)
         return item
 
-    def list_instructions(self, *, scope_hash: str, owner_id: str) -> list[Instruction]:
-        items = self._items.get((owner_id, scope_hash), [])
+    def list_instructions(
+        self,
+        *,
+        scope_hash: str | None = None,
+        owner_id: str = "",
+        scope_hashes: list[str] | None = None,
+    ) -> list[Instruction]:
+        del owner_id
+        items = [
+            item
+            for hash_ in _as_scope_hashes(scope_hash, scope_hashes)
+            for item in self._items.get(hash_, [])
+        ]
         return sorted(items, key=lambda item: item.created_at, reverse=True)
 
-    def delete(self, instruction_id: str, *, owner_id: str) -> bool:
-        for key, items in self._items.items():
-            if key[0] != owner_id:
-                continue
+    def delete(
+        self,
+        instruction_id: str,
+        *,
+        owner_id: str = "",
+        scope_hashes: list[str] | None = None,
+    ) -> bool:
+        del owner_id
+        keys = (
+            _as_scope_hashes(None, scope_hashes)
+            if scope_hashes is not None
+            else list(self._items)
+        )
+        for key in keys:
+            items = self._items.get(key, [])
             for index, item in enumerate(items):
                 if item.id == instruction_id:
                     del items[index]
@@ -200,9 +262,17 @@ class InMemoryInstructionStore:
         return False
 
     def recall(
-        self, question: str, *, scope_hash: str, owner_id: str, k: int
+        self,
+        question: str,
+        *,
+        scope_hash: str | None = None,
+        owner_id: str = "",
+        k: int,
+        scope_hashes: list[str] | None = None,
     ) -> list[Instruction]:
-        items = self._items.get((owner_id, scope_hash), [])
+        items = self.list_instructions(
+            scope_hash=scope_hash, owner_id=owner_id, scope_hashes=scope_hashes
+        )
         return _recall(question, items, k, self.embedder)
 
 
@@ -226,6 +296,7 @@ class SqlAlchemyInstructionStore:
         owner_id: str,
         is_global: bool = False,
         project_id: str | None = None,
+        database_uri_fingerprint: str | None = None,
     ) -> Instruction:
         item = Instruction(
             instruction=instruction, is_global=is_global, project_id=project_id
@@ -237,6 +308,7 @@ class SqlAlchemyInstructionStore:
                     owner_id=owner_id,
                     project_id=project_id,
                     scope_hash=scope_hash,
+                    database_uri_fingerprint=database_uri_fingerprint,
                     instruction=instruction,
                     is_global=is_global,
                     created_at=item.created_at,
@@ -245,32 +317,62 @@ class SqlAlchemyInstructionStore:
             session.commit()
         return item
 
-    def list_instructions(self, *, scope_hash: str, owner_id: str) -> list[Instruction]:
+    def list_instructions(
+        self,
+        *,
+        scope_hash: str | None = None,
+        owner_id: str = "",
+        scope_hashes: list[str] | None = None,
+    ) -> list[Instruction]:
+        # DB-tied (D1b): no owner filter — the scope hashes (fingerprint-keyed,
+        # plus the legacy per-connection hash) identify the shared set.
+        del owner_id
+        hashes = _as_scope_hashes(scope_hash, scope_hashes)
+        if not hashes:
+            return []
         with self.session_factory() as session:
             rows = session.scalars(
                 select(AiAgentInstruction)
-                .where(
-                    AiAgentInstruction.owner_id == owner_id,
-                    AiAgentInstruction.scope_hash == scope_hash,
-                )
+                .where(AiAgentInstruction.scope_hash.in_(hashes))
                 .order_by(AiAgentInstruction.created_at.desc())
                 .limit(500)
             ).all()
         return [_from_model(row) for row in rows]
 
-    def delete(self, instruction_id: str, *, owner_id: str) -> bool:
+    def delete(
+        self,
+        instruction_id: str,
+        *,
+        owner_id: str = "",
+        scope_hashes: list[str] | None = None,
+    ) -> bool:
+        # DB-tied (D1b): deletion is gated by scope membership — the caller
+        # must have proven the scope whose hashes are passed (route-level
+        # authorization), not by ownership. Passing no hashes fails closed.
+        del owner_id
+        hashes = _as_scope_hashes(None, scope_hashes)
         with self.session_factory() as session:
             row = session.get(AiAgentInstruction, instruction_id)
-            if row is None or row.owner_id != owner_id:
+            if row is None or (hashes and row.scope_hash not in hashes):
+                return False
+            if not hashes:
                 return False
             session.delete(row)
             session.commit()
             return True
 
     def recall(
-        self, question: str, *, scope_hash: str, owner_id: str, k: int
+        self,
+        question: str,
+        *,
+        scope_hash: str | None = None,
+        owner_id: str = "",
+        k: int,
+        scope_hashes: list[str] | None = None,
     ) -> list[Instruction]:
-        items = self.list_instructions(scope_hash=scope_hash, owner_id=owner_id)
+        items = self.list_instructions(
+            scope_hash=scope_hash, owner_id=owner_id, scope_hashes=scope_hashes
+        )
         return _recall(question, items, k, self.embedder)
 
 
@@ -303,8 +405,12 @@ class LanceDbInstructionStore:
         self.cache = cache
 
     @staticmethod
-    def _scope_key(owner_id: str, scope_hash: str) -> str:
-        return f"{owner_id}:{scope_hash}"
+    def _scope_key(scope_hash: str) -> str:
+        # DB-tied: the cache partitions by scope alone — an owner-qualified key
+        # would fork the shared instruction set back into per-user partitions.
+        # (Pre-D1b rows lived under ``{owner}:{hash}`` keys; they are inert —
+        # recall under the new key degrades closed to the inner store.)
+        return scope_hash
 
     def add(
         self,
@@ -314,6 +420,7 @@ class LanceDbInstructionStore:
         owner_id: str,
         is_global: bool = False,
         project_id: str | None = None,
+        database_uri_fingerprint: str | None = None,
     ) -> Instruction:
         item = self.inner.add(
             instruction=instruction,
@@ -321,27 +428,55 @@ class LanceDbInstructionStore:
             owner_id=owner_id,
             is_global=is_global,
             project_id=project_id,
+            database_uri_fingerprint=database_uri_fingerprint,
         )
         if not is_global:
             self.cache.upsert(
-                scope_key=self._scope_key(owner_id, scope_hash),
+                scope_key=self._scope_key(scope_hash),
                 row_id=item.id,
                 text=instruction,
             )
         return item
 
-    def list_instructions(self, *, scope_hash: str, owner_id: str) -> list[Instruction]:
-        return self.inner.list_instructions(scope_hash=scope_hash, owner_id=owner_id)
+    def list_instructions(
+        self,
+        *,
+        scope_hash: str | None = None,
+        owner_id: str = "",
+        scope_hashes: list[str] | None = None,
+    ) -> list[Instruction]:
+        return self.inner.list_instructions(
+            scope_hash=scope_hash, owner_id=owner_id, scope_hashes=scope_hashes
+        )
 
-    def delete(self, instruction_id: str, *, owner_id: str) -> bool:
-        return self.inner.delete(instruction_id, owner_id=owner_id)
+    def delete(
+        self,
+        instruction_id: str,
+        *,
+        owner_id: str = "",
+        scope_hashes: list[str] | None = None,
+    ) -> bool:
+        return self.inner.delete(
+            instruction_id, owner_id=owner_id, scope_hashes=scope_hashes
+        )
 
     def recall(
-        self, question: str, *, scope_hash: str, owner_id: str, k: int
+        self,
+        question: str,
+        *,
+        scope_hash: str | None = None,
+        owner_id: str = "",
+        k: int,
+        scope_hashes: list[str] | None = None,
     ) -> list[Instruction]:
-        items = self.inner.list_instructions(scope_hash=scope_hash, owner_id=owner_id)
-        ids = self.cache.search(
-            scope_key=self._scope_key(owner_id, scope_hash), query=question, k=k
+        items = self.inner.list_instructions(
+            scope_hash=scope_hash, owner_id=owner_id, scope_hashes=scope_hashes
+        )
+        hashes = _as_scope_hashes(scope_hash, scope_hashes)
+        ids = (
+            self.cache.search(scope_key=self._scope_key(hashes[0]), query=question, k=k)
+            if hashes
+            else None
         )
         if ids is None:
             return _recall(question, items, k, self.inner.embedder)

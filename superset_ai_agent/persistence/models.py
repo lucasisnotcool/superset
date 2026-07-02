@@ -143,8 +143,15 @@ class AiAgentSemanticDocument(Base):
 
     id = Column(String(36), primary_key=True)
     project_id = Column(String(36), index=True, nullable=True)
+    #: Uploader audit stamp only — documents are DB-tied (shared by everyone
+    #: who can reach the database), never owner-filtered on read.
     owner_id = Column(String(255), index=True, nullable=False)
     database_id = Column(Integer, index=True, nullable=False)
+    #: Credential-free physical-database identity (DB-tied sharing key).
+    #: ``database_id`` identifies one Superset connection row; two users'
+    #: separate connections to the same physical DB share this fingerprint.
+    #: NULL on legacy rows (reads fall back to ``database_id``).
+    database_uri_fingerprint = Column(String(128), index=True, nullable=True)
     catalog_name = Column(String(255), nullable=True)
     schema_name = Column(String(255), nullable=True)
     dataset_ids = Column(JSON, nullable=False)
@@ -416,11 +423,13 @@ class AiAgentSemanticMdlFile(Base):
 class AiAgentNlSqlExample(Base):
     """A confirmed NL->SQL pair recalled as few-shot (memory learning loop).
 
-    Keyed by ``database_id`` (a shared, database-level pool — see F1); ``owner_id``
-    is retained as authorship metadata only, no longer a scoping key. ``scope_hash``
-    is kept for back-compat / legacy rows. ``referenced_tables`` /
-    ``referenced_schemas`` capture the physical references the pair touches, used
-    to RBAC-filter recall (F2).
+    Keyed by ``database_uri_fingerprint`` when present (DB-tied: shared across
+    every user's own connection to the same physical database), falling back to
+    ``database_id`` for legacy rows (see F1); ``owner_id`` is retained as
+    authorship metadata only, no longer a scoping key. ``scope_hash`` is kept
+    for back-compat / legacy rows. ``referenced_tables`` /
+    ``referenced_schemas`` capture the physical references the pair touches,
+    used to RBAC-filter recall (F2).
     """
 
     __tablename__ = "ai_agent_nl_sql_examples"
@@ -429,6 +438,8 @@ class AiAgentNlSqlExample(Base):
     owner_id = Column(String(255), index=True, nullable=False)
     project_id = Column(String(36), index=True, nullable=True)
     database_id = Column(Integer, index=True, nullable=True)
+    #: DB-tied sharing key (see AiAgentSemanticDocument). NULL on legacy rows.
+    database_uri_fingerprint = Column(String(128), index=True, nullable=True)
     scope_hash = Column(String(128), index=True, nullable=False)
     question = Column(Text, nullable=False)
     semantic_sql = Column(Text, nullable=False)
@@ -442,8 +453,12 @@ class AiAgentNlSqlExample(Base):
 class AiAgentInstruction(Base):
     """A user-authored instruction injected into prompts (Wren `instructions`).
 
-    ``is_global`` instructions always apply for the scope; non-global ones are
-    retrieved by similarity to the question.
+    DB-tied: keyed by ``scope_hash`` alone (computed with the database
+    fingerprint substituted for ``database_id`` when resolvable), so every user
+    who can reach the database shares the same instruction set. ``owner_id`` is
+    an authorship audit stamp only, never a read filter. ``is_global``
+    instructions always apply for the scope; non-global ones are retrieved by
+    similarity to the question.
     """
 
     __tablename__ = "ai_agent_instructions"
@@ -452,6 +467,9 @@ class AiAgentInstruction(Base):
     owner_id = Column(String(255), index=True, nullable=False)
     project_id = Column(String(36), index=True, nullable=True)
     scope_hash = Column(String(128), index=True, nullable=False)
+    #: DB-tied sharing key (see AiAgentSemanticDocument); denormalized for
+    #: querying/debugging — reads key on ``scope_hash``. NULL on legacy rows.
+    database_uri_fingerprint = Column(String(128), index=True, nullable=True)
     instruction = Column(Text, nullable=False)
     is_global = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime(timezone=True), nullable=False)

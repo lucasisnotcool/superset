@@ -263,6 +263,7 @@ from superset_ai_agent.semantic_layer.sqlalchemy_store import (
 )
 from superset_ai_agent.semantic_layer.store import (
     instruction_scope_hash,
+    scope_hashes,
     SemanticDocumentNotFoundError,
     SemanticLayerStore,
 )
@@ -558,6 +559,9 @@ def create_app(  # noqa: C901
             mdl_file_store=active_mdl_file_store,
             memory=active_memory,
             retriever=active_retriever,
+            # Identical-behavior parity (D1b): the Copilot recalls the same
+            # DB-tied instruction set the AI SQL agent does.
+            instruction_store=active_instruction_store,
         )
 
     # Authorization derives a project's read/write level from the caller's *live*
@@ -617,6 +621,13 @@ def create_app(  # noqa: C901
                 catalog_name=catalog_name,
             )
 
+        def list_databases() -> list[Any]:
+            # Runs under the caller's session, so Superset's owner-scoping of
+            # connections applies — this enumerates only *their* databases,
+            # which is what fingerprint→connection translation must see.
+            _, request_superset_client = build_superset_runtime(request)
+            return request_superset_client.list_databases()
+
         return SemanticAccessService(
             project_store=active_semantic_project_store,
             load_context=load_context,
@@ -625,6 +636,7 @@ def create_app(  # noqa: C901
             semantic_full_access_grants_write=(
                 app_config.semantic_full_access_grants_write
             ),
+            list_databases=list_databases,
         )
 
     def authorize_semantic_scope(
@@ -644,6 +656,50 @@ def create_app(  # noqa: C901
             )
         except SupersetAuthError as ex:
             raise HTTPException(status_code=ex.status_code, detail=str(ex)) from ex
+
+    def _with_scope_fingerprint(
+        request: Request,
+        scope: ConversationScope,
+    ) -> ConversationScope:
+        """Stamp the physical-database fingerprint onto a request scope.
+
+        The DB-tied sharing key for documents/instructions/memory. Resolved
+        through the caller's own session (access-gated server-side, never
+        trusted from the client) and TTL-cached alongside the auth contexts.
+        Fail-open to ``None`` — stores then fall back to per-connection
+        ``database_id`` behavior.
+        """
+
+        cache_key = ("fingerprint", scope.database_id, scope.catalog_name)
+        fingerprint = _auth_context_cache.get(cache_key)
+        if fingerprint is None:
+            try:
+                _, request_superset_client = build_superset_runtime(request)
+                identity_info = request_superset_client.get_database_identity(
+                    database_id=scope.database_id,
+                    catalog_name=scope.catalog_name,
+                )
+                fingerprint = getattr(identity_info, "uri_fingerprint", None) or None
+            except Exception:  # pylint: disable=broad-except - best-effort key
+                fingerprint = None
+            if fingerprint is not None:
+                _auth_context_cache.set(cache_key, fingerprint)
+        return scope.model_copy(update={"database_uri_fingerprint": fingerprint})
+
+    def _instruction_scope_hashes(
+        request: Request,
+        scope: ConversationScope,
+    ) -> list[str]:
+        """DB-tied instruction hash first, legacy per-connection hash second.
+
+        Instructions are schema-scoped (dataset selection ignored), mirroring
+        ``instruction_scope_hash``.
+        """
+
+        resolved = _with_scope_fingerprint(request, scope)
+        if resolved.dataset_ids:
+            resolved = resolved.model_copy(update={"dataset_ids": []})
+        return scope_hashes(resolved)
 
     def authorize_semantic_project(
         request: Request,
@@ -980,6 +1036,10 @@ def create_app(  # noqa: C901
                 identity=identity,
                 permission=SemanticPermission.WRITE,
             )
+            # Stamp the DB-tied sharing key (post-authorization) so the new
+            # document is reachable from any user's own connection to the
+            # same physical database.
+            parsed_scope = _with_scope_fingerprint(fastapi_request, parsed_scope)
             content = await file.read()
             document = create_document(
                 filename=file.filename or "document",
@@ -2639,18 +2699,28 @@ def create_app(  # noqa: C901
                 },
             )
 
+    def _project_instruction_hashes(project: SemanticProject) -> list[str]:
+        """Instruction scope hashes for a project's scope, DB-tied hash first.
+
+        The project row already carries the URI fingerprint, so no identity
+        round-trip is needed; the legacy per-connection hash rides along for
+        rows authored before fingerprints existed.
+        """
+
+        return scope_hashes(_scope_from_project(project))
+
     def _project_instruction_views(
         project: SemanticProject, owner_id: str
     ) -> list[InstructionView]:
         if project.default_database_id is None:
             return []
-        scope = _scope_from_project(project)
         return [
             InstructionView(
                 id=item.id, instruction=item.instruction, is_global=item.is_global
             )
             for item in active_instruction_store.list_instructions(
-                scope_hash=instruction_scope_hash(scope), owner_id=owner_id
+                scope_hashes=_project_instruction_hashes(project),
+                owner_id=owner_id,
             )
         ]
 
@@ -2659,12 +2729,11 @@ def create_app(  # noqa: C901
     ) -> list[str]:
         if project.default_database_id is None:
             return []
-        scope = _scope_from_project(project)
         return [
             item.instruction
             for item in active_instruction_store.recall(
                 query,
-                scope_hash=instruction_scope_hash(scope),
+                scope_hashes=_project_instruction_hashes(project),
                 owner_id=owner_id,
                 k=app_config.wren_instruction_recall_k,
             )
@@ -4168,12 +4237,11 @@ def create_app(  # noqa: C901
         # relevant to the document) so guidance steers the enrichment too.
         instructions: list[str] = []
         if project.default_database_id is not None:
-            scope = _scope_from_project(project)
             instructions = [
                 item.instruction
                 for item in active_instruction_store.recall(
                     f"{document.filename} {document.summary or ''}".strip(),
-                    scope_hash=instruction_scope_hash(scope),
+                    scope_hashes=_project_instruction_hashes(project),
                     owner_id=identity.owner_id,
                     k=app_config.wren_instruction_recall_k,
                 )
@@ -4265,8 +4333,11 @@ def create_app(  # noqa: C901
             identity=identity,
             permission=SemanticPermission.READ,
         )
+        # DB-tied (D1b): list by the physical database. Enriched only after
+        # the scope authorization above, so the fingerprint can never widen
+        # what an unauthorized caller sees.
         return active_semantic_layer_store.list_documents(
-            scope,
+            _with_scope_fingerprint(fastapi_request, scope),
             owner_id=identity.owner_id,
         )
 
@@ -4281,23 +4352,11 @@ def create_app(  # noqa: C901
     ) -> SemanticDocument:
         """Return one semantic-layer document."""
 
-        try:
-            document = active_semantic_layer_store.get_document(
-                document_id,
-                owner_id=identity.owner_id,
-            )
-        except SemanticDocumentNotFoundError as ex:
-            raise HTTPException(
-                status_code=404,
-                detail="Semantic document not found.",
-            ) from ex
-        authorize_semantic_scope(
-            fastapi_request,
-            document.scope,
-            identity=identity,
-            permission=SemanticPermission.READ,
+        # Shared object-level gate (DB-tied: includes fingerprint translation
+        # onto the caller's own connection).
+        return _load_authorized_document(
+            document_id, fastapi_request, identity, SemanticPermission.READ
         )
-        return document
 
     # -- Document RAG + CRUD (uploaded_documents_rag_and_crud.md) ----------
 
@@ -4317,7 +4376,15 @@ def create_app(  # noqa: C901
         identity: AgentIdentity,
         permission: SemanticPermission,
     ) -> SemanticDocument:
-        """Load a document and enforce object-level scope auth (404 then access)."""
+        """Load a document and enforce object-level scope auth (404 then access).
+
+        Documents are DB-tied (D1b): the stored scope carries the *author's*
+        connection id, which the caller may not see under self-service
+        connections. When direct scope authorization fails, translate the
+        document's URI fingerprint onto one of the caller's own connections
+        and re-prove; a caller with no connection to that physical database
+        stays denied (fail closed, R6).
+        """
 
         try:
             document = active_semantic_layer_store.get_document(
@@ -4327,9 +4394,24 @@ def create_app(  # noqa: C901
             raise HTTPException(
                 status_code=404, detail="Semantic document not found."
             ) from ex
-        authorize_semantic_scope(
-            request, document.scope, identity=identity, permission=permission
-        )
+        try:
+            authorize_semantic_scope(
+                request, document.scope, identity=identity, permission=permission
+            )
+        except HTTPException:
+            translated_id = build_semantic_access_service(
+                request, owner_id=identity.owner_id
+            ).caller_database_id_for_fingerprint(
+                document.scope.database_uri_fingerprint
+            )
+            if translated_id is None or translated_id == document.scope.database_id:
+                raise
+            authorize_semantic_scope(
+                request,
+                document.scope.model_copy(update={"database_id": translated_id}),
+                identity=identity,
+                permission=permission,
+            )
         return document
 
     @api.get(
@@ -4534,11 +4616,16 @@ def create_app(  # noqa: C901
         text = request.instruction.strip()
         if not text:
             raise HTTPException(status_code=400, detail="Instruction is empty.")
+        # DB-tied (D1b): key by the fingerprint-substituted scope hash (post-
+        # authorization) so every user's own connection to this physical
+        # database recalls the same instruction; owner_id is audit-only.
+        scope = _with_scope_fingerprint(fastapi_request, request.scope)
         return active_instruction_store.add(
             instruction=text,
-            scope_hash=instruction_scope_hash(request.scope),
+            scope_hash=instruction_scope_hash(scope),
             owner_id=identity.owner_id,
             is_global=request.is_global,
+            database_uri_fingerprint=scope.database_uri_fingerprint,
         )
 
     @api.get(
@@ -4567,20 +4654,47 @@ def create_app(  # noqa: C901
             identity=identity,
             permission=SemanticPermission.READ,
         )
+        # DB-tied hash first, legacy per-connection hash second (enriched only
+        # after the scope authorization above).
         return active_instruction_store.list_instructions(
-            scope_hash=instruction_scope_hash(scope),
+            scope_hashes=_instruction_scope_hashes(fastapi_request, scope),
             owner_id=identity.owner_id,
         )
 
     @api.delete("/agent/semantic-layer/instructions/{instruction_id}")
     def delete_instruction(
         instruction_id: str,
+        fastapi_request: Request,
+        database_id: int,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        dataset_ids: str | None = Query(default=None),
         identity: AgentIdentity = identity_dependency,
     ) -> dict[str, bool]:
-        """Delete one of the caller's instructions."""
+        """Delete an instruction in a scope the caller can write.
 
+        DB-tied (D1b): instructions belong to the database, so deletion is
+        authorized by write access to the scope (proven via the caller's own
+        connection) and gated in the store by scope-hash membership — never by
+        ownership.
+        """
+
+        scope = ConversationScope(
+            database_id=database_id,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            dataset_ids=_parse_dataset_ids(dataset_ids),
+        )
+        authorize_semantic_scope(
+            fastapi_request,
+            scope,
+            identity=identity,
+            permission=SemanticPermission.WRITE,
+        )
         deleted = active_instruction_store.delete(
-            instruction_id, owner_id=identity.owner_id
+            instruction_id,
+            owner_id=identity.owner_id,
+            scope_hashes=_instruction_scope_hashes(fastapi_request, scope),
         )
         if not deleted:
             raise HTTPException(status_code=404, detail="Instruction not found.")
@@ -5086,6 +5200,10 @@ def _scope_from_project(project: SemanticProject) -> ConversationScope:
         database_id=project.default_database_id,
         catalog_name=project.catalog_name,
         schema_name=project.schema_name,
+        # The project already carries the DB-tied sharing key — stamp it so
+        # documents written under a project scope are fingerprinted without
+        # another identity round-trip.
+        database_uri_fingerprint=project.database_uri_fingerprint or None,
     )
 
 

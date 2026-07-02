@@ -89,3 +89,63 @@ def test_command_with_oauth2(mocker: MockerFixture) -> None:
         level=ErrorLevel.WARNING,
         extra={"url": "url", "tab_id": "tab_id", "redirect_uri": "redirect_uri"},
     )
+
+
+def test_command_does_not_unmask_inaccessible_database(
+    mocker: MockerFixture,
+) -> None:
+    """
+    Test that stored secrets are only reused for databases the caller can see.
+
+    The stored model is resolved by *name*; a caller who cannot reach that
+    database through the owner-scoped base filter (``find_by_id`` returns
+    None) must not have its masked URI substituted with the decrypted one
+    (object-level authorization, OWASP API1).
+    """
+    DatabaseDAO = mocker.patch(  # noqa: N806
+        "superset.commands.database.test_connection.DatabaseDAO"
+    )
+    stored = mocker.MagicMock()
+    stored.id = 42
+    stored.safe_sqlalchemy_uri.return_value = "postgresql://u:XXXXXXXXXX@host/db"
+    stored.sqlalchemy_uri_decrypted = "postgresql://u:real-secret@host/db"
+    DatabaseDAO.get_database_by_name.return_value = stored
+    # Owner-scoped resolution fails: caller cannot see this database.
+    DatabaseDAO.find_by_id.return_value = None
+
+    command = TestConnectionDatabaseCommand(
+        {
+            "database_name": "victims_db",
+            "sqlalchemy_uri": "postgresql://u:XXXXXXXXXX@host/db",
+        }
+    )
+
+    assert command._model is None
+    assert "real-secret" not in command._uri
+    assert command._context["password"] == "XXXXXXXXXX"
+
+
+def test_command_unmasks_accessible_database(mocker: MockerFixture) -> None:
+    """
+    Test that stored secrets ARE reused when the caller can see the database.
+    """
+    DatabaseDAO = mocker.patch(  # noqa: N806
+        "superset.commands.database.test_connection.DatabaseDAO"
+    )
+    stored = mocker.MagicMock()
+    stored.id = 42
+    stored.safe_sqlalchemy_uri.return_value = "postgresql://u:XXXXXXXXXX@host/db"
+    stored.sqlalchemy_uri_decrypted = "postgresql://u:real-secret@host/db"
+    DatabaseDAO.get_database_by_name.return_value = stored
+    # Owner-scoped resolution succeeds: this is the caller's own database.
+    DatabaseDAO.find_by_id.return_value = stored
+
+    command = TestConnectionDatabaseCommand(
+        {
+            "database_name": "my_db",
+            "sqlalchemy_uri": "postgresql://u:XXXXXXXXXX@host/db",
+        }
+    )
+
+    assert command._model is stored
+    assert command._context["password"] == "real-secret"
