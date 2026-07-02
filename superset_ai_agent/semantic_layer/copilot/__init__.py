@@ -19,7 +19,7 @@
 
 This package hosts the copilot's tool registry, agentic edit loop, and the
 workspace/inspector aggregation that powers the Cursor-style MDL editor. See
-``superset_ai_agent/wren_mdl_copilot.md`` for the design and sequencing.
+``superset_ai_agent/docs/plans/wren_mdl_copilot.md`` for the design and sequencing.
 """
 
 from __future__ import annotations

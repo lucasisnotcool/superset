@@ -85,6 +85,10 @@ class AgentQueryRequest(BaseModel):
     execute: bool = False
     model: str | None = None
     max_steps: int = Field(default=6, ge=2, le=12)
+    #: Questions whose recalled golden/memory examples must be dropped before
+    #: drafting — the benchmark leakage guard (an item must not be answered
+    #: with its own exemplar). Server-side only; harmless when unset.
+    exclude_example_questions: list[str] | None = None
 
     @property
     def effective_schema_names(self) -> list[str]:

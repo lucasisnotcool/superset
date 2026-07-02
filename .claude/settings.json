@@ -6,7 +6,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "jq -r '.tool_input.command // \"\"' | grep -qE '^git commit' && cd \"$CLAUDE_PROJECT_DIR\" && echo '🔍 Running pre-commit before commit...' && pre-commit run || true"
+            "command": "\"$CLAUDE_PROJECT_DIR/.claude/hooks/git-guard.sh\""
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR/.claude/hooks/pre-commit-gate.sh\""
           }
         ]
       }

@@ -2259,3 +2259,331 @@ export const promoteGoldenQuery = (
     `/agent/semantic-layer/projects/${projectId}/golden-queries/promote`,
     { method: 'POST', body: JSON.stringify(body) },
   );
+
+// --- Project Benchmarks (testing platform F11) -------------------------------
+
+export type BenchmarkAnswerType = 'gold_sql' | 'expected_values' | 'eval_note';
+export type BenchmarkVerdict = 'pass' | 'fail' | 'needs_review' | 'error';
+export type BenchmarkRunStatus =
+  | 'pending'
+  | 'running'
+  | 'complete'
+  | 'failed'
+  | 'superseded';
+
+export interface Benchmark {
+  id: string;
+  project_id: string;
+  name: string;
+  description?: string | null;
+  item_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface BenchmarkItem {
+  id: string;
+  benchmark_id: string;
+  position: number;
+  question: string;
+  answer_type: BenchmarkAnswerType;
+  answer_spec: Record<string, unknown>;
+  capability_tags: string[];
+  use_as_example: boolean;
+  verified_by?: string | null;
+  verified_at?: string | null;
+}
+
+export interface BenchmarkRunTotals {
+  items: number;
+  trials: number;
+  passed: number;
+  failed: number;
+  needs_review: number;
+  errors: number;
+  pass_hat_k?: number | null;
+  by_capability?: Record<string, { items: number; passed: number }> | null;
+}
+
+export interface BenchmarkRun {
+  id: string;
+  benchmark_id: string;
+  project_id: string;
+  status: BenchmarkRunStatus;
+  trials: number;
+  mdl_checksum?: string | null;
+  benchmark_checksum: string;
+  score?: number | null;
+  totals?: BenchmarkRunTotals | null;
+  progress?: {
+    completed: number;
+    total: number;
+    current_question?: string | null;
+  } | null;
+  error?: string | null;
+  created_at: string;
+}
+
+export interface BenchmarkScore {
+  name: string;
+  value?: number | null;
+  label?: string | null;
+  explanation?: string | null;
+  source: string;
+}
+
+export interface BenchmarkResult {
+  id: string;
+  run_id: string;
+  item_id: string;
+  trial_index: number;
+  question: string;
+  answer_type: BenchmarkAnswerType;
+  agent_sql?: string | null;
+  agent_rows_preview?: Record<string, unknown>[] | null;
+  gold_rows_preview?: Record<string, unknown>[] | null;
+  verdict: BenchmarkVerdict;
+  reasons: string[];
+  matched_models?: string[] | null;
+  duration_ms?: number | null;
+  override_verdict?: BenchmarkVerdict | null;
+  override_by?: string | null;
+  override_comment?: string | null;
+  scores: BenchmarkScore[];
+}
+
+export interface BenchmarkRunComparison {
+  run_id: string;
+  other_run_id: string;
+  delta: number;
+  ci_low: number;
+  ci_high: number;
+  significant: boolean;
+  n_items: number;
+  improved: string[];
+  regressed: string[];
+  unchanged: string[];
+  benchmark_changed: boolean;
+}
+
+export interface BenchmarkDryRunResponse {
+  answer_type: BenchmarkAnswerType;
+  columns: string[];
+  rows: Record<string, unknown>[];
+  row_count: number;
+  note?: string | null;
+  spec?: Record<string, unknown> | null;
+  problems: string[];
+}
+
+const benchmarksBase = (projectId: string) =>
+  `/agent/semantic-layer/projects/${projectId}/benchmarks`;
+
+export const listBenchmarks = (projectId: string) =>
+  requestJson<Benchmark[]>(benchmarksBase(projectId));
+
+export const createBenchmark = (
+  projectId: string,
+  body: { name: string; description?: string },
+) =>
+  requestJson<Benchmark>(benchmarksBase(projectId), {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+
+export const deleteBenchmark = (projectId: string, benchmarkId: string) =>
+  requestJson<{ deleted: boolean }>(
+    `${benchmarksBase(projectId)}/${benchmarkId}`,
+    { method: 'DELETE' },
+  );
+
+export const listBenchmarkItems = (projectId: string, benchmarkId: string) =>
+  requestJson<BenchmarkItem[]>(
+    `${benchmarksBase(projectId)}/${benchmarkId}/items`,
+  );
+
+export const createBenchmarkItem = (
+  projectId: string,
+  benchmarkId: string,
+  body: {
+    question: string;
+    answer_type: BenchmarkAnswerType;
+    answer_spec: Record<string, unknown>;
+    capability_tags?: string[];
+    use_as_example?: boolean;
+    verified?: boolean;
+  },
+) =>
+  requestJson<BenchmarkItem>(
+    `${benchmarksBase(projectId)}/${benchmarkId}/items`,
+    { method: 'POST', body: JSON.stringify(body) },
+  );
+
+export const deleteBenchmarkItem = (
+  projectId: string,
+  benchmarkId: string,
+  itemId: string,
+) =>
+  requestJson<{ deleted: boolean }>(
+    `${benchmarksBase(projectId)}/${benchmarkId}/items/${itemId}`,
+    { method: 'DELETE' },
+  );
+
+export const dryRunBenchmarkItem = (
+  projectId: string,
+  benchmarkId: string,
+  itemId: string,
+) =>
+  requestJson<BenchmarkDryRunResponse>(
+    `${benchmarksBase(projectId)}/${benchmarkId}/items/${itemId}/dry-run`,
+    { method: 'POST' },
+  );
+
+export const promoteBenchmarkItem = (
+  projectId: string,
+  benchmarkId: string,
+  itemId: string,
+) =>
+  requestJson<BenchmarkItem>(
+    `${benchmarksBase(projectId)}/${benchmarkId}/items/${itemId}/promote-example`,
+    { method: 'POST' },
+  );
+
+export const importGoldenAsBenchmarkItems = (
+  projectId: string,
+  benchmarkId: string,
+) =>
+  requestJson<{ created: number; skipped_duplicates: number }>(
+    `${benchmarksBase(projectId)}/${benchmarkId}/import-golden`,
+    { method: 'POST' },
+  );
+
+export const startBenchmarkRun = (
+  projectId: string,
+  benchmarkId: string,
+  body: {
+    trials?: number;
+    item_ids?: string[];
+    model?: string;
+    exclude_example_recall?: boolean;
+  },
+) =>
+  requestJson<{
+    run_id: string;
+    status: BenchmarkRunStatus;
+    total_items: number;
+  }>(`${benchmarksBase(projectId)}/${benchmarkId}/runs`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+
+export const listBenchmarkRuns = (projectId: string, benchmarkId: string) =>
+  requestJson<BenchmarkRun[]>(
+    `${benchmarksBase(projectId)}/${benchmarkId}/runs`,
+  );
+
+export const getBenchmarkRun = (
+  projectId: string,
+  benchmarkId: string,
+  runId: string,
+) =>
+  requestJson<BenchmarkRun>(
+    `${benchmarksBase(projectId)}/${benchmarkId}/runs/${runId}`,
+  );
+
+export const listBenchmarkRunResults = (
+  projectId: string,
+  benchmarkId: string,
+  runId: string,
+) =>
+  requestJson<BenchmarkResult[]>(
+    `${benchmarksBase(projectId)}/${benchmarkId}/runs/${runId}/results`,
+  );
+
+export const compareBenchmarkRuns = (
+  projectId: string,
+  benchmarkId: string,
+  runId: string,
+  otherRunId: string,
+) =>
+  requestJson<BenchmarkRunComparison>(
+    `${benchmarksBase(projectId)}/${benchmarkId}/runs/${runId}/compare/${otherRunId}`,
+  );
+
+export const overrideBenchmarkResult = (
+  projectId: string,
+  benchmarkId: string,
+  runId: string,
+  resultId: string,
+  body: { verdict: BenchmarkVerdict; comment?: string },
+) =>
+  requestJson<BenchmarkResult>(
+    `${benchmarksBase(projectId)}/${benchmarkId}/runs/${runId}/results/${resultId}/override`,
+    { method: 'POST', body: JSON.stringify(body) },
+  );
+
+export interface ScientistFinding {
+  item_id: string;
+  question: string;
+  diagnosis: string;
+  suggested_fix_type?: string | null;
+  suggested_action?: string | null;
+  test_suspect: boolean;
+}
+
+export interface ScientistReport {
+  summary: string;
+  stats_note?: string | null;
+  within_noise?: boolean | null;
+  findings: ScientistFinding[];
+  parse_degraded: boolean;
+}
+
+export const analyzeBenchmarkRun = (
+  projectId: string,
+  benchmarkId: string,
+  runId: string,
+) =>
+  requestJson<{ report: ScientistReport; conversation_id: string | null }>(
+    `${benchmarksBase(projectId)}/${benchmarkId}/runs/${runId}/analyze`,
+    { method: 'POST' },
+  );
+
+export interface MatrixRunConfig {
+  label?: string;
+  model?: string | null;
+  exclude_example_recall?: boolean;
+}
+
+export const startBenchmarkMatrix = (
+  projectId: string,
+  benchmarkId: string,
+  body: { configs: MatrixRunConfig[]; trials?: number; item_ids?: string[] },
+) =>
+  requestJson<{
+    runs: { run_id: string; label: string }[];
+    total_items: number;
+  }>(`${benchmarksBase(projectId)}/${benchmarkId}/matrix-runs`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+
+export interface CopilotHandoffResponse {
+  changeset: {
+    message?: string | null;
+    items: { op: string; path: string }[];
+  };
+  report: ScientistReport;
+  conversation_id: string | null;
+  verification_hint: string;
+}
+
+export const handoffBenchmarkRunToCopilot = (
+  projectId: string,
+  benchmarkId: string,
+  runId: string,
+) =>
+  requestJson<CopilotHandoffResponse>(
+    `${benchmarksBase(projectId)}/${benchmarkId}/runs/${runId}/handoff-copilot`,
+    { method: 'POST' },
+  );

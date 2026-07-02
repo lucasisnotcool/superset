@@ -1,1 +1,0 @@
-.\scripts\docker-compose-ai-diagnostics.ps1 -OutputPath .\diagnostics\ai-docker.txt

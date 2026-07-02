@@ -158,6 +158,11 @@ const AiAgentUsage = lazy(
   () => import(/* webpackChunkName: "AiAgentUsage" */ 'src/pages/AiAgentUsage'),
 );
 
+const AiAgentPrompts = lazy(
+  () =>
+    import(/* webpackChunkName: "AiAgentPrompts" */ 'src/pages/AiAgentPrompts'),
+);
+
 const UsersList: LazyExoticComponent<any> = lazy(
   () => import(/* webpackChunkName: "UsersList" */ 'src/pages/UsersList'),
 );
@@ -380,6 +385,10 @@ if (isAdmin) {
     {
       path: '/ai-agent/usage/',
       Component: AiAgentUsage,
+    },
+    {
+      path: '/ai-agent/prompts/',
+      Component: AiAgentPrompts,
     },
   );
 

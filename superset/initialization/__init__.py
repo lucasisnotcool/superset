@@ -467,6 +467,18 @@ class SupersetAppInitializer:  # pylint: disable=too-many-public-methods
             cond=lambda: bool(appbuilder.sm.is_admin()),
         )
 
+        appbuilder.add_link(
+            "AI Agent Prompts",
+            label=_("AI Agent Prompts"),
+            href=f"{app_root}/ai-agent/prompts/",
+            icon="fa-pencil-square-o",
+            category="Manage",
+            category_label=_("Manage"),
+            # Admin-only: prompt editing is an operational capability; the agent
+            # API enforces the same gate (defense-in-depth).
+            cond=lambda: bool(appbuilder.sm.is_admin()),
+        )
+
         #
         # Setup views with no menu
         #

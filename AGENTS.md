@@ -294,6 +294,14 @@ pre-commit run eslint            # Frontend linting
 - **Utilities**: Use helpers from `superset.migrations.shared.utils` for database compatibility
 - **Pattern**: Import utilities instead of raw SQLAlchemy operations
 
+## Fork Working Agreement (this fork only)
+
+Mandatory session rules for this fork — definition of done, verification standard,
+plan-checklist workflow, git discipline, and multi-machine deployment facts.
+Read and follow [.claude/fork-workflow.md](.claude/fork-workflow.md):
+
+@.claude/fork-workflow.md
+
 ## Platform-Specific Instructions
 
 - **[CLAUDE.md](CLAUDE.md)** - For Claude/Anthropic tools

@@ -308,7 +308,7 @@ FEATURE_FLAGS = {
 # default role for self-registered users. Connection visibility for
 # non-privileged users is owner-scoped by DatabaseFilter; see
 # superset/security/builder.py and
-# superset_ai_agent/plan_self_service_connections_spec.md.
+# superset_ai_agent/docs/plans/plan_self_service_connections_spec.md.
 from superset.security.builder import BuilderSecurityManager  # noqa: E402
 
 CUSTOM_SECURITY_MANAGER = BuilderSecurityManager

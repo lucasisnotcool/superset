@@ -46,13 +46,46 @@ def strip_leading_metadata(text: str) -> str:
     return stripped.lstrip()
 
 
-@lru_cache(maxsize=32)
-def get_prompt(name: str) -> str:
-    """Load a prompt by name.
+#: Optional DB-backed override resolver (testing platform P2.1). Installed by
+#: ``create_app`` when a prompt store exists; returns the ``production``-labeled
+#: content for a name or ``None`` (→ file fallback). The file always remains
+#: the fail-safe default, so prompt resolution can never take the agent down.
+_prompt_resolver = None
 
-    This is intentionally file-backed for Phase 1. A later prompt registry can
-    replace this function with a database-backed implementation.
-    """
+
+def set_prompt_resolver(resolver) -> None:
+    """Install (or clear, with ``None``) the DB-backed prompt override hook."""
+
+    global _prompt_resolver  # noqa: PLW0603 - single process-wide seam
+    _prompt_resolver = resolver
+
+
+@lru_cache(maxsize=32)
+def get_file_prompt(name: str) -> str:
+    """Load the repo-file default for a prompt name (the git-reviewed seed)."""
 
     prompt_path = Path(__file__).parent / f"{name}.md"
     return strip_leading_metadata(prompt_path.read_text(encoding="utf-8"))
+
+
+def list_file_prompt_names() -> list[str]:
+    """Names of all repo-file prompt defaults (``prompts/*.md``)."""
+
+    return sorted(path.stem for path in Path(__file__).parent.glob("*.md"))
+
+
+def get_prompt(name: str) -> str:
+    """Resolve a prompt: DB ``production`` override first, file default second.
+
+    The override path is best-effort — any resolver error degrades to the file
+    default rather than failing the agent turn.
+    """
+
+    if _prompt_resolver is not None:
+        try:
+            override = _prompt_resolver(name)
+        except Exception:  # pylint: disable=broad-except - fail-safe fallback
+            override = None
+        if override is not None:
+            return strip_leading_metadata(override)
+    return get_file_prompt(name)

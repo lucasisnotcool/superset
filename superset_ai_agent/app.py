@@ -71,6 +71,53 @@ from superset_ai_agent.conversations.store import (
     DEFAULT_OWNER_ID,
 )
 from superset_ai_agent.conversations.turns import ConversationTurnService
+from superset_ai_agent.evals.comparator import compare_result_sets
+from superset_ai_agent.evals.judge import judge_eval_note
+from superset_ai_agent.evals.otel_export import run_to_evaluation_events
+from superset_ai_agent.evals.schemas import (
+    Benchmark,
+    BenchmarkCreateRequest,
+    BenchmarkItem,
+    BenchmarkItemCreateRequest,
+    BenchmarkItemUpdateRequest,
+    BenchmarkMatrixRunRequest,
+    BenchmarkMatrixSubmitted,
+    BenchmarkRunRequest,
+    BenchmarkRunSubmitted,
+    BenchmarkUpdateRequest,
+    DryRunResponse,
+    EvalResult,
+    EvalRun,
+    EvalScore,
+    GoldenImportResponse,
+    MatrixRunSubmitted,
+    MAX_ITEMS_PER_BENCHMARK,
+    PREVIEW_ROW_CAP,
+    ResultOverrideRequest,
+    RunComparisonResponse,
+    RunProgress,
+    RunTotals,
+)
+from superset_ai_agent.evals.scientist import analyze_run, ScientistReport
+from superset_ai_agent.evals.stats import (
+    mean_pass_rate,
+    paired_delta_ci,
+    pass_hat_k,
+)
+from superset_ai_agent.evals.store import (
+    BenchmarkItemNotFoundError,
+    BenchmarkNotFoundError,
+    compute_benchmark_checksum,
+    EvalResultNotFoundError,
+    EvalRunNotFoundError,
+    EvalStore,
+    InMemoryEvalStore,
+    SqlAlchemyEvalStore,
+)
+from superset_ai_agent.evals.typed_spec import (
+    score_expected_values,
+    validate_expected_values_spec,
+)
 from superset_ai_agent.graph import TextToSqlGraph
 from superset_ai_agent.integrations.superset.client import SupersetAuthError
 from superset_ai_agent.integrations.superset.factory import create_superset_client
@@ -91,6 +138,23 @@ from superset_ai_agent.persistence.database import (
     run_migrations,
 )
 from superset_ai_agent.persistence.ttl_cache import TtlCache
+from superset_ai_agent.prompts.registry import (
+    get_file_prompt,
+    list_file_prompt_names,
+    set_prompt_resolver,
+)
+from superset_ai_agent.prompts.store import (
+    InMemoryPromptStore,
+    PRODUCTION_LABEL,
+    PromptDetail,
+    PromptPromoteRequest,
+    PromptStore,
+    PromptSummary,
+    PromptVersion,
+    PromptVersionCreateRequest,
+    PromptVersionNotFoundError,
+    SqlAlchemyPromptStore,
+)
 from superset_ai_agent.schemas import (
     AgentQueryRequest,
     AgentQueryResponse,
@@ -180,6 +244,7 @@ from superset_ai_agent.semantic_layer.golden_queries import (
     GOLDEN_QUERIES_PATH,
     GoldenQuery,
     GoldenQueryPromoteRequest,
+    parse_golden_queries,
     upsert_golden_query,
 )
 from superset_ai_agent.semantic_layer.instructions import (
@@ -315,6 +380,8 @@ def create_app(  # noqa: C901
     job_store: JobStore | None = None,
     job_runner: JobRunner | None = None,
     coverage_run_store: CoverageRunStore | None = None,
+    eval_store: EvalStore | None = None,
+    prompt_store: PromptStore | None = None,
     schema_snapshot_store: SchemaSnapshotStore | None = None,
     retriever: Any | None = None,
     llm_call_store: LlmUsageStore | None = None,
@@ -418,6 +485,31 @@ def create_app(  # noqa: C901
         app_config,
         session_factory=session_factory,
     )
+    # Project Benchmarks (testing platform F11): benchmarks/items/runs/results.
+    active_eval_store = eval_store or _create_eval_store(
+        app_config,
+        session_factory=session_factory,
+    )
+    # Prompt registry (P2.1): DB overrides over the repo-file defaults. The
+    # resolver serves the `production` label through a short TTL cache; a miss
+    # or error falls back to the file, so prompts are always resolvable.
+    active_prompt_store = prompt_store or _create_prompt_store(
+        app_config,
+        session_factory=session_factory,
+    )
+    _prompt_cache: TtlCache[str, str] = TtlCache(ttl_seconds=5.0)
+
+    def _resolve_prompt_override(name: str) -> str | None:
+        cached = _prompt_cache.get(name)
+        if cached is not None:
+            return cached
+        version = active_prompt_store.get_labeled(name, PRODUCTION_LABEL)
+        if version is None:
+            return None
+        _prompt_cache.set(name, version.content)
+        return version.content
+
+    set_prompt_resolver(_resolve_prompt_override)
     active_vector_index = effective_vector_index(app_config, active_retriever)
     if active_vector_index == "memory_fallback":
         logger.warning(
@@ -776,6 +868,120 @@ def create_app(  # noqa: C901
             else None
         )
         return active_llm_usage_store.summary(since=since)
+
+    # ------------------------------------------------------------------
+    # Prompt registry (testing platform P2.1) — admin-only, candidate→promote.
+    # Files stay the git-reviewed defaults; the DB holds override versions and
+    # the `production` label the runtime resolver serves.
+    # ------------------------------------------------------------------
+
+    def _file_prompt_or_none(name: str) -> str | None:
+        try:
+            return get_file_prompt(name)
+        except OSError:
+            return None
+
+    @api.get("/agent/admin/prompts", response_model=list[PromptSummary])
+    def list_prompts(
+        request: Request,
+        _admin: None = admin_dependency,
+    ) -> list[PromptSummary]:
+        """All prompt names (file defaults ∪ DB overrides) with version state."""
+
+        file_names = set(list_file_prompt_names())
+        db_names = set(active_prompt_store.list_names())
+        summaries: list[PromptSummary] = []
+        for name in sorted(file_names | db_names):
+            versions = active_prompt_store.list_versions(name)
+            production = active_prompt_store.get_labeled(name, PRODUCTION_LABEL)
+            summaries.append(
+                PromptSummary(
+                    name=name,
+                    has_file_default=name in file_names,
+                    versions_count=len(versions),
+                    production_version=(
+                        production.version if production is not None else None
+                    ),
+                )
+            )
+        return summaries
+
+    @api.get("/agent/admin/prompts/{name}", response_model=PromptDetail)
+    def get_prompt_detail(
+        name: str,
+        request: Request,
+        _admin: None = admin_dependency,
+    ) -> PromptDetail:
+        file_content = _file_prompt_or_none(name)
+        versions = active_prompt_store.list_versions(name)
+        if file_content is None and not versions:
+            raise HTTPException(status_code=404, detail="Prompt not found.")
+        production = active_prompt_store.get_labeled(name, PRODUCTION_LABEL)
+        return PromptDetail(
+            name=name,
+            file_content=file_content,
+            production_version_id=production.id if production else None,
+            versions=versions,
+        )
+
+    @api.post(
+        "/agent/admin/prompts/{name}/versions", response_model=PromptVersion
+    )
+    def create_prompt_version(
+        name: str,
+        body: PromptVersionCreateRequest,
+        request: Request,
+        identity: AgentIdentity = identity_dependency,
+        _admin: None = admin_dependency,
+    ) -> PromptVersion:
+        """Save a candidate version. Never touches `production` by itself."""
+
+        if _file_prompt_or_none(name) is None and not active_prompt_store.list_versions(
+            name
+        ):
+            raise HTTPException(status_code=404, detail="Prompt not found.")
+        return active_prompt_store.create_version(
+            name,
+            body.content,
+            comment=body.comment,
+            created_by=identity.username or identity.email or identity.owner_id,
+        )
+
+    @api.post("/agent/admin/prompts/{name}/promote", response_model=PromptVersion)
+    def promote_prompt_version(
+        name: str,
+        body: PromptPromoteRequest,
+        request: Request,
+        identity: AgentIdentity = identity_dependency,
+        _admin: None = admin_dependency,
+    ) -> PromptVersion:
+        """Point `production` at a version (deploy); also how rollback works."""
+
+        try:
+            version = active_prompt_store.set_label(
+                name,
+                PRODUCTION_LABEL,
+                body.version_id,
+                updated_by=identity.username or identity.email or identity.owner_id,
+            )
+        except PromptVersionNotFoundError as ex:
+            raise HTTPException(
+                status_code=404, detail="Prompt version not found."
+            ) from ex
+        _prompt_cache.invalidate(name)
+        return version
+
+    @api.delete("/agent/admin/prompts/{name}/promotion")
+    def reset_prompt_to_file_default(
+        name: str,
+        request: Request,
+        _admin: None = admin_dependency,
+    ) -> dict[str, bool]:
+        """Clear `production` — the runtime falls back to the repo file."""
+
+        removed = active_prompt_store.clear_label(name, PRODUCTION_LABEL)
+        _prompt_cache.invalidate(name)
+        return {"reset": removed}
 
     @api.post("/agent/query", response_model=AgentQueryResponse)
     def query_agent(
@@ -3662,6 +3868,1446 @@ def create_app(  # noqa: C901
             owner_id=identity.owner_id,
         )
 
+    # ------------------------------------------------------------------
+    # Project Benchmarks (testing platform F11) — user-curated NL test sets
+    # scored against ground truth, per-project, curator-facing (project authz,
+    # not admin). Runs execute on the shared job runner and report progress
+    # through the project events SSE, mirroring coverage runs.
+    # ------------------------------------------------------------------
+
+    def _require_benchmarks_enabled() -> None:
+        if not app_config.wren_benchmarks_enabled:
+            raise HTTPException(
+                status_code=403,
+                detail="Project benchmarks are disabled on this deployment.",
+            )
+
+    def _get_project_benchmark(project_id: str, benchmark_id: str) -> Benchmark:
+        try:
+            benchmark = active_eval_store.get_benchmark(benchmark_id)
+        except BenchmarkNotFoundError as ex:
+            raise HTTPException(
+                status_code=404, detail="Benchmark not found."
+            ) from ex
+        if benchmark.project_id != project_id:
+            raise HTTPException(status_code=404, detail="Benchmark not found.")
+        return benchmark
+
+    def _validated_answer_spec(
+        answer_type: str, answer_spec: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Shape-check an item's answer spec; 422 with reasons on failure."""
+
+        problems: list[str] = []
+        if answer_type == "gold_sql":
+            sql = str(answer_spec.get("sql") or "").strip()
+            if not sql:
+                problems.append("gold_sql spec requires a non-empty `sql`.")
+            else:
+                validation = validate_read_only_sql(
+                    sql, policy_mode=app_config.sql_policy_mode
+                )
+                if not validation.is_read_only:
+                    problems.append(
+                        "Gold SQL must be read-only: "
+                        f"{validation.reason or validation.classification}."
+                    )
+        elif answer_type == "expected_values":
+            problems.extend(validate_expected_values_spec(answer_spec))
+        elif answer_type == "eval_note":
+            if not str(answer_spec.get("note") or "").strip():
+                problems.append("eval_note spec requires a non-empty `note`.")
+        else:  # pragma: no cover - pydantic Literal already blocks this
+            problems.append(f"Unknown answer_type {answer_type!r}.")
+        if problems:
+            raise HTTPException(status_code=422, detail="; ".join(problems))
+        return answer_spec
+
+    def _resolve_benchmark_database_id(
+        request: Request, project: SemanticProject, owner_id: str
+    ) -> int:
+        """The caller's own connection to the project's physical DB (BYO-creds).
+
+        Prefers the fingerprint-translated connection (self-service model) and
+        falls back to the project's default connection id. Gold SQL and agent
+        execution both ride this id, so a benchmark run can never read beyond
+        the runner's own database rights.
+        """
+
+        try:
+            translated = build_semantic_access_service(
+                request, owner_id=owner_id
+            ).caller_database_id_for_fingerprint(project.database_uri_fingerprint)
+        except Exception:  # pylint: disable=broad-except - best-effort translate
+            translated = None
+        database_id = translated or project.default_database_id
+        if database_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail="No database connection is available for this project.",
+            )
+        return int(database_id)
+
+    def _preview_rows(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+        return list(rows or [])[:PREVIEW_ROW_CAP]
+
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}/benchmarks",
+        response_model=list[Benchmark],
+    )
+    def list_benchmarks(
+        project_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> list[Benchmark]:
+        _require_benchmarks_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id
+        )
+        return active_eval_store.list_benchmarks(project_id)
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/benchmarks",
+        response_model=Benchmark,
+    )
+    def create_benchmark(
+        project_id: str,
+        request: BenchmarkCreateRequest,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> Benchmark:
+        _require_benchmarks_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
+        )
+        return active_eval_store.create_benchmark(
+            project_id=project_id,
+            owner_id=identity.owner_id,
+            name=request.name,
+            description=request.description,
+        )
+
+    @api.patch(
+        "/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}",
+        response_model=Benchmark,
+    )
+    def update_benchmark(
+        project_id: str,
+        benchmark_id: str,
+        request: BenchmarkUpdateRequest,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> Benchmark:
+        _require_benchmarks_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
+        )
+        _get_project_benchmark(project_id, benchmark_id)
+        return active_eval_store.update_benchmark(
+            benchmark_id, name=request.name, description=request.description
+        )
+
+    @api.delete(
+        "/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}"
+    )
+    def delete_benchmark(
+        project_id: str,
+        benchmark_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> dict[str, bool]:
+        _require_benchmarks_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
+        )
+        _get_project_benchmark(project_id, benchmark_id)
+        active_eval_store.delete_benchmark(benchmark_id)
+        return {"deleted": True}
+
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}/items",
+        response_model=list[BenchmarkItem],
+    )
+    def list_benchmark_items(
+        project_id: str,
+        benchmark_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> list[BenchmarkItem]:
+        _require_benchmarks_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id
+        )
+        _get_project_benchmark(project_id, benchmark_id)
+        return active_eval_store.list_items(benchmark_id)
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}/items",
+        response_model=BenchmarkItem,
+    )
+    def create_benchmark_item(
+        project_id: str,
+        benchmark_id: str,
+        request: BenchmarkItemCreateRequest,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> BenchmarkItem:
+        _require_benchmarks_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
+        )
+        benchmark = _get_project_benchmark(project_id, benchmark_id)
+        if benchmark.item_count >= MAX_ITEMS_PER_BENCHMARK:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Benchmark is at its {MAX_ITEMS_PER_BENCHMARK}-item cap; "
+                    "split it into a second benchmark."
+                ),
+            )
+        spec = _validated_answer_spec(request.answer_type, request.answer_spec)
+        verified_stamp = (
+            identity.username or identity.email or identity.owner_id
+            if request.verified
+            else None
+        )
+        item = BenchmarkItem(
+            benchmark_id=benchmark_id,
+            position=benchmark.item_count,
+            question=request.question.strip(),
+            answer_type=request.answer_type,
+            answer_spec=spec,
+            capability_tags=request.capability_tags,
+            use_as_example=request.use_as_example,
+            verified_by=verified_stamp,
+            verified_at=datetime.now(timezone.utc) if verified_stamp else None,
+            created_by=identity.owner_id,
+        )
+        return active_eval_store.add_item(item)
+
+    @api.patch(
+        "/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}"
+        "/items/{item_id}",
+        response_model=BenchmarkItem,
+    )
+    def update_benchmark_item(
+        project_id: str,
+        benchmark_id: str,
+        item_id: str,
+        request: BenchmarkItemUpdateRequest,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> BenchmarkItem:
+        _require_benchmarks_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
+        )
+        _get_project_benchmark(project_id, benchmark_id)
+        try:
+            item = active_eval_store.get_item(item_id)
+        except BenchmarkItemNotFoundError as ex:
+            raise HTTPException(status_code=404, detail="Item not found.") from ex
+        if item.benchmark_id != benchmark_id:
+            raise HTTPException(status_code=404, detail="Item not found.")
+        if request.question is not None:
+            item.question = request.question.strip()
+        if request.answer_type is not None or request.answer_spec is not None:
+            item.answer_type = request.answer_type or item.answer_type
+            item.answer_spec = (
+                request.answer_spec
+                if request.answer_spec is not None
+                else item.answer_spec
+            )
+            _validated_answer_spec(item.answer_type, item.answer_spec)
+        if request.capability_tags is not None:
+            item.capability_tags = request.capability_tags
+        if request.use_as_example is not None:
+            item.use_as_example = request.use_as_example
+        if request.verified is not None:
+            if request.verified:
+                item.verified_by = (
+                    identity.username or identity.email or identity.owner_id
+                )
+                item.verified_at = datetime.now(timezone.utc)
+            else:
+                item.verified_by = None
+                item.verified_at = None
+        return active_eval_store.update_item(item)
+
+    @api.delete(
+        "/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}"
+        "/items/{item_id}"
+    )
+    def delete_benchmark_item(
+        project_id: str,
+        benchmark_id: str,
+        item_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> dict[str, bool]:
+        _require_benchmarks_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
+        )
+        _get_project_benchmark(project_id, benchmark_id)
+        try:
+            item = active_eval_store.get_item(item_id)
+        except BenchmarkItemNotFoundError as ex:
+            raise HTTPException(status_code=404, detail="Item not found.") from ex
+        if item.benchmark_id != benchmark_id:
+            raise HTTPException(status_code=404, detail="Item not found.")
+        active_eval_store.delete_item(item_id)
+        return {"deleted": True}
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}"
+        "/items/{item_id}/dry-run",
+        response_model=DryRunResponse,
+    )
+    def dry_run_benchmark_item(
+        project_id: str,
+        benchmark_id: str,
+        item_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> DryRunResponse:
+        """Preview what the item's gold side produces (nothing is persisted)."""
+
+        _require_benchmarks_enabled()
+        project = authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id
+        )
+        _get_project_benchmark(project_id, benchmark_id)
+        try:
+            item = active_eval_store.get_item(item_id)
+        except BenchmarkItemNotFoundError as ex:
+            raise HTTPException(status_code=404, detail="Item not found.") from ex
+        if item.benchmark_id != benchmark_id:
+            raise HTTPException(status_code=404, detail="Item not found.")
+        if item.answer_type == "expected_values":
+            return DryRunResponse(
+                answer_type=item.answer_type,
+                spec=item.answer_spec,
+                problems=validate_expected_values_spec(item.answer_spec),
+            )
+        if item.answer_type == "eval_note":
+            return DryRunResponse(
+                answer_type=item.answer_type,
+                note=str(item.answer_spec.get("note") or ""),
+            )
+        database_id = _resolve_benchmark_database_id(
+            fastapi_request, project, identity.owner_id
+        )
+        _, run_superset_client = build_superset_runtime(fastapi_request)
+        try:
+            result = run_superset_client.execute_sql(
+                database_id=database_id,
+                sql=str(item.answer_spec.get("sql") or ""),
+                catalog_name=project.catalog_name or None,
+                schema_name=project.schema_name,
+                limit=PREVIEW_ROW_CAP,
+            )
+        except Exception as ex:  # pylint: disable=broad-except
+            raise HTTPException(
+                status_code=400, detail=f"Gold SQL failed to execute: {ex}"
+            ) from ex
+        return DryRunResponse(
+            answer_type=item.answer_type,
+            columns=result.columns,
+            rows=_preview_rows(result.rows),
+            row_count=result.row_count,
+        )
+
+    def _score_benchmark_result(
+        item_snapshot: dict[str, Any],
+        response: Any,
+        gold_result: Any | None,
+    ) -> tuple[str, list[str], list[EvalScore]]:
+        """Verdict + named reasons + score rows for one agent answer."""
+
+        scores: list[EvalScore] = []
+        answer_type = item_snapshot["answer_type"]
+        answer_spec = item_snapshot["answer_spec"]
+        execution = getattr(response, "execution_result", None)
+        if getattr(response, "status", "error") == "error" or execution is None:
+            reason = (
+                "Agent did not produce an executed result "
+                f"(status={getattr(response, 'status', 'error')})."
+            )
+            scores.append(
+                EvalScore(name="ex", value=0.0, label="error", explanation=reason)
+            )
+            return "error", [reason], scores
+
+        agent_rows = execution.rows or []
+        if answer_type == "expected_values":
+            outcome = score_expected_values(answer_spec, agent_rows)
+            scores.append(
+                EvalScore(
+                    name="ex",
+                    value=1.0 if outcome.verdict == "pass" else 0.0,
+                    label=outcome.verdict,
+                    explanation="; ".join(outcome.reasons) or None,
+                )
+            )
+            if outcome.targets:
+                scores.append(
+                    EvalScore(
+                        name="target_hit_rate",
+                        value=outcome.hits / outcome.targets,
+                    )
+                )
+            return outcome.verdict, outcome.reasons, scores
+
+        if answer_type == "eval_note":
+            note = str(answer_spec.get("note") or "")
+            if not app_config.wren_benchmark_judge_enabled:
+                reason = "Free-text expectation — needs human review (judge off)."
+                scores.append(EvalScore(name="ex", label="needs_review"))
+                return "needs_review", [reason], scores
+            outcome = judge_eval_note(
+                active_model_client,
+                question=item_snapshot.get("question", ""),
+                note=note,
+                sql=getattr(response, "sql", None),
+                rows=agent_rows,
+                summary=getattr(response, "answer_summary", None),
+                votes=app_config.wren_benchmark_judge_votes,
+                model=app_config.wren_benchmark_judge_model,
+            )
+            scores.append(
+                EvalScore(
+                    name="ex",
+                    value=1.0 if outcome.verdict == "pass" else 0.0,
+                    label=outcome.verdict,
+                    explanation=outcome.critique or None,
+                    source="llm_judge",
+                )
+            )
+            reasons = [outcome.critique] if outcome.critique else []
+            return outcome.verdict, reasons, scores
+
+        assert gold_result is not None  # gold_sql items always execute gold
+        comparison = compare_result_sets(
+            predicted_columns=execution.columns or [],
+            predicted_rows=agent_rows,
+            gold_columns=gold_result.columns or [],
+            gold_rows=gold_result.rows or [],
+        )
+        scores.append(
+            EvalScore(
+                name="ex",
+                value=1.0 if comparison.ex else 0.0,
+                label=comparison.verdict,
+                explanation="; ".join(comparison.reasons) or None,
+            )
+        )
+        scores.append(EvalScore(name="soft_f1", value=comparison.soft_f1))
+        if comparison.low_confidence:
+            scores.append(
+                EvalScore(
+                    name="low_confidence",
+                    label="empty_vs_empty",
+                    explanation="Both result sets were empty.",
+                )
+            )
+        return comparison.verdict, comparison.reasons, scores
+
+    _verdict_severity = {"pass": 0, "needs_review": 1, "fail": 2, "error": 3}
+
+    def _run_benchmark_job(  # noqa: C901 - claim/loop/score/persist/emit seams
+        run_id: str,
+        project: SemanticProject,
+        owner_id: str,
+        items: list[BenchmarkItem],
+        trials: int,
+        database_id: int,
+        graph: Any,
+        run_superset_client: Any,
+        model: str | None = None,
+        exclude_example_recall: bool = True,
+    ) -> None:
+        """Background body: claim → (item × trial) agent+gold+score → persist."""
+
+        if not active_eval_store.claim_run(run_id):
+            return
+
+        def _superseded() -> bool:
+            try:
+                return active_eval_store.get_run(run_id).status == "superseded"
+            except EvalRunNotFoundError:
+                return True
+
+        verdicts_by_item: dict[str, list[str]] = {}
+        gold_cache: dict[str, Any] = {}
+        total = len(items) * trials
+        completed = 0
+        try:
+            for item in items:
+                for trial_index in range(trials):
+                    if _superseded():
+                        return
+                    started = time.monotonic()
+                    reasons: list[str] = []
+                    scores: list[EvalScore] = []
+                    gold_result = None
+                    response = None
+                    try:
+                        response = graph.run(
+                            AgentQueryRequest(
+                                question=item.question,
+                                database_id=database_id,
+                                catalog_name=project.catalog_name or None,
+                                schema_name=project.schema_name,
+                                project_id=project.id,
+                                execute=True,
+                                model=model,
+                                exclude_example_questions=(
+                                    [item.question]
+                                    if exclude_example_recall
+                                    else None
+                                ),
+                            ),
+                            owner_id=owner_id,
+                        )
+                        if item.answer_type == "gold_sql":
+                            if item.id not in gold_cache:
+                                gold_cache[item.id] = run_superset_client.execute_sql(
+                                    database_id=database_id,
+                                    sql=str(item.answer_spec.get("sql") or ""),
+                                    catalog_name=project.catalog_name or None,
+                                    schema_name=project.schema_name,
+                                )
+                            gold_result = gold_cache[item.id]
+                        verdict, reasons, scores = _score_benchmark_result(
+                            {
+                                "question": item.question,
+                                "answer_type": item.answer_type,
+                                "answer_spec": item.answer_spec,
+                            },
+                            response,
+                            gold_result,
+                        )
+                    except Exception as ex:  # pylint: disable=broad-except
+                        verdict = "error"
+                        reasons = [f"Run step failed: {ex}"]
+                        scores = [
+                            EvalScore(
+                                name="ex", value=0.0, label="error",
+                                explanation=str(ex),
+                            )
+                        ]
+                    execution = getattr(response, "execution_result", None)
+                    wren_context = getattr(response, "wren_context", None)
+                    recalled = getattr(wren_context, "recalled_example_count", 0) or 0
+                    if recalled and item.use_as_example and not exclude_example_recall:
+                        # Exclusion was deliberately off: flag the exemplar-
+                        # assisted score so it is never mistaken for unaided
+                        # accuracy (I-6 detection; P2.4 prevention is the flag).
+                        scores.append(
+                            EvalScore(
+                                name="leakage_suspected",
+                                label="golden_example_recalled",
+                                explanation=(
+                                    "This item is also a golden example and "
+                                    "example recall was active for this answer."
+                                ),
+                            )
+                        )
+                    active_eval_store.add_result(
+                        EvalResult(
+                            run_id=run_id,
+                            item_id=item.id,
+                            trial_index=trial_index,
+                            question=item.question,
+                            answer_type=item.answer_type,
+                            answer_spec=item.answer_spec,
+                            agent_sql=getattr(response, "sql", None),
+                            agent_status=getattr(response, "status", None),
+                            agent_rows_preview=_preview_rows(
+                                execution.rows if execution else None
+                            ),
+                            gold_rows_preview=_preview_rows(
+                                gold_result.rows if gold_result else None
+                            ),
+                            verdict=verdict,  # type: ignore[arg-type]
+                            verdict_source=(
+                                "llm_judge"
+                                if item.answer_type == "eval_note"
+                                and app_config.wren_benchmark_judge_enabled
+                                else "code"
+                            ),
+                            reasons=reasons,
+                            matched_models=list(
+                                getattr(wren_context, "matched_models", []) or []
+                            )
+                            or None,
+                            duration_ms=int((time.monotonic() - started) * 1000),
+                            scores=scores,
+                        )
+                    )
+                    verdicts_by_item.setdefault(item.id, []).append(verdict)
+                    completed += 1
+                    active_eval_store.report_run_progress(
+                        run_id,
+                        RunProgress(
+                            completed=completed,
+                            total=total,
+                            current_question=item.question[:200],
+                        ),
+                    )
+                    # SSE liveness without flooding: every 5th tick + the last.
+                    if completed % 5 == 0 or completed == total:
+                        try:
+                            _append_semantic_event(
+                                store=active_semantic_layer_store,
+                                owner_id=owner_id,
+                                event_type="benchmark_run_progress",
+                                scope=_scope_from_project(project),
+                                document_id=None,
+                                message=f"Benchmark run {completed}/{total}",
+                                project_id=project.id,
+                                detail={
+                                    "run_id": run_id,
+                                    "completed": completed,
+                                    "total": total,
+                                },
+                            )
+                        except Exception:  # pylint: disable=broad-except
+                            logger.debug(
+                                "Benchmark progress event failed.", exc_info=True
+                            )
+        except Exception as ex:  # pylint: disable=broad-except
+            logger.warning("Benchmark run %s failed.", run_id, exc_info=True)
+            try:
+                active_eval_store.fail_run(run_id, str(ex))
+            except EvalRunNotFoundError:
+                pass
+            return
+
+        def _item_verdict(trial_verdicts: list[str]) -> str:
+            return max(trial_verdicts, key=lambda v: _verdict_severity.get(v, 3))
+
+        item_verdicts = {
+            item_id: _item_verdict(v) for item_id, v in verdicts_by_item.items()
+        }
+        # Diagnostic capability breakdown (P2.3): tag -> {items, passed}, from
+        # each item's tags at run time.
+        by_capability: dict[str, dict[str, int]] = {}
+        for item in items:
+            verdict_for_item = item_verdicts.get(item.id)
+            if verdict_for_item is None:
+                continue
+            for tag in item.capability_tags or []:
+                bucket = by_capability.setdefault(tag, {"items": 0, "passed": 0})
+                bucket["items"] += 1
+                if verdict_for_item == "pass":
+                    bucket["passed"] += 1
+        totals = RunTotals(
+            items=len(item_verdicts),
+            trials=trials,
+            passed=sum(1 for v in item_verdicts.values() if v == "pass"),
+            failed=sum(1 for v in item_verdicts.values() if v == "fail"),
+            needs_review=sum(
+                1 for v in item_verdicts.values() if v == "needs_review"
+            ),
+            errors=sum(1 for v in item_verdicts.values() if v == "error"),
+            pass_hat_k=pass_hat_k(verdicts_by_item) if trials > 1 else None,
+            by_capability=by_capability or None,
+        )
+        score = mean_pass_rate(verdicts_by_item)
+        active_eval_store.complete_run(run_id, totals=totals, score=score)
+        try:
+            _append_semantic_event(
+                store=active_semantic_layer_store,
+                owner_id=owner_id,
+                event_type="benchmark_run_complete",
+                scope=_scope_from_project(project),
+                document_id=None,
+                message=(
+                    f"Benchmark run complete: {totals.passed}/{totals.items} passed"
+                ),
+                project_id=project.id,
+                detail={
+                    "run_id": run_id,
+                    "score": score,
+                    "passed": totals.passed,
+                    "items": totals.items,
+                },
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.debug("Benchmark completion event failed.", exc_info=True)
+
+        # Scientist v3 (flag-gated): auto-analyze completed runs with failures.
+        if app_config.wren_benchmark_auto_analyze_enabled and (
+            totals.failed + totals.errors + totals.needs_review
+        ) > 0:
+            active_job_runner.submit(
+                functools.partial(
+                    _auto_analyze_benchmark_run, run_id, project, owner_id
+                )
+            )
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}"
+        "/runs",
+        response_model=BenchmarkRunSubmitted,
+        status_code=202,
+    )
+    def start_benchmark_run(
+        project_id: str,
+        benchmark_id: str,
+        request: BenchmarkRunRequest,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> BenchmarkRunSubmitted:
+        """Submit an async scored run of the benchmark against this project."""
+
+        _require_benchmarks_enabled()
+        project = authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
+        )
+        _get_project_benchmark(project_id, benchmark_id)
+        items = active_eval_store.list_items(benchmark_id)
+        if request.item_ids is not None:
+            wanted = set(request.item_ids)
+            items = [item for item in items if item.id in wanted]
+        if not items:
+            raise HTTPException(
+                status_code=400, detail="Benchmark has no items to run."
+            )
+        database_id = _resolve_benchmark_database_id(
+            fastapi_request, project, identity.owner_id
+        )
+        try:
+            mdl_checksum = _active_mdl_checksum(project.id, identity.owner_id)
+        except Exception:  # pylint: disable=broad-except - best-effort stamp
+            mdl_checksum = None
+        # Build the request-bound runtime NOW: the background thread has no
+        # Request. Long runs in user_session mode can outlive the caller's
+        # Superset token — item-level auth errors then surface as `error`
+        # results rather than killing the run (documented risk).
+        graph = build_text_to_sql_graph(fastapi_request)
+        _, run_superset_client = build_superset_runtime(fastapi_request)
+        active_eval_store.supersede_runs(benchmark_id)
+        run = active_eval_store.create_run(
+            EvalRun(
+                benchmark_id=benchmark_id,
+                project_id=project_id,
+                owner_id=identity.owner_id,
+                trials=request.trials,
+                config={
+                    "execute": request.execute,
+                    "item_ids": request.item_ids,
+                    "model": request.model,
+                    "exclude_example_recall": request.exclude_example_recall,
+                },
+                mdl_checksum=mdl_checksum,
+                benchmark_checksum=compute_benchmark_checksum(items),
+                database_id=database_id,
+            )
+        )
+        active_job_runner.submit(
+            functools.partial(
+                _run_benchmark_job,
+                run.id,
+                project,
+                identity.owner_id,
+                items,
+                request.trials,
+                database_id,
+                graph,
+                run_superset_client,
+                model=request.model,
+                exclude_example_recall=request.exclude_example_recall,
+            )
+        )
+        return BenchmarkRunSubmitted(
+            run_id=run.id, status="pending", total_items=len(items)
+        )
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}"
+        "/matrix-runs",
+        response_model=BenchmarkMatrixSubmitted,
+        status_code=202,
+    )
+    def start_benchmark_matrix(
+        project_id: str,
+        benchmark_id: str,
+        request: BenchmarkMatrixRunRequest,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> BenchmarkMatrixSubmitted:
+        """Fan out one labeled run per config arm (F5 matrix, P2.3).
+
+        Sibling runs of a batch never supersede each other; the batch as a
+        whole supersedes any earlier in-flight run. Each arm records its label
+        in the run config, so the capability-matrix view can pivot
+        capability x config from stored runs alone.
+        """
+
+        _require_benchmarks_enabled()
+        project = authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
+        )
+        _get_project_benchmark(project_id, benchmark_id)
+        labels = [config.effective_label() for config in request.configs]
+        if len(set(labels)) != len(labels):
+            raise HTTPException(
+                status_code=400, detail="Matrix config labels must be unique."
+            )
+        items = active_eval_store.list_items(benchmark_id)
+        if request.item_ids is not None:
+            wanted = set(request.item_ids)
+            items = [item for item in items if item.id in wanted]
+        if not items:
+            raise HTTPException(
+                status_code=400, detail="Benchmark has no items to run."
+            )
+        database_id = _resolve_benchmark_database_id(
+            fastapi_request, project, identity.owner_id
+        )
+        try:
+            mdl_checksum = _active_mdl_checksum(project.id, identity.owner_id)
+        except Exception:  # pylint: disable=broad-except - best-effort stamp
+            mdl_checksum = None
+        checksum = compute_benchmark_checksum(items)
+        graph = build_text_to_sql_graph(fastapi_request)
+        _, run_superset_client = build_superset_runtime(fastapi_request)
+        created: list[tuple[Any, Any]] = []
+        for config in request.configs:
+            run = active_eval_store.create_run(
+                EvalRun(
+                    benchmark_id=benchmark_id,
+                    project_id=project_id,
+                    owner_id=identity.owner_id,
+                    trials=request.trials,
+                    config={
+                        "execute": True,
+                        "item_ids": request.item_ids,
+                        "model": config.model,
+                        "exclude_example_recall": config.exclude_example_recall,
+                        "label": config.effective_label(),
+                        "matrix": True,
+                    },
+                    mdl_checksum=mdl_checksum,
+                    benchmark_checksum=checksum,
+                    database_id=database_id,
+                )
+            )
+            created.append((run, config))
+        active_eval_store.supersede_runs(
+            benchmark_id, except_run_ids=[run.id for run, _ in created]
+        )
+        for run, config in created:
+            active_job_runner.submit(
+                functools.partial(
+                    _run_benchmark_job,
+                    run.id,
+                    project,
+                    identity.owner_id,
+                    items,
+                    request.trials,
+                    database_id,
+                    graph,
+                    run_superset_client,
+                    model=config.model,
+                    exclude_example_recall=config.exclude_example_recall,
+                )
+            )
+        return BenchmarkMatrixSubmitted(
+            runs=[
+                MatrixRunSubmitted(run_id=run.id, label=config.effective_label())
+                for run, config in created
+            ],
+            total_items=len(items),
+        )
+
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}"
+        "/runs",
+        response_model=list[EvalRun],
+    )
+    def list_benchmark_runs(
+        project_id: str,
+        benchmark_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> list[EvalRun]:
+        _require_benchmarks_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id
+        )
+        _get_project_benchmark(project_id, benchmark_id)
+        return active_eval_store.list_runs(benchmark_id)
+
+    def _get_benchmark_run(
+        project_id: str, benchmark_id: str, run_id: str
+    ) -> EvalRun:
+        try:
+            run = active_eval_store.get_run(run_id)
+        except EvalRunNotFoundError as ex:
+            raise HTTPException(status_code=404, detail="Run not found.") from ex
+        if run.benchmark_id != benchmark_id or run.project_id != project_id:
+            raise HTTPException(status_code=404, detail="Run not found.")
+        return run
+
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}"
+        "/runs/{run_id}",
+        response_model=EvalRun,
+    )
+    def get_benchmark_run(
+        project_id: str,
+        benchmark_id: str,
+        run_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> EvalRun:
+        _require_benchmarks_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id
+        )
+        return _get_benchmark_run(project_id, benchmark_id, run_id)
+
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}"
+        "/runs/{run_id}/results",
+        response_model=list[EvalResult],
+    )
+    def list_benchmark_run_results(
+        project_id: str,
+        benchmark_id: str,
+        run_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> list[EvalResult]:
+        _require_benchmarks_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id
+        )
+        _get_benchmark_run(project_id, benchmark_id, run_id)
+        return active_eval_store.list_results(run_id)
+
+    def _verdicts_by_item(run_id: str) -> dict[str, list[str]]:
+        verdicts: dict[str, list[str]] = {}
+        for result in active_eval_store.list_results(run_id):
+            verdicts.setdefault(result.item_id, []).append(result.effective_verdict)
+        return verdicts
+
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}"
+        "/runs/{run_id}/compare/{other_run_id}",
+        response_model=RunComparisonResponse,
+    )
+    def compare_benchmark_runs(
+        project_id: str,
+        benchmark_id: str,
+        run_id: str,
+        other_run_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> RunComparisonResponse:
+        """Paired comparison of two runs — delta always carries its CI (§16)."""
+
+        _require_benchmarks_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id
+        )
+        run = _get_benchmark_run(project_id, benchmark_id, run_id)
+        other = _get_benchmark_run(project_id, benchmark_id, other_run_id)
+        outcome = paired_delta_ci(
+            _verdicts_by_item(other_run_id), _verdicts_by_item(run_id)
+        )
+        return RunComparisonResponse(
+            run_id=run_id,
+            other_run_id=other_run_id,
+            delta=outcome.delta,
+            ci_low=outcome.ci_low,
+            ci_high=outcome.ci_high,
+            significant=outcome.significant,
+            n_items=outcome.n_items,
+            improved=outcome.improved,
+            regressed=outcome.regressed,
+            unchanged=outcome.unchanged,
+            benchmark_changed=run.benchmark_checksum != other.benchmark_checksum,
+        )
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}"
+        "/runs/{run_id}/results/{result_id}/override",
+        response_model=EvalResult,
+    )
+    def override_benchmark_result(
+        project_id: str,
+        benchmark_id: str,
+        run_id: str,
+        result_id: str,
+        request: ResultOverrideRequest,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> EvalResult:
+        """Human verdict override (audited; recomputes the run's totals)."""
+
+        _require_benchmarks_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
+        )
+        run = _get_benchmark_run(project_id, benchmark_id, run_id)
+        try:
+            result = active_eval_store.get_result(result_id)
+        except EvalResultNotFoundError as ex:
+            raise HTTPException(status_code=404, detail="Result not found.") from ex
+        if result.run_id != run_id:
+            raise HTTPException(status_code=404, detail="Result not found.")
+        overridden = active_eval_store.override_result(
+            result_id,
+            verdict=request.verdict,
+            by=identity.username or identity.email or identity.owner_id,
+            comment=request.comment,
+        )
+        if run.status == "complete":
+            verdicts = _verdicts_by_item(run_id)
+            item_verdicts = {
+                item_id: max(v, key=lambda x: _verdict_severity.get(x, 3))
+                for item_id, v in verdicts.items()
+            }
+            # Recompute the capability breakdown from current item tags (an
+            # item deleted since the run keeps its verdict but drops out of
+            # the tag pivot — the frozen result rows remain authoritative).
+            tags_by_item = {
+                item.id: item.capability_tags or []
+                for item in active_eval_store.list_items(benchmark_id)
+            }
+            by_capability: dict[str, dict[str, int]] = {}
+            for item_id, verdict_value in item_verdicts.items():
+                for tag in tags_by_item.get(item_id, []):
+                    bucket = by_capability.setdefault(
+                        tag, {"items": 0, "passed": 0}
+                    )
+                    bucket["items"] += 1
+                    if verdict_value == "pass":
+                        bucket["passed"] += 1
+            active_eval_store.complete_run(
+                run_id,
+                totals=RunTotals(
+                    items=len(item_verdicts),
+                    trials=run.trials,
+                    passed=sum(1 for v in item_verdicts.values() if v == "pass"),
+                    failed=sum(1 for v in item_verdicts.values() if v == "fail"),
+                    needs_review=sum(
+                        1 for v in item_verdicts.values() if v == "needs_review"
+                    ),
+                    errors=sum(1 for v in item_verdicts.values() if v == "error"),
+                    pass_hat_k=pass_hat_k(verdicts) if run.trials > 1 else None,
+                    by_capability=by_capability or None,
+                ),
+                score=mean_pass_rate(verdicts),
+            )
+        return overridden
+
+    def _persist_scientist_report(
+        project: SemanticProject,
+        owner_id: str,
+        run_id: str,
+        report: ScientistReport,
+    ) -> str | None:
+        """Persist an analysis as a ``scientist`` conversation; id or None."""
+
+        try:
+            conversation = active_conversation_store.create(
+                _scope_from_project(project),
+                owner_id=owner_id,
+                kind="scientist",
+                project_id=project.id,
+            )
+            turn_service = ConversationTurnService(active_conversation_store)
+            turn_service.begin_turn(
+                conversation.id,
+                user_content=f"Analyze benchmark run {run_id}",
+                scope=_scope_from_project(project),
+                owner_id=owner_id,
+            )
+            turn_service.commit_turn(
+                conversation.id,
+                assistant_content=report.model_dump_json(indent=2),
+                artifacts=[],
+                owner_id=owner_id,
+            )
+            return conversation.id
+        except Exception:  # pylint: disable=broad-except - audit is best-effort
+            logger.warning("Failed to persist scientist conversation.", exc_info=True)
+            return None
+
+    def _auto_analyze_benchmark_run(
+        run_id: str, project: SemanticProject, owner_id: str
+    ) -> None:
+        """Scientist v3 job body: analyze, persist, notify (never raises)."""
+
+        try:
+            run = active_eval_store.get_run(run_id)
+            if run.status != "complete":
+                return
+            results = active_eval_store.list_results(run_id)
+            report = analyze_run(
+                active_model_client, run=run, results=results, comparison=None
+            )
+            conversation_id = _persist_scientist_report(
+                project, owner_id, run_id, report
+            )
+            _append_semantic_event(
+                store=active_semantic_layer_store,
+                owner_id=owner_id,
+                event_type="benchmark_analysis_ready",
+                scope=_scope_from_project(project),
+                document_id=None,
+                message="Benchmark failure analysis ready",
+                project_id=project.id,
+                detail={
+                    "run_id": run_id,
+                    "conversation_id": conversation_id,
+                    "finding_count": len(report.findings),
+                },
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.warning("Auto-analysis failed for run %s.", run_id, exc_info=True)
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}"
+        "/runs/{run_id}/handoff-copilot",
+    )
+    def handoff_benchmark_failures_to_copilot(
+        project_id: str,
+        benchmark_id: str,
+        run_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> dict[str, Any]:
+        """Scientist v2 (F12): failures -> a reviewable Copilot changeset.
+
+        Seeds a Copilot turn with the run's failure evidence (and the
+        Scientist diagnosis when one exists on the latest analysis) and
+        returns the STAGED changeset — never auto-applied; review/apply rides
+        the existing Copilot apply flow. Mirrors the coverage-recovery
+        pattern, synchronously (single turn, user-triggered).
+        """
+
+        _require_benchmarks_enabled()
+        _require_copilot_enabled()
+        project = authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
+        )
+        run = _get_benchmark_run(project_id, benchmark_id, run_id)
+        if run.status != "complete":
+            raise HTTPException(
+                status_code=409, detail="Only completed runs can be handed off."
+            )
+        results = active_eval_store.list_results(run_id)
+        failures = [
+            r for r in results if r.effective_verdict in ("fail", "error")
+        ]
+        if not failures:
+            raise HTTPException(
+                status_code=400,
+                detail="No failed questions to hand off — nothing to fix.",
+            )
+        report = analyze_run(
+            active_model_client,
+            run=run,
+            results=results,
+            comparison=None,
+        )
+        lines = [
+            "A benchmark run against this project produced failures. Propose",
+            "MDL edits (synonyms/descriptions, relationships, metrics, sample",
+            "values, time dimensions) that would make the agent answer these",
+            "correctly. Stage edits only — they will be human-reviewed.",
+            "",
+            f"Analyst summary: {report.summary}",
+            "",
+            "Failed questions:",
+        ]
+        for result in failures[:20]:
+            finding = next(
+                (f for f in report.findings if f.item_id == result.item_id),
+                None,
+            )
+            lines.append(
+                f"- Q: {result.question}\n"
+                f"  agent SQL: {result.agent_sql or '(none)'}\n"
+                f"  reasons: {'; '.join(result.reasons) or '(none)'}\n"
+                + (
+                    f"  diagnosis: {finding.diagnosis} — "
+                    f"{finding.suggested_action or ''}\n"
+                    if finding is not None
+                    else ""
+                )
+            )
+        user_message = "\n".join(lines)
+        files = active_mdl_file_store.list(project.id, owner_id=identity.owner_id)
+        instructions = [
+            view.instruction
+            for view in _project_instruction_views(project, identity.owner_id)
+        ]
+        changeset = run_copilot(
+            model_client=active_model_client,
+            files=files,
+            schema_index=_cached_schema_index(project),
+            user_message=user_message,
+            instructions=instructions,
+            history=None,
+            max_steps=app_config.wren_copilot_max_steps,
+            tool_result_max_chars=app_config.wren_copilot_tool_result_max_chars,
+            deep_validate=app_config.wren_modeling_deep_validation,
+            autopilot=app_config.wren_copilot_autopilot_enabled,
+            document_store=active_semantic_layer_store,
+            document_index=active_document_index,
+            project_id=project.id,
+            owner_id=identity.owner_id,
+            retrieve_k=app_config.wren_document_retrieve_k,
+            embedder=active_embedder,
+        )
+        conversation_id: str | None = None
+        try:
+            conversation = active_conversation_store.create(
+                _scope_from_project(project),
+                owner_id=identity.owner_id,
+                kind="scientist",
+                project_id=project.id,
+            )
+            turn_service = ConversationTurnService(active_conversation_store)
+            turn_service.begin_turn(
+                conversation.id,
+                user_content=user_message,
+                scope=_scope_from_project(project),
+                owner_id=identity.owner_id,
+            )
+            turn_service.commit_turn(
+                conversation.id,
+                assistant_content=changeset.message or "",
+                artifacts=[changeset_to_artifact(changeset)],
+                owner_id=identity.owner_id,
+            )
+            conversation_id = conversation.id
+        except Exception:  # pylint: disable=broad-except - audit is best-effort
+            logger.warning("Failed to persist handoff conversation.", exc_info=True)
+        return {
+            "changeset": changeset.model_dump(mode="json"),
+            "report": report.model_dump(mode="json"),
+            "conversation_id": conversation_id,
+            "verification_hint": (
+                "After applying the changeset, re-run this benchmark and use "
+                "the run comparison to verify the fix (paired delta + CI)."
+            ),
+        }
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}"
+        "/runs/{run_id}/analyze",
+    )
+    def analyze_benchmark_run(
+        project_id: str,
+        benchmark_id: str,
+        run_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> dict[str, Any]:
+        """Scientist v1 (F12): diagnose a completed run — read-only, on demand.
+
+        Computes the paired-CI comparison to the previous completed run in
+        code (the statistical gate), asks the model to classify each failure
+        on the error taxonomy, and persists the report as a ``scientist``
+        conversation for audit. Proposes nothing and changes nothing (v1).
+        """
+
+        _require_benchmarks_enabled()
+        project = authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
+        )
+        run = _get_benchmark_run(project_id, benchmark_id, run_id)
+        if run.status != "complete":
+            raise HTTPException(
+                status_code=409, detail="Only completed runs can be analyzed."
+            )
+        results = active_eval_store.list_results(run_id)
+        previous = next(
+            (
+                candidate
+                for candidate in active_eval_store.list_runs(benchmark_id)
+                if candidate.status == "complete"
+                and candidate.id != run_id
+                and candidate.created_at < run.created_at
+            ),
+            None,
+        )
+        comparison = (
+            paired_delta_ci(_verdicts_by_item(previous.id), _verdicts_by_item(run_id))
+            if previous is not None
+            else None
+        )
+        report: ScientistReport = analyze_run(
+            active_model_client,
+            run=run,
+            results=results,
+            comparison=comparison,
+        )
+        conversation_id = _persist_scientist_report(
+            project, identity.owner_id, run_id, report
+        )
+        return {
+            "report": report.model_dump(mode="json"),
+            "conversation_id": conversation_id,
+        }
+
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}"
+        "/runs/{run_id}/export-otel",
+    )
+    def export_benchmark_run_otel(
+        project_id: str,
+        benchmark_id: str,
+        run_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> dict[str, Any]:
+        """Run scores as OTel ``gen_ai.evaluation.result`` events (F8)."""
+
+        _require_benchmarks_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id
+        )
+        run = _get_benchmark_run(project_id, benchmark_id, run_id)
+        events = run_to_evaluation_events(
+            run, active_eval_store.list_results(run_id)
+        )
+        return {"events": events, "count": len(events)}
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}"
+        "/items/{item_id}/promote-example",
+        response_model=BenchmarkItem,
+    )
+    def promote_benchmark_item_to_example(
+        project_id: str,
+        benchmark_id: str,
+        item_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> BenchmarkItem:
+        """Flywheel (DP-18): a gold_sql item becomes a golden few-shot example."""
+
+        _require_benchmarks_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
+        )
+        _get_project_benchmark(project_id, benchmark_id)
+        try:
+            item = active_eval_store.get_item(item_id)
+        except BenchmarkItemNotFoundError as ex:
+            raise HTTPException(status_code=404, detail="Item not found.") from ex
+        if item.benchmark_id != benchmark_id:
+            raise HTTPException(status_code=404, detail="Item not found.")
+        if item.answer_type != "gold_sql":
+            raise HTTPException(
+                status_code=400,
+                detail="Only gold_sql items can be promoted to golden examples.",
+            )
+        entry = GoldenQuery(
+            name=item.question,
+            question=item.question,
+            semantic_sql=str(item.answer_spec.get("sql") or ""),
+            verified_by=identity.username or identity.email or identity.owner_id,
+            verified_at=int(time.time()),
+        )
+        existing = find_golden_queries_file(
+            active_mdl_file_store.list(project_id, owner_id=identity.owner_id)
+        )
+        try:
+            content = upsert_golden_query(
+                existing.content if existing is not None else None, entry
+            )
+        except (ValueError, TypeError) as ex:
+            raise HTTPException(
+                status_code=400, detail=f"Existing queries.json is invalid: {ex}"
+            ) from ex
+        if existing is None:
+            active_mdl_file_store.create(
+                project_id,
+                MdlFileCreateRequest(path=GOLDEN_QUERIES_PATH, content=content),
+                owner_id=identity.owner_id,
+            )
+        else:
+            active_mdl_file_store.update(
+                existing.id,
+                MdlFileUpdateRequest(content=content),
+                owner_id=identity.owner_id,
+            )
+        item.use_as_example = True
+        return active_eval_store.update_item(item)
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}"
+        "/import-golden",
+        response_model=GoldenImportResponse,
+    )
+    def import_golden_queries_as_items(
+        project_id: str,
+        benchmark_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> GoldenImportResponse:
+        """Flywheel (DP-18): seed benchmark items from the project golden set."""
+
+        _require_benchmarks_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
+        )
+        benchmark = _get_project_benchmark(project_id, benchmark_id)
+        golden_file = find_golden_queries_file(
+            active_mdl_file_store.list(project_id, owner_id=identity.owner_id)
+        )
+        if golden_file is None:
+            return GoldenImportResponse(created=0, skipped_duplicates=0)
+        try:
+            golden = parse_golden_queries(golden_file.content)
+        except (ValueError, TypeError) as ex:
+            raise HTTPException(
+                status_code=400, detail=f"queries.json is invalid: {ex}"
+            ) from ex
+        existing_questions = {
+            item.question.strip().casefold()
+            for item in active_eval_store.list_items(benchmark_id)
+        }
+        created = 0
+        skipped = 0
+        position = benchmark.item_count
+        for query in golden.queries:
+            key = query.question.strip().casefold()
+            if key in existing_questions:
+                skipped += 1
+                continue
+            if position >= MAX_ITEMS_PER_BENCHMARK:
+                skipped += 1
+                continue
+            active_eval_store.add_item(
+                BenchmarkItem(
+                    benchmark_id=benchmark_id,
+                    position=position,
+                    question=query.question,
+                    answer_type="gold_sql",
+                    answer_spec={"sql": query.semantic_sql},
+                    capability_tags=["golden"],
+                    use_as_example=True,
+                    verified_by=query.verified_by,
+                    created_by=identity.owner_id,
+                )
+            )
+            existing_questions.add(key)
+            created += 1
+            position += 1
+        return GoldenImportResponse(created=created, skipped_duplicates=skipped)
+
     @api.post(
         "/agent/semantic-layer/projects/{project_id}/materialize",
         response_model=WrenMaterializationResult,
@@ -5091,6 +6737,40 @@ def _create_llm_usage_store(
     if session_factory is None:
         return InMemoryLlmUsageStore()
     return SqlAlchemyLlmUsageStore(session_factory)
+
+
+def _create_prompt_store(
+    config: AgentConfig,
+    *,
+    session_factory: Any | None = None,
+) -> PromptStore:
+    if config.semantic_layer_store == "memory":
+        return InMemoryPromptStore()
+    if config.semantic_layer_store == "sqlalchemy":
+        if session_factory is None:
+            raise ValueError("SQLAlchemy prompt store requires a database.")
+        return SqlAlchemyPromptStore(session_factory)
+    raise ValueError(
+        "Unsupported AI_AGENT_SEMANTIC_LAYER_STORE value "
+        f"{config.semantic_layer_store!r}. Expected one of: memory, sqlalchemy."
+    )
+
+
+def _create_eval_store(
+    config: AgentConfig,
+    *,
+    session_factory: Any | None = None,
+) -> EvalStore:
+    if config.semantic_layer_store == "memory":
+        return InMemoryEvalStore()
+    if config.semantic_layer_store == "sqlalchemy":
+        if session_factory is None:
+            raise ValueError("SQLAlchemy eval store requires a database.")
+        return SqlAlchemyEvalStore(session_factory)
+    raise ValueError(
+        "Unsupported AI_AGENT_SEMANTIC_LAYER_STORE value "
+        f"{config.semantic_layer_store!r}. Expected one of: memory, sqlalchemy."
+    )
 
 
 def _create_coverage_run_store(

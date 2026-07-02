@@ -749,6 +749,23 @@ class TextToSqlGraph:
             embedder=getattr(self.memory, "embedder", None),
             access=access,
         )
+        # Leakage guard (testing platform P2.4): a benchmark run must not hand
+        # the agent an item's own golden exemplar while measuring that item.
+        excluded = {
+            " ".join(q.lower().split())
+            for q in (request.exclude_example_questions or [])
+        }
+        if excluded:
+            memory_pairs = [
+                pair
+                for pair in memory_pairs
+                if " ".join(pair.question.lower().split()) not in excluded
+            ]
+            golden_pairs = [
+                pair
+                for pair in golden_pairs
+                if " ".join(pair.question.lower().split()) not in excluded
+            ]
         recalled = [
             pair.model_dump()
             for pair in merge_recalled_examples(golden_pairs, memory_pairs, k)

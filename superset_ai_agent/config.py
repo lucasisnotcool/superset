@@ -224,6 +224,22 @@ class AgentConfig:
     # agent reads raw/ and proposes without a question) is a further opt-in.
     wren_copilot_enabled: bool = False
     wren_copilot_autopilot_enabled: bool = False
+    # Project Benchmarks (testing platform F11): user-curated NL test sets scored
+    # against ground truth in-product. User-triggered only (no background
+    # workers), so it defaults on; disable to hide the surface entirely.
+    wren_benchmarks_enabled: bool = True
+    # LLM judge for free-text (`eval_note`) benchmark items. Off → those items
+    # score `needs_review` for a human. Votes > 1 runs a small panel (majority
+    # wins; ties degrade to review) at proportional token cost.
+    wren_benchmark_judge_enabled: bool = True
+    wren_benchmark_judge_votes: int = 1
+    # Judge/scientist model override (self-preference mitigation): grade with a
+    # different model than the one answering. None = the agent's default model.
+    wren_benchmark_judge_model: str | None = None
+    # Scientist v3: auto-run the failure analysis after a benchmark run
+    # completes with failures (persisted as a `scientist` conversation +
+    # `benchmark_analysis_ready` event). Off by default (recovery-agent parity).
+    wren_benchmark_auto_analyze_enabled: bool = False
     # Ceiling for inline conversation attachments (long-context, no RAG). Oversize
     # text is truncated with a visible warning rather than rejected.
     wren_copilot_attachment_max_chars: int = 200_000
@@ -781,6 +797,29 @@ class AgentConfig:
             wren_copilot_autopilot_enabled=_env_bool(
                 "WREN_COPILOT_AUTOPILOT_ENABLED",
                 cls.wren_copilot_autopilot_enabled,
+            ),
+            wren_benchmarks_enabled=_env_bool(
+                "WREN_BENCHMARKS_ENABLED",
+                cls.wren_benchmarks_enabled,
+            ),
+            wren_benchmark_judge_enabled=_env_bool(
+                "WREN_BENCHMARK_JUDGE_ENABLED",
+                cls.wren_benchmark_judge_enabled,
+            ),
+            wren_benchmark_judge_votes=int(
+                os.getenv(
+                    "WREN_BENCHMARK_JUDGE_VOTES",
+                    cls.wren_benchmark_judge_votes,
+                )
+            ),
+            wren_benchmark_judge_model=os.getenv(
+                "WREN_BENCHMARK_JUDGE_MODEL",
+                cls.wren_benchmark_judge_model,
+            )
+            or None,
+            wren_benchmark_auto_analyze_enabled=_env_bool(
+                "WREN_BENCHMARK_AUTO_ANALYZE_ENABLED",
+                cls.wren_benchmark_auto_analyze_enabled,
             ),
             wren_copilot_attachment_max_chars=int(
                 os.getenv(

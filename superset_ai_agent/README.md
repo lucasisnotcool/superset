@@ -28,6 +28,13 @@ For a file-by-file architecture map, runtime diagrams, agent endpoints,
 Superset REST/MCP surfaces, and SQL robustness extension points, see
 `ARCHITECTURE.md`.
 
+## Documentation
+
+Design docs, feature specs, implementation plans, audits, and as-built
+references live under [`docs/`](docs/README.md) — the index there maps every
+document with its status. Evaluation specs and results live in
+[`evaluation/`](evaluation/README.md), beside the eval runner code.
+
 ## Windows PowerShell Fresh Setup
 
 Run these commands from the repository root.

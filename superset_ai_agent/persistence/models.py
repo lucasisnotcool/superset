@@ -510,6 +510,194 @@ class AiAgentCoverageRun(Base):
     updated_at = Column(DateTime(timezone=True), index=True, nullable=False)
 
 
+class AiAgentEvalBenchmark(Base):
+    """A project-scoped benchmark (Dataset): a named set of NL test questions.
+
+    The user-facing test set for "score MY MDL project" (F11). Soft-deleted so
+    historical runs keep resolving their parent. ``owner_id`` is an authorship
+    audit stamp; access is derived from the project (db-access), never
+    owner-filtered on read.
+    """
+
+    __tablename__ = "ai_agent_eval_benchmarks"
+
+    id = Column(String(36), primary_key=True)
+    project_id = Column(String(36), index=True, nullable=False)
+    owner_id = Column(String(255), index=True, nullable=False)
+    name = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class AiAgentEvalItem(Base):
+    """One benchmark test case: NL question + typed expected answer.
+
+    ``answer_type`` discriminates the ``answer_spec`` JSON payload:
+    ``gold_sql`` (ground-truth SQL, compared by executed result sets),
+    ``expected_values`` (typed value assertions: nums/names/absent/trap/zero),
+    or ``eval_note`` (free-text rubric; scores ``needs_review`` until the
+    LLM-judge evaluator lands). Soft-deleted so past results keep their
+    reference; results additionally freeze the question/spec they ran against.
+    """
+
+    __tablename__ = "ai_agent_eval_items"
+
+    id = Column(String(36), primary_key=True)
+    benchmark_id = Column(String(36), index=True, nullable=False)
+    position = Column(Integer, nullable=False, default=0)
+    question = Column(Text, nullable=False)
+    answer_type = Column(String(32), nullable=False)
+    answer_spec = Column(JSON, nullable=False)
+    capability_tags = Column(JSON, nullable=False, default=list)
+    #: Dual-use flywheel (DP-18): item doubles as a recallable golden example.
+    use_as_example = Column(Boolean, nullable=False, default=False)
+    verified_by = Column(String(255), nullable=True)
+    verified_at = Column(DateTime(timezone=True), nullable=True)
+    created_by = Column(String(255), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class AiAgentEvalRun(Base):
+    """One scored execution of a benchmark against the agent + project.
+
+    Immutable once terminal: ``benchmark_checksum`` pins the exact item set and
+    ``mdl_checksum`` the MDL version it ran against, so run-vs-run comparison is
+    apples-to-apples. Lifecycle mirrors coverage runs (pending → running via a
+    compare-and-set claim; a new submission supersedes in-flight runs for the
+    same benchmark).
+    """
+
+    __tablename__ = "ai_agent_eval_runs"
+
+    id = Column(String(36), primary_key=True)
+    benchmark_id = Column(String(36), index=True, nullable=False)
+    project_id = Column(String(36), index=True, nullable=False)
+    owner_id = Column(String(255), index=True, nullable=False)
+    status = Column(String(32), index=True, nullable=False)
+    trials = Column(Integer, nullable=False, default=1)
+    #: Snapshot of submit-time options (item subset, execute, recall mode…).
+    config = Column(JSON, nullable=False, default=dict)
+    mdl_checksum = Column(String(128), nullable=True)
+    benchmark_checksum = Column(String(128), nullable=False, default="")
+    database_id = Column(Integer, nullable=True)
+    #: Headline pass rate (0..1); pass^k when ``trials`` > 1 lives in totals.
+    score = Column(Float, nullable=True)
+    totals = Column(JSON, nullable=True)
+    progress = Column(JSON, nullable=True)
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), index=True, nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class AiAgentEvalResult(Base):
+    """Per-item, per-trial outcome inside a run.
+
+    Freezes the item's ``question``/``answer_spec`` at execution time (runs stay
+    truthful after later item edits — I-1). Row previews are capped copies for
+    the UI; verdict math ran on the full result sets. ``override_*`` columns are
+    the human review trail (HUMAN-source verdict wins over the automated one).
+    """
+
+    __tablename__ = "ai_agent_eval_results"
+    __table_args__ = (
+        Index("ix_ai_agent_eval_result_run_item", "run_id", "item_id"),
+    )
+
+    id = Column(String(36), primary_key=True)
+    run_id = Column(String(36), index=True, nullable=False)
+    item_id = Column(String(36), index=True, nullable=False)
+    trial_index = Column(Integer, nullable=False, default=0)
+    question = Column(Text, nullable=False)
+    answer_type = Column(String(32), nullable=False)
+    answer_spec = Column(JSON, nullable=False)
+    agent_sql = Column(Text, nullable=True)
+    agent_status = Column(String(32), nullable=True)
+    agent_rows_preview = Column(JSON, nullable=True)
+    gold_rows_preview = Column(JSON, nullable=True)
+    #: Three-way automated verdict: pass | fail | needs_review | error.
+    verdict = Column(String(32), index=True, nullable=False)
+    verdict_source = Column(String(32), nullable=False, default="code")
+    #: Named score reasons ("Column count mismatch…"), Wren-style.
+    reasons = Column(JSON, nullable=True)
+    matched_models = Column(JSON, nullable=True)
+    duration_ms = Column(Integer, nullable=True)
+    override_verdict = Column(String(32), nullable=True)
+    override_by = Column(String(255), nullable=True)
+    override_at = Column(DateTime(timezone=True), nullable=True)
+    override_comment = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class AiAgentEvalScore(Base):
+    """One measured score on a result, shaped like OTel ``gen_ai.evaluation.result``.
+
+    ``name``/``value`` (numeric) / ``label`` (categorical) / ``explanation`` map
+    1:1 onto the OTel GenAI semconv attributes so a later OTLP exporter is a
+    serializer, not a remodel. ``source`` follows the cross-tool consensus enum:
+    code | llm_judge | human | api.
+    """
+
+    __tablename__ = "ai_agent_eval_scores"
+
+    id = Column(String(36), primary_key=True)
+    result_id = Column(String(36), index=True, nullable=False)
+    name = Column(String(128), index=True, nullable=False)
+    value = Column(Float, nullable=True)
+    label = Column(String(255), nullable=True)
+    explanation = Column(Text, nullable=True)
+    source = Column(String(32), nullable=False, default="code")
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class AiAgentPromptVersion(Base):
+    """One immutable version of a named agent prompt (testing platform P2.1).
+
+    Versions are append-only and monotonically numbered per ``name`` (the
+    cross-tool consensus: versions are immutable, labels are the only mutable
+    thing). The repo's ``prompts/*.md`` files remain the seed/default — a name
+    with no promoted version resolves to its file (fail-safe fallback).
+    """
+
+    __tablename__ = "ai_agent_prompt_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "name", "version", name="uq_ai_agent_prompt_version_name_version"
+        ),
+    )
+
+    id = Column(String(36), primary_key=True)
+    name = Column(String(128), index=True, nullable=False)
+    version = Column(Integer, nullable=False)
+    content = Column(Text, nullable=False)
+    comment = Column(Text, nullable=True)
+    created_by = Column(String(255), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class AiAgentPromptLabel(Base):
+    """A mutable label pointing at one prompt version (deploy = move label).
+
+    ``production`` is the label the runtime resolver serves; promotion moves it,
+    rollback moves it back, deleting it resets the prompt to its file default.
+    """
+
+    __tablename__ = "ai_agent_prompt_labels"
+    __table_args__ = (
+        UniqueConstraint("name", "label", name="uq_ai_agent_prompt_label"),
+    )
+
+    id = Column(String(36), primary_key=True)
+    name = Column(String(128), index=True, nullable=False)
+    label = Column(String(64), nullable=False)
+    version_id = Column(String(36), nullable=False)
+    updated_by = Column(String(255), nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+
 class AiAgentLlmCall(Base):
     """One LLM call, appended per invocation (count + timing telemetry).
 
