@@ -46,6 +46,7 @@ from superset_ai_agent.semantic_layer.document_chunks import (
     DocumentChunkMatch,
     keyword_rank_chunks,
 )
+from superset_ai_agent.semantic_layer.pgvector import PgVectorCache
 from superset_ai_agent.semantic_layer.store import scope_hash
 from superset_ai_agent.semantic_layer.vector_cache import LanceVectorCache
 
@@ -218,12 +219,19 @@ def create_document_index(
     deployment with the feature off never opens a LanceDB connection.
     """
 
-    if (
-        config.wren_document_indexing_enabled
-        and config.wren_document_vector_index == "lancedb"
-    ):
-        cache = LanceVectorCache(
-            embedder, _document_lancedb_path(config), DOCUMENT_CHUNK_COLLECTION
-        )
-        return DocumentChunkIndex(cache)
+    if config.wren_document_indexing_enabled:
+        if config.wren_document_vector_index == "lancedb":
+            return DocumentChunkIndex(
+                LanceVectorCache(
+                    embedder, _document_lancedb_path(config), DOCUMENT_CHUNK_COLLECTION
+                )
+            )
+        if config.wren_document_vector_index == "postgres":
+            return DocumentChunkIndex(
+                PgVectorCache(
+                    embedder,
+                    config.effective_vector_database_url,
+                    DOCUMENT_CHUNK_COLLECTION,
+                )
+            )
     return DocumentChunkIndex(None)

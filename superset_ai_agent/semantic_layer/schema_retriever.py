@@ -43,6 +43,7 @@ from superset_ai_agent.semantic_layer.mdl_compile import (
     CompiledManifest,
 )
 from superset_ai_agent.semantic_layer.mdl_files import MdlFile, MdlFileStore
+from superset_ai_agent.semantic_layer.pgvector import PgVectorSchemaStore
 
 logger = logging.getLogger(__name__)
 
@@ -583,6 +584,129 @@ class LanceDbRetriever:
             logger.warning("LanceDB rehydrate failed (%s); in-process only.", ex)
 
 
+class PgVectorRetriever:
+    """Persistent embedding retriever backed by Postgres/pgvector.
+
+    The `LanceDbRetriever` twin for postgres-only deployments (no writable
+    disk): identical warm/cold/rehydrate behavior, with `PgVectorSchemaStore`
+    rows as the durable layer instead of LanceDB tables. All ranking reuses the
+    in-process `EmbeddingRetriever`; every backend call degrades closed to the
+    in-process index, so it can never crash the request path.
+    """
+
+    name = "embedding"
+
+    def __init__(self, embedder: Embedder, database_url: str, max_scopes: int = 0):
+        self.embedder = embedder
+        self._mem = EmbeddingRetriever(embedder, max_scopes)
+        self._store = PgVectorSchemaStore(database_url, embedder.dimensions())
+
+    def is_persistent(self) -> bool:
+        """Whether the durable Postgres backend is usable (vs. in-process only)."""
+
+        return self._store.is_available()
+
+    def has_index(self, scope_key: str, checksum: str) -> bool:
+        if self._mem.has_index(scope_key, checksum):
+            return True
+        return self._store.exists(scope_key, self._mem.effective_checksum(checksum))
+
+    def index(self, items: list[SchemaItem], *, scope_key: str, checksum: str) -> None:
+        if self.has_index(scope_key, checksum):
+            return
+        self._mem.index(items, scope_key=scope_key, checksum=checksum)
+        # Only persist when embedding actually produced vectors; the store is
+        # vector-only, so a keyword fallback stays purely in-process.
+        if self._mem.effective_name(scope_key) != "embedding":
+            return
+        entry = self._mem._index.get(scope_key)  # pylint: disable=protected-access
+        if entry is None or entry.vectors is None:
+            return
+        self._store.replace(
+            scope_key=scope_key,
+            checksum=self._mem.effective_checksum(checksum),
+            rows=[
+                {
+                    "kind": item.kind,
+                    "name": item.name,
+                    "model": item.model,
+                    "body": item.text,
+                }
+                for item in entry.items
+            ],
+            vectors=entry.vectors,
+        )
+
+    def retrieve(
+        self, question: str, *, scope_key: str, checksum: str, k: int
+    ) -> list[SchemaItem]:
+        # Warm (same process as index()) → in-process rank over cached vectors.
+        if self._mem.has_index(scope_key, checksum):
+            return self._mem.retrieve(
+                question, scope_key=scope_key, checksum=checksum, k=k
+            )
+        # Cold (restart/new worker) → SQL cosine search so the whole corpus is
+        # never loaded into memory; degrades to rehydrate + in-process rank.
+        if self.embedder.is_available():
+            try:
+                query_vector = self.embedder.embed([question])[0]
+            except Exception as ex:  # pylint: disable=broad-except
+                logger.warning("Question embedding failed; keyword fallback: %s", ex)
+                query_vector = None
+            if query_vector is not None:
+                rows = self._store.search(
+                    scope_key=scope_key,
+                    checksum=self._mem.effective_checksum(checksum),
+                    query_vector=query_vector,
+                    k=k,
+                )
+                if rows is not None:
+                    return [
+                        SchemaItem(
+                            kind=row["kind"],
+                            name=row["name"],
+                            model=row["model"] or None,
+                            text=row["body"],
+                            score=(
+                                round(float(row["score"]), 4)
+                                if row.get("score") is not None
+                                else None
+                            ),
+                        )
+                        for row in rows
+                    ]
+        self._rehydrate(scope_key, checksum)
+        return self._mem.retrieve(question, scope_key=scope_key, checksum=checksum, k=k)
+
+    def effective_name(self, scope_key: str) -> str:
+        entry = self._mem._index.get(scope_key)  # pylint: disable=protected-access
+        if entry is not None:
+            return self._mem.effective_name(scope_key)
+        # Cold search path doesn't populate the in-process index; a usable
+        # Postgres store means vectors were persisted, so the mode is embedding.
+        return "embedding" if self._store.is_available() else "keyword"
+
+    def _rehydrate(self, scope_key: str, checksum: str) -> None:
+        fetched = self._store.fetch_all(
+            scope_key=scope_key, checksum=self._mem.effective_checksum(checksum)
+        )
+        if fetched is None:
+            return
+        rows, vectors = fetched
+        items = [
+            SchemaItem(
+                kind=row["kind"],
+                name=row["name"],
+                model=row["model"] or None,
+                text=row["body"],
+            )
+            for row in rows
+        ]
+        self._mem.prime(
+            scope_key, self._mem.effective_checksum(checksum), items, vectors
+        )
+
+
 def create_retriever(
     config: AgentConfig, embedder: Embedder | None = None
 ) -> Retriever:
@@ -594,6 +718,10 @@ def create_retriever(
         if active.is_available():
             if config.wren_vector_index == "lancedb":
                 return LanceDbRetriever(active, _lancedb_path(config), max_scopes)
+            if config.wren_vector_index == "postgres":
+                return PgVectorRetriever(
+                    active, config.effective_vector_database_url, max_scopes
+                )
             return EmbeddingRetriever(active, max_scopes)
     return KeywordRetriever(max_scopes)
 
@@ -607,16 +735,21 @@ def _lancedb_path(config: AgentConfig) -> str:
 def effective_vector_index(config: AgentConfig, retriever: Retriever) -> str:
     """Report the index actually in use (C1 loud fallback).
 
-    ``memory_fallback`` means LanceDB was requested but did not connect (e.g. the
-    wheel is absent), so the index silently runs in-process — surfaced so an
+    ``memory_fallback`` means a durable backend (LanceDB or Postgres/pgvector)
+    was requested but is not usable (wheel absent, server unreachable, ``vector``
+    extension missing), so the index silently runs in-process — surfaced so an
     operator can see the misconfig instead of it degrading invisibly.
     """
 
-    if config.wren_vector_index != "lancedb":
-        return "memory"
-    if isinstance(retriever, LanceDbRetriever) and retriever.is_persistent():
-        return "lancedb"
-    return "memory_fallback"
+    if config.wren_vector_index == "lancedb":
+        if isinstance(retriever, LanceDbRetriever) and retriever.is_persistent():
+            return "lancedb"
+        return "memory_fallback"
+    if config.wren_vector_index == "postgres":
+        if isinstance(retriever, PgVectorRetriever) and retriever.is_persistent():
+            return "postgres"
+        return "memory_fallback"
+    return "memory"
 
 
 def _content_checksum(files: list[MdlFile]) -> str:

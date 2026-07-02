@@ -1,0 +1,99 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# -----------------------------------------------------------------------
+# Postgres-only persistence overlay (third -f after docker-compose.no-bind.yml
+# and docker-compose.ai-agent.yml) for environments with NO persistent volumes:
+# every durable store moves to an external PostgreSQL and the local db / redis /
+# websocket containers do not start.
+#
+#   docker compose -f docker-compose.no-bind.yml \
+#                  -f docker-compose.ai-agent.yml \
+#                  -f docker-compose.postgres-only.yml up -d --build
+#
+# Requires docker compose >= 2.24 (uses `!reset` to drop depends_on entries).
+#
+# Operator prerequisites (docker/.env-local — loaded after docker/.env, wins):
+#   DATABASE_HOST/PORT/DB/USER/PASSWORD -> the external Postgres
+#   EXAMPLES_* likewise (or a separate database on the same server)
+# and superset_ai_agent/.env:
+#   AI_AGENT_DATABASE_URL=postgresql+psycopg://user:pass@host:5432/db
+#   WREN_VECTOR_INDEX=postgres  WREN_MEMORY_STORE=postgres
+#   WREN_DOCUMENT_VECTOR_INDEX=postgres  AI_AGENT_DOCUMENT_STORAGE=postgres
+# The external database needs the pgvector extension available
+# (CREATE EXTENSION vector; by a privileged role — the agent attempts
+# CREATE EXTENSION IF NOT EXISTS itself and degrades with a warning if denied).
+#
+# To keep the bundled db/redis containers for a local rehearsal of this mode,
+# add: --profile local-state
+# -----------------------------------------------------------------------
+
+services:
+  # Local state containers are excluded from a plain `up` in this overlay; the
+  # profile lets a dev rehearsal keep them while the apps run postgres-only.
+  db:
+    profiles: ["local-state"]
+  redis:
+    profiles: ["local-state"]
+  # The async-queries websocket layer is Redis-backed and GLOBAL_ASYNC_QUERIES
+  # is not enabled in this stack; exclude it with its backend.
+  superset-websocket:
+    profiles: ["local-state"]
+
+  nginx:
+    environment:
+      # nginx resolves upstream hostnames at startup; when superset-websocket
+      # does not run, point the (unused — GAQ off) /ws upstream at a
+      # guaranteed-resolvable address so nginx still boots.
+      SUPERSET_WEBSOCKET_UPSTREAM: 127.0.0.1:8080
+
+  superset:
+    environment:
+      SUPERSET_PERSISTENCE_MODE: postgres
+
+  superset-init:
+    environment:
+      SUPERSET_PERSISTENCE_MODE: postgres
+    # The base file gates init on the bundled db/redis containers, which do not
+    # run here — the external Postgres is assumed reachable.
+    depends_on: !reset {}
+
+  superset-worker:
+    environment:
+      SUPERSET_PERSISTENCE_MODE: postgres
+      # kombu's SQLAlchemy broker transport can deliver a task more than once
+      # when many consumer processes poll the same message table; keep this
+      # deployment at ONE worker container and minimal prefork concurrency.
+      CELERYD_CONCURRENCY: 1
+    deploy:
+      replicas: 1
+    # The base healthcheck uses `celery inspect ping`, which needs the broker's
+    # remote-control channel — the SQLAlchemy transport has none, so the check
+    # would mark a healthy worker unhealthy forever.
+    healthcheck:
+      disable: true
+
+  superset-worker-beat:
+    environment:
+      SUPERSET_PERSISTENCE_MODE: postgres
+
+  superset-ai-agent:
+    environment:
+      # The agent reads its persistence config from superset_ai_agent/.env
+      # (see header); nothing forced here so local rehearsals can mix modes.
+      # Placeholder key keeps this service block valid for future overrides.
+      SUPERSET_BASE_URL: http://superset:8088

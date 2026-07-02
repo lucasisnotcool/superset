@@ -40,7 +40,11 @@ from sqlalchemy.orm import Session, sessionmaker
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.llm.embeddings import Embedder
 from superset_ai_agent.persistence.models import AiAgentInstruction
-from superset_ai_agent.semantic_layer.vector_cache import LanceVectorCache
+from superset_ai_agent.semantic_layer.pgvector import PgVectorCache
+from superset_ai_agent.semantic_layer.vector_cache import (
+    LanceVectorCache,
+    VectorCache,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -131,9 +135,7 @@ class InstructionStore(Protocol):
     ) -> Instruction:
         """Persist a new instruction."""
 
-    def list_instructions(
-        self, *, scope_hash: str, owner_id: str
-    ) -> list[Instruction]:
+    def list_instructions(self, *, scope_hash: str, owner_id: str) -> list[Instruction]:
         """List instructions for an owner+scope (newest first)."""
 
     def delete(self, instruction_id: str, *, owner_id: str) -> bool:
@@ -296,9 +298,7 @@ class LanceDbInstructionStore:
     once gone from SQL), matching the memory cache's stale-row behavior.
     """
 
-    def __init__(
-        self, inner: SqlAlchemyInstructionStore, cache: LanceVectorCache
-    ) -> None:
+    def __init__(self, inner: SqlAlchemyInstructionStore, cache: VectorCache) -> None:
         self.inner = inner
         self.cache = cache
 
@@ -379,17 +379,21 @@ def create_instruction_store(
     wrapped in a persistent `instructions` vector cache (plan C0.2).
     """
 
-    if config.wren_memory_store in {"sqlalchemy", "lancedb"}:
+    if config.wren_memory_store in {"sqlalchemy", "lancedb", "postgres"}:
         if session_factory is None:
             raise ValueError("Durable instruction store requires a database.")
         inner = SqlAlchemyInstructionStore(session_factory, embedder=embedder)
-        if (
-            config.wren_memory_store == "lancedb"
-            and embedder is not None
-            and embedder.is_available()
-        ):
-            cache = LanceVectorCache(embedder, _lancedb_path(config), "instructions")
-            if cache.is_available():
+        if embedder is not None and embedder.is_available():
+            cache: LanceVectorCache | PgVectorCache | None = None
+            if config.wren_memory_store == "lancedb":
+                cache = LanceVectorCache(
+                    embedder, _lancedb_path(config), "instructions"
+                )
+            elif config.wren_memory_store == "postgres":
+                cache = PgVectorCache(
+                    embedder, config.effective_vector_database_url, "instructions"
+                )
+            if cache is not None and cache.is_available():
                 return LanceDbInstructionStore(inner, cache)
         return inner
     return InMemoryInstructionStore(embedder=embedder)

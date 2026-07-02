@@ -23,6 +23,7 @@ import pytest
 
 from superset_ai_agent.semantic_layer.file_storage import (
     LocalDocumentStorage,
+    PostgresDocumentStorage,
     S3DocumentStorage,
 )
 
@@ -56,9 +57,7 @@ def test_s3_document_storage_round_trips_bytes() -> None:
         content=b"stage means opportunity stage",
     )
 
-    assert uri == (
-        "s3://agent-docs/semantic/docs/doc_.._1/Gross_Moves_Notes.md"
-    )
+    assert uri == ("s3://agent-docs/semantic/docs/doc_.._1/Gross_Moves_Notes.md")
     assert storage.read(uri) == b"stage means opportunity stage"
     storage.delete(uri)
     assert client.objects == {}
@@ -67,6 +66,53 @@ def test_s3_document_storage_round_trips_bytes() -> None:
 def test_s3_document_storage_requires_bucket() -> None:
     with pytest.raises(ValueError, match="AI_AGENT_DOCUMENT_S3_BUCKET"):
         S3DocumentStorage(bucket="", client=FakeS3Client())
+
+
+def _session_factory():
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from superset_ai_agent.persistence.models import Base
+
+    engine = create_engine("sqlite://", future=True)
+    Base.metadata.create_all(engine)
+    return sessionmaker(bind=engine, expire_on_commit=False, future=True)
+
+
+def test_postgres_document_storage_round_trips_bytes() -> None:
+    storage = PostgresDocumentStorage(_session_factory())
+
+    uri = storage.write(
+        document_id="doc-1",
+        filename="../Gross Moves Notes.md",
+        content=b"stage means opportunity stage",
+    )
+
+    assert uri == "agent-db://documents/doc-1/Gross_Moves_Notes.md"
+    assert storage.read(uri) == b"stage means opportunity stage"
+
+    # Overwrite replaces bytes under the same key (re-upload path).
+    same_uri = storage.write(
+        document_id="doc-1",
+        filename="../Gross Moves Notes.md",
+        content=b"v2",
+    )
+    assert same_uri == uri
+    assert storage.read(uri) == b"v2"
+
+    storage.delete(uri)
+    with pytest.raises(FileNotFoundError):
+        storage.read(uri)
+    # Deleting again is a no-op, matching the local backend.
+    storage.delete(uri)
+
+
+def test_postgres_document_storage_rejects_foreign_uris() -> None:
+    storage = PostgresDocumentStorage(_session_factory())
+    with pytest.raises(ValueError, match="Unsupported document storage URI"):
+        storage.read("file:///tmp/doc.md")
+    with pytest.raises(ValueError, match="Unsupported document storage URI"):
+        storage.read("s3://bucket/key")
 
 
 class FakeS3Client:

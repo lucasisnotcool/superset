@@ -20,7 +20,14 @@ param(
 
     [switch]$Detached,
     [switch]$Follow,
-    [string]$Service
+    [string]$Service,
+
+    # Postgres-only persistence: no local db/redis/websocket containers; every
+    # durable store rides the external PostgreSQL configured in
+    # docker/.env-local (DATABASE_*) and superset_ai_agent/.env
+    # (AI_AGENT_DATABASE_URL + the *=postgres mode knobs). See
+    # docker-compose.postgres-only.yml for the full prerequisites.
+    [switch]$PostgresOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -31,6 +38,9 @@ $ComposeFiles = @(
     "-f", "docker-compose.no-bind.yml",
     "-f", "docker-compose.ai-agent.yml"
 )
+if ($PostgresOnly) {
+    $ComposeFiles += @("-f", "docker-compose.postgres-only.yml")
+}
 $AiAgentEnvFile = Join-Path $RepoRoot "superset_ai_agent/.env"
 $ProjectName = [regex]::Replace((Split-Path -Leaf $RepoRoot).ToLowerInvariant(), "[^a-z0-9]+", "-").Trim("-")
 
@@ -276,6 +286,9 @@ function Show-ConnectionInfo {
     Write-Host "   AI proxy: http://localhost:$env:NGINX_HOST_PORT/ai-agent"
     Write-Host "   Internal services are reachable only on the Docker network."
     Write-Host "   Docker mode: packaged images, no host bind mounts."
+    if ($PostgresOnly) {
+        Write-Host "   Persistence: postgres-only (external DB; no local db/redis containers)."
+    }
     if ($env:SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION) {
         Write-Host "   Python compat: cryptography==$env:SUPERSET_DOCKER_CRYPTOGRAPHY_VERSION"
     }

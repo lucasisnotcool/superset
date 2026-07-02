@@ -25,11 +25,11 @@ SupersetAdapterMode = Literal["local", "rest", "mcp"]
 WrenAdapterMode = Literal["file", "http", "llm"]
 WrenEngineMode = Literal["passthrough", "wren_core"]
 WrenRetrieverMode = Literal["keyword", "embedding"]
-WrenVectorIndexMode = Literal["memory", "lancedb"]
-WrenMemoryStoreMode = Literal["none", "sqlalchemy", "lancedb"]
+WrenVectorIndexMode = Literal["memory", "lancedb", "postgres"]
+WrenMemoryStoreMode = Literal["none", "sqlalchemy", "lancedb", "postgres"]
 ConversationStoreMode = Literal["memory", "sqlalchemy"]
 SemanticLayerStoreMode = Literal["memory", "sqlalchemy"]
-DocumentStorageMode = Literal["local", "s3"]
+DocumentStorageMode = Literal["local", "s3", "postgres"]
 IdentityProviderMode = Literal["static", "signed_header", "superset_session"]
 SupersetAuthMode = Literal["service_account", "user_session"]
 AgentEnvironment = Literal["development", "production"]
@@ -100,6 +100,11 @@ class AgentConfig:
     # purge script deletes rows older than this. 0 = keep forever.
     llm_usage_retention_days: int = 90
     agent_database_url: str = "sqlite:///./.data/ai_agent.db"
+    # Postgres URL for the pgvector-backed stores (WREN_VECTOR_INDEX=postgres /
+    # WREN_MEMORY_STORE=postgres / WREN_DOCUMENT_VECTOR_INDEX=postgres). Unset
+    # means "same database as the relational agent store" — the normal
+    # postgres-only topology where one external database holds everything.
+    vector_database_url: str | None = None
     agent_database_echo: bool = False
     agent_run_migrations: bool = True
     agent_migration_bootstrap: MigrationBootstrapMode = "error"
@@ -396,6 +401,16 @@ class AgentConfig:
                 "authorization), or set AI_AGENT_ENV=development for local use."
             )
 
+    @property
+    def effective_vector_database_url(self) -> str:
+        """The Postgres URL the pgvector stores use.
+
+        Falls back to the relational agent database URL, so the common
+        postgres-only deployment needs exactly one AI_AGENT_DATABASE_URL.
+        """
+
+        return self.vector_database_url or self.agent_database_url
+
     @classmethod
     def from_env(cls) -> "AgentConfig":
         """Build config from environment variables."""
@@ -522,6 +537,9 @@ class AgentConfig:
             agent_database_url=os.getenv(
                 "AI_AGENT_DATABASE_URL",
                 cls.agent_database_url,
+            ),
+            vector_database_url=(
+                os.getenv("AI_AGENT_VECTOR_DATABASE_URL") or cls.vector_database_url
             ),
             agent_database_echo=_env_bool(
                 "AI_AGENT_DATABASE_ECHO",

@@ -53,8 +53,10 @@ python-docx>=1.1,<2.0
 openpyxl>=3.1,<4.0
 python-pptx>=1.0,<2.0
 #
-# Optional (production): PostgreSQL driver for durable agent persistence
-# (AI_AGENT_DATABASE_URL=postgresql+psycopg://...). The default
-# sqlite:///./.data/ai_agent.db needs no driver; install this only when pointing
-# conversation/semantic stores at Postgres for multi-worker deployments.
-# psycopg[binary]>=3.1,<4.0
+# PostgreSQL driver for durable agent persistence
+# (AI_AGENT_DATABASE_URL=postgresql+psycopg://...) and the pgvector-backed
+# vector stores (WREN_VECTOR_INDEX / WREN_MEMORY_STORE /
+# WREN_DOCUMENT_VECTOR_INDEX = postgres). The default
+# sqlite:///./.data/ai_agent.db does not use it, but volume-less deployments
+# (postgres-only persistence) require it, so it ships in the image.
+psycopg[binary]>=3.1,<4.0

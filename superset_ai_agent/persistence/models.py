@@ -26,6 +26,7 @@ from sqlalchemy import (
     Index,
     Integer,
     JSON,
+    LargeBinary,
     String,
     Text,
     text,
@@ -160,6 +161,27 @@ class AiAgentSemanticDocument(Base):
     error = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False)
     updated_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class AiAgentDocumentBlob(Base):
+    """Raw uploaded-document bytes for ``AI_AGENT_DOCUMENT_STORAGE=postgres``.
+
+    The Postgres twin of the local-FS/S3 object stores: one row per stored file,
+    keyed by the same ``document_id``/``filename`` pair the other backends encode
+    in their storage URIs. Bytes ride a ``LargeBinary`` (Postgres ``bytea`` —
+    TOASTed transparently, deleted with the row) sized by the existing upload cap
+    (``wren_max_document_bytes``), so no large-object bookkeeping is needed.
+    """
+
+    __tablename__ = "ai_agent_document_blobs"
+
+    #: ``<document_id>/<safe_filename>`` — the same identity the URI carries.
+    storage_key = Column(String(1024), primary_key=True)
+    document_id = Column(String(36), index=True, nullable=False)
+    filename = Column(String(512), nullable=False)
+    size_bytes = Column(Integer, nullable=False)
+    data = Column(LargeBinary, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False)
 
 
 class AiAgentDocumentChunk(Base):

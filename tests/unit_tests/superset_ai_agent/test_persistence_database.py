@@ -52,7 +52,7 @@ def test_run_migrations_upgrades_empty_database_and_is_idempotent(tmp_path) -> N
     inspector = inspect(engine)
     table_names = set(inspector.get_table_names())
 
-    assert "alembic_version" in table_names
+    assert "ai_agent_alembic_version" in table_names
     assert {
         "ai_agent_conversations",
         "ai_agent_messages",
@@ -153,4 +153,4 @@ def test_run_migrations_can_stamp_existing_development_tables(tmp_path) -> None:
     )
 
     inspector = inspect(create_engine_from_config(config))
-    assert "alembic_version" in inspector.get_table_names()
+    assert "ai_agent_alembic_version" in inspector.get_table_names()

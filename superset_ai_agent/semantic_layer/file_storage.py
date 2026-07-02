@@ -18,9 +18,13 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, TYPE_CHECKING
 from urllib.parse import quote, unquote, urlparse
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session, sessionmaker
 
 
 class DocumentStorage(Protocol):
@@ -118,6 +122,80 @@ def _bucket_key_from_s3_uri(storage_uri: str) -> tuple[str, str]:
     if parsed.scheme != "s3" or not parsed.netloc or not parsed.path.strip("/"):
         raise ValueError(f"Unsupported document storage URI: {storage_uri}")
     return parsed.netloc, unquote(parsed.path.lstrip("/"))
+
+
+#: URI scheme for rows in ``ai_agent_document_blobs`` (the agent's own database).
+_AGENT_DB_SCHEME = "agent-db"
+_AGENT_DB_NETLOC = "documents"
+
+
+class PostgresDocumentStorage:
+    """Store uploaded documents as rows in the agent database.
+
+    The postgres-only twin of `LocalDocumentStorage`/`S3DocumentStorage` for
+    deployments with no writable disk and no object store: bytes land in the
+    ``ai_agent_document_blobs`` table next to the rest of the agent's relational
+    state, bounded per-file by the existing upload cap. URIs are
+    ``agent-db://documents/<document_id>/<filename>`` and round-trip through the
+    same ``storage_uri`` column the other backends use.
+    """
+
+    def __init__(self, session_factory: "sessionmaker[Session]") -> None:
+        self._session_factory = session_factory
+
+    def write(self, *, document_id: str, filename: str, content: bytes) -> str:
+        from superset_ai_agent.persistence.models import AiAgentDocumentBlob
+
+        safe_filename = _safe_filename(filename)
+        storage_key = f"{document_id}/{safe_filename}"
+        with self._session_factory() as session:
+            blob = session.get(AiAgentDocumentBlob, storage_key)
+            if blob is None:
+                blob = AiAgentDocumentBlob(
+                    storage_key=storage_key,
+                    document_id=document_id,
+                    filename=safe_filename,
+                    created_at=datetime.now(timezone.utc),
+                )
+                session.add(blob)
+            blob.size_bytes = len(content)
+            blob.data = content
+            session.commit()
+        return (
+            f"{_AGENT_DB_SCHEME}://{_AGENT_DB_NETLOC}/"
+            f"{quote(document_id)}/{quote(safe_filename)}"
+        )
+
+    def read(self, storage_uri: str) -> bytes:
+        from superset_ai_agent.persistence.models import AiAgentDocumentBlob
+
+        storage_key = _storage_key_from_agent_db_uri(storage_uri)
+        with self._session_factory() as session:
+            blob = session.get(AiAgentDocumentBlob, storage_key)
+            if blob is None:
+                raise FileNotFoundError(f"No stored document for URI: {storage_uri}")
+            return bytes(blob.data)
+
+    def delete(self, storage_uri: str) -> None:
+        from superset_ai_agent.persistence.models import AiAgentDocumentBlob
+
+        storage_key = _storage_key_from_agent_db_uri(storage_uri)
+        with self._session_factory() as session:
+            blob = session.get(AiAgentDocumentBlob, storage_key)
+            if blob is not None:
+                session.delete(blob)
+                session.commit()
+
+
+def _storage_key_from_agent_db_uri(storage_uri: str) -> str:
+    parsed = urlparse(storage_uri)
+    if (
+        parsed.scheme != _AGENT_DB_SCHEME
+        or parsed.netloc != _AGENT_DB_NETLOC
+        or not parsed.path.strip("/")
+    ):
+        raise ValueError(f"Unsupported document storage URI: {storage_uri}")
+    return unquote(parsed.path.lstrip("/"))
 
 
 def _create_s3_client(

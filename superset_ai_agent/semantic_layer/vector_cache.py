@@ -39,11 +39,29 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from typing import Any
+from typing import Any, Protocol
 
 from superset_ai_agent.llm.embeddings import Embedder
 
 logger = logging.getLogger(__name__)
+
+
+class VectorCache(Protocol):
+    """The row-mutable vector-collection contract (LanceDB or Postgres/pgvector).
+
+    Implemented by :class:`LanceVectorCache` and
+    :class:`superset_ai_agent.semantic_layer.pgvector.PgVectorCache`; consumed by
+    the memory/instruction/document-chunk stores, which only ever rely on this
+    degrade-closed surface.
+    """
+
+    def is_available(self) -> bool: ...
+
+    def upsert(self, *, scope_key: str, row_id: str, text: str) -> bool: ...
+
+    def remove(self, *, scope_key: str, row_id: str) -> bool: ...
+
+    def search(self, *, scope_key: str, query: str, k: int) -> list[str] | None: ...
 
 
 def _table_name(collection: str, scope_key: str, signature: str) -> str:

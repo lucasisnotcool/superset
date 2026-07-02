@@ -189,6 +189,113 @@ class CeleryConfig:
 
 CELERY_CONFIG = CeleryConfig
 
+# ---------------------------------------------------------------------------
+# Postgres-only persistence (SUPERSET_PERSISTENCE_MODE=postgres).
+#
+# For deployments with no persistent volumes and no Redis: every durable store
+# rides the (external) Postgres metadata database instead of Redis or the
+# superset_home filesystem. Selected via env so one image serves both
+# topologies; the default ("redis") keeps the stack above unchanged.
+#   - SQL Lab async results  -> metastore key_value table (metadata DB)
+#   - metadata cache         -> SupersetMetastoreCache (metadata DB)
+#   - data/thumbnail caches  -> NullCache (perf-only accelerators; upstream
+#                               production default when unset)
+#   - Celery broker          -> kombu SQLAlchemy transport on the metadata DB
+#   - Celery result backend  -> Celery database backend on the metadata DB
+# ---------------------------------------------------------------------------
+SUPERSET_PERSISTENCE_MODE = os.getenv("SUPERSET_PERSISTENCE_MODE", "redis").lower()
+
+if SUPERSET_PERSISTENCE_MODE == "postgres":
+    from flask_caching.backends.base import BaseCache
+
+    class MetastoreResultsBackend(BaseCache):
+        """SQL Lab results backend on the metadata DB (``key_value`` table).
+
+        A lazy delegate to ``SupersetMetastoreCache``: constructing the real
+        class at config-import time would import ``superset.db`` while
+        ``superset.config`` is itself still importing (circular), so the inner
+        cache is resolved on first use — inside app/worker context, where the
+        import is safe. Values are the zlib-compressed msgpack payloads
+        ``sql_lab`` already produces. The ``key_value.value`` column caps one
+        entry at ~16MB (MEDIUMBLOB-equivalent); a larger result set fails the
+        write and surfaces as a results-backend error rather than corrupting.
+        Expired rows are only pruned opportunistically — schedule
+        ``DELETE FROM key_value WHERE expires_on < now()`` if SQL Lab volume
+        is high.
+        """
+
+        def __init__(self, default_timeout: int = 86400) -> None:
+            super().__init__(default_timeout)
+            self._inner: BaseCache | None = None
+
+        def _cache(self) -> BaseCache:
+            if self._inner is None:
+                from uuid import NAMESPACE_OID, uuid3
+
+                from superset.extensions.metastore_cache import (
+                    SupersetMetastoreCache,
+                )
+                from superset.key_value.types import PickleKeyValueCodec
+
+                self._inner = SupersetMetastoreCache(
+                    # Fixed namespace: web + worker processes must derive the
+                    # same key UUIDs for the same cache keys.
+                    namespace=uuid3(NAMESPACE_OID, "superset.results_backend"),
+                    codec=PickleKeyValueCodec(),
+                    default_timeout=self.default_timeout,
+                )
+            return self._inner
+
+        def get(self, key):
+            return self._cache().get(key)
+
+        def set(self, key, value, timeout=None):
+            return self._cache().set(key, value, timeout=timeout)
+
+        def add(self, key, value, timeout=None):
+            return self._cache().add(key, value, timeout=timeout)
+
+        def delete(self, key):
+            return self._cache().delete(key)
+
+        def has(self, key):
+            return self._cache().has(key)
+
+    RESULTS_BACKEND = MetastoreResultsBackend()
+
+    # All three are perf-only accelerators; NullCache is the upstream production
+    # default when Redis is absent. A metastore-backed CACHE_CONFIG is possible
+    # but interacts badly with startup config-sync (its key_value write can land
+    # inside an in-progress session flush), so it is deliberately not used. The
+    # required caches (filter state, explore form data) already default to
+    # SupersetMetastoreCache upstream and are not overridden here.
+    CACHE_CONFIG = {"CACHE_TYPE": "NullCache"}
+    DATA_CACHE_CONFIG = {"CACHE_TYPE": "NullCache"}
+    THUMBNAIL_CACHE_CONFIG = {"CACHE_TYPE": "NullCache"}
+
+    class PostgresCeleryConfig(CeleryConfig):  # type: ignore[valid-type,misc]
+        """Celery on the metadata Postgres via kombu's SQLAlchemy transport.
+
+        The SQL broker transport is upstream-experimental: polling-based, no
+        remote control (``celery inspect``/events do not work, so worker
+        healthchecks based on them must be disabled), and duplicate delivery
+        is possible with many consumer processes — run exactly ONE worker
+        container with low concurrency in this mode
+        (docker-compose.postgres-only.yml pins both). The ``db+`` result
+        backend is a first-class supported Celery backend.
+        """
+
+        broker_url = (
+            f"sqla+{DATABASE_DIALECT}://{DATABASE_USER}:{DATABASE_PASSWORD}"
+            f"@{DATABASE_HOST}:{DATABASE_PORT}/{DATABASE_DB}"
+        )
+        result_backend = (
+            f"db+{DATABASE_DIALECT}://{DATABASE_USER}:{DATABASE_PASSWORD}"
+            f"@{DATABASE_HOST}:{DATABASE_PORT}/{DATABASE_DB}"
+        )
+
+    CELERY_CONFIG = PostgresCeleryConfig
+
 FEATURE_FLAGS = {
     "ALERT_REPORTS": True,
     "DATASET_FOLDERS": True,

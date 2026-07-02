@@ -172,6 +172,7 @@ from superset_ai_agent.semantic_layer.extractors import (
 from superset_ai_agent.semantic_layer.file_storage import (
     DocumentStorage,
     LocalDocumentStorage,
+    PostgresDocumentStorage,
     S3DocumentStorage,
 )
 from superset_ai_agent.semantic_layer.golden_queries import (
@@ -371,7 +372,9 @@ def create_app(  # noqa: C901
         app_config,
         session_factory=session_factory,
     )
-    active_document_storage = document_storage or _create_document_storage(app_config)
+    active_document_storage = document_storage or _create_document_storage(
+        app_config, session_factory=session_factory
+    )
     active_document_extractor = document_extractor or CompositeDocumentExtractor()
     active_job_store = job_store or _create_job_store(
         app_config,
@@ -4993,7 +4996,10 @@ def _create_coverage_run_store(
     )
 
 
-def _create_document_storage(config: AgentConfig) -> DocumentStorage:
+def _create_document_storage(
+    config: AgentConfig,
+    session_factory: Any | None = None,
+) -> DocumentStorage:
     if config.document_storage == "local":
         return LocalDocumentStorage(config.agent_storage_dir)
     if config.document_storage == "s3":
@@ -5003,9 +5009,17 @@ def _create_document_storage(config: AgentConfig) -> DocumentStorage:
             endpoint_url=config.document_s3_endpoint_url,
             region_name=config.document_s3_region_name,
         )
+    if config.document_storage == "postgres":
+        if session_factory is None:
+            raise ValueError(
+                "AI_AGENT_DOCUMENT_STORAGE=postgres requires the agent "
+                "database (set AI_AGENT_DATABASE_URL and a sqlalchemy-backed "
+                "store so a session factory exists)."
+            )
+        return PostgresDocumentStorage(session_factory)
     raise ValueError(
         "Unsupported AI_AGENT_DOCUMENT_STORAGE value "
-        f"{config.document_storage!r}. Expected one of: local, s3."
+        f"{config.document_storage!r}. Expected one of: local, s3, postgres."
     )
 
 
@@ -5184,7 +5198,8 @@ def _requires_agent_database(config: AgentConfig) -> bool:
     return (
         config.conversation_store == "sqlalchemy"
         or config.semantic_layer_store == "sqlalchemy"
-        or config.wren_memory_store == "sqlalchemy"
+        or config.wren_memory_store in {"sqlalchemy", "lancedb", "postgres"}
+        or config.document_storage == "postgres"
     )
 
 

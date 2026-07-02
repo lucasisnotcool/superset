@@ -41,7 +41,11 @@ from sqlalchemy.orm import Session, sessionmaker
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.llm.embeddings import Embedder
 from superset_ai_agent.persistence.models import AiAgentNlSqlExample
-from superset_ai_agent.semantic_layer.vector_cache import LanceVectorCache
+from superset_ai_agent.semantic_layer.pgvector import PgVectorCache
+from superset_ai_agent.semantic_layer.vector_cache import (
+    LanceVectorCache,
+    VectorCache,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -201,9 +205,7 @@ def load_recall_access(
                 )
             )
         except Exception as ex:  # pylint: disable=broad-except - best-effort
-            logger.warning(
-                "Recall access load failed for schema %s: %s", schema, ex
-            )
+            logger.warning("Recall access load failed for schema %s: %s", schema, ex)
             return RecallAccess()
     return build_recall_access(datasets)
 
@@ -646,7 +648,7 @@ class LanceDbMemory:
     are inert.
     """
 
-    def __init__(self, inner: SqlAlchemyMemory, cache: LanceVectorCache) -> None:
+    def __init__(self, inner: SqlAlchemyMemory, cache: VectorCache) -> None:
         self.inner = inner
         self.cache = cache
 
@@ -744,7 +746,7 @@ def create_memory(
 
     if not config.wren_memory_learning_enabled or config.wren_memory_store == "none":
         return NullMemory()
-    if config.wren_memory_store in {"sqlalchemy", "lancedb"}:
+    if config.wren_memory_store in {"sqlalchemy", "lancedb", "postgres"}:
         if session_factory is None:
             raise ValueError("Durable memory store requires a database.")
         inner = SqlAlchemyMemory(
@@ -752,13 +754,15 @@ def create_memory(
             max_examples=config.wren_memory_max_examples,
             embedder=embedder,
         )
-        if (
-            config.wren_memory_store == "lancedb"
-            and embedder is not None
-            and embedder.is_available()
-        ):
-            cache = LanceVectorCache(embedder, _lancedb_path(config), "sql_pairs")
-            if cache.is_available():
+        if embedder is not None and embedder.is_available():
+            cache: LanceVectorCache | PgVectorCache | None = None
+            if config.wren_memory_store == "lancedb":
+                cache = LanceVectorCache(embedder, _lancedb_path(config), "sql_pairs")
+            elif config.wren_memory_store == "postgres":
+                cache = PgVectorCache(
+                    embedder, config.effective_vector_database_url, "sql_pairs"
+                )
+            if cache is not None and cache.is_available():
                 return LanceDbMemory(inner, cache)
         return inner
     return NullMemory()
