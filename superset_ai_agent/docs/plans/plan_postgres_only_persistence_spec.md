@@ -19,7 +19,14 @@ under the License.
 
 # Feature Spec — Postgres-Only Persistence (No Docker Volumes / PVs)
 
-> **Status: BUILT + verified end-to-end locally.** All decision points below
+> **Status: SHIPPED — postgres-only is the DEFAULT topology.** The docker
+> config defaults `SUPERSET_PERSISTENCE_MODE` to `postgres`
+> (docker/pythonpath_dev/superset_config.py; a committed-`.env` default is
+> blocked by the repo's git-guard hook) and `superset_ai_agent/.env.example`
+> ships every store on `postgres`, so `make up-ai` and the Windows deploy both
+> run against Postgres out of the box (`redis`/`lancedb`/`local`/`sqlite`
+> remain supported opt-outs via env). Existing SQLite/local-document data moves
+> with `python -m superset_ai_agent.scripts.migrate_to_postgres`. All decision points below
 > are resolved (annotated inline); as-built details, live e2e results, the two
 > defects discovered only by running against real Postgres (§7 R9/R10 — both
 > would have broken *any* Postgres deployment of the agent), and the

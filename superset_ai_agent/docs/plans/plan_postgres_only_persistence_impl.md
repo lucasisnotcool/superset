@@ -214,7 +214,8 @@ Code reaches the box via `git pull origin master` (one merge commit). Then:
    ```
    (`SUPERSET_PERSISTENCE_MODE=postgres` is injected by the overlay; setting it
    here too is harmless.)
-3. **`superset_ai_agent/.env`:**
+3. **`superset_ai_agent/.env`** (these are also the `.env.example` defaults —
+   only the URL's host/credentials need changing offsite):
    ```
    AI_AGENT_DATABASE_URL=postgresql+psycopg://<user>:<password>@<host>:<port>/<db>
    WREN_VECTOR_INDEX=postgres
@@ -229,6 +230,17 @@ Code reaches the box via `git pull origin master` (one merge commit). Then:
    ```
    (`up --build` is the script's default, so the rebuild happens; a plain
    `restart` would NOT pick any of this up.)
+4b. **Carry existing agent data over (once, if the box has SQLite state worth
+   keeping — conversations, projects, MDL, uploaded documents):**
+   ```powershell
+   docker compose -f docker-compose.no-bind.yml -f docker-compose.ai-agent.yml -f docker-compose.postgres-only.yml `
+     exec superset-ai-agent python -m superset_ai_agent.scripts.migrate_to_postgres `
+       --source sqlite:////app/.data/ai_agent.db --include-documents --apply
+   ```
+   Dry-run first by omitting `--apply`. Idempotent (PK-skips rows already in
+   the target), so re-running after a partial copy is safe. Requires the old
+   `superset_ai_agent_data` volume still mounted for this one run; vectors are
+   not copied (they re-embed on first use).
 5. **Verify it's live in the containers, not assumed:**
    ```powershell
    docker compose -f docker-compose.no-bind.yml -f docker-compose.ai-agent.yml -f docker-compose.postgres-only.yml `
@@ -261,9 +273,21 @@ mode-gated, so the redis/volume topology is untouched.
   `DELETE FROM key_value WHERE expires_on < now()` on the external DB.
 - **Document blobs** count against DB size/backup; per-file cap is the existing
   10MB guard. Config-only escape hatch back to `s3` mode.
-- **No data migration tooling** was built (fresh-DB cutover assumed). If the
-  offsite box has SQLite/LanceDB/local-document state worth keeping, say so —
-  a one-time copy script is a small, separate task (vectors don't need it:
-  they re-embed on first use per scope; cold-start cost only).
+- ~~**No data migration tooling** was built~~ — superseded: the postgres
+  topology is now the **default** (`SUPERSET_PERSISTENCE_MODE` defaults to
+  `postgres` in docker/pythonpath_dev/superset_config.py — the repo's
+  git-guard hook forbids committing `docker/.env`, so the default lives in
+  code; `superset_ai_agent/.env.example` ships the five knobs on `postgres`),
+  and existing SQLite/local-document state moves
+  with the one-time copy script (idempotent; dry-run by default):
+  ```
+  docker compose ... exec superset-ai-agent \
+    python -m superset_ai_agent.scripts.migrate_to_postgres \
+      --source sqlite:////app/.data/ai_agent.db --include-documents --apply
+  ```
+  `--target` defaults to the configured `AI_AGENT_DATABASE_URL`. Vectors are
+  deliberately not copied — they re-embed on first use per scope (one-time
+  cold-start cost only). Reverting to the legacy topology remains a pure env
+  flip (`SUPERSET_PERSISTENCE_MODE=redis` + the lancedb/local/sqlite knobs).
 - **GLOBAL_ASYNC_QUERIES** stays off — the websocket layer is Redis-only and is
   excluded by the overlay.

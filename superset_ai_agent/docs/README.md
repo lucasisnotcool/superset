@@ -209,7 +209,8 @@ The founding design corpus; code comments cite these by name and section.
 - [plan_postgres_only_persistence_spec.md](plans/plan_postgres_only_persistence_spec.md)
   / [plan_postgres_only_persistence_impl.md](plans/plan_postgres_only_persistence_impl.md):
   all state in one external Postgres — pgvector, blob storage, pg-only mode
-  (Built + verified end-to-end).
+  (Shipped as the DEFAULT topology; `migrate_to_postgres` script carries
+  legacy SQLite/local-document data over).
 - [plan_self_service_connections_spec.md](plans/plan_self_service_connections_spec.md)
   / [plan_self_service_connections_impl.md](plans/plan_self_service_connections_impl.md):
   BYO-credential connections + Builder role, DB-fingerprint authz (Built

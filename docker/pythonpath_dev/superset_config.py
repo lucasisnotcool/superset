@@ -203,7 +203,11 @@ CELERY_CONFIG = CeleryConfig
 #   - Celery broker          -> kombu SQLAlchemy transport on the metadata DB
 #   - Celery result backend  -> Celery database backend on the metadata DB
 # ---------------------------------------------------------------------------
-SUPERSET_PERSISTENCE_MODE = os.getenv("SUPERSET_PERSISTENCE_MODE", "redis").lower()
+# Default is postgres — the finalized topology for this fork (no Redis state,
+# no filesystem state). Set SUPERSET_PERSISTENCE_MODE=redis (e.g. in
+# docker/.env-local) to opt back into the upstream Redis topology. The
+# superset-worker healthcheck in docker-compose.yml assumes the same default.
+SUPERSET_PERSISTENCE_MODE = os.getenv("SUPERSET_PERSISTENCE_MODE", "postgres").lower()
 
 if SUPERSET_PERSISTENCE_MODE == "postgres":
     from flask_caching.backends.base import BaseCache

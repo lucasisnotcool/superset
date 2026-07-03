@@ -242,7 +242,11 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
-      test: ["CMD-SHELL", "celery -A superset.tasks.celery_app:app inspect ping -d celery@$$HOSTNAME"]
+      # `celery inspect ping` needs the broker's remote-control channel, which
+      # the SQLAlchemy transport (SUPERSET_PERSISTENCE_MODE=postgres) does not
+      # have — fall back to a process-liveness check there so a healthy worker
+      # is not reported unhealthy forever.
+      test: ["CMD-SHELL", "if [ \"$${SUPERSET_PERSISTENCE_MODE:-postgres}\" = \"postgres\" ]; then for p in /proc/[0-9]*/cmdline; do tr '\\0' ' ' < \"$$p\" | grep -q celery && exit 0; done; exit 1; else celery -A superset.tasks.celery_app:app inspect ping -d celery@$$HOSTNAME; fi"]
     # Bump memory limit if processing selenium / thumbnails on superset-worker
     # mem_limit: 2038m
     # mem_reservation: 128M
