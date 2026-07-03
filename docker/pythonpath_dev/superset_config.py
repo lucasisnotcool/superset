@@ -312,6 +312,14 @@ FEATURE_FLAGS = {
 from superset.security.builder import BuilderSecurityManager  # noqa: E402
 
 CUSTOM_SECURITY_MANAGER = BuilderSecurityManager
+# Auto-provision an account on a user's first successful login (e.g. first
+# LDAP/SSO sign-in) instead of requiring an admin to create it. Combined with
+# AUTH_USER_REGISTRATION_ROLE below, every first-time user is created with the
+# Builder role. Leave AUTH_ROLES_SYNC_AT_LOGIN unset (default False): enabling
+# IdP group->role sync overwrites user.roles on *every* login and would strip
+# Builder from anyone whose groups don't map to it (on_user_login only
+# re-claims database *grants*, not the Builder base role).
+AUTH_USER_REGISTRATION = True
 AUTH_USER_REGISTRATION_ROLE = "Builder"
 
 EXTENSIONS_PATH = "/app/docker/extensions"

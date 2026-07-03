@@ -48,14 +48,23 @@ echo_step "1" "Starting" "Applying DB migrations"
 superset db upgrade
 echo_step "1" "Complete" "Applying DB migrations"
 
-# Create an admin user
-echo_step "2" "Starting" "Setting up admin user ( admin / $ADMIN_PASSWORD )"
+# Create an admin user.
+# Under LDAP/SSO, FAB matches an incoming login to a local account by its
+# `username` (case-insensitive) and validates the password via directory bind,
+# leaving the account's roles untouched (unless AUTH_ROLES_SYNC_AT_LOGIN is on).
+# Setting ADMIN_USERNAME to your exact directory login (e.g. the AD
+# userPrincipalName or sAMAccountName) therefore makes the native admin account
+# resolve to your directory identity on first sign-in — no auto-registration
+# needed for the operator. Defaults preserve the stock admin/admin behaviour.
+ADMIN_USERNAME="${ADMIN_USERNAME:-admin}"
+ADMIN_EMAIL="${ADMIN_EMAIL:-admin@superset.com}"
+echo_step "2" "Starting" "Setting up admin user ( $ADMIN_USERNAME / $ADMIN_PASSWORD )"
 if [ "$CYPRESS_CONFIG" == "true" ]; then
     superset load_test_users
 else
     superset fab create-admin \
-        --username admin \
-        --email admin@superset.com \
+        --username "$ADMIN_USERNAME" \
+        --email "$ADMIN_EMAIL" \
         --password "$ADMIN_PASSWORD" \
         --firstname Superset \
         --lastname Admin
