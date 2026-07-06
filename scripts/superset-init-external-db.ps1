@@ -49,13 +49,27 @@
 .PARAMETER Force
     Skip the interactive confirmation prompt (for non-interactive use).
 
+.PARAMETER DatabaseUri
+    A full SQLAlchemy connection URI, e.g.
+    postgresql+psycopg2://user:pass@host:5432/dbname?sslmode=require
+    When given, it is parsed into the DATABASE_* components the config expects,
+    so it takes precedence over the env files. If the password contains any of
+    @ : / ? percent-encode them in the URI (e.g. '@' -> '%40'). To keep the URI
+    out of your shell history, set the SUPERSET_INIT_DATABASE_URI environment
+    variable instead of passing -DatabaseUri.
+
 .EXAMPLE
+    pwsh scripts/superset-init-external-db.ps1 -DatabaseUri "postgresql+psycopg2://superset:secret@db.internal:5432/superset"
+
+.EXAMPLE
+    $env:SUPERSET_INIT_DATABASE_URI = "postgresql+psycopg2://superset:secret@db.internal:5432/superset"
     pwsh scripts/superset-init-external-db.ps1
 
 .EXAMPLE
     pwsh scripts/superset-init-external-db.ps1 -Migrate
 #>
 param(
+    [string]$DatabaseUri,
     [string[]]$EnvFile = @("docker/.env", "docker/.env-local"),
     [switch]$Migrate,
     [switch]$Force
@@ -102,19 +116,89 @@ function Import-DotEnv {
     return $result
 }
 
-# Merge env files in order; later files override earlier ones.
-$envVars = @{}
-foreach ($rel in $EnvFile) {
-    $full = Join-Path $RepoRoot $rel
-    if (Test-Path -LiteralPath $full) {
-        $parsed = Import-DotEnv -Path $full
-        foreach ($k in $parsed.Keys) {
-            $envVars[$k] = $parsed[$k]
-        }
-        Write-Host "Loaded env from $rel"
+# Parse a SQLAlchemy URI into the DATABASE_* components the config reconstructs.
+# Splits defensively (last '@' before host, first ':' in userinfo, first '/'
+# before the database) so ordinary URIs parse correctly; a query string
+# (?sslmode=...) is kept on the database component so the reconstructed URI
+# preserves it.
+function ConvertFrom-SqlAlchemyUri {
+    param([string]$Uri)
+
+    $schemeSplit = $Uri -split '://', 2
+    if ($schemeSplit.Count -ne 2) {
+        throw "Invalid database URI (expected '<dialect>://user:pass@host:port/db'): $Uri"
+    }
+    $dialect = $schemeSplit[0]
+    $rest = $schemeSplit[1]
+
+    $atIdx = $rest.LastIndexOf('@')
+    if ($atIdx -lt 1) { throw "Invalid database URI: missing '@' between credentials and host." }
+    $userInfo = $rest.Substring(0, $atIdx)
+    $hostPart = $rest.Substring($atIdx + 1)
+
+    $colonIdx = $userInfo.IndexOf(':')
+    if ($colonIdx -lt 1) { throw "Invalid database URI: missing ':' between user and password." }
+    $user = $userInfo.Substring(0, $colonIdx)
+    $pass = $userInfo.Substring($colonIdx + 1)
+
+    $slashIdx = $hostPart.IndexOf('/')
+    if ($slashIdx -lt 1) { throw "Invalid database URI: missing '/<database>'." }
+    $hostPort = $hostPart.Substring(0, $slashIdx)
+    $dbPart = $hostPart.Substring($slashIdx + 1)
+    if ([string]::IsNullOrEmpty($dbPart)) { throw "Invalid database URI: empty database name." }
+
+    $hpColon = $hostPort.LastIndexOf(':')
+    if ($hpColon -ge 1) {
+        $dbHost = $hostPort.Substring(0, $hpColon)
+        $dbPort = $hostPort.Substring($hpColon + 1)
     }
     else {
-        Write-Warning "Env file not found (skipped): $rel"
+        $dbHost = $hostPort
+        $dbPort = "5432"
+    }
+
+    return @{
+        DATABASE_DIALECT  = $dialect
+        DATABASE_USER     = $user
+        DATABASE_PASSWORD = $pass
+        DATABASE_HOST     = $dbHost
+        DATABASE_PORT     = $dbPort
+        DATABASE_DB       = $dbPart
+    }
+}
+
+# Resolve the connection: an explicit URI (-DatabaseUri, or the
+# SUPERSET_INIT_DATABASE_URI env var) wins; otherwise fall back to the
+# DATABASE_* components read from the env files.
+$envVars = @{}
+$effectiveUri = if ($DatabaseUri) {
+    $DatabaseUri
+}
+elseif ($env:SUPERSET_INIT_DATABASE_URI) {
+    $env:SUPERSET_INIT_DATABASE_URI
+}
+else {
+    $null
+}
+
+if ($effectiveUri) {
+    $envVars = ConvertFrom-SqlAlchemyUri -Uri $effectiveUri
+    $source = if ($DatabaseUri) { "-DatabaseUri parameter" } else { "SUPERSET_INIT_DATABASE_URI env var" }
+    Write-Host "Using database URI from $source"
+}
+else {
+    foreach ($rel in $EnvFile) {
+        $full = Join-Path $RepoRoot $rel
+        if (Test-Path -LiteralPath $full) {
+            $parsed = Import-DotEnv -Path $full
+            foreach ($k in $parsed.Keys) {
+                $envVars[$k] = $parsed[$k]
+            }
+            Write-Host "Loaded env from $rel"
+        }
+        else {
+            Write-Warning "Env file not found (skipped): $rel"
+        }
     }
 }
 
@@ -128,7 +212,7 @@ $required = @(
 )
 $missing = $required | Where-Object { [string]::IsNullOrEmpty($envVars[$_]) }
 if ($missing) {
-    throw "Missing DATABASE_* variables: $($missing -join ', '). Set the external Postgres connection in docker/.env-local (or pass -EnvFile) and retry."
+    throw "Missing DATABASE_* variables: $($missing -join ', '). Pass -DatabaseUri '<sqlalchemy-uri>' (or set SUPERSET_INIT_DATABASE_URI), or provide the DATABASE_* values via -EnvFile, and retry."
 }
 
 # Guard against silently targeting the local compose DB. With --no-deps there is
