@@ -358,17 +358,29 @@ class SemanticAccessService:
         context: AgentContext | None,
     ) -> SemanticProject:
         # F5/DP2: permission is derived purely from the caller's level of access to
-        # the project's database — no ownership/admin tier. FULL access (the user can
-        # see the database's datasets) → write; PARTIAL → read. ``private``/legacy
-        # projects stay read-only regardless.
+        # the project's database — no ownership/admin tier. ``private``/legacy
+        # projects stay read-only regardless (the ``visibility`` gate below).
+        #
+        # FULL vs PARTIAL: a non-None ``context`` already proves the caller can
+        # reach the database — ``load_context`` fetches it through Superset's
+        # owner-scoped REST API, which raises for a principal who cannot see it
+        # (fail-closed, R6). Visible Superset *datasets* are only an over-narrow
+        # proxy for "full access": a deployment that models straight from a
+        # connection without cataloging datasets legitimately has an empty dataset
+        # set, which would otherwise pin every caller to read-only. When the
+        # operator opts in via ``semantic_full_access_grants_write``, treat that
+        # proven database/schema context as FULL so any principal with real access
+        # to the database can write — the original "full schema/database proof →
+        # write" contract (see wren.md). The dataset-derived FULL path and the
+        # deny-without-proof path are unchanged.
         _ = identity
         access_level = _access_level_from_context(context)
+        has_full_access = access_level == SemanticAccessLevel.FULL or (
+            self.semantic_full_access_grants_write and context is not None
+        )
         permission = (
             "write"
-            if (
-                project.visibility == "db_access"
-                and access_level == SemanticAccessLevel.FULL
-            )
+            if (project.visibility == "db_access" and has_full_access)
             else "read"
         )
         return project.model_copy(update={"permission": permission}, deep=True)

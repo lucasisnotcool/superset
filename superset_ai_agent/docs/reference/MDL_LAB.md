@@ -59,7 +59,7 @@ under the License.
 
 ## 3. DB-access scoping (P2) — security-critical
 
-- **Permission derivation** (`semantic_layer/access.py::_project_with_permission`): no owner/admin tier. `visibility=="db_access"` + FULL context (datasets visible) → **write**; else **read**. `semantic_full_access_grants_write` flag is now vestigial (FULL always grants write).
+- **Permission derivation** (`semantic_layer/access.py::_project_with_permission`): no owner/admin tier. `visibility=="db_access"` + FULL context → **write**; else **read**. FULL is reached two ways: (a) visible Superset datasets in the context, or (b) `semantic_full_access_grants_write=true` + any non-None context (i.e. a proven owner-scoped database/schema load, even with **no catalogued datasets**). Path (b) restores the original "full schema/database proof → write" contract for deployments that model straight from connections without registering datasets; the fail-closed deny-without-proof path is unchanged.
 - **Store baseline** (`projects.py::_with_permission`/`_is_visible`): `db_access` → write (the access service proved DB access before the store is reached); visibility is purely DB-access (owner branch dropped). `update`/`delete` gate `read → raise` (was admin-only).
 - **`owner_id`→`created_by` audit only.** Project access = proven access to its single database (`database_uri_fingerprint`).
 - **Owner→project read re-scope** (the literal "project-level provenance/coverage/RAG" ask) — done at the **store layer** so every app.py call site is project-scoped with no app.py change (`del owner_id` keeps the signature):

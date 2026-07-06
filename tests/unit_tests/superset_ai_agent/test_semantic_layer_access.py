@@ -137,6 +137,42 @@ def test_partial_access_grants_read_only() -> None:
         )
 
 
+def test_database_proof_grants_write_when_flag_enabled() -> None:
+    # A caller who proves database access (the context loads) but has NO visible
+    # datasets is read-only by default (see test_partial_access_grants_read_only).
+    # With semantic_full_access_grants_write, that proven owner-scoped context is
+    # treated as FULL and grants write — the original "full database/schema proof
+    # → write" contract, for deployments that model straight from a connection
+    # without cataloging Superset datasets (empty ``tables``).
+    store = InMemorySemanticProjectStore()
+    _service(store).resolve_project(
+        identity=AgentIdentity(owner_id="owner"),
+        request=_request(),
+    )
+    project_id = store.list(owner_id="owner")[0].id
+    analyst = AgentIdentity(owner_id="analyst")
+
+    def empty_context(scope: ConversationScope) -> AgentContext:
+        return AgentContext(
+            database=DatabaseSummary(id=scope.database_id, name="Sales"),
+            datasets=[],
+        )
+
+    service = SemanticAccessService(
+        project_store=store,
+        load_context=empty_context,
+        semantic_full_access_grants_write=True,
+    )
+
+    project = service.require_project_permission(
+        identity=analyst,
+        project_id=project_id,
+        permission=SemanticPermission.WRITE,
+    )
+
+    assert project.permission == "write"
+
+
 def test_full_access_grants_write_to_any_db_user() -> None:
     # A different user with FULL database access also gets write — no flag needed.
     store = InMemorySemanticProjectStore()
