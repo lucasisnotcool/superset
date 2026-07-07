@@ -183,9 +183,7 @@ def upgrade() -> None:
     op.create_index(
         "ix_ai_agent_eval_scores_result_id", "ai_agent_eval_scores", ["result_id"]
     )
-    op.create_index(
-        "ix_ai_agent_eval_scores_name", "ai_agent_eval_scores", ["name"]
-    )
+    op.create_index("ix_ai_agent_eval_scores_name", "ai_agent_eval_scores", ["name"])
 
 
 def downgrade() -> None:
@@ -203,17 +201,13 @@ def downgrade() -> None:
     op.drop_index(
         "ix_ai_agent_eval_results_item_id", table_name="ai_agent_eval_results"
     )
-    op.drop_index(
-        "ix_ai_agent_eval_results_run_id", table_name="ai_agent_eval_results"
-    )
+    op.drop_index("ix_ai_agent_eval_results_run_id", table_name="ai_agent_eval_results")
     op.drop_table("ai_agent_eval_results")
     op.drop_index("ix_ai_agent_eval_runs_created_at", table_name="ai_agent_eval_runs")
     op.drop_index("ix_ai_agent_eval_runs_status", table_name="ai_agent_eval_runs")
     op.drop_index("ix_ai_agent_eval_runs_owner_id", table_name="ai_agent_eval_runs")
     op.drop_index("ix_ai_agent_eval_runs_project_id", table_name="ai_agent_eval_runs")
-    op.drop_index(
-        "ix_ai_agent_eval_runs_benchmark_id", table_name="ai_agent_eval_runs"
-    )
+    op.drop_index("ix_ai_agent_eval_runs_benchmark_id", table_name="ai_agent_eval_runs")
     op.drop_table("ai_agent_eval_runs")
     op.drop_index(
         "ix_ai_agent_eval_items_benchmark_id", table_name="ai_agent_eval_items"

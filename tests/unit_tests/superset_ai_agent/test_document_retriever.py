@@ -103,6 +103,28 @@ def test_retrieve_falls_back_when_cache_ids_unknown() -> None:
     assert result[0].text == "weather notes"
 
 
+def test_hybrid_retrieve_fuses_vector_and_keyword_rankings() -> None:
+    # B1: with hybrid on, a chunk the vector ranking missed but keyword nails
+    # (exact term "churn") fuses into the top-k instead of being replaced.
+    chunks = _chunks()
+    # Vector ranking knows only the first two chunks, in this order.
+    cache = _FakeCache(ranking=[chunks[1].id, chunks[0].id])
+    index = DocumentChunkIndex(cache, hybrid=True)
+    result = index.retrieve("customer churn drivers", chunks, scope_key="s", k=3)
+    ids = [chunk.id for chunk in result]
+    assert chunks[2].id in ids  # keyword-only hit survives fusion
+    # An item present in BOTH rankings outranks single-ranker items.
+    assert ids[0] == chunks[2].id or chunks[2].id in ids[:2]
+
+
+def test_hybrid_off_preserves_vector_replacement_behavior() -> None:
+    chunks = _chunks()
+    cache = _FakeCache(ranking=[chunks[1].id, chunks[0].id])
+    index = DocumentChunkIndex(cache)  # hybrid defaults off at the class level
+    result = index.retrieve("customer churn drivers", chunks, scope_key="s", k=2)
+    assert [chunk.id for chunk in result] == [chunks[1].id, chunks[0].id]
+
+
 def test_no_cache_index_is_keyword_only() -> None:
     chunks = _chunks()
     index = DocumentChunkIndex(None)

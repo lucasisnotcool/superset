@@ -71,7 +71,10 @@ def test_in_memory_store_and_recall() -> None:
 def test_recall_is_database_isolated_not_owner_scoped() -> None:
     memory = InMemoryMemory()
     memory.store_confirmed(
-        question="q", semantic_sql="x", native_sql="x", database_id=DB,
+        question="q",
+        semantic_sql="x",
+        native_sql="x",
+        database_id=DB,
         created_by="owner-1",
     )
     # Another user on the SAME database shares the pool (no owner scoping).
@@ -130,7 +133,9 @@ def test_in_memory_decay_evicts_oldest_past_cap() -> None:
     memory = InMemoryMemory(max_examples=2)
     for i in range(4):
         memory.store_confirmed(
-            question=f"q{i}", semantic_sql=f"s{i}", native_sql=f"SELECT {i}",
+            question=f"q{i}",
+            semantic_sql=f"s{i}",
+            native_sql=f"SELECT {i}",
             database_id=DB,
         )
     recalled = memory.recall_examples("q", database_id=DB, k=9)
@@ -149,7 +154,9 @@ def test_sqlalchemy_memory_decay_evicts_oldest(tmp_path) -> None:
     )
     for i in range(4):
         memory.store_confirmed(
-            question=f"q{i}", semantic_sql=f"s{i}", native_sql=f"SELECT {i}",
+            question=f"q{i}",
+            semantic_sql=f"s{i}",
+            native_sql=f"SELECT {i}",
             database_id=DB,
         )
     recalled = memory.recall_examples("q", database_id=DB, k=9)
@@ -250,8 +257,12 @@ def test_recall_fails_closed_when_references_unknown() -> None:
     memory = InMemoryMemory()
     # A legacy/unparseable pair with no referenced_tables is never surfaced.
     memory.store_confirmed(
-        question="legacy", semantic_sql="x", native_sql="x", database_id=DB,
-        referenced_tables=[], referenced_schemas=[],
+        question="legacy",
+        semantic_sql="x",
+        native_sql="x",
+        database_id=DB,
+        referenced_tables=[],
+        referenced_schemas=[],
     )
     recalled = memory.recall_examples(
         "legacy", database_id=DB, k=9, access=_access("crm.customers")
@@ -541,9 +552,7 @@ def test_lancedb_memory_recall_is_semantic_via_cache(tmp_path) -> None:
     run_migrations(config)
     session_factory = create_session_factory(create_engine_from_config(config))
     embedder = _TopicEmbedder()
-    memory = create_memory(
-        config, session_factory=session_factory, embedder=embedder
-    )
+    memory = create_memory(config, session_factory=session_factory, embedder=embedder)
     assert isinstance(memory, LanceDbMemory)
     _seed_two(memory)
 

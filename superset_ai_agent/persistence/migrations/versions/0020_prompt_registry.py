@@ -70,9 +70,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index(
-        "ix_ai_agent_prompt_labels_name", table_name="ai_agent_prompt_labels"
-    )
+    op.drop_index("ix_ai_agent_prompt_labels_name", table_name="ai_agent_prompt_labels")
     op.drop_table("ai_agent_prompt_labels")
     op.drop_index(
         "ix_ai_agent_prompt_versions_name", table_name="ai_agent_prompt_versions"

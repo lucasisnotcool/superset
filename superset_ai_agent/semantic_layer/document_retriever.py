@@ -35,8 +35,9 @@ deferred gap (memory mode degrades to keyword); see the plan's risk notes.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.conversations.schemas import ConversationScope
@@ -99,8 +100,16 @@ class DocumentChunkIndex:
     recall through the keyword fallback.
     """
 
-    def __init__(self, cache: VectorCache | None) -> None:
+    #: Reciprocal-rank-fusion constant (standard k=60) for the hybrid path.
+    _RRF_K = 60
+
+    def __init__(self, cache: VectorCache | None, *, hybrid: bool = False) -> None:
         self._cache = cache
+        #: When on (B1), an embedding-served result is FUSED with the keyword
+        #: ranking by RRF instead of replacing it — exact identifiers are
+        #: lexical-match territory, colloquial phrasings are embedding
+        #: territory, and the two fail complementarily.
+        self._hybrid = hybrid
 
     @property
     def is_embedding_backed(self) -> bool:
@@ -153,13 +162,171 @@ class DocumentChunkIndex:
         if k <= 0:
             return []
         if self._cache is not None:
-            ids = self._cache.search(scope_key=scope_key, query=query, k=k)
+            pool = k * 2 if self._hybrid else k
+            ids = self._cache.search(scope_key=scope_key, query=query, k=pool)
             if ids is not None:
                 by_id = {chunk.id: chunk for chunk in chunks}
                 ordered = [by_id[chunk_id] for chunk_id in ids if chunk_id in by_id]
+                if ordered and self._hybrid:
+                    return self._fuse(
+                        ordered, keyword_rank_chunks(query, chunks, pool), k
+                    )
                 if ordered:
-                    return ordered
+                    return ordered[:k]
         return keyword_rank_chunks(query, chunks, k)
+
+    def _fuse(
+        self,
+        embedded: list[DocumentChunk],
+        lexical: list[DocumentChunk],
+        k: int,
+    ) -> list[DocumentChunk]:
+        """Reciprocal-rank fusion of the two chunk rankings (hybrid, B1)."""
+
+        if not lexical:
+            return embedded[:k]
+        scores: dict[str, float] = {}
+        by_id: dict[str, DocumentChunk] = {}
+        for ranking in (embedded, lexical):
+            for rank, chunk in enumerate(ranking):
+                scores[chunk.id] = scores.get(chunk.id, 0.0) + 1.0 / (
+                    self._RRF_K + rank + 1
+                )
+                by_id.setdefault(chunk.id, chunk)
+        ordered = sorted(scores.items(), key=lambda pair: -pair[1])
+        return [by_id[chunk_id] for chunk_id, _ in ordered[:k]]
+
+
+class DocumentContextStore(Protocol):
+    """The subset of ``SemanticLayerStore`` the SQL-agent doc channel reads.
+
+    Declared locally (like :class:`VectorCache`) so the channel depends on two
+    read methods, not the full store protocol — tests inject a small fake.
+    """
+
+    def list_project_documents(
+        self, project_id: str, *, owner_id: str = ...
+    ) -> list[Any]: ...
+
+    def list_project_chunks(
+        self, project_id: str, *, owner_id: str = ...
+    ) -> list[DocumentChunk]: ...
+
+
+#: A second-stage reranking strategy (B3): given (question, candidate texts,
+#: top_k), return candidate indices best-first, or ``None`` to keep the
+#: first-stage order. The callable owns validating its output.
+Reranker = Callable[[str, list[str], int], "list[int] | None"]
+
+
+def retrieve_document_context(
+    *,
+    question: str,
+    project_id: str | None,
+    owner_id: str,
+    store: DocumentContextStore | None,
+    index: DocumentChunkIndex | None,
+    k: int,
+    max_chars: int,
+    reranker: Reranker | None = None,
+) -> dict[str, Any] | None:
+    """Rank the project's uploaded-document chunks for a question (plan A1).
+
+    The SQL agent's *advisory* grounding channel: eval v4 measured the raw BI
+    document worth ~+12/30 over the bare semantic layer (`wren_bi_context` 22.0
+    vs `wren_bi` ~9), so relevant document passages are retrieved into the
+    prompt — budgeted, never dumped whole (doc-context oversupply measurably
+    degrades SQL accuracy).
+
+    Returns ``None`` (channel inert) when there is no project/store/index, the
+    budget or ``k`` is non-positive, the project has no chunks, or on any error
+    — degrade closed, the SQL path is never disrupted. Otherwise a JSON-safe
+    dict: ``passages`` (document filename + text, budget-trimmed to
+    ``max_chars`` total), ``document_ids`` (provenance for the explain UI),
+    ``retriever`` (embedding vs keyword), and ``truncated``.
+    """
+
+    if project_id is None or store is None or index is None or k <= 0 or max_chars <= 0:
+        return None
+    try:
+        chunks = store.list_project_chunks(project_id, owner_id=owner_id)
+        if not chunks:
+            return None
+        # With a reranker, over-fetch so the second stage has a real pool.
+        pool = k * 2 if reranker is not None else k
+        ranked = index.retrieve(
+            question,
+            chunks,
+            scope_key=document_scope_key(project_id),
+            k=pool,
+        )
+        if not ranked:
+            return None
+        reranked = False
+        if reranker is not None and len(ranked) > 1:
+            order = reranker(question, [chunk.text for chunk in ranked], k)
+            if order:
+                ranked = [ranked[i] for i in order]
+                reranked = True
+        ranked = ranked[:k]
+        filenames = {
+            document.id: document.filename
+            for document in store.list_project_documents(project_id, owner_id=owner_id)
+        }
+        passages, document_ids, truncated = _budget_trim(ranked, filenames, max_chars)
+        if not passages:
+            return None
+        return {
+            "passages": passages,
+            "document_ids": document_ids,
+            "retriever": "embedding" if index.is_embedding_backed else "keyword",
+            "truncated": truncated,
+            "reranked": reranked,
+        }
+    except Exception as ex:  # pylint: disable=broad-except - channel is best-effort
+        logger.warning("Document context retrieval failed (non-fatal): %s", ex)
+        return None
+
+
+def _budget_trim(
+    ranked: list[DocumentChunk],
+    filenames: dict[str, Any],
+    max_chars: int,
+) -> tuple[list[dict[str, Any]], list[str], bool]:
+    """Fit ranked chunks into the char budget; flag any drop/cut loudly.
+
+    A partial first passage beats none; everything past the budget is dropped
+    with ``truncated=True`` (no silent cap).
+    """
+
+    passages: list[dict[str, Any]] = []
+    document_ids: list[str] = []
+    used = 0
+    truncated = False
+    for chunk in ranked:
+        text = chunk.text
+        remaining = max_chars - used
+        if remaining <= 0:
+            truncated = True
+            break
+        if len(text) > remaining:
+            if passages:
+                truncated = True
+                break
+            text = text[:remaining]
+            truncated = True
+        passages.append(
+            {
+                "document_id": chunk.document_id,
+                "filename": filenames.get(chunk.document_id),
+                "chunk_index": chunk.chunk_index,
+                "text": text,
+            }
+        )
+        used += len(text)
+        if chunk.document_id not in document_ids:
+            document_ids.append(chunk.document_id)
+    return passages, document_ids, truncated
 
 
 def find_exact_duplicate_matches(
@@ -219,12 +386,14 @@ def create_document_index(
     deployment with the feature off never opens a LanceDB connection.
     """
 
+    hybrid = config.wren_document_hybrid_retrieval
     if config.wren_document_indexing_enabled:
         if config.wren_document_vector_index == "lancedb":
             return DocumentChunkIndex(
                 LanceVectorCache(
                     embedder, _document_lancedb_path(config), DOCUMENT_CHUNK_COLLECTION
-                )
+                ),
+                hybrid=hybrid,
             )
         if config.wren_document_vector_index == "postgres":
             return DocumentChunkIndex(
@@ -232,6 +401,7 @@ def create_document_index(
                     embedder,
                     config.effective_vector_database_url,
                     DOCUMENT_CHUNK_COLLECTION,
-                )
+                ),
+                hybrid=hybrid,
             )
     return DocumentChunkIndex(None)

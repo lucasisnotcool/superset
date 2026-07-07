@@ -259,16 +259,12 @@ def test_numeric_tolerance_applies_inside_table_compare() -> None:
 
 
 def test_typed_nums_pass_with_percent_scale() -> None:
-    outcome = score_expected_values(
-        {"nums": [0.57]}, [{"rate_pct": 57.1}]
-    )
+    outcome = score_expected_values({"nums": [0.57]}, [{"rate_pct": 57.1}])
     assert outcome.verdict == "pass"
 
 
 def test_typed_nums_partial_is_fail_with_reason() -> None:
-    outcome = score_expected_values(
-        {"nums": [10, 99]}, [{"a": 10}]
-    )
+    outcome = score_expected_values({"nums": [10, 99]}, [{"a": 10}])
     assert outcome.verdict == "fail"
     assert any("Partial match" in r for r in outcome.reasons)
 
@@ -277,9 +273,7 @@ def test_typed_names_and_absent() -> None:
     rows = [{"region": "EMEA"}, {"region": "APAC"}]
     ok = score_expected_values({"names": ["emea", "apac"]}, rows)
     assert ok.verdict == "pass"
-    bad = score_expected_values(
-        {"names": ["emea"], "absent": ["apac"]}, rows
-    )
+    bad = score_expected_values({"names": ["emea"], "absent": ["apac"]}, rows)
     assert bad.verdict == "fail"
 
 
@@ -292,9 +286,7 @@ def test_typed_trap_and_zero() -> None:
 
 
 def test_typed_multi_value_degrades_to_review() -> None:
-    outcome = score_expected_values(
-        {"nums": [10], "multi_value": True}, [{"a": 10}]
-    )
+    outcome = score_expected_values({"nums": [10], "multi_value": True}, [{"a": 10}])
     assert outcome.verdict == "needs_review"
 
 

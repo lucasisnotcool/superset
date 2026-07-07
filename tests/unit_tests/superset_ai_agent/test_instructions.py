@@ -109,9 +109,7 @@ def test_recall_returns_globals_plus_relevant_non_global() -> None:
         owner_id="u1",
     )
 
-    recalled = store.recall(
-        "total sales report", scope_hash="s1", owner_id="u1", k=1
-    )
+    recalled = store.recall("total sales report", scope_hash="s1", owner_id="u1", k=1)
     texts = [item.instruction for item in recalled]
     # Global always present; the revenue-topic non-global wins the single slot.
     assert "GLOBAL: never expose PII" in texts

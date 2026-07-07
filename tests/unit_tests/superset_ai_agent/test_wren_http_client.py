@@ -101,15 +101,19 @@ def test_wren_http_client_fetches_context_examples_and_dry_plan() -> None:
     assert client.recall_examples(question="Show moves", limit=1)[0]["id"] == (
         "example-1"
     )
-    assert client.dry_plan(
-        question="Show moves",
-        sql="select 1",
-        context=_agent_context(),
-        mdl_path="/tmp/project/mdl.json",
-    )["execution"] == "disabled"
-    assert client.validate_mdl_project(mdl_path="/tmp/project/mdl.json")[
-        "execution"
-    ] == "disabled"
+    assert (
+        client.dry_plan(
+            question="Show moves",
+            sql="select 1",
+            context=_agent_context(),
+            mdl_path="/tmp/project/mdl.json",
+        )["execution"]
+        == "disabled"
+    )
+    assert (
+        client.validate_mdl_project(mdl_path="/tmp/project/mdl.json")["execution"]
+        == "disabled"
+    )
     assert [request.url.path for request in requests] == [
         "/health",
         "/models",

@@ -40,8 +40,10 @@ from superset_ai_agent.integrations.superset.rest import (
     _normalize_dataset,
     _normalize_execution_result,
 )
-from superset_ai_agent.semantic_layer.uri_fingerprint import fingerprint_database_identity
 from superset_ai_agent.schemas import ExecutionResult, SqlExecutionSource
+from superset_ai_agent.semantic_layer.uri_fingerprint import (
+    fingerprint_database_identity,
+)
 
 
 class SupersetMcpClient:
@@ -327,9 +329,27 @@ class SupersetMcpClient:
         return [
             _normalize_dataset(_as_dict(self.get_dataset_raw(dataset.id)))
             for dataset in datasets
-            if dataset.id and dataset.database_id in {0, database_id}
+            if dataset.id
+            and dataset.database_id in {0, database_id}
             and (schema_name is None or dataset.schema_name == schema_name)
         ]
+
+    def introspect_schema(
+        self,
+        *,
+        database_id: int,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        limit: int = 100,
+        include_views: bool = True,
+    ) -> list[DatasetMetadata]:
+        """Live introspection is not yet exposed over MCP; degrade to empty.
+
+        Keeps the ``SupersetClient`` contract satisfied so the context provider's
+        fallback is a no-op on the MCP adapter (the dataset path is unchanged).
+        """
+
+        return []
 
     def get_agent_context(
         self,

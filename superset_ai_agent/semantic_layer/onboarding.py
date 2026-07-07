@@ -87,9 +87,7 @@ def onboard_schema_project(
     files = []
     warnings: list[str] = []
     if not superset_context.datasets:
-        warnings.append(
-            "No permission-filtered datasets were found for this schema."
-        )
+        warnings.append("No permission-filtered datasets were found for this schema.")
     for proposal in proposals:
         # Physical, schema-aware validation (R3): a hallucinated table/column
         # makes the draft non-activatable but is still written so a human can

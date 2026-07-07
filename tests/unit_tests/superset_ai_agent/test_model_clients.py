@@ -192,9 +192,7 @@ class _RejectsJsonSchemaCompletions:
             raise _BadRequestError("Invalid schema for response_format")
         return SimpleNamespace(
             choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(content='{"sql":"select 1"}')
-                )
+                SimpleNamespace(message=SimpleNamespace(content='{"sql":"select 1"}'))
             ],
             model_dump=lambda: {"id": "chatcmpl-test"},
         )
@@ -254,9 +252,7 @@ def test_openai_client_does_not_retry_non_schema_errors() -> None:
     )
 
     with pytest.raises(Exception, match="OpenAI request failed"):
-        client.chat(
-            [ChatMessage(role="user", content="x")], format_schema=SCHEMA
-        )
+        client.chat([ChatMessage(role="user", content="x")], format_schema=SCHEMA)
     assert completions.calls == 1  # no wasteful retries on a non-schema error
 
 

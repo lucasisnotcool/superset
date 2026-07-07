@@ -95,9 +95,7 @@ def upgrade() -> None:
             index += 1
         taken[key].add(slug)
         bind.execute(
-            sa.update(projects)
-            .where(projects.c.id == row.id)
-            .values(slug=slug)
+            sa.update(projects).where(projects.c.id == row.id).values(slug=slug)
         )
 
     # Make slug non-nullable + drop the old (schema-based) unique constraint

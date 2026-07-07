@@ -31,6 +31,7 @@ import {
 import type {
   AgentStep,
   AgentStepDetail as Detail,
+  DocumentPassage,
   RecalledExample,
   RetrievedChunk,
 } from './api';
@@ -428,6 +429,48 @@ const RetrievedChunks = ({
   );
 };
 
+// Collapsible list of the uploaded-document passages retrieved into the prompt
+// (doc RAG). Grouped implicitly by their document filename on each card so the
+// question -> business-document provenance reads at a glance.
+const DocumentPassages = ({
+  passages,
+}: {
+  passages?: DocumentPassage[] | null;
+}) => {
+  if (!passages || passages.length === 0) {
+    return null;
+  }
+  return (
+    <CollapsePanel
+      ghost
+      data-test="document-passages"
+      items={[
+        {
+          key: 'passages',
+          label: t('Document passages (%s)', passages.length),
+          children: (
+            <ChunkList>
+              {passages.map((passage, index) => (
+                <ChunkCard
+                  key={`${passage.document_id ?? ''}.${
+                    passage.chunk_index ?? index
+                  }`}
+                >
+                  <ChunkHead>
+                    <Tag>{t('document')}</Tag>
+                    {passage.filename ?? passage.document_id}
+                  </ChunkHead>
+                  <ChunkText>{passage.text}</ChunkText>
+                </ChunkCard>
+              ))}
+            </ChunkList>
+          ),
+        },
+      ]}
+    />
+  );
+};
+
 const ProvenanceMeta = styled.div`
   ${({ theme }) => css`
     margin-bottom: ${theme.sizeUnit / 2}px;
@@ -654,6 +697,68 @@ function DetailBody({ detail }: { detail: Detail }) {
             }
           />
         </>
+      );
+    case 'document_context':
+      return (
+        <>
+          <List>
+            <Row
+              label={t('Available')}
+              value={detail.available ? t('yes') : t('no')}
+            />
+            <Row label={t('Documents')} value={detail.document_count || null} />
+            <Row label={t('Passages')} value={detail.passage_count || null} />
+            <Row label={t('Retriever')} value={detail.retriever} />
+            {detail.truncated ? (
+              <Field>
+                <dt>{t('Truncated')}</dt>
+                <dd>
+                  <Tag color="warning">{t('budget-trimmed')}</Tag>
+                </dd>
+              </Field>
+            ) : null}
+          </List>
+          <DocumentPassages passages={detail.passages} />
+          <WarningList messages={detail.warnings} />
+        </>
+      );
+    case 'dimension_values':
+      return detail.hints.length ? (
+        <ChunkList>
+          {detail.hints.map(hint => (
+            <ChunkCard key={`${hint.literal}.${hint.column ?? ''}`}>
+              <ChunkHead>
+                <Tag>{t('stored values')}</Tag>
+                {hint.table && hint.column
+                  ? `${hint.table}.${hint.column}`
+                  : hint.column}
+              </ChunkHead>
+              <ChunkText>
+                {t('“%s” matches: %s', hint.literal, hint.values.join(', '))}
+              </ChunkText>
+            </ChunkCard>
+          ))}
+        </ChunkList>
+      ) : (
+        <List>
+          <Row label={t('Matches')} value={t('none')} />
+        </List>
+      );
+    case 'candidate_selection':
+      return (
+        <List>
+          <Row
+            label={t('Chosen')}
+            value={
+              detail.chosen === 'semantic'
+                ? t('Semantic-layer candidate')
+                : t('Raw-schema candidate')
+            }
+          />
+          <Row label={t('Reason')} value={detail.reason} />
+          <Sql label={t('Semantic candidate')} sql={detail.semantic_sql} />
+          <Sql label={t('Raw candidate')} sql={detail.raw_sql} />
+        </List>
       );
     case 'draft':
       return (

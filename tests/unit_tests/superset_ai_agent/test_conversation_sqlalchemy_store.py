@@ -135,9 +135,7 @@ def test_sqlalchemy_conversation_store_pins_project_id() -> None:
     conversation = store.create(_scope(), owner_id="user-1")
     assert conversation.project_id is None
 
-    pinned = store.update_project_id(
-        conversation.id, "proj-123", owner_id="user-1"
-    )
+    pinned = store.update_project_id(conversation.id, "proj-123", owner_id="user-1")
     assert pinned.project_id == "proj-123"
     assert store.get(conversation.id, owner_id="user-1").project_id == "proj-123"
 
@@ -256,6 +254,4 @@ def test_sqlalchemy_store_round_trips_changeset_artifact() -> None:
     stored = reloaded.messages[-1].artifacts[0]
     assert stored.type == "changeset"
     assert stored.sql is None
-    assert stored.payload == {
-        "items": [{"op": "update", "path": "models/orders.json"}]
-    }
+    assert stored.payload == {"items": [{"op": "update", "path": "models/orders.json"}]}

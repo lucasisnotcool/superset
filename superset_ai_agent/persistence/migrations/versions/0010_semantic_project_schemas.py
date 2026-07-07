@@ -74,9 +74,7 @@ def upgrade() -> None:
     )
     # Read only the values we copy through; the project's stored ``created_at`` is
     # left uninterpreted (mixed tz formats across backends would break a typed read).
-    rows = bind.execute(
-        sa.select(projects.c.id, projects.c.schema_name)
-    ).fetchall()
+    rows = bind.execute(sa.select(projects.c.id, projects.c.schema_name)).fetchall()
     if rows:
         created_at = datetime.now(timezone.utc)
         memberships = sa.table(
@@ -104,7 +102,5 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index(
-        "ix_ai_agent_semantic_project_schemas_project_id", table_name=_TABLE
-    )
+    op.drop_index("ix_ai_agent_semantic_project_schemas_project_id", table_name=_TABLE)
     op.drop_table(_TABLE)

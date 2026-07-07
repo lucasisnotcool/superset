@@ -47,9 +47,7 @@ class _FakeModelClient:
         self.sql = sql
 
     def chat(self, messages, *, model=None, format_schema=None) -> ModelResult:
-        return ModelResult(
-            content=json.dumps({"sql": self.sql, "explanation": "test"})
-        )
+        return ModelResult(content=json.dumps({"sql": self.sql, "explanation": "test"}))
 
 
 class _FakeContextProvider:

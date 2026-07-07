@@ -499,6 +499,54 @@ def test_fetch_context_surfaces_matching_view_excludes_native(tmp_path) -> None:
     assert surfaced == {"warm_line_output"}
 
 
+def test_fetch_context_surfaces_matching_metrics(tmp_path) -> None:
+    # A2 (eval v4 Q27): an authored metric must reach the prompt context — the
+    # `metrics` array previously surfaced nowhere in fetch_context.
+    mdl_path = tmp_path / "mdl.json"
+    mdl_path.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {"name": "production", "columns": [{"name": "good_units"}]},
+                ],
+                "metrics": [
+                    {
+                        "name": "yield_rate",
+                        "baseObject": "production",
+                        "measure": [
+                            {
+                                "name": "yield_rate",
+                                "expression": "SUM(good_units) / SUM(total_units)",
+                            }
+                        ],
+                        "properties": {"synonyms": ["first pass yield"]},
+                    },
+                    {
+                        "name": "freight_cost",
+                        "baseObject": "production",
+                        "measure": [{"name": "freight_cost"}],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    client = LlmWrenClient(_config(), FakeModelClient("{}"))
+
+    context = client.fetch_context(
+        question="what is the yield rate this week",
+        superset_context=_agent_context(),
+        mdl_path=str(mdl_path),
+    )
+
+    metric_items = [i for i in context.context_items if i.get("type") == "metrics"]
+    assert metric_items
+    surfaced = [m["name"] for m in metric_items[0]["items"]]
+    # The matching metric leads; the unrelated one never crowds the context.
+    assert "yield_rate" in surfaced
+    assert "freight_cost" not in surfaced
+
+
 def test_fetch_context_omits_views_when_none_match(tmp_path) -> None:
     mdl_path = tmp_path / "mdl.json"
     mdl_path.write_text(

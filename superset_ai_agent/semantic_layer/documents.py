@@ -176,6 +176,7 @@ def extract_document(
             store=store,
             document_index=document_index,
             owner_id=owner_id,
+            contextual_prefix=config.wren_document_contextual_prefix,
         )
     return saved
 
@@ -234,18 +235,35 @@ def _index_document_chunks(
     store: SemanticLayerStore,
     document_index: DocumentChunkIndex | None,
     owner_id: str,
+    contextual_prefix: bool = False,
 ) -> None:
     """Persist (and best-effort embed) a document's chunks. Never raises.
 
     Chunks are persisted even without an embedder — they back the viewer, keyword
     retrieval, and exact-duplicate detection; embedding only adds semantic recall.
+
+    ``contextual_prefix`` (B2, plan_sql_agent_doc_grounding_spec.md): the vector
+    for each chunk is computed over ``[filename] chunk-text`` — a deterministic
+    situating prefix (the no-LLM variant of contextual retrieval) so a chunk's
+    embedding carries which document it belongs to. Only the *embedded* text is
+    prefixed; the persisted chunk rows (viewer, keyword recall, dedup checksums)
+    are unchanged, and vector ids stay the chunk ids, so retrieval maps back and
+    a reindex replaces vectors in place after toggling the flag.
     """
 
     try:
         records = build_chunk_records(document.id, document.extracted_text or "")
         if document_index is not None and records:
             scope_key = document_scope_key(document.project_id, document.scope)
-            embedded = set(document_index.index(records, scope_key=scope_key))
+            to_embed = records
+            if contextual_prefix and document.filename:
+                to_embed = [
+                    record.model_copy(
+                        update={"text": f"[{document.filename}] {record.text}"}
+                    )
+                    for record in records
+                ]
+            embedded = set(document_index.index(to_embed, scope_key=scope_key))
             if embedded:
                 records = [
                     record.model_copy(update={"embedded": record.id in embedded})
@@ -302,11 +320,13 @@ def reindex_document(
     owner_id: str,
     store: SemanticLayerStore,
     document_index: DocumentChunkIndex | None = None,
+    config: AgentConfig | None = None,
 ) -> list[DocumentChunk]:
     """Re-chunk + re-embed a document from its stored extracted text.
 
     Idempotent: chunk ids are deterministic per ``(document_id, index)`` so vectors
-    are replaced in place. Returns the persisted chunks.
+    are replaced in place. Returns the persisted chunks. ``config`` carries the
+    contextual-prefix flag (B2); omitted, the reindex embeds bare chunk text.
     """
 
     document = store.get_document(document_id, owner_id=owner_id)
@@ -315,6 +335,7 @@ def reindex_document(
         store=store,
         document_index=document_index,
         owner_id=owner_id,
+        contextual_prefix=bool(config and config.wren_document_contextual_prefix),
     )
     return store.list_chunks(document_id, owner_id=owner_id)
 

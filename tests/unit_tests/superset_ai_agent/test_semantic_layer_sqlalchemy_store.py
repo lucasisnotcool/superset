@@ -91,9 +91,9 @@ def test_sqlalchemy_semantic_layer_store_round_trips_state() -> None:
     )
     # DB-tied (D1b): documents belong to the database scope, not the uploader
     # — another authorized user's list over the same scope sees the same set.
-    assert [
-        item.id for item in store.list_documents(scope, owner_id="user-2")
-    ] == [document.id]
+    assert [item.id for item in store.list_documents(scope, owner_id="user-2")] == [
+        document.id
+    ]
 
 
 def test_delete_project_events_by_type_preserves_document_events() -> None:

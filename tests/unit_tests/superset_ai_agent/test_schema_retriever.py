@@ -139,6 +139,148 @@ def test_semantic_view_is_indexed_with_its_description_native_excluded() -> None
     assert "Warm line output by family" in view_items[0].text
 
 
+def test_metrics_are_chunked_with_definition_and_synonyms() -> None:
+    # A2 (plan_sql_agent_doc_grounding_spec.md / eval v4 Q27): an authored metric
+    # must be retrievable by name AND by synonym, carrying its definition — the
+    # `metrics` array previously reached the retriever nowhere.
+    mdl = json.dumps(
+        {
+            "models": [
+                {
+                    "name": "production",
+                    "tableReference": {"schema": "core", "table": "production"},
+                    "columns": [
+                        {"name": "good_units", "type": "BIGINT"},
+                        {"name": "total_units", "type": "BIGINT"},
+                    ],
+                }
+            ],
+            "metrics": [
+                {
+                    "name": "yield_rate",
+                    "baseObject": "production",
+                    "measure": [
+                        {
+                            "name": "yield_rate",
+                            "type": "double",
+                            "expression": "SUM(good_units) / SUM(total_units)",
+                        }
+                    ],
+                    "properties": {
+                        "description": "Share of good units out of all units",
+                        "synonyms": ["first pass yield", "FPY"],
+                    },
+                }
+            ],
+        }
+    )
+    items = manifest_to_schema_items(compile_manifest(json_contents=[mdl]))
+    metric_items = [i for i in items if i.kind == "metric"]
+    assert [i.name for i in metric_items] == ["yield_rate"]
+    metric = metric_items[0]
+    # Table-selection keeps the metric with its base model.
+    assert metric.model == "production"
+    # Definition + enriched terms are in the chunk text (the recall key).
+    assert "SUM(good_units) / SUM(total_units)" in metric.text
+    assert "first pass yield" in metric.text
+    assert "Share of good units" in metric.text
+
+
+def test_metric_chunk_tolerates_minimal_shapes() -> None:
+    mdl = json.dumps(
+        {
+            "models": [],
+            "metrics": [
+                {"name": "simple", "expression": "COUNT(*)"},
+                {"baseObject": "orphan"},  # nameless -> skipped
+            ],
+        }
+    )
+    items = manifest_to_schema_items(compile_manifest(json_contents=[mdl]))
+    metric_items = [i for i in items if i.kind == "metric"]
+    assert [i.name for i in metric_items] == ["simple"]
+    assert metric_items[0].model is None  # base-less metrics always survive pruning
+    assert "COUNT(*)" in metric_items[0].text
+
+
+# --- B1: hybrid keyword+embedding retrieval fused by RRF -----------------------
+
+
+def test_rrf_fuse_rewards_agreement_across_rankers() -> None:
+    from superset_ai_agent.semantic_layer.schema_retriever import (
+        rrf_fuse,
+        SchemaItem,
+    )
+
+    a = SchemaItem(kind="model", name="a", text="a")
+    b = SchemaItem(kind="model", name="b", text="b")
+    c = SchemaItem(kind="model", name="c", text="c")
+    # `b` appears (2nd) in BOTH rankings; `a`/`c` lead one list each. An item
+    # both rankers surface outranks an item only one ranker knows about.
+    fused = rrf_fuse([[a, b], [c, b]], 3)
+    assert [item.name for item in fused][0] == "b"
+    assert all(item.score is not None for item in fused)
+    assert len(fused) == 3  # a and c both survive after b
+
+
+def test_hybrid_retriever_fuses_and_reports_mode() -> None:
+    from superset_ai_agent.semantic_layer.schema_retriever import (
+        EmbeddingRetriever,
+        HybridRetriever,
+    )
+
+    embedder = _FakeEmbedder()
+    hybrid = HybridRetriever(EmbeddingRetriever(embedder))
+    items = _items()
+    hybrid.index(items, scope_key="s", checksum="c1")
+    assert hybrid.has_index("s", "c1")
+    top = hybrid.retrieve("customers by region", scope_key="s", checksum="c1", k=3)
+    assert top
+    assert hybrid.effective_name("s") == "hybrid"
+    # The exact-name keyword signal keeps `customers` in the fused top-k even
+    # though the fake embedder only keys on 'region'.
+    assert any(item.model == "customers" or item.name == "customers" for item in top)
+
+
+def test_hybrid_retriever_degrades_to_keyword_without_vectors() -> None:
+    from superset_ai_agent.llm.embeddings import NullEmbedder
+    from superset_ai_agent.semantic_layer.schema_retriever import (
+        EmbeddingRetriever,
+        HybridRetriever,
+    )
+
+    hybrid = HybridRetriever(EmbeddingRetriever(NullEmbedder()))
+    hybrid.index(_items(), scope_key="s", checksum="c1")
+    top = hybrid.retrieve("deals amount", scope_key="s", checksum="c1", k=2)
+    assert top  # keyword ranking stands alone
+    assert hybrid.effective_name("s") == "keyword"
+
+
+def test_create_retriever_hybrid_mode_and_fallback() -> None:
+    from superset_ai_agent.semantic_layer.schema_retriever import (
+        HybridRetriever,
+        KeywordRetriever,
+    )
+
+    hybrid = create_retriever(AgentConfig(wren_retriever="hybrid"), _FakeEmbedder())
+    assert isinstance(hybrid, HybridRetriever)
+    # No embedder -> keyword, same as the embedding mode's degrade path.
+    fallback = create_retriever(AgentConfig(wren_retriever="hybrid"), None)
+    assert isinstance(fallback, KeywordRetriever)
+
+
+def test_effective_vector_index_unwraps_hybrid() -> None:
+    from superset_ai_agent.semantic_layer.schema_retriever import (
+        effective_vector_index,
+        EmbeddingRetriever,
+        HybridRetriever,
+    )
+
+    config = AgentConfig(wren_retriever="hybrid", wren_vector_index="memory")
+    retriever = HybridRetriever(EmbeddingRetriever(_FakeEmbedder()))
+    assert effective_vector_index(config, retriever) == "memory"
+
+
 def test_chunk_text_carries_enriched_semantics_and_join_condition() -> None:
     # CR9: enriched description/alias/synonyms and the relationship condition must be
     # in the chunk *text* — that is what a colloquial question embeds/matches against.

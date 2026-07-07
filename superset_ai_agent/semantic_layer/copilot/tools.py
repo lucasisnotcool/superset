@@ -750,9 +750,7 @@ class MdlToolset:
                 self._summaries[path] = str(summary)
             return {
                 "path": path,
-                "validation": validate_golden_queries(content).model_dump(
-                    mode="json"
-                ),
+                "validation": validate_golden_queries(content).model_dump(mode="json"),
             }
         prior = self._working.get(path)
         restored = False

@@ -49,6 +49,7 @@ def test_friendly_engine_error_passes_through_unknown_shape() -> None:
     assert msg.code == "wren_core_error"
     assert "some other engine failure" in msg.message
 
+
 # wren-core requires every column to carry a ``type``; a complete model
 # round-trips through deep validation cleanly.
 _VALID_MODEL = json.dumps(

@@ -184,6 +184,47 @@ export interface LoadWrenContextDetail {
   retrieved_chunks?: RetrievedChunk[] | null;
   warnings?: string[] | null;
 }
+export interface DocumentPassage {
+  document_id?: string | null;
+  filename?: string | null;
+  chunk_index?: number | null;
+  text: string;
+}
+// Uploaded-document RAG retrieval (`load_document_context`) — the SQL agent's
+// advisory grounding channel over the pinned project's BI documents
+// (plan_sql_agent_doc_grounding_spec.md A1).
+export interface LoadDocumentContextDetail {
+  kind: 'document_context';
+  available: boolean;
+  document_count: number;
+  passage_count: number;
+  retriever?: string | null;
+  truncated: boolean;
+  passages?: DocumentPassage[] | null;
+  warnings?: string[] | null;
+}
+export interface DimensionValueHint {
+  literal: string;
+  table?: string | null;
+  column?: string | null;
+  values: string[];
+}
+// Dimension-value probing (`probe_dimension_values`, C2) — stored values found
+// for the question's quoted string literals.
+export interface DimensionValuesDetail {
+  kind: 'dimension_values';
+  hints: DimensionValueHint[];
+}
+// Dual-candidate pairwise selection (`select_sql_candidate`, C3).
+export interface CandidateSelectionDetail {
+  kind: 'candidate_selection';
+  chosen?: string | null;
+  reason?: string | null;
+  semantic_sql?: string | null;
+  raw_sql?: string | null;
+  semantic_valid: boolean;
+  raw_valid: boolean;
+}
 export interface RecalledExample {
   question: string;
   native_sql?: string | null;
@@ -268,6 +309,9 @@ export type AgentStepDetail =
   | LoadContextDetail
   | IntentDetail
   | LoadWrenContextDetail
+  | LoadDocumentContextDetail
+  | DimensionValuesDetail
+  | CandidateSelectionDetail
   | DraftDetail
   | DryPlanDetail
   | PlanSemanticSqlDetail

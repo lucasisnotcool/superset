@@ -74,8 +74,16 @@ class _RecordingSupersetClient:
     def get_database_dialect(self, database_id: int) -> str:
         return "oracle"
 
-    def execute_sql(self, *, database_id, sql, catalog_name=None, schema_name=None,
-                    limit=1000, source: SqlExecutionSource | None = None):
+    def execute_sql(
+        self,
+        *,
+        database_id,
+        sql,
+        catalog_name=None,
+        schema_name=None,
+        limit=1000,
+        source: SqlExecutionSource | None = None,
+    ):
         self.executed_sql.append(sql)
         return ExecutionResult(columns=["ID"], rows=[{"ID": 1}], row_count=1)
 

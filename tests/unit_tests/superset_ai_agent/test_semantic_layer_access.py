@@ -277,6 +277,4 @@ def test_list_projects_uses_superset_database_fingerprint() -> None:
         ),
     )
 
-    assert [project.database_uri_fingerprint for project in projects] == [
-        "physical-db"
-    ]
+    assert [project.database_uri_fingerprint for project in projects] == ["physical-db"]

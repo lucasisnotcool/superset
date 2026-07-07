@@ -603,9 +603,7 @@ class AiAgentEvalResult(Base):
     """
 
     __tablename__ = "ai_agent_eval_results"
-    __table_args__ = (
-        Index("ix_ai_agent_eval_result_run_item", "run_id", "item_id"),
-    )
+    __table_args__ = (Index("ix_ai_agent_eval_result_run_item", "run_id", "item_id"),)
 
     id = Column(String(36), primary_key=True)
     run_id = Column(String(36), index=True, nullable=False)

@@ -63,9 +63,7 @@ def mean_pass_rate(verdicts_by_item: dict[str, list[str]]) -> float:
     passes = _item_pass_map(verdicts_by_item)
     if not passes:
         return 0.0
-    return sum(
-        sum(trials) / len(trials) for trials in passes.values()
-    ) / len(passes)
+    return sum(sum(trials) / len(trials) for trials in passes.values()) / len(passes)
 
 
 @dataclass
@@ -98,12 +96,8 @@ def paired_delta_ci(
     via ``seed``.
     """
 
-    a_scores = {
-        item: sum(t) / len(t) for item, t in _item_pass_map(a_by_item).items()
-    }
-    b_scores = {
-        item: sum(t) / len(t) for item, t in _item_pass_map(b_by_item).items()
-    }
+    a_scores = {item: sum(t) / len(t) for item, t in _item_pass_map(a_by_item).items()}
+    b_scores = {item: sum(t) / len(t) for item, t in _item_pass_map(b_by_item).items()}
     shared = sorted(set(a_scores) & set(b_scores))
     if not shared:
         return PairedDelta(

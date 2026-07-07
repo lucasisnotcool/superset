@@ -232,9 +232,7 @@ class SqlAlchemySemanticLayerStore:
             # Converge-on-update: legacy rows gain their fingerprint the next
             # time any authorized user updates them; never null one out.
             if document.scope.database_uri_fingerprint is not None:
-                model.database_uri_fingerprint = (
-                    document.scope.database_uri_fingerprint
-                )
+                model.database_uri_fingerprint = document.scope.database_uri_fingerprint
             model.catalog_name = document.scope.catalog_name
             model.schema_name = document.scope.schema_name
             model.dataset_ids = document.scope.dataset_ids

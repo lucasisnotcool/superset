@@ -115,10 +115,7 @@ def _all_numbers(rows: list[dict[str, Any]]) -> list[float]:
 
 def _all_strings(rows: list[dict[str, Any]]) -> list[str]:
     return [
-        value
-        for row in rows or []
-        for value in row.values()
-        if isinstance(value, str)
+        value for row in rows or [] for value in row.values() if isinstance(value, str)
     ]
 
 

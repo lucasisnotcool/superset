@@ -342,9 +342,7 @@ class InMemoryEvalStore:
             self._runs[run_id] = updated
             return updated.model_copy(deep=True)
 
-    def complete_run(
-        self, run_id: str, *, totals: RunTotals, score: float
-    ) -> EvalRun:
+    def complete_run(self, run_id: str, *, totals: RunTotals, score: float) -> EvalRun:
         return self._finish(run_id, status="complete", totals=totals, score=score)
 
     def fail_run(self, run_id: str, error: str) -> EvalRun:
@@ -506,9 +504,7 @@ class SqlAlchemyEvalStore:
                 .all()
             )
             return [
-                _benchmark_from_model(
-                    m, item_count=self._item_count(session, m.id)
-                )
+                _benchmark_from_model(m, item_count=self._item_count(session, m.id))
                 for m in models
             ]
 
@@ -659,9 +655,7 @@ class SqlAlchemyEvalStore:
             session.commit()
             return _run_from_model(model)
 
-    def complete_run(
-        self, run_id: str, *, totals: RunTotals, score: float
-    ) -> EvalRun:
+    def complete_run(self, run_id: str, *, totals: RunTotals, score: float) -> EvalRun:
         return self._finish(run_id, status="complete", totals=totals, score=score)
 
     def fail_run(self, run_id: str, error: str) -> EvalRun:
@@ -783,9 +777,7 @@ class SqlAlchemyEvalStore:
             return _result_from_model(model, self._scores(session, [result_id]))
 
     @staticmethod
-    def _scores(
-        session: Session, result_ids: list[str]
-    ) -> dict[str, list[EvalScore]]:
+    def _scores(session: Session, result_ids: list[str]) -> dict[str, list[EvalScore]]:
         if not result_ids:
             return {}
         models = (

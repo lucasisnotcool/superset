@@ -24,7 +24,7 @@ from typing import cast, Literal
 SupersetAdapterMode = Literal["local", "rest", "mcp"]
 WrenAdapterMode = Literal["file", "http", "llm"]
 WrenEngineMode = Literal["passthrough", "wren_core"]
-WrenRetrieverMode = Literal["keyword", "embedding"]
+WrenRetrieverMode = Literal["keyword", "embedding", "hybrid"]
 WrenVectorIndexMode = Literal["memory", "lancedb", "postgres"]
 WrenMemoryStoreMode = Literal["none", "sqlalchemy", "lancedb", "postgres"]
 ConversationStoreMode = Literal["memory", "sqlalchemy"]
@@ -137,6 +137,15 @@ class AgentConfig:
     wren_context_limit: int = 8
     wren_example_limit: int = 5
     wren_schema_table_scan_limit: int = 100
+    # When the Superset *dataset* catalog is empty for a project's schema, source
+    # the physical catalog from live database introspection (Superset
+    # ``/tables/`` + ``/table_metadata/``) instead. This lets a BYO / live
+    # connection + MDL project onboard and validate against the real tables
+    # without first registering Superset datasets. Owner-scoped (the REST calls
+    # run under the caller's session, 404 on no access), and a no-op when
+    # datasets exist. Default on; set the env var false to force the
+    # dataset-only path.
+    wren_live_schema_introspection: bool = True
     wren_schema_table_candidate_limit: int = 12
     # Cross-schema query context: when grounding on a multi-schema project, the
     # dataset candidate scan unions every member schema (so the agent can rank +
@@ -188,10 +197,62 @@ class AgentConfig:
     # sql_pairs / instructions store.
     wren_document_vector_index: WrenVectorIndexMode = "lancedb"
     wren_document_lancedb_path: str | None = None
+    # B1 (plan_sql_agent_doc_grounding_spec.md): fuse embedding and keyword
+    # chunk rankings by reciprocal-rank fusion instead of letting a vector hit
+    # replace the lexical ranking — exact identifiers are keyword territory,
+    # colloquial phrasings embedding territory (complementary failure modes,
+    # +15-30% recall in the hybrid-retrieval literature). No-op without an
+    # embedding-backed document index.
+    wren_document_hybrid_retrieval: bool = True
+    # B2: embed each chunk as "[filename] chunk-text" — a deterministic
+    # situating prefix (the no-LLM variant of contextual retrieval) so the
+    # vector carries which document a passage belongs to. Persisted chunk rows
+    # are unchanged; re-upload or reindex applies the change to vectors.
+    wren_document_contextual_prefix: bool = True
     # OCR seam (reserved). Image-only PDFs are tagged status="needs_ocr" today; no
     # OCR is performed. A future OCR backend would gate on this flag and slot into
     # ``extract_document``'s ``needs_ocr`` branch (document_format_tier1_plan.md D).
     wren_document_ocr_enabled: bool = False
+    # SQL-agent document grounding (plan_sql_agent_doc_grounding_spec.md A1):
+    # retrieve the resolved project's uploaded-document chunks into the SQL prompt
+    # as an *advisory* business-context section. Grounded in eval v4: the raw BI
+    # doc carried ~+12/30 over the bare semantic layer (`wren_bi_context` 22.0 vs
+    # `wren_bi` ~9). Inert without persisted chunks (requires
+    # ``wren_document_indexing_enabled`` at ingestion time), so the default is on.
+    wren_sql_doc_context_enabled: bool = True
+    # Top-k document chunks retrieved per question for the SQL prompt.
+    wren_sql_doc_retrieve_k: int = 6
+    # Hard character budget for the doc-context section (~4k tokens). Deliberately
+    # well under the enrichment-side ``wren_document_prompt_char_budget``: the
+    # RAG-Text2SQL literature shows an inverted-U where oversized doc context
+    # degrades SQL accuracy. 0 disables the channel.
+    wren_sql_doc_context_max_chars: int = 16_000
+    # B3: LLM listwise rerank of the doc-context candidate pool (one extra model
+    # call per query, ~2x candidate over-fetch). Opt-in — the spec gates it on
+    # latency budget; the fused first-stage order is the default.
+    wren_rerank_enabled: bool = False
+    # C3: dual-candidate drafting. Draft a semantic-layer-grounded candidate AND
+    # a raw-schema candidate, validate both, and pick via an LLM pairwise judge
+    # (semantic wins ties). Costs up to 2 extra model calls per question —
+    # opt-in; ablations put candidate diversity + selection at 2-5 points but
+    # the latency doubles (Agentar-Scale-SQL). Fires only when semantic context
+    # is actually available (otherwise there is nothing to diversify).
+    wren_dual_candidate_enabled: bool = False
+    # C2: dimension-value probing. When the question quotes a string literal,
+    # probe the grounded datasets' string columns for the ACTUAL stored values
+    # (bounded SELECT DISTINCT ... LIKE ... LIMIT probes through the caller's
+    # governed execution path, TTL-cached). Fixes the wrong-string-literal
+    # failure class (Cortex Analyst's value search / CHESS's value index).
+    # Opt-in: each probe is a real warehouse query.
+    wren_dimension_value_probe_enabled: bool = False
+    wren_dimension_value_probe_max_queries: int = 3
+    # B4 size gate: when the pinned project's FULL manifest chunk set fits under
+    # this many characters (~10k tokens at chars/4), skip retrieval/selection
+    # and ship the whole manifest (retrieval_mode="dump"). Below the context-
+    # collapse zone, pruning's recall loss outweighs the distractor cost —
+    # "Death of Schema Linking" / eval v4's missing-join-partner asymmetry.
+    # 0 disables the gate (always retrieve/select).
+    wren_context_dump_char_threshold: int = 40_000
     semantic_access_mode: SemanticAccessMode = "superset_or_uri"
     semantic_full_access_grants_write: bool = False
     semantic_activation_requires_live_schema: bool = False
@@ -637,6 +698,10 @@ class AgentConfig:
             wren_project_path=os.getenv("WREN_PROJECT_PATH") or cls.wren_project_path,
             wren_mdl_path=os.getenv("WREN_MDL_PATH") or cls.wren_mdl_path,
             wren_memory_path=os.getenv("WREN_MEMORY_PATH") or cls.wren_memory_path,
+            wren_live_schema_introspection=_env_bool(
+                "AI_AGENT_WREN_LIVE_SCHEMA_INTROSPECTION",
+                cls.wren_live_schema_introspection,
+            ),
             wren_dry_plan_enabled=_env_bool(
                 "WREN_DRY_PLAN_ENABLED",
                 cls.wren_dry_plan_enabled,
@@ -751,9 +816,57 @@ class AgentConfig:
                 os.getenv("WREN_DOCUMENT_LANCEDB_PATH")
                 or cls.wren_document_lancedb_path
             ),
+            wren_document_hybrid_retrieval=_env_bool(
+                "WREN_DOCUMENT_HYBRID_RETRIEVAL",
+                cls.wren_document_hybrid_retrieval,
+            ),
+            wren_document_contextual_prefix=_env_bool(
+                "WREN_DOCUMENT_CONTEXTUAL_PREFIX",
+                cls.wren_document_contextual_prefix,
+            ),
             wren_document_ocr_enabled=_env_bool(
                 "WREN_DOCUMENT_OCR_ENABLED",
                 cls.wren_document_ocr_enabled,
+            ),
+            wren_sql_doc_context_enabled=_env_bool(
+                "WREN_SQL_DOC_CONTEXT_ENABLED",
+                cls.wren_sql_doc_context_enabled,
+            ),
+            wren_sql_doc_retrieve_k=int(
+                os.getenv(
+                    "WREN_SQL_DOC_RETRIEVE_K",
+                    str(cls.wren_sql_doc_retrieve_k),
+                )
+            ),
+            wren_sql_doc_context_max_chars=int(
+                os.getenv(
+                    "WREN_SQL_DOC_CONTEXT_MAX_CHARS",
+                    str(cls.wren_sql_doc_context_max_chars),
+                )
+            ),
+            wren_rerank_enabled=_env_bool(
+                "WREN_RERANK_ENABLED",
+                cls.wren_rerank_enabled,
+            ),
+            wren_context_dump_char_threshold=int(
+                os.getenv(
+                    "WREN_CONTEXT_DUMP_CHAR_THRESHOLD",
+                    str(cls.wren_context_dump_char_threshold),
+                )
+            ),
+            wren_dual_candidate_enabled=_env_bool(
+                "WREN_DUAL_CANDIDATE_ENABLED",
+                cls.wren_dual_candidate_enabled,
+            ),
+            wren_dimension_value_probe_enabled=_env_bool(
+                "WREN_DIMENSION_VALUE_PROBE_ENABLED",
+                cls.wren_dimension_value_probe_enabled,
+            ),
+            wren_dimension_value_probe_max_queries=int(
+                os.getenv(
+                    "WREN_DIMENSION_VALUE_PROBE_MAX_QUERIES",
+                    str(cls.wren_dimension_value_probe_max_queries),
+                )
             ),
             semantic_access_mode=cast(
                 SemanticAccessMode,

@@ -134,7 +134,9 @@ def test_in_memory_store_round_trips_changeset_artifact() -> None:
     )
     store.append(
         conversation.id,
-        ConversationMessage(role="assistant", content="Proposed.", artifacts=[artifact]),
+        ConversationMessage(
+            role="assistant", content="Proposed.", artifacts=[artifact]
+        ),
         owner_id="u1",
     )
 
@@ -142,6 +144,4 @@ def test_in_memory_store_round_trips_changeset_artifact() -> None:
     stored = reloaded.messages[-1].artifacts[0]
     assert stored.type == "changeset"
     assert stored.sql is None
-    assert stored.payload == {
-        "items": [{"op": "create", "path": "models/orders.json"}]
-    }
+    assert stored.payload == {"items": [{"op": "create", "path": "models/orders.json"}]}

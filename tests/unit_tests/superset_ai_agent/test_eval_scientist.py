@@ -98,8 +98,7 @@ def test_analyze_returns_taxonomy_findings_and_persists_conversation(
     client, pid, bid, run_id = _client_with_failed_run(tmp_path, model)
 
     response = client.post(
-        f"/agent/semantic-layer/projects/{pid}/benchmarks/{bid}"
-        f"/runs/{run_id}/analyze"
+        f"/agent/semantic-layer/projects/{pid}/benchmarks/{bid}/runs/{run_id}/analyze"
     )
     assert response.status_code == 200, response.text
     body = response.json()
@@ -115,9 +114,7 @@ def test_analyze_returns_taxonomy_findings_and_persists_conversation(
     assert "999" in model.prompts[0]
 
     # The report is persisted as a `scientist` conversation turn.
-    conversation = client.get(
-        f"/agent/conversations/{body['conversation_id']}"
-    ).json()
+    conversation = client.get(f"/agent/conversations/{body['conversation_id']}").json()
     assert conversation["kind"] == "scientist"
     assert "join_path" in conversation["messages"][-1]["content"]
 
@@ -144,8 +141,7 @@ def test_analyze_degrades_gracefully_on_unparseable_reply(tmp_path) -> None:
     client, pid, bid, run_id = _client_with_failed_run(tmp_path, model)
 
     response = client.post(
-        f"/agent/semantic-layer/projects/{pid}/benchmarks/{bid}"
-        f"/runs/{run_id}/analyze"
+        f"/agent/semantic-layer/projects/{pid}/benchmarks/{bid}/runs/{run_id}/analyze"
     )
     assert response.status_code == 200
     report = response.json()["report"]
@@ -158,8 +154,7 @@ def test_analyze_rejects_incomplete_runs(tmp_path) -> None:
     client, pid, bid, run_id = _client_with_failed_run(tmp_path, model)
     # Unknown run id -> 404; a pending run would 409 (covered by status gate).
     response = client.post(
-        f"/agent/semantic-layer/projects/{pid}/benchmarks/{bid}"
-        f"/runs/nope/analyze"
+        f"/agent/semantic-layer/projects/{pid}/benchmarks/{bid}/runs/nope/analyze"
     )
     assert response.status_code == 404
 
@@ -193,9 +188,7 @@ def test_otel_export_emits_gen_ai_evaluation_events(tmp_path) -> None:
     assert attrs["gen_ai.evaluation.name"] == "ex"
     assert attrs["superset_ai_agent.eval.run_id"] == run_id
     # Score names across the run include soft_f1 for gold items.
-    names = {
-        e["attributes"]["gen_ai.evaluation.name"] for e in body["events"]
-    }
+    names = {e["attributes"]["gen_ai.evaluation.name"] for e in body["events"]}
     assert {"ex", "soft_f1"} <= names
     # Results endpoint still serves the raw rows the events were built from.
     assert len(_results(client, pid, bid, run_id)) == 2
@@ -271,9 +264,7 @@ def test_handoff_produces_reviewable_changeset_and_conversation(tmp_path) -> Non
     assert "models/regions.json" not in {f["path"] for f in files}
 
     # Persisted as a scientist conversation carrying the changeset artifact.
-    conversation = client.get(
-        f"/agent/conversations/{body['conversation_id']}"
-    ).json()
+    conversation = client.get(f"/agent/conversations/{body['conversation_id']}").json()
     assert conversation["kind"] == "scientist"
 
 

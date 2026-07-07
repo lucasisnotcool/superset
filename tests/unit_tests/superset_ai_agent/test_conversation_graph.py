@@ -1237,3 +1237,127 @@ def test_explicit_scope_project_id_overrides_pin_and_heuristic(tmp_path) -> None
     _answer_turn(graph, conversation.id, pinned_scope)
 
     assert store.get(conversation.id).project_id == "p-old"
+
+
+# --- C1 (plan_sql_agent_doc_grounding_spec.md): doc-RAG channel parity ----------
+
+
+def _doc_state(graph: ConversationGraph, message: str, project_id: str | None):
+    from superset_ai_agent.schemas import WrenContextArtifact
+
+    scope = ConversationScope(database_id=1, schema_name="main", dataset_ids=[16])
+    return {
+        "owner_id": "analyst",
+        "request": ConversationTurnRequest(message=message, scope=scope),
+        "wren_context": WrenContextArtifact(
+            enabled=True, available=True, project_id=project_id
+        ),
+        "trace": [],
+    }
+
+
+def _doc_channel_graph(doc_store):
+    from superset_ai_agent.semantic_layer.document_retriever import DocumentChunkIndex
+
+    store = InMemoryConversationStore()
+    return ConversationGraph(
+        config=AgentConfig(),
+        model_client=FakeModelClient(
+            {"response_type": "answer", "message": "ok", "sql": ""}
+        ),
+        context_provider=FakeContextProvider(),
+        superset_client=FakeSupersetClient(),
+        conversation_store=store,
+        semantic_layer_store=doc_store,
+        document_index=DocumentChunkIndex(None),
+    )
+
+
+class _ConvDocStore:
+    def __init__(self, chunks) -> None:
+        self.chunks = chunks
+        self.calls: list[str] = []
+
+    def list_project_documents(self, project_id, *, owner_id="local"):
+        from types import SimpleNamespace
+
+        self.calls.append("docs")
+        return [SimpleNamespace(id="doc-1", filename="glossary.md")]
+
+    def list_project_chunks(self, project_id, *, owner_id="local"):
+        self.calls.append("chunks")
+        return self.chunks
+
+
+def _conv_chunk(text: str, index: int = 0):
+    from superset_ai_agent.semantic_layer.document_chunks import (
+        chunk_checksum,
+        chunk_id,
+        DocumentChunk,
+    )
+
+    return DocumentChunk(
+        id=chunk_id("doc-1", index),
+        document_id="doc-1",
+        chunk_index=index,
+        text=text,
+        checksum=chunk_checksum(text),
+        char_start=0,
+        char_end=len(text),
+    )
+
+
+def test_conversation_load_document_context_retrieves_and_traces() -> None:
+    doc_store = _ConvDocStore([_conv_chunk("Yield rate is good over total units.")])
+    graph = _doc_channel_graph(doc_store)
+    state = _doc_state(graph, "what is the yield rate", project_id="p1")
+
+    out = graph._load_document_context(state)  # noqa: SLF001
+
+    assert out["document_context"] is not None
+    assert out["document_context"]["passages"][0]["filename"] == "glossary.md"
+    assert out["wren_context"].document_ids == ["doc-1"]
+    events = [e for e in out["trace"] if e.step == "load_document_context"]
+    assert len(events) == 1
+    assert events[0].details["passage_count"] == 1
+
+
+def test_conversation_document_channel_inert_without_project() -> None:
+    doc_store = _ConvDocStore([_conv_chunk("anything")])
+    graph = _doc_channel_graph(doc_store)
+    state = _doc_state(graph, "hello", project_id=None)
+
+    out = graph._load_document_context(state)  # noqa: SLF001
+
+    assert out["document_context"] is None
+    assert out["trace"] == []
+    assert doc_store.calls == []
+
+
+def test_conversation_model_payload_carries_document_context() -> None:
+    # The retrieved passages must reach the conversation model's user payload.
+    doc_store = _ConvDocStore([_conv_chunk("Yield rate is good over total units.")])
+    graph = _doc_channel_graph(doc_store)
+    store = graph.conversation_store
+    scope = ConversationScope(database_id=1, schema_name="main", dataset_ids=[16])
+    conversation = store.create(scope)
+    state = {
+        **_doc_state(graph, "what is the yield rate", project_id="p1"),
+        "conversation_id": conversation.id,
+        "conversation": conversation,
+        "context": FakeContextProvider().get_context(
+            AgentQueryRequest(question="q", database_id=1, schema_name="main")
+        ),
+        "recalled_examples": [],
+    }
+    state = graph._load_document_context(state)  # noqa: SLF001
+    graph._call_conversation_model(state=state, validation_errors=[])  # noqa: SLF001
+
+    sent = "\n".join(
+        message.content
+        for messages in graph.model_client.messages
+        for message in messages
+        if message.role == "user"
+    )
+    assert "Yield rate is good over total units." in sent
+    assert '"document_context"' in sent

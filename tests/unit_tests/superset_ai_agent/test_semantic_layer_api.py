@@ -1243,3 +1243,53 @@ def test_semantic_mode_status_honors_scope_authorization(tmp_path) -> None:
 
     assert response.status_code == 401
     assert response.json()["detail"] == "Superset session expired."
+
+
+# --- C4 (plan_sql_agent_doc_grounding_spec.md): consistency route ---------------
+
+
+def test_project_consistency_route_reports_findings(tmp_path) -> None:
+    client, _ = _client(tmp_path)
+    project = _resolve_project(client)
+    # No declared columns: the live-schema activation gate checks declared
+    # columns against the physical table, and StaticContextProvider's `moves`
+    # dataset carries none.
+    file = _seed_base_model(client, project["id"], columns=[])
+    activate = client.patch(
+        f"/agent/semantic-layer/projects/{project['id']}/mdl-files/{file['id']}",
+        json={"status": "active"},
+    )
+    assert activate.status_code == 200, activate.text
+    golden = client.post(
+        f"/agent/semantic-layer/projects/{project['id']}/mdl-files",
+        json={
+            "path": "queries.json",
+            "content": json.dumps(
+                {
+                    "queries": [
+                        {
+                            "name": "stale",
+                            "question": "legacy revenue?",
+                            "semantic_sql": "SELECT * FROM retired_table",
+                        }
+                    ]
+                }
+            ),
+        },
+    )
+    assert golden.status_code in (200, 201), golden.text
+    golden_activate = client.patch(
+        f"/agent/semantic-layer/projects/{project['id']}/mdl-files/"
+        f"{golden.json()['id']}",
+        json={"status": "active"},
+    )
+    assert golden_activate.status_code == 200, golden_activate.text
+
+    response = client.get(f"/agent/semantic-layer/projects/{project['id']}/consistency")
+
+    assert response.status_code == 200, response.text
+    report = response.json()
+    assert report["project_id"] == project["id"]
+    assert report["checked_golden_queries"] == 1
+    codes = [finding["code"] for finding in report["findings"]]
+    assert "golden_unknown_reference" in codes

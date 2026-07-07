@@ -127,6 +127,10 @@ The founding design corpus; code comments cite these by name and section.
   onboarding UI gating & user flow (Implemented).
 - [plan_onboarding_dataset_registration_ux.md](plans/plan_onboarding_dataset_registration_ux.md):
   close the tables-vs-datasets expectation gap in the picker (Implemented).
+- [plan_live_schema_introspection_spec.md](plans/plan_live_schema_introspection_spec.md):
+  source the physical catalog from live DB introspection (Superset `/tables/` +
+  `/table_metadata/`) when no datasets are registered, so BYO-connection projects
+  can onboard with an empty `tables` catalog (Implemented, default-on).
 - [plan_onboarding_picker_hardening.md](plans/plan_onboarding_picker_hardening.md):
   picker hardening — R1/R2/virtualization/R3 (Implemented).
 - [plan_onboarding_seed_robustness_spec.md](plans/plan_onboarding_seed_robustness_spec.md):
@@ -179,6 +183,10 @@ The founding design corpus; code comments cite these by name and section.
 - [plan_oracle_semantic_transpile_impl.md](plans/plan_oracle_semantic_transpile_impl.md):
   Oracle semantic mode via sqlglot dialect finalization (Implemented, all 6
   phases).
+- [plan_sql_agent_doc_grounding_spec.md](plans/plan_sql_agent_doc_grounding_spec.md)
+  / [plan_sql_agent_doc_grounding_impl.md](plans/plan_sql_agent_doc_grounding_impl.md):
+  raw BI-doc RAG channel in the SQL agent, metric surfacing, trust-ladder
+  prompt, hybrid retrieval, dual-candidate (In progress; grounded in eval v4).
 
 ## Documents & RAG
 

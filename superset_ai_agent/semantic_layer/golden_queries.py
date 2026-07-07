@@ -299,9 +299,7 @@ def recall_golden_queries(
         files = mdl_file_store.list(project_id, owner_id=owner_id)
     except Exception:  # pylint: disable=broad-except - recall is best-effort
         return []
-    active = [
-        f for f in files if getattr(f, "status", None) == "active"
-    ]
+    active = [f for f in files if getattr(f, "status", None) == "active"]
     queries_file = next(
         (f for f in active if is_golden_queries_path(getattr(f, "path", None))), None
     )
@@ -323,9 +321,7 @@ def recall_golden_queries(
     _ = extract_qualified_tables  # referenced by golden_query_refs
     pairs: list[Any] = []
     for entry in parsed.queries:
-        tables, schemas = golden_query_refs(
-            entry.semantic_sql, model_table_index=index
-        )
+        tables, schemas = golden_query_refs(entry.semantic_sql, model_table_index=index)
         pair = NlSqlPair(
             question=entry.question,
             semantic_sql=entry.semantic_sql,

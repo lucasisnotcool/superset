@@ -92,9 +92,7 @@ def downgrade() -> None:
         sa.Column("mdl", sa.JSON(), nullable=True),
         sa.Column("wren_context", sa.JSON(), nullable=True),
         sa.Column("source_update_ids", sa.JSON(), nullable=False),
-        sa.Column(
-            "published_semantic_layer_uuid", sa.String(length=36), nullable=True
-        ),
+        sa.Column("published_semantic_layer_uuid", sa.String(length=36), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.PrimaryKeyConstraint("id"),
     )

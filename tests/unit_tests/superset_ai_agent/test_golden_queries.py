@@ -224,18 +224,24 @@ def test_recall_golden_queries_drops_inaccessible() -> None:
 
 
 def test_recall_golden_queries_empty_without_project_or_file() -> None:
-    assert recall_golden_queries(
-        mdl_file_store=InMemoryMdlFileStore(),
-        project_id=None,
-        owner_id="local",
-        question="x",
-        k=3,
-    ) == []
+    assert (
+        recall_golden_queries(
+            mdl_file_store=InMemoryMdlFileStore(),
+            project_id=None,
+            owner_id="local",
+            question="x",
+            k=3,
+        )
+        == []
+    )
     # Project with no golden file -> empty (runtime memory stands alone).
     store = InMemoryMdlFileStore()
-    assert recall_golden_queries(
-        mdl_file_store=store, project_id="proj", owner_id="local", question="x", k=3
-    ) == []
+    assert (
+        recall_golden_queries(
+            mdl_file_store=store, project_id="proj", owner_id="local", question="x", k=3
+        )
+        == []
+    )
 
 
 def test_merge_prioritizes_golden_and_supersedes_runtime_twin() -> None:

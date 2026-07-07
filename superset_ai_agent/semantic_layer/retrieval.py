@@ -174,7 +174,5 @@ def _estimate_tokens(dataset: DatasetMetadata) -> int:
 
 def _tokens(value: str) -> list[str]:
     return [
-        token
-        for token in re.split(r"[^A-Za-z0-9]+", value.lower())
-        if len(token) >= 2
+        token for token in re.split(r"[^A-Za-z0-9]+", value.lower()) if len(token) >= 2
     ]

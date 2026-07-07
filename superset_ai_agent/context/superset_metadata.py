@@ -170,5 +170,45 @@ class SupersetMetadataContextProvider(ContextProvider):
             limit=max(self.config.wren_schema_table_scan_limit, 1),
         )
         if not candidate_datasets:
+            # No registered Superset datasets for this schema: for a live / BYO
+            # connection the physical catalog still exists in the database. Source
+            # it straight from the connection (owner-scoped introspection) so
+            # onboarding and MDL validation work without forcing dataset
+            # registration into Superset.
+            candidate_datasets = self._introspect_schema(request)
+        if not candidate_datasets:
             return base_context
         return base_context.model_copy(update={"datasets": candidate_datasets})
+
+    def _introspect_schema(self, request: AgentQueryRequest) -> list[DatasetMetadata]:
+        """Live-introspect the request's schema when the dataset catalog is empty.
+
+        Gated by ``wren_live_schema_introspection`` and the adapter actually
+        implementing ``introspect_schema`` (the MCP adapter returns ``[]``).
+        Fail-soft: any adapter/engine error degrades to an empty catalog — the
+        pre-introspection behavior, never worse.
+        """
+
+        if not self.config.wren_live_schema_introspection:
+            return []
+        introspect = getattr(self.superset_client, "introspect_schema", None)
+        if introspect is None:
+            return []
+        try:
+            result = introspect(
+                database_id=request.database_id,
+                catalog_name=request.catalog_name,
+                schema_name=request.schema_name,
+                limit=max(self.config.wren_schema_table_scan_limit, 1),
+            )
+            # Defensive: only a real list feeds the context (guards a misbehaving
+            # adapter — and MagicMock clients in tests, which auto-return mocks).
+            return result if isinstance(result, list) else []
+        except Exception:  # noqa: BLE001  # pylint: disable=broad-except
+            logger.warning(
+                "Live schema introspection failed for database %s schema %s",
+                request.database_id,
+                request.schema_name,
+                exc_info=True,
+            )
+            return []

@@ -464,8 +464,7 @@ def _category_metric_cards(
                 value=_format_number(spread),
                 metric=analysis.primary_metric,
                 description=(
-                    f"Difference between {leader['category']} and "
-                    f"{lowest['category']}."
+                    f"Difference between {leader['category']} and {lowest['category']}."
                 ),
             )
         )

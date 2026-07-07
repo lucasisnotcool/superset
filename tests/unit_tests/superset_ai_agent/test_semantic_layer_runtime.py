@@ -151,8 +151,14 @@ def test_build_unified_context_merges_selects_and_caps() -> None:
         ],
     )
     retrieved = [
-        {"source": "retriever", "retriever": "embedding", "kind": "column",
-         "name": "id", "model": "alpha", "text": "alpha.id"},
+        {
+            "source": "retriever",
+            "retriever": "embedding",
+            "kind": "column",
+            "name": "id",
+            "model": "alpha",
+            "text": "alpha.id",
+        },
     ]
     out = build_unified_context(
         wren_context=wren_context,
@@ -184,6 +190,91 @@ def test_build_unified_context_overlay_only_passthrough() -> None:
     assert out.context_items == [{"kind": "document", "name": "terms"}]
     assert out.retrieval_mode is None
     assert out.retrieved_item_count == 0
+
+
+# --- B4: full-manifest dump gate for small projects -----------------------------
+
+
+def _manifest_items(*names: str) -> list[dict]:
+    return [
+        {
+            "source": "manifest",
+            "kind": "model",
+            "name": n,
+            "model": n,
+            "text": f"model {n}",
+        }
+        for n in names
+    ]
+
+
+def test_size_gate_dumps_whole_small_manifest() -> None:
+    wren_context = WrenContextArtifact(
+        enabled=True,
+        available=True,
+        context_items=[{"type": "relationships", "items": [{"name": "r"}]}],
+    )
+    out = build_unified_context(
+        wren_context=wren_context,
+        retrieved_items=[
+            {
+                "source": "retriever",
+                "kind": "column",
+                "name": "c",
+                "model": "alpha",
+                "text": "alpha.c",
+                "retriever": "keyword",
+            }
+        ],
+        table_selection_limit=1,  # would prune beta/gamma without the gate
+        max_context_items=2,  # would truncate without the gate
+        manifest_items=_manifest_items("alpha", "beta", "gamma"),
+        dump_threshold_chars=10_000,
+    )
+    assert out.retrieval_mode == "dump"
+    assert out.retrieved_item_count == 0
+    names = {item.get("name") for item in out.context_items}
+    # Every manifest model survives — no selection, no count cap — and the
+    # fetch_context bundle items ride along.
+    assert {"alpha", "beta", "gamma"}.issubset(names)
+    assert any(item.get("type") == "relationships" for item in out.context_items)
+
+
+def test_size_gate_skipped_when_manifest_exceeds_threshold() -> None:
+    big = [
+        {**item, "text": item["text"] * 100}
+        for item in _manifest_items("alpha", "beta")
+    ]
+    out = build_unified_context(
+        wren_context=WrenContextArtifact(enabled=True, available=True),
+        retrieved_items=[
+            {
+                "source": "retriever",
+                "kind": "model",
+                "name": "alpha",
+                "model": "alpha",
+                "text": "alpha",
+                "retriever": "keyword",
+            }
+        ],
+        table_selection_limit=5,
+        max_context_items=0,
+        manifest_items=big,
+        dump_threshold_chars=100,  # manifest is far larger
+    )
+    assert out.retrieval_mode == "keyword"  # normal retrieval path ran
+
+
+def test_size_gate_disabled_at_zero() -> None:
+    out = build_unified_context(
+        wren_context=WrenContextArtifact(enabled=True, available=True),
+        retrieved_items=[],
+        table_selection_limit=5,
+        max_context_items=0,
+        manifest_items=_manifest_items("alpha"),
+        dump_threshold_chars=0,
+    )
+    assert out.retrieval_mode != "dump"
 
 
 # --- C1.3: LLM table/column selection -----------------------------------------

@@ -256,7 +256,10 @@ KNOWN_AGENT_STEP_KINDS: frozenset[str] = frozenset(
         "answer_directly",
         "load_context",
         "load_wren_context",
+        "load_document_context",
+        "probe_dimension_values",
         "draft_sql",
+        "select_sql_candidate",
         "draft_response",
         "approved_sql",
         "dry_plan_with_wren",
@@ -336,6 +339,67 @@ class LoadWrenContextDetail(BaseModel):
     retrieved_chunks: list[RetrievedChunk] = Field(default_factory=list)
     #: Why context is unavailable / degraded, surfaced verbatim (B6/B8).
     warnings: list[str] = Field(default_factory=list)
+
+
+class DocumentPassage(BaseModel):
+    """One uploaded-document passage retrieved into the SQL prompt (doc RAG).
+
+    Surfaced in the explain timeline so users see *which* business-document
+    passages grounded the draft; ``text`` is truncated for display.
+    """
+
+    document_id: str | None = None
+    filename: str | None = None
+    chunk_index: int | None = None
+    text: str
+
+
+class LoadDocumentContextDetail(BaseModel):
+    """Uploaded-document RAG retrieval (``load_document_context``).
+
+    The SQL agent's advisory grounding channel over the resolved project's
+    uploaded BI documents (plan_sql_agent_doc_grounding_spec.md A1).
+    """
+
+    kind: Literal["document_context"] = "document_context"
+    available: bool = False
+    document_count: int = 0
+    passage_count: int = 0
+    #: Which ranker served the passages: ``embedding`` or ``keyword``.
+    retriever: str | None = None
+    #: Whether the char budget dropped or cut ranked passages (no silent cap).
+    truncated: bool = False
+    passages: list[DocumentPassage] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class DimensionValueHint(BaseModel):
+    """Stored values found for one quoted literal (``probe_dimension_values``)."""
+
+    literal: str
+    table: str | None = None
+    column: str | None = None
+    values: list[str] = Field(default_factory=list)
+
+
+class DimensionValuesDetail(BaseModel):
+    """Dimension-value probing (``probe_dimension_values``, C2)."""
+
+    kind: Literal["dimension_values"] = "dimension_values"
+    hints: list[DimensionValueHint] = Field(default_factory=list)
+
+
+class CandidateSelectionDetail(BaseModel):
+    """Dual-candidate pairwise selection (``select_sql_candidate``, C3)."""
+
+    kind: Literal["candidate_selection"] = "candidate_selection"
+    #: Which candidate won: ``semantic`` (layer-grounded) or ``raw`` (schema-only).
+    chosen: str | None = None
+    reason: str | None = None
+    semantic_sql: str | None = None
+    raw_sql: str | None = None
+    semantic_valid: bool = False
+    raw_valid: bool = False
 
 
 class RecalledExample(BaseModel):
@@ -448,6 +512,9 @@ AgentStepDetail = Annotated[
         LoadContextDetail,
         IntentDetail,
         LoadWrenContextDetail,
+        LoadDocumentContextDetail,
+        DimensionValuesDetail,
+        CandidateSelectionDetail,
         DraftDetail,
         DryPlanDetail,
         PlanSemanticSqlDetail,

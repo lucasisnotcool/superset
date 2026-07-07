@@ -108,13 +108,18 @@ def build_scoreboard(
     *,
     capability: dict[str, tuple[str, ...]],
     meta: dict[str, Any],
+    config_names: list[str] | None = None,
+    extra_deltas: dict[str, tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Aggregate per-trial ``{config: {qid: verdict}}`` into the v4 scoreboard.
 
     Output: ``by_config`` (total mean[min-max] + per-capability mean correct),
     ``by_capability`` (each config's mean correct), and headline ``deltas``.
+    ``config_names``/``extra_deltas`` let an extended matrix (v5's rag configs)
+    reuse this aggregation without duplicating it.
     """
-    config_names: list[str] = [c["name"] for c in expand_configs()]
+    if config_names is None:
+        config_names = [c["name"] for c in expand_configs()]
     by_config: dict[str, Any] = {}
     cap_table: dict[str, dict[str, float]] = {}
 
@@ -157,6 +162,8 @@ def build_scoreboard(
             "wren_bi·auto", "context_dump"
         ),
     }
+    for label, (a, b) in (extra_deltas or {}).items():
+        deltas[label] = delta(a, b)
     return {
         "meta": meta,
         "by_config": by_config,

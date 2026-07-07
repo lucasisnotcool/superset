@@ -836,9 +836,7 @@ def run_directory_coverage(
             current=index + 1,
             total=total_docs,
         )
-        outcome = extract_claims(
-            model_client, document_text=document.text, model=model
-        )
+        outcome = extract_claims(model_client, document_text=document.text, model=model)
         if outcome.claims is None:
             failed_docs += 1
             # Name the document AND the reason so the user can act (retry a

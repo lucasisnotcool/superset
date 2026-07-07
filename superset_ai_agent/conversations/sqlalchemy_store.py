@@ -108,9 +108,7 @@ class SqlAlchemyConversationStore:
             if project_id is not None:
                 query = query.where(AiAgentConversation.project_id == project_id)
             conversations = (
-                session.execute(
-                    query.order_by(AiAgentConversation.updated_at.desc())
-                )
+                session.execute(query.order_by(AiAgentConversation.updated_at.desc()))
                 .scalars()
                 .all()
             )

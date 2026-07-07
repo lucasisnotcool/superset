@@ -57,20 +57,12 @@ def upgrade() -> None:
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.PrimaryKeyConstraint("id"),
     )
-    op.create_index(
-        "ix_ai_agent_coverage_runs_project_id", _TABLE, ["project_id"]
-    )
+    op.create_index("ix_ai_agent_coverage_runs_project_id", _TABLE, ["project_id"])
     op.create_index("ix_ai_agent_coverage_runs_owner_id", _TABLE, ["owner_id"])
-    op.create_index(
-        "ix_ai_agent_coverage_runs_mdl_checksum", _TABLE, ["mdl_checksum"]
-    )
+    op.create_index("ix_ai_agent_coverage_runs_mdl_checksum", _TABLE, ["mdl_checksum"])
     op.create_index("ix_ai_agent_coverage_runs_status", _TABLE, ["status"])
-    op.create_index(
-        "ix_ai_agent_coverage_runs_created_at", _TABLE, ["created_at"]
-    )
-    op.create_index(
-        "ix_ai_agent_coverage_runs_updated_at", _TABLE, ["updated_at"]
-    )
+    op.create_index("ix_ai_agent_coverage_runs_created_at", _TABLE, ["created_at"])
+    op.create_index("ix_ai_agent_coverage_runs_updated_at", _TABLE, ["updated_at"])
 
 
 def downgrade() -> None:

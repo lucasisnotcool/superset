@@ -512,11 +512,7 @@ class SqlAlchemyMdlFileStore:
         owner_id: str,
     ) -> AiAgentSemanticMdlFile:
         model = session.get(AiAgentSemanticMdlFile, file_id)
-        if (
-            model is None
-            or model.deleted_at is not None
-            or model.status == "deleted"
-        ):
+        if model is None or model.deleted_at is not None or model.status == "deleted":
             raise MdlFileNotFoundError(file_id)
         return model
 

@@ -60,6 +60,7 @@ from superset_ai_agent.integrations.wren.client import DisabledWrenClient, WrenC
 from superset_ai_agent.intent import classify_intent
 from superset_ai_agent.llm.base import ChatMessage, ModelClient
 from superset_ai_agent.llm.embeddings import create_embedder
+from superset_ai_agent.llm.rerank import llm_rerank
 from superset_ai_agent.prompts.registry import get_prompt
 from superset_ai_agent.schemas import (
     AgentQueryRequest,
@@ -73,6 +74,10 @@ from superset_ai_agent.schemas import (
     TraceEvent,
     WrenContextArtifact,
     WrenRetrievalArtifact,
+)
+from superset_ai_agent.semantic_layer.document_retriever import (
+    DocumentChunkIndex,
+    retrieve_document_context,
 )
 from superset_ai_agent.semantic_layer.engine import (
     create_semantic_engine,
@@ -112,7 +117,7 @@ from superset_ai_agent.semantic_layer.schemas import (
     SemanticProject,
     WrenMaterializationResult,
 )
-from superset_ai_agent.semantic_layer.store import scope_hashes
+from superset_ai_agent.semantic_layer.store import scope_hashes, SemanticLayerStore
 from superset_ai_agent.semantic_layer.wren_runtime import (
     materialize_request_semantic_project,
     resolve_effective_schema,
@@ -205,6 +210,7 @@ class ConversationState(TypedDict, total=False):
     recommended_followups: list[str]
     wren_context: WrenContextArtifact | None
     wren_retrieval: WrenRetrievalArtifact | None
+    document_context: dict[str, Any] | None
     wren_materialization: WrenMaterializationResult | None
     wren_mdl_path: str | None
     recall_access: RecallAccess | None
@@ -244,6 +250,8 @@ class ConversationGraph:
         memory: Memory | None = None,
         retriever: Retriever | None = None,
         instruction_store: InstructionStore | None = None,
+        semantic_layer_store: SemanticLayerStore | None = None,
+        document_index: DocumentChunkIndex | None = None,
     ):
         self.config = config
         self.model_client = model_client
@@ -259,6 +267,10 @@ class ConversationGraph:
         # Identical-behavior parity (D1b): the Copilot recalls the same DB-tied
         # instruction set the AI SQL agent does at draft time.
         self.instruction_store = instruction_store or NullInstructionStore()
+        # Doc-RAG channel parity with TextToSqlGraph (C1): both optional, so
+        # the channel is inert for callers without a document corpus.
+        self.semantic_layer_store = semantic_layer_store
+        self.document_index = document_index
         self.graph = self._compile_graph()
 
     def _scope_fingerprint(self, scope: ConversationScope) -> str | None:
@@ -525,6 +537,7 @@ class ConversationGraph:
             "recommended_followups": [],
             "wren_context": None,
             "wren_retrieval": None,
+            "document_context": None,
             "wren_materialization": None,
             "wren_mdl_path": None,
             "recalled_examples": [],
@@ -691,6 +704,7 @@ class ConversationGraph:
         graph.add_node("answer_directly", self._answer_directly)
         graph.add_node("load_context", self._load_context)
         graph.add_node("load_wren_context", self._load_wren_context)
+        graph.add_node("load_document_context", self._load_document_context)
         graph.add_node("draft_response", self._draft_response)
         graph.add_node("dry_plan_with_wren", self._dry_plan_with_wren)
         graph.add_node("plan_semantic_sql", self._plan_semantic_sql)
@@ -715,7 +729,8 @@ class ConversationGraph:
         )
         graph.add_edge("answer_directly", END)
         graph.add_edge("load_context", "load_wren_context")
-        graph.add_edge("load_wren_context", "draft_response")
+        graph.add_edge("load_wren_context", "load_document_context")
+        graph.add_edge("load_document_context", "draft_response")
         graph.add_conditional_edges(
             "draft_response",
             self._route_after_draft,
@@ -1132,6 +1147,78 @@ class ConversationGraph:
                 ),
             ],
         }
+
+    def _load_document_context(self, state: ConversationState) -> ConversationState:
+        """Retrieve uploaded-document passages for the turn (doc RAG parity, C1).
+
+        Mirrors ``TextToSqlGraph._load_document_context``: advisory grounding
+        over the access-checked project's document corpus, budgeted, inert (no
+        trace noise) when the channel is off or no corpus/project exists.
+        """
+
+        request = state["request"]
+        project_id = getattr(state.get("wren_context"), "project_id", None)
+        if (
+            not self.config.wren_sql_doc_context_enabled
+            or self.semantic_layer_store is None
+            or self.document_index is None
+            or project_id is None
+        ):
+            return {**state, "document_context": None}
+        document_context = retrieve_document_context(
+            question=request.message,
+            project_id=project_id,
+            owner_id=state["owner_id"],
+            store=self.semantic_layer_store,
+            index=self.document_index,
+            k=self.config.wren_sql_doc_retrieve_k,
+            max_chars=self.config.wren_sql_doc_context_max_chars,
+            reranker=self._doc_reranker(),
+        )
+        wren_context = state.get("wren_context")
+        if document_context and wren_context is not None:
+            wren_context = wren_context.model_copy(
+                update={"document_ids": document_context["document_ids"]}
+            )
+        passages = (document_context or {}).get("passages") or []
+        document_ids = (document_context or {}).get("document_ids") or []
+        details = {
+            "available": bool(passages),
+            "document_count": len(document_ids),
+            "passage_count": len(passages),
+            "retriever": (document_context or {}).get("retriever"),
+            "truncated": bool((document_context or {}).get("truncated", False)),
+            "passages": passages,
+        }
+        return {
+            **state,
+            "document_context": document_context,
+            "wren_context": wren_context,
+            "trace": [
+                *state.get("trace", []),
+                TraceEvent(
+                    step="load_document_context",
+                    summary=(
+                        f"Retrieved {len(passages)} passage(s) from "
+                        f"{len(document_ids)} uploaded document(s)."
+                        if passages
+                        else "No relevant uploaded-document passages."
+                    ),
+                    details=details,
+                ),
+            ],
+        }
+
+    def _doc_reranker(self):
+        """The B3 LLM reranker for doc-context candidates when enabled."""
+
+        if not self.config.wren_rerank_enabled:
+            return None
+
+        def reranker(question: str, texts: list[str], k: int) -> list[int] | None:
+            return llm_rerank(self.model_client, question, texts, k)
+
+        return reranker
 
     def _recall_access(
         self, request: ConversationTurnRequest, project: SemanticProject | None
@@ -1869,6 +1956,9 @@ class ConversationGraph:
             "database": context.database.model_dump(),
             "datasets": [dataset.model_dump() for dataset in context.datasets],
             "wren_context": wren_context.model_dump() if wren_context else None,
+            # Advisory business context retrieved from uploaded BI documents
+            # (doc RAG parity, C1) — below the semantic layer in precedence.
+            "document_context": state.get("document_context"),
             "conversation": _conversation_payload(
                 conversation,
                 max_history_messages=self.config.max_history_messages,

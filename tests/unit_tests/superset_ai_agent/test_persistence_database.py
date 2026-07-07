@@ -148,9 +148,7 @@ def test_run_migrations_can_stamp_existing_development_tables(tmp_path) -> None:
     engine = create_engine_from_config(config)
     create_all_for_tests(engine)
 
-    run_migrations(
-        _config(database_url, agent_migration_bootstrap="stamp_existing")
-    )
+    run_migrations(_config(database_url, agent_migration_bootstrap="stamp_existing"))
 
     inspector = inspect(create_engine_from_config(config))
     assert "ai_agent_alembic_version" in inspector.get_table_names()

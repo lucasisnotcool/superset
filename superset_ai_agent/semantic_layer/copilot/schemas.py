@@ -54,9 +54,7 @@ ChangesetOp = Literal["create", "update", "delete"]
 #: Semantic verb for an MDL-mutating tool call, named at dispatch time (not
 #: reverse-engineered from a diff). An unmapped/future tool defaults to ``write``
 #: and still surfaces its raw ``tool`` name — extend additively, no migration.
-ToolActionKind = Literal[
-    "write", "delete", "onboard", "relate", "remove", "curate"
-]
+ToolActionKind = Literal["write", "delete", "onboard", "relate", "remove", "curate"]
 
 
 class ToolCallRecord(BaseModel):

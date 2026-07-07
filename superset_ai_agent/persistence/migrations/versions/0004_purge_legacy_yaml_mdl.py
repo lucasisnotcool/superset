@@ -57,8 +57,7 @@ def upgrade() -> None:
 
     legacy_count = bind.execute(
         sa.text(
-            "SELECT COUNT(*) FROM ai_agent_semantic_mdl_files "
-            "WHERE content_type <> :ct"
+            "SELECT COUNT(*) FROM ai_agent_semantic_mdl_files WHERE content_type <> :ct"
         ),
         {"ct": _JSON_CONTENT_TYPE},
     ).scalar()
@@ -75,9 +74,7 @@ def upgrade() -> None:
 
     # 1. The YAML-bearing MDL files themselves (the rows that no longer parse).
     bind.execute(
-        sa.text(
-            "DELETE FROM ai_agent_semantic_mdl_files WHERE content_type <> :ct"
-        ),
+        sa.text("DELETE FROM ai_agent_semantic_mdl_files WHERE content_type <> :ct"),
         {"ct": _JSON_CONTENT_TYPE},
     )
     # 2. Derived state built from the old MDL: materialized versions and the

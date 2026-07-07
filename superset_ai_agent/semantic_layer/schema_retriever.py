@@ -164,6 +164,7 @@ def manifest_to_schema_items(manifest: CompiledManifest) -> list[SchemaItem]:
                     text=col_text,
                 )
             )
+    items.extend(_metric_items(manifest.metrics))
     for rel in manifest.relationships:
         rel_name = str(rel.get("name") or "")
         if not rel_name:
@@ -187,6 +188,80 @@ def manifest_to_schema_items(manifest: CompiledManifest) -> list[SchemaItem]:
         )
     items.extend(_view_items(manifest.views))
     return items
+
+
+def _metric_items(metrics: list[dict[str, Any]]) -> list[SchemaItem]:
+    """Chunk MDL metrics into retrievable items (A2, plan_sql_agent_doc_grounding).
+
+    Eval v4's Q27: a freshly-authored metric never reached the retrieved layer —
+    the manifest's ``metrics`` array was chunked nowhere, so a metric question
+    could only be answered when the raw document was also in the prompt. The
+    chunk leads with the metric's definition (measures/expression) and semantic
+    terms so a colloquial metric question ranks it. ``model`` is the metric's
+    ``baseObject`` so table-selection keeps the metric with its base model (and
+    a metric hit pulls its base model into the candidate set).
+    """
+
+    items: list[SchemaItem] = []
+    for metric in metrics:
+        name = str(metric.get("name") or "")
+        if not name:
+            continue
+        base = str(metric.get("baseObject") or "")
+        parts: list[str] = [f"metric {name}"]
+        if base:
+            parts.append(f"on {base}")
+        definition = _metric_definition_text(metric)
+        if definition:
+            parts.append(f"defined as {definition}")
+        dimensions = metric.get("dimension")
+        if isinstance(dimensions, list) and dimensions:
+            dim_names = ", ".join(
+                str(d.get("name")) if isinstance(d, dict) else str(d)
+                for d in dimensions
+            )
+            parts.append(f"by {dim_names}")
+        text = " ".join(parts)
+        terms = _semantic_terms(metric)
+        if terms:
+            text = f"{text} — {terms}"
+        items.append(
+            SchemaItem(
+                kind="metric",
+                name=name,
+                model=base or None,
+                text=text,
+            )
+        )
+    return items
+
+
+def _metric_definition_text(metric: dict[str, Any]) -> str:
+    """The metric's measure expressions as one retrievable definition string.
+
+    Wren-native metrics carry a singular ``measure`` array; the legacy
+    ``measures`` alias and a bare top-level ``expression`` are tolerated
+    (mirrors mdl_validator).
+    """
+
+    measures = metric.get("measure")
+    if measures is None:
+        measures = metric.get("measures")
+    texts: list[str] = []
+    if isinstance(measures, list):
+        for measure in measures:
+            if not isinstance(measure, dict):
+                continue
+            m_name = str(measure.get("name") or "")
+            m_expr = str(measure.get("expression") or "")
+            if m_name and m_expr:
+                texts.append(f"{m_name} = {m_expr}")
+            elif m_name or m_expr:
+                texts.append(m_name or m_expr)
+    expression = metric.get("expression")
+    if isinstance(expression, str) and expression.strip():
+        texts.append(expression.strip())
+    return "; ".join(texts)
 
 
 def _view_items(views: list[dict[str, Any]]) -> list[SchemaItem]:
@@ -405,6 +480,95 @@ class EmbeddingRetriever:
         self._index.set(
             scope_key, _IndexEntry(checksum=checksum, items=items, vectors=vectors)
         )
+
+
+#: Reciprocal-rank-fusion constant (the standard k=60 from the RRF literature);
+#: dampens the head so one ranker's top hit cannot dominate the fused order.
+_RRF_K = 60
+
+
+def _rrf_key(item: SchemaItem) -> tuple[str, str, str]:
+    return (item.kind, item.name, item.model or "")
+
+
+def rrf_fuse(rankings: list[list[SchemaItem]], k: int) -> list[SchemaItem]:
+    """Fuse ranked lists by reciprocal-rank fusion; top-``k`` of the fused order.
+
+    Exact table/column/metric names are lexical-match territory (keyword) while
+    colloquial phrasings are embedding territory — the two rankers have
+    complementary failure modes, and RRF is the standard zero-tuning fusion
+    (B1, plan_sql_agent_doc_grounding_spec.md). The fused ``score`` is the RRF
+    sum, so downstream consumers still see a comparable relevance signal.
+    """
+
+    scores: dict[tuple[str, str, str], float] = {}
+    first_seen: dict[tuple[str, str, str], SchemaItem] = {}
+    for ranking in rankings:
+        for rank, item in enumerate(ranking):
+            key = _rrf_key(item)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (_RRF_K + rank + 1)
+            if key not in first_seen:
+                first_seen[key] = item
+    ordered = sorted(scores.items(), key=lambda pair: -pair[1])
+    return [
+        first_seen[key].model_copy(update={"score": round(score, 4)})
+        for key, score in ordered[:k]
+    ]
+
+
+class HybridRetriever:
+    """Keyword + embedding retrieval fused by RRF (B1).
+
+    Wraps an embedding-capable retriever (in-process, LanceDB, or pgvector) and
+    keeps its own keyword index over the same items; ``retrieve`` pulls an
+    over-fetched candidate pool from both rankers and fuses with
+    :func:`rrf_fuse`. Degrades closed: when the embedding side has no vectors
+    the keyword ranking stands alone, and on a cold worker where only the
+    persistent embedding index survives, its ranking is served as-is.
+    """
+
+    name = "hybrid"
+
+    #: Over-fetch multiplier per ranker before fusion, so an item ranked just
+    #: past k by both rankers can still fuse into the top-k.
+    pool_factor = 2
+
+    def __init__(self, inner: Retriever, max_scopes: int = 0) -> None:
+        self.inner = inner
+        self._keyword = KeywordRetriever(max_scopes)
+
+    def has_index(self, scope_key: str, checksum: str) -> bool:
+        return self.inner.has_index(scope_key, checksum) or self._keyword.has_index(
+            scope_key, checksum
+        )
+
+    def index(self, items: list[SchemaItem], *, scope_key: str, checksum: str) -> None:
+        self.inner.index(items, scope_key=scope_key, checksum=checksum)
+        self._keyword.index(items, scope_key=scope_key, checksum=checksum)
+
+    def retrieve(
+        self, question: str, *, scope_key: str, checksum: str, k: int
+    ) -> list[SchemaItem]:
+        pool = max(k * self.pool_factor, k)
+        embedded = self.inner.retrieve(
+            question, scope_key=scope_key, checksum=checksum, k=pool
+        )
+        lexical = self._keyword.retrieve(
+            question, scope_key=scope_key, checksum=checksum, k=pool
+        )
+        if not lexical:
+            # Cold worker: only the persistent embedding index survives.
+            return embedded[:k]
+        if not embedded or self.inner.effective_name(scope_key) != "embedding":
+            # No vectors (embedder down / keyword fallback inside the inner
+            # retriever) — don't fuse keyword with keyword.
+            return lexical[:k]
+        return rrf_fuse([embedded, lexical], k)
+
+    def effective_name(self, scope_key: str) -> str:
+        if self.inner.effective_name(scope_key) == "embedding":
+            return "hybrid"
+        return "keyword"
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -713,16 +877,21 @@ def create_retriever(
     """Build the configured retriever; degrade to keyword when embedding is off."""
 
     max_scopes = config.wren_retriever_cache_scopes
-    if config.wren_retriever == "embedding":
+    if config.wren_retriever in ("embedding", "hybrid"):
         active = embedder or NullEmbedder()
         if active.is_available():
+            inner: Retriever
             if config.wren_vector_index == "lancedb":
-                return LanceDbRetriever(active, _lancedb_path(config), max_scopes)
-            if config.wren_vector_index == "postgres":
-                return PgVectorRetriever(
+                inner = LanceDbRetriever(active, _lancedb_path(config), max_scopes)
+            elif config.wren_vector_index == "postgres":
+                inner = PgVectorRetriever(
                     active, config.effective_vector_database_url, max_scopes
                 )
-            return EmbeddingRetriever(active, max_scopes)
+            else:
+                inner = EmbeddingRetriever(active, max_scopes)
+            if config.wren_retriever == "hybrid":
+                return HybridRetriever(inner, max_scopes)
+            return inner
     return KeywordRetriever(max_scopes)
 
 
@@ -741,6 +910,9 @@ def effective_vector_index(config: AgentConfig, retriever: Retriever) -> str:
     operator can see the misconfig instead of it degrading invisibly.
     """
 
+    # A hybrid retriever's persistence lives on its embedding inner retriever.
+    if isinstance(retriever, HybridRetriever):
+        retriever = retriever.inner
     if config.wren_vector_index == "lancedb":
         if isinstance(retriever, LanceDbRetriever) and retriever.is_persistent():
             return "lancedb"

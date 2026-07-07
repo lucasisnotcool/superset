@@ -130,6 +130,21 @@ class LlmWrenClient:
         ]
         if relationships:
             context_items.append({"type": "relationships", "items": relationships})
+        # Surface authored metrics (A2, plan_sql_agent_doc_grounding_spec.md):
+        # the ``metrics`` array previously reached the prompt nowhere, so a
+        # question about a defined metric (eval v4 Q27) could only be answered
+        # when the raw document was also present. Question-ranked like views —
+        # a metric earns its slot by matching.
+        metrics = [
+            metric
+            for metric in mdl.get("metrics", [])
+            if isinstance(metric, dict) and metric.get("name")
+        ]
+        ranked_metrics = _rank_matching(question, metrics)[
+            : self.config.wren_context_limit
+        ]
+        if ranked_metrics:
+            context_items.append({"type": "metrics", "items": ranked_metrics})
         # Surface views the same way: a view is a vetted, named query the agent can
         # select from instead of re-deriving the joins. Native (``dialect``) views
         # are excluded — they are not in the engine manifest, so the agent must not
@@ -724,23 +739,33 @@ def _rank_models(
     return scored
 
 
-def _rank_views(
+def _rank_matching(
     question: str,
-    views: list[dict[str, Any]],
+    entities: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Rank views by token overlap with the question (mirrors ``_rank_models``).
+    """Rank entities by token overlap with the question (mirrors ``_rank_models``).
 
-    Only views that share at least one term with the question are returned, so an
-    unrelated view never crowds the context — a view earns its slot by matching.
+    Only entities that share at least one term with the question are returned, so
+    an unrelated view/metric never crowds the context — each earns its slot by
+    matching.
     """
 
     question_tokens = _tokens(question)
 
-    def score(view: dict[str, Any]) -> int:
-        return len(question_tokens & _tokens(json.dumps(view, default=str)))
+    def score(entity: dict[str, Any]) -> int:
+        return len(question_tokens & _tokens(json.dumps(entity, default=str)))
 
-    matched = [view for view in views if score(view) > 0]
+    matched = [entity for entity in entities if score(entity) > 0]
     return sorted(matched, key=score, reverse=True)
+
+
+def _rank_views(
+    question: str,
+    views: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Rank views by question overlap (kept as the named seam; see _rank_matching)."""
+
+    return _rank_matching(question, views)
 
 
 def _trim_to_budget(

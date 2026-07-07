@@ -27,9 +27,7 @@ from alembic.config import Config
 from sqlalchemy import create_engine, text
 
 _HERE = Path(__file__).resolve()
-_MIGRATIONS_DIR = (
-    _HERE.parents[3] / "superset_ai_agent" / "persistence" / "migrations"
-)
+_MIGRATIONS_DIR = _HERE.parents[3] / "superset_ai_agent" / "persistence" / "migrations"
 _ALEMBIC_INI = _MIGRATIONS_DIR.parent / "alembic.ini"
 
 

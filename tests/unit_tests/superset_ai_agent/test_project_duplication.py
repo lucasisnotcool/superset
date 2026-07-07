@@ -86,9 +86,7 @@ def _seed_files(file_store, project_id: str) -> None:
         MdlFileCreateRequest(path="models/orders.json", content=_VALID_MODEL),
         owner_id="o",
     )
-    file_store.update(
-        active.id, MdlFileUpdateRequest(status="active"), owner_id="o"
-    )
+    file_store.update(active.id, MdlFileUpdateRequest(status="active"), owner_id="o")
     file_store.create(
         project_id,
         MdlFileCreateRequest(path="models/draft.json", content='{"models":[]}'),

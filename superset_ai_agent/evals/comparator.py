@@ -377,9 +377,7 @@ def compare_result_sets(  # noqa: C901 - the normative rule set is inherently br
                 pred_tuples, gold_tuples, sig_digits=sig_digits, rel_tol=rel_tol
             )
             if not ex:
-                reasons.append(
-                    f"{fn} gold cell(s) unmatched across aligned columns."
-                )
+                reasons.append(f"{fn} gold cell(s) unmatched across aligned columns.")
     if ex and extra_pred_cols and extra_columns_policy == "strict":
         ex = False
         reasons.append("Extra columns fail exact match under the strict policy.")

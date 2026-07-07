@@ -75,9 +75,7 @@ def validate_with_wren_core(
     rather than at query time.
     """
 
-    return validate_engine_manifest(
-        to_wren_core_manifest(models, relationships, views)
-    )
+    return validate_engine_manifest(to_wren_core_manifest(models, relationships, views))
 
 
 def validate_engine_manifest(engine_manifest: dict[str, Any]) -> MdlValidationResult:
@@ -100,9 +98,9 @@ def validate_engine_manifest(engine_manifest: dict[str, Any]) -> MdlValidationRe
             ],
         )
 
-    encoded = base64.b64encode(
-        json.dumps(engine_manifest).encode("utf-8")
-    ).decode("ascii")
+    encoded = base64.b64encode(json.dumps(engine_manifest).encode("utf-8")).decode(
+        "ascii"
+    )
     try:
         # Constructing a SessionContext loads + validates the manifest.
         SessionContext(encoded)  # type: ignore[misc]

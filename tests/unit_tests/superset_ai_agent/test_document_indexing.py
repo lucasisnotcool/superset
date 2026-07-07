@@ -138,6 +138,66 @@ def test_indexing_enabled_embeds_with_index() -> None:
     assert all(chunk.embedded is True for chunk in chunks)
 
 
+class _TextRecordingIndex(DocumentChunkIndex):
+    """Records the exact text each vector is computed over (B2 assertions)."""
+
+    def __init__(self) -> None:
+        recorder = self
+
+        class _Cache:
+            def is_available(self) -> bool:
+                return True
+
+            def upsert(self, *, scope_key: str, row_id: str, text: str) -> bool:
+                recorder.embedded_texts.append(text)
+                return True
+
+            def remove(self, *, scope_key: str, row_id: str) -> bool:
+                return True
+
+            def search(self, *, scope_key: str, query: str, k: int) -> list[str] | None:
+                return []
+
+        self.embedded_texts: list[str] = []
+        super().__init__(_Cache())
+
+
+def test_contextual_prefix_situates_embedded_text_only() -> None:
+    # B2: the vector is computed over "[filename] chunk-text"; the persisted
+    # chunk rows keep the bare text (viewer, keyword recall, checksums).
+    store = InMemorySemanticLayerStore()
+    index = _TextRecordingIndex()
+    document = _create(
+        store,
+        _RecordingStorage(),
+        config=AgentConfig(
+            wren_document_indexing_enabled=True,
+            wren_document_contextual_prefix=True,
+        ),
+        document_index=index,
+    )
+    assert index.embedded_texts
+    assert all(text.startswith("[doc.md] ") for text in index.embedded_texts)
+    chunks = store.list_chunks(document.id, owner_id="user-1")
+    assert all(not chunk.text.startswith("[doc.md]") for chunk in chunks)
+
+
+def test_contextual_prefix_off_embeds_bare_text() -> None:
+    store = InMemorySemanticLayerStore()
+    index = _TextRecordingIndex()
+    _create(
+        store,
+        _RecordingStorage(),
+        config=AgentConfig(
+            wren_document_indexing_enabled=True,
+            wren_document_contextual_prefix=False,
+        ),
+        document_index=index,
+    )
+    assert index.embedded_texts
+    assert all(not text.startswith("[doc.md]") for text in index.embedded_texts)
+
+
 def test_indexing_failure_never_fails_upload(monkeypatch) -> None:
     # A broken index must not break extraction (best-effort, degrade closed).
     store = InMemorySemanticLayerStore()

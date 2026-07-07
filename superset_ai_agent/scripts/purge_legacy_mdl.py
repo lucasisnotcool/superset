@@ -57,15 +57,13 @@ _DERIVED_TABLES: tuple[str, ...] = ()
 def _counts(connection: sa.Connection) -> dict[str, int]:
     legacy = connection.execute(
         sa.text(
-            "SELECT COUNT(*) FROM ai_agent_semantic_mdl_files "
-            "WHERE content_type <> :ct"
+            "SELECT COUNT(*) FROM ai_agent_semantic_mdl_files WHERE content_type <> :ct"
         ),
         {"ct": _JSON_CONTENT_TYPE},
     ).scalar_one()
     json_files = connection.execute(
         sa.text(
-            "SELECT COUNT(*) FROM ai_agent_semantic_mdl_files "
-            "WHERE content_type = :ct"
+            "SELECT COUNT(*) FROM ai_agent_semantic_mdl_files WHERE content_type = :ct"
         ),
         {"ct": _JSON_CONTENT_TYPE},
     ).scalar_one()
@@ -80,9 +78,7 @@ def _counts(connection: sa.Connection) -> dict[str, int]:
 
 def _purge(connection: sa.Connection) -> None:
     connection.execute(
-        sa.text(
-            "DELETE FROM ai_agent_semantic_mdl_files WHERE content_type <> :ct"
-        ),
+        sa.text("DELETE FROM ai_agent_semantic_mdl_files WHERE content_type <> :ct"),
         {"ct": _JSON_CONTENT_TYPE},
     )
     for table in _DERIVED_TABLES:

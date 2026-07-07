@@ -55,22 +55,52 @@ def _event(
 
 def test_build_timeline_maps_each_step_to_a_typed_detail() -> None:
     trace = [
-        _event("load_context", "Loaded 2 dataset(s) from database analytics.",
-               dataset_count=2, database_name="analytics", retrieval=None),
-        _event("load_wren_context", "Loaded Wren semantic context.",
-               available=True, matched_models=["orders"], retrieval_mode="embedding",
-               retrieved_item_count=3, context_items=[{}, {}], project_id="p1"),
-        _event("draft_response", "Generated a SQL draft.",
-               response_type="sql", model="gpt"),
-        _event("plan_semantic_sql", "Rewrote semantic SQL to native SQL.",
-               engine="wren", rewritten=True, semantic_sql="SELECT 1",
-               native_sql="SELECT 2", referenced_tables=["orders"], warnings=[]),
-        _event("validate_sql", "SQL passed read-only validation.",
-               dialect="postgresql", errors=[]),
-        _event("execute_sql", "Executed SQL and returned 1,234 row(s).",
-               row_count=1234),
-        _event("build_artifacts", "Built artifacts.",
-               insight_card_count=2, chart_type="bar", has_data_preview=True),
+        _event(
+            "load_context",
+            "Loaded 2 dataset(s) from database analytics.",
+            dataset_count=2,
+            database_name="analytics",
+            retrieval=None,
+        ),
+        _event(
+            "load_wren_context",
+            "Loaded Wren semantic context.",
+            available=True,
+            matched_models=["orders"],
+            retrieval_mode="embedding",
+            retrieved_item_count=3,
+            context_items=[{}, {}],
+            project_id="p1",
+        ),
+        _event(
+            "draft_response", "Generated a SQL draft.", response_type="sql", model="gpt"
+        ),
+        _event(
+            "plan_semantic_sql",
+            "Rewrote semantic SQL to native SQL.",
+            engine="wren",
+            rewritten=True,
+            semantic_sql="SELECT 1",
+            native_sql="SELECT 2",
+            referenced_tables=["orders"],
+            warnings=[],
+        ),
+        _event(
+            "validate_sql",
+            "SQL passed read-only validation.",
+            dialect="postgresql",
+            errors=[],
+        ),
+        _event(
+            "execute_sql", "Executed SQL and returned 1,234 row(s).", row_count=1234
+        ),
+        _event(
+            "build_artifacts",
+            "Built artifacts.",
+            insight_card_count=2,
+            chart_type="bar",
+            has_data_preview=True,
+        ),
     ]
     timeline = build_agent_timeline(trace)
 
@@ -89,8 +119,13 @@ def test_build_timeline_maps_each_step_to_a_typed_detail() -> None:
 
 def test_validate_sql_detail_reflects_error_status() -> None:
     trace = [
-        _event("validate_sql", "SQL failed read-only validation.",
-               status="error", dialect="sqlite", errors=["no such table"]),
+        _event(
+            "validate_sql",
+            "SQL failed read-only validation.",
+            status="error",
+            dialect="sqlite",
+            errors=["no such table"],
+        ),
     ]
     detail = build_agent_timeline(trace)[0].detail
     assert detail.is_valid is False
@@ -136,8 +171,14 @@ def test_attempt_index_groups_steps_by_draft_cycle() -> None:
 
 def test_dry_plan_diagnostics_are_extracted_and_deduped() -> None:
     trace = [
-        _event("dry_plan_with_wren", "Collected Wren dry-plan metadata.",
-               status="warning", available=False, error="dup", errors=["dup", "other"]),
+        _event(
+            "dry_plan_with_wren",
+            "Collected Wren dry-plan metadata.",
+            status="warning",
+            available=False,
+            error="dup",
+            errors=["dup", "other"],
+        ),
     ]
     detail = build_agent_timeline(trace)[0].detail
     assert detail.available is False
@@ -148,8 +189,12 @@ def test_carriers_backfill_sparse_steps() -> None:
     # An older/sparse trace with no per-event detail: the carriers fill the gap.
     trace = [
         _event("load_wren_context", "Loaded Wren semantic context."),
-        _event("plan_semantic_sql", "Rewrote semantic SQL to native SQL.",
-               engine="wren", rewritten=True),
+        _event(
+            "plan_semantic_sql",
+            "Rewrote semantic SQL to native SQL.",
+            engine="wren",
+            rewritten=True,
+        ),
         _event("execute_sql", "Executed SQL and returned 3 row(s)."),
     ]
     wren_context = WrenContextArtifact(
@@ -160,8 +205,12 @@ def test_carriers_backfill_sparse_steps() -> None:
         recalled_example_count=4,
     )
     audit = AuditInfo(
-        semantic_sql="SELECT a", native_sql="SELECT b", executed_sql="SELECT b",
-        engine="wren", query_id=99, adapter="rest",
+        semantic_sql="SELECT a",
+        native_sql="SELECT b",
+        executed_sql="SELECT b",
+        engine="wren",
+        query_id=99,
+        adapter="rest",
     )
     timeline = build_agent_timeline(trace, wren_context=wren_context, audit=audit)
     by_kind = {step.kind: step for step in timeline}
@@ -264,9 +313,7 @@ def test_wren_context_without_retriever_items_has_no_chunks() -> None:
     detail = build_agent_timeline(trace)[0].detail
     assert detail.retrieved_chunks == []
     assert detail.available is False
-    assert detail.warnings == [
-        "Select a database schema before loading Wren context."
-    ]
+    assert detail.warnings == ["Select a database schema before loading Wren context."]
 
 
 def test_draft_surfaces_recalled_examples_bounded() -> None:
@@ -350,16 +397,26 @@ def test_artifact_id_matched_by_sql() -> None:
         wren_context = None
         audit = None
 
-    trace = [_event("execute_sql", "Executed SQL and returned 1 row(s).",
-                    sql="SELECT 1 FROM t;")]
+    trace = [
+        _event(
+            "execute_sql", "Executed SQL and returned 1 row(s).", sql="SELECT 1 FROM t;"
+        )
+    ]
     step = build_agent_timeline(trace, artifacts=[_Artifact()])[0]
     assert step.artifact_id == "art-1"
 
 
 def test_step_from_event_is_json_round_trippable() -> None:
-    event = _event("plan_semantic_sql", "Rewrote semantic SQL to native SQL.",
-                   engine="wren", rewritten=True, semantic_sql="SELECT 1",
-                   native_sql="SELECT 1", referenced_tables=["t"], warnings=[])
+    event = _event(
+        "plan_semantic_sql",
+        "Rewrote semantic SQL to native SQL.",
+        engine="wren",
+        rewritten=True,
+        semantic_sql="SELECT 1",
+        native_sql="SELECT 1",
+        referenced_tables=["t"],
+        warnings=[],
+    )
     step = step_from_event(event, attempt_index=2)
     payload = step.model_dump(mode="json")
     restored = AgentStep.model_validate(payload)

@@ -135,9 +135,7 @@ def _stats_note(comparison: PairedDelta | None) -> tuple[str, bool | None]:
 
 def _failures_payload(results: list[EvalResult]) -> list[dict[str, Any]]:
     interesting = [
-        r
-        for r in results
-        if r.effective_verdict in ("fail", "error", "needs_review")
+        r for r in results if r.effective_verdict in ("fail", "error", "needs_review")
     ]
     payload = []
     for result in interesting[:_MAX_FINDINGS_INPUT]:

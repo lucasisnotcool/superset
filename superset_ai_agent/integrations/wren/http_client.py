@@ -173,10 +173,7 @@ class WrenHttpClient:
             )
         data = _result(payload)
         proposed_content = str(
-            data.get("proposed_content")
-            or data.get("mdl")
-            or data.get("content")
-            or ""
+            data.get("proposed_content") or data.get("mdl") or data.get("content") or ""
         )
         validation = validate_mdl(proposed_content)
         warnings = data.get("warnings")
@@ -303,9 +300,7 @@ def _context_artifact(payload: dict[str, Any]) -> WrenContextArtifact:
     return WrenContextArtifact(
         enabled=True,
         available=bool(data.get("available", True)),
-        matched_models=[
-            str(item) for item in matched_models if isinstance(item, str)
-        ],
+        matched_models=[str(item) for item in matched_models if isinstance(item, str)],
         example_ids=[str(item) for item in example_ids if isinstance(item, str)],
         document_ids=[str(item) for item in document_ids if isinstance(item, str)],
         context_items=(

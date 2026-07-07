@@ -28,9 +28,12 @@ def test_expand_configs_is_eight():
     assert names[:2] == ["basic", "context_dump"]
     # 3 wren modes x 2 onboard
     expected_wren = {
-        "wren_base·manual", "wren_base·auto",
-        "wren_bi·manual", "wren_bi·auto",
-        "wren_bi_context·manual", "wren_bi_context·auto",
+        "wren_base·manual",
+        "wren_base·auto",
+        "wren_bi·manual",
+        "wren_bi·auto",
+        "wren_bi_context·manual",
+        "wren_bi_context·auto",
     }
     assert expected_wren.issubset(set(names))
     assert sum(1 for c in configs if c["onboard"] is None) == 2

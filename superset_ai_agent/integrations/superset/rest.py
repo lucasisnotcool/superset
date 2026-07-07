@@ -181,8 +181,7 @@ class SupersetRestClient:
             "((col:database,opr:rel_o_m,value:%s))" % database_id
             if schema_name is None
             else (
-                "((col:database,opr:rel_o_m,value:%s),"
-                "(col:schema,opr:eq,value:'%s'))"
+                "((col:database,opr:rel_o_m,value:%s),(col:schema,opr:eq,value:'%s'))"
             )
             % (database_id, schema_name.replace("'", "\\'"))
         )
@@ -230,6 +229,51 @@ class SupersetRestClient:
             "GET",
             f"/api/v1/dataset/{dataset_id}",
             params={"q": "(columns:!(%s))" % projection},
+        )
+
+    def list_tables_raw(
+        self,
+        *,
+        database_id: int,
+        schema_name: str,
+        catalog_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Return raw `GET /api/v1/database/{id}/tables/` payload for a schema.
+
+        Owner-scoped (``@protect`` + ``TablesDatabaseCommand``). Result items are
+        ``{value, type}`` where ``type`` is ``table``/``view``/``materialized_view``.
+        """
+
+        parts = ["schema_name:'%s'" % schema_name.replace("'", "\\'")]
+        if catalog_name:
+            parts.append("catalog_name:'%s'" % catalog_name.replace("'", "\\'"))
+        return self.request(
+            "GET",
+            f"/api/v1/database/{database_id}/tables/",
+            params={"q": "(%s)" % ",".join(parts)},
+        )
+
+    def get_table_metadata_raw(
+        self,
+        *,
+        database_id: int,
+        name: str,
+        schema_name: str,
+        catalog_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Return raw `GET /api/v1/database/{id}/table_metadata/` payload.
+
+        Owner-scoped: ``raise_for_access`` maps a denied table to 404 (hides
+        existence). ``columns`` items are ``{name, type, comment, ...}``.
+        """
+
+        params: dict[str, Any] = {"name": name, "schema": schema_name}
+        if catalog_name:
+            params["catalog"] = catalog_name
+        return self.request(
+            "GET",
+            f"/api/v1/database/{database_id}/table_metadata/",
+            params=params,
         )
 
     def execute_sql_raw(
@@ -357,6 +401,73 @@ class SupersetRestClient:
             if summary.id and _dataset_matches_scope(summary, schema_name=schema_name)
         ]
 
+    def introspect_schema(
+        self,
+        *,
+        database_id: int,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        limit: int = 100,
+        include_views: bool = True,
+    ) -> list[DatasetMetadata]:
+        """Introspect a schema's physical tables/views straight from the DB.
+
+        Lists tables via ``/tables/`` (bounded by ``limit``), then fetches each
+        table's columns via ``/table_metadata/``, returning synthetic
+        ``DatasetMetadata`` (negative, deterministic ids that never collide with
+        real dataset ids). Fail-soft per table and per schema: a table that
+        cannot be reflected is skipped rather than failing the whole scan, and a
+        schema that cannot be listed yields ``[]`` — so the caller degrades to an
+        empty catalog exactly as it did before, never worse.
+        """
+
+        if not schema_name:
+            return []
+        try:
+            tables_payload = self.list_tables_raw(
+                database_id=database_id,
+                schema_name=schema_name,
+                catalog_name=catalog_name,
+            )
+        except SupersetAdapterError:
+            return []
+        allowed = {"table"}
+        if include_views:
+            allowed |= {"view", "materialized_view"}
+        names: list[str] = []
+        for item in _items(tables_payload, "result"):
+            value = item.get("value")
+            if value and item.get("type") in allowed:
+                names.append(str(value))
+            if len(names) >= max(limit, 1):
+                break
+        datasets: list[DatasetMetadata] = []
+        for table_name in names:
+            try:
+                meta = self.get_table_metadata_raw(
+                    database_id=database_id,
+                    name=table_name,
+                    schema_name=schema_name,
+                    catalog_name=catalog_name,
+                )
+            except SupersetAdapterError:
+                continue
+            columns = _normalize_introspected_columns(meta.get("columns"))
+            if not columns:
+                continue
+            datasets.append(
+                DatasetMetadata(
+                    id=_synthetic_dataset_id(schema_name, table_name),
+                    table_name=table_name,
+                    schema_name=schema_name,
+                    database_id=database_id,
+                    description=meta.get("comment"),
+                    columns=columns,
+                    metrics=[],
+                )
+            )
+        return datasets
+
     def get_agent_context(
         self,
         *,
@@ -436,9 +547,7 @@ class SupersetRestClient:
     def create_semantic_layer(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Create a Superset semantic layer through REST."""
 
-        return _result(
-            self.request("POST", "/api/v1/semantic_layer/", json=payload)
-        )
+        return _result(self.request("POST", "/api/v1/semantic_layer/", json=payload))
 
     def update_semantic_layer(
         self,
@@ -615,9 +724,7 @@ def _normalize_database_identity(payload: dict[str, Any]) -> DatabaseIdentity:
         uri_fingerprint=str(data.get("uri_fingerprint") or ""),
         catalog_name=data.get("catalog") or data.get("catalog_name"),
         schema_names=(
-            [str(schema) for schema in schemas]
-            if isinstance(schemas, list)
-            else []
+            [str(schema) for schema in schemas] if isinstance(schemas, list) else []
         ),
     )
 
@@ -664,6 +771,43 @@ def _normalize_column(data: dict[str, Any]) -> ColumnSummary:
         is_dttm=bool(data.get("is_dttm") or False),
         description=data.get("description"),
     )
+
+
+def _synthetic_dataset_id(schema_name: str | None, table_name: str) -> int:
+    """A stable, negative id for a live-introspected table (no dataset row).
+
+    Real Superset dataset ids are positive and 0 is the "unknown" sentinel, so a
+    negative deterministic hash never collides with them — keeping the id-based
+    dedup in the schema-index / permission paths correct across schemas and
+    cache reuse.
+    """
+
+    key = f"{(schema_name or '').lower()}.{table_name.lower()}"
+    digest = int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:12], 16)
+    return -(digest + 1)
+
+
+def _normalize_introspected_columns(raw: Any) -> list[ColumnSummary]:
+    """Map ``/table_metadata/`` columns (``{name, type, comment}``) to ColumnSummary."""
+
+    if not isinstance(raw, list):
+        return []
+    columns: list[ColumnSummary] = []
+    for column in raw:
+        if not isinstance(column, dict):
+            continue
+        name = column.get("name") or column.get("column_name")
+        if not name:
+            continue
+        columns.append(
+            ColumnSummary(
+                name=str(name),
+                type=column.get("type") or column.get("longType"),
+                is_dttm=bool(column.get("is_dttm") or False),
+                description=column.get("comment") or column.get("description"),
+            )
+        )
+    return sorted(columns, key=lambda column: column.name)
 
 
 def _normalize_metric(data: dict[str, Any]) -> MetricSummary:
@@ -812,7 +956,9 @@ def _with_request_audit(
                     "tab": audit.tab or payload.get("tab"),
                     "source_hash": audit.source_hash
                     or (marker.source_hash if marker else None),
-                    "source": marker.source if marker and marker.source else audit.source,
+                    "source": marker.source
+                    if marker and marker.source
+                    else audit.source,
                 }
             )
         }

@@ -118,9 +118,7 @@ def test_resolver_errors_degrade_to_file_default() -> None:
         raise RuntimeError("db down")
 
     registry.set_prompt_resolver(broken)
-    assert registry.get_prompt("text_to_sql") == registry.get_file_prompt(
-        "text_to_sql"
-    )
+    assert registry.get_prompt("text_to_sql") == registry.get_file_prompt("text_to_sql")
 
 
 def test_file_prompt_names_include_known_prompts() -> None:
@@ -203,9 +201,7 @@ def test_candidate_promote_resolve_and_reset_flow() -> None:
     assert version["version"] == 1
 
     # A candidate alone does NOT change what the runtime serves.
-    assert registry.get_prompt("text_to_sql") == registry.get_file_prompt(
-        "text_to_sql"
-    )
+    assert registry.get_prompt("text_to_sql") == registry.get_file_prompt("text_to_sql")
 
     promoted = client.post(
         "/agent/admin/prompts/text_to_sql/promote",
@@ -220,9 +216,7 @@ def test_candidate_promote_resolve_and_reset_flow() -> None:
 
     reset = client.delete("/agent/admin/prompts/text_to_sql/promotion")
     assert reset.json() == {"reset": True}
-    assert registry.get_prompt("text_to_sql") == registry.get_file_prompt(
-        "text_to_sql"
-    )
+    assert registry.get_prompt("text_to_sql") == registry.get_file_prompt("text_to_sql")
 
 
 def test_unknown_prompt_name_is_404() -> None:

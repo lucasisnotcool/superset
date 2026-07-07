@@ -294,8 +294,7 @@ def test_dry_run_gold_sql_previews_rows(tmp_path) -> None:
     item_id = add_gold_item(client, pid, bid)
 
     response = client.post(
-        f"/agent/semantic-layer/projects/{pid}/benchmarks/{bid}"
-        f"/items/{item_id}/dry-run"
+        f"/agent/semantic-layer/projects/{pid}/benchmarks/{bid}/items/{item_id}/dry-run"
     )
     assert response.status_code == 200, response.text
     body = response.json()
@@ -310,8 +309,7 @@ def test_dry_run_surfaces_gold_sql_errors_as_400(tmp_path) -> None:
     item_id = add_gold_item(client, pid, bid)
 
     response = client.post(
-        f"/agent/semantic-layer/projects/{pid}/benchmarks/{bid}"
-        f"/items/{item_id}/dry-run"
+        f"/agent/semantic-layer/projects/{pid}/benchmarks/{bid}/items/{item_id}/dry-run"
     )
     assert response.status_code == 400
     assert "failed to execute" in response.json()["detail"]
@@ -331,8 +329,7 @@ def test_dry_run_expected_values_echoes_spec(tmp_path) -> None:
     )
     item_id = created.json()["id"]
     response = client.post(
-        f"/agent/semantic-layer/projects/{pid}/benchmarks/{bid}"
-        f"/items/{item_id}/dry-run"
+        f"/agent/semantic-layer/projects/{pid}/benchmarks/{bid}/items/{item_id}/dry-run"
     )
     assert response.status_code == 200
     assert response.json()["spec"] == {"nums": [42]}

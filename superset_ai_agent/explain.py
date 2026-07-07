@@ -36,12 +36,17 @@ from superset_ai_agent.schemas import (
     AgentStep,
     AuditInfo,
     BuildArtifactsDetail,
+    CandidateSelectionDetail,
+    DimensionValueHint,
+    DimensionValuesDetail,
+    DocumentPassage,
     DRAFT_STEP_KINDS,
     DraftDetail,
     DryPlanDetail,
     ExecuteSqlDetail,
     IntentDetail,
     LoadContextDetail,
+    LoadDocumentContextDetail,
     LoadWrenContextDetail,
     PlanSemanticSqlDetail,
     RecalledExample,
@@ -210,6 +215,74 @@ def _detail_draft(event: TraceEvent, wren_context: Any, _audit: Any) -> Any:
     )
 
 
+def _detail_document_context(event: TraceEvent, _wc: Any, _audit: Any) -> Any:
+    details = event.details or {}
+    passages: list[DocumentPassage] = []
+    for raw in details.get("passages") or []:
+        if not isinstance(raw, dict):
+            continue
+        text = raw.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        if len(text) > _CHUNK_TEXT_LIMIT:
+            text = text[:_CHUNK_TEXT_LIMIT].rstrip() + "…"
+        passages.append(
+            DocumentPassage(
+                document_id=raw.get("document_id"),
+                filename=raw.get("filename"),
+                chunk_index=raw.get("chunk_index"),
+                text=text,
+            )
+        )
+    return LoadDocumentContextDetail(
+        available=bool(details.get("available", False)),
+        document_count=int(details.get("document_count", 0) or 0),
+        passage_count=int(details.get("passage_count", 0) or 0),
+        retriever=details.get("retriever"),
+        truncated=bool(details.get("truncated", False)),
+        passages=passages,
+        warnings=_str_list(details.get("warnings")),
+    )
+
+
+def _detail_dimension_values(event: TraceEvent, _wc: Any, _audit: Any) -> Any:
+    details = event.details or {}
+    hints: list[DimensionValueHint] = []
+    for raw in details.get("hints") or []:
+        if not isinstance(raw, dict) or not raw.get("literal"):
+            continue
+        hints.append(
+            DimensionValueHint(
+                literal=str(raw.get("literal")),
+                table=raw.get("table"),
+                column=raw.get("column"),
+                values=[str(v) for v in (raw.get("values") or [])],
+            )
+        )
+    return DimensionValuesDetail(hints=hints)
+
+
+def _detail_candidate_selection(event: TraceEvent, _wc: Any, _audit: Any) -> Any:
+    details = event.details or {}
+
+    def _sql(key: str) -> str | None:
+        value = details.get(key)
+        if not isinstance(value, str) or not value.strip():
+            return None
+        if len(value) > _EXAMPLE_SQL_LIMIT:
+            return value[:_EXAMPLE_SQL_LIMIT].rstrip() + "…"
+        return value
+
+    return CandidateSelectionDetail(
+        chosen=details.get("chosen"),
+        reason=details.get("reason"),
+        semantic_sql=_sql("semantic_sql"),
+        raw_sql=_sql("raw_sql"),
+        semantic_valid=bool(details.get("semantic_valid", False)),
+        raw_valid=bool(details.get("raw_valid", False)),
+    )
+
+
 def _detail_dry_plan(event: TraceEvent, _wc: Any, _audit: Any) -> Any:
     details = event.details or {}
     return DryPlanDetail(
@@ -260,6 +333,9 @@ _DETAIL_HANDLERS = {
     "load_context": lambda e, wc, _a: _load_context_detail(e, e.details or {}, wc),
     "classify_intent": _detail_intent,
     "load_wren_context": lambda e, wc, _a: _wren_context_detail(e.details or {}, wc),
+    "load_document_context": _detail_document_context,
+    "probe_dimension_values": _detail_dimension_values,
+    "select_sql_candidate": _detail_candidate_selection,
     "draft_sql": _detail_draft,
     "draft_response": _detail_draft,
     "approved_sql": _detail_draft,

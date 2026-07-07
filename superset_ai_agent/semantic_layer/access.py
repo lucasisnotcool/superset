@@ -266,9 +266,7 @@ class SemanticAccessService:
         )
         projects = self.project_store.list(
             owner_id=identity.owner_id,
-            database_id=(
-                None if database_identity is not None else scope.database_id
-            ),
+            database_id=(None if database_identity is not None else scope.database_id),
             database_uri_fingerprint=(
                 database_identity.uri_fingerprint
                 if database_identity is not None
@@ -456,8 +454,4 @@ def has_permission(
 def _access_level_from_context(context: AgentContext | None) -> SemanticAccessLevel:
     if context is None:
         return SemanticAccessLevel.PARTIAL
-    return (
-        SemanticAccessLevel.FULL
-        if context.datasets
-        else SemanticAccessLevel.PARTIAL
-    )
+    return SemanticAccessLevel.FULL if context.datasets else SemanticAccessLevel.PARTIAL

@@ -36,6 +36,7 @@ from superset_ai_agent.integrations.superset.client import AgentContext, Superse
 from superset_ai_agent.integrations.wren.client import DisabledWrenClient, WrenClient
 from superset_ai_agent.llm.base import ChatMessage, ModelClient
 from superset_ai_agent.llm.embeddings import create_embedder
+from superset_ai_agent.llm.rerank import llm_rerank
 from superset_ai_agent.prompts.registry import get_prompt
 from superset_ai_agent.schemas import (
     AgentQueryRequest,
@@ -49,6 +50,14 @@ from superset_ai_agent.schemas import (
     TraceEvent,
     WrenContextArtifact,
     WrenRetrievalArtifact,
+)
+from superset_ai_agent.semantic_layer.dimension_values import (
+    extract_quoted_literals,
+    probe_dimension_values,
+)
+from superset_ai_agent.semantic_layer.document_retriever import (
+    DocumentChunkIndex,
+    retrieve_document_context,
 )
 from superset_ai_agent.semantic_layer.engine import (
     create_semantic_engine,
@@ -94,6 +103,7 @@ from superset_ai_agent.semantic_layer.schemas import (
 )
 from superset_ai_agent.semantic_layer.store import (
     scope_hashes,
+    SemanticLayerStore,
 )
 from superset_ai_agent.semantic_layer.wren_runtime import (
     materialize_request_semantic_project,
@@ -195,6 +205,66 @@ def llm_select_models(
     return ordered or None
 
 
+_CANDIDATE_SELECTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "choice": {"type": "string", "enum": ["a", "b"]},
+        "reason": {"type": "string"},
+    },
+    "required": ["choice"],
+}
+
+
+def llm_select_candidate(
+    model_client: ModelClient,
+    question: str,
+    sql_a: str,
+    sql_b: str,
+    context_items: list[dict[str, Any]] | None = None,
+) -> tuple[str, str]:
+    """Pairwise LLM judgment between two SQL candidates (C3).
+
+    Returns ``(choice, reason)`` with ``choice`` in ``{"a", "b"}``. Degrades
+    closed to the semantic candidate (``"a"``) on a missing prompt, provider
+    error, or malformed output — the semantic layer encodes curated meaning,
+    so it is the safe default.
+    """
+
+    fallback = ("a", "Judge unavailable; kept the semantic-layer candidate.")
+    try:
+        prompt = get_prompt("candidate_selection")
+    except OSError:
+        return fallback
+    payload = {
+        "question": question,
+        "candidate_a": sql_a,
+        "candidate_b": sql_b,
+        "context": (context_items or [])[:10],
+    }
+    try:
+        result = model_client.chat(
+            [
+                ChatMessage(role="system", content=prompt),
+                ChatMessage(
+                    role="user",
+                    content=(
+                        "Pick the better candidate. Return only JSON matching "
+                        f"the schema.\n{json.dumps(payload, default=str)}"
+                    ),
+                ),
+            ],
+            format_schema=_CANDIDATE_SELECTION_SCHEMA,
+        )
+        data = json.loads(result.content)
+    except Exception:  # pylint: disable=broad-except - degrade to semantic
+        return fallback
+    choice = data.get("choice") if isinstance(data, dict) else None
+    if choice not in ("a", "b"):
+        return fallback
+    reason = data.get("reason")
+    return choice, reason if isinstance(reason, str) and reason.strip() else ""
+
+
 def dry_plan_diagnostics(dry_plan: dict[str, Any] | None) -> list[str]:
     """Actionable engine diagnostics from a Wren dry-plan, for repair (C2.2).
 
@@ -254,6 +324,8 @@ class AgentState(TypedDict, total=False):
     recommended_followups: list[str]
     wren_context: WrenContextArtifact | None
     wren_retrieval: WrenRetrievalArtifact | None
+    document_context: dict[str, Any] | None
+    dimension_values: list[dict[str, Any]]
     wren_materialization: WrenMaterializationResult | None
     wren_mdl_path: str | None
     recall_access: RecallAccess | None
@@ -287,6 +359,8 @@ class TextToSqlGraph:
         memory: Memory | None = None,
         retriever: Retriever | None = None,
         instruction_store: InstructionStore | None = None,
+        semantic_layer_store: SemanticLayerStore | None = None,
+        document_index: DocumentChunkIndex | None = None,
     ):
         self.config = config
         self.model_client = model_client
@@ -299,6 +373,10 @@ class TextToSqlGraph:
         self.memory = memory or NullMemory()
         self.retriever = retriever or create_retriever(config, create_embedder(config))
         self.instruction_store = instruction_store or NullInstructionStore()
+        # Doc-RAG channel (A1): both optional so the channel is inert (and the
+        # graph unchanged) for callers that don't carry a document corpus.
+        self.semantic_layer_store = semantic_layer_store
+        self.document_index = document_index
         self.graph = self._compile_graph()
 
     def _with_inferred_schema(
@@ -353,6 +431,8 @@ class TextToSqlGraph:
             "recommended_followups": [],
             "wren_context": None,
             "wren_retrieval": None,
+            "document_context": None,
+            "dimension_values": [],
             "wren_materialization": None,
             "wren_mdl_path": None,
             "error": None,
@@ -405,6 +485,8 @@ class TextToSqlGraph:
         graph = StateGraph(AgentState)
         graph.add_node("load_context", self._load_context)
         graph.add_node("load_wren_context", self._load_wren_context)
+        graph.add_node("load_document_context", self._load_document_context)
+        graph.add_node("probe_dimension_values", self._probe_dimension_values)
         graph.add_node("draft_sql", self._draft_sql)
         graph.add_node("dry_plan_with_wren", self._dry_plan_with_wren)
         graph.add_node("plan_semantic_sql", self._plan_semantic_sql)
@@ -416,7 +498,9 @@ class TextToSqlGraph:
 
         graph.set_entry_point("load_context")
         graph.add_edge("load_context", "load_wren_context")
-        graph.add_edge("load_wren_context", "draft_sql")
+        graph.add_edge("load_wren_context", "load_document_context")
+        graph.add_edge("load_document_context", "probe_dimension_values")
+        graph.add_edge("probe_dimension_values", "draft_sql")
         graph.add_edge("draft_sql", "dry_plan_with_wren")
         graph.add_edge("dry_plan_with_wren", "plan_semantic_sql")
         graph.add_edge("plan_semantic_sql", "validate_sql")
@@ -573,6 +657,9 @@ class TextToSqlGraph:
             model_selector=self._model_selector(request.question),
             manifest_items=manifest_items,
             join_closure_limit=self.config.wren_join_closure_limit,
+            # B4 size gate: a small project's full manifest is dumped whole —
+            # below the collapse zone, pruning risks recall for no gain.
+            dump_threshold_chars=self.config.wren_context_dump_char_threshold,
         )
         retrieval_artifact = state.get("wren_retrieval")
         if retrieval_artifact is not None and project_id is not None:
@@ -604,6 +691,129 @@ class TextToSqlGraph:
                 ),
             ],
         }
+
+    def _load_document_context(self, state: AgentState) -> AgentState:
+        """Retrieve uploaded-document passages for the question (doc RAG, A1).
+
+        Advisory grounding: eval v4 measured the raw BI document worth ~+12/30
+        over the bare semantic layer, so relevant passages are retrieved
+        (budgeted) into the prompt. Structurally inert — no trace noise — when
+        the channel is off or this deployment carries no document corpus; a
+        trace event is emitted whenever the channel actually ran, including
+        the zero-passage case, so the explain UI shows what grounded (or
+        didn't ground) the draft.
+        """
+
+        request = state["request"]
+        # Only the access-checked resolution from load_wren_context — never the
+        # raw request pin, so an inaccessible project's documents cannot ground
+        # a draft (the materialize path re-checks access + schema coverage).
+        project_id = getattr(state.get("wren_context"), "project_id", None)
+        if (
+            not self.config.wren_sql_doc_context_enabled
+            or self.semantic_layer_store is None
+            or self.document_index is None
+            or project_id is None
+        ):
+            return {**state, "document_context": None}
+        document_context = retrieve_document_context(
+            question=request.question,
+            project_id=project_id,
+            owner_id=state.get("owner_id", DEFAULT_OWNER_ID),
+            store=self.semantic_layer_store,
+            index=self.document_index,
+            k=self.config.wren_sql_doc_retrieve_k,
+            max_chars=self.config.wren_sql_doc_context_max_chars,
+            reranker=self._doc_reranker(),
+        )
+        wren_context = state.get("wren_context")
+        if document_context and wren_context is not None:
+            wren_context = wren_context.model_copy(
+                update={"document_ids": document_context["document_ids"]}
+            )
+        passages = (document_context or {}).get("passages") or []
+        document_ids = (document_context or {}).get("document_ids") or []
+        details = {
+            "available": bool(passages),
+            "document_count": len(document_ids),
+            "passage_count": len(passages),
+            "retriever": (document_context or {}).get("retriever"),
+            "truncated": bool((document_context or {}).get("truncated", False)),
+            "passages": passages,
+        }
+        return {
+            **state,
+            "document_context": document_context,
+            "wren_context": wren_context,
+            "trace": [
+                *state.get("trace", []),
+                TraceEvent(
+                    step="load_document_context",
+                    summary=(
+                        f"Retrieved {len(passages)} passage(s) from "
+                        f"{len(document_ids)} uploaded document(s)."
+                        if passages
+                        else "No relevant uploaded-document passages."
+                    ),
+                    details=details,
+                ),
+            ],
+        }
+
+    def _probe_dimension_values(self, state: AgentState) -> AgentState:
+        """Probe stored values for the question's quoted literals (C2, gated).
+
+        Inert (no trace noise) when the flag is off or the question quotes no
+        literal; when it fires, the hints and probe activity are traced so the
+        explain UI shows what value evidence grounded the draft.
+        """
+
+        request = state["request"]
+        if not self.config.wren_dimension_value_probe_enabled:
+            return {**state, "dimension_values": []}
+        if not extract_quoted_literals(request.question):
+            return {**state, "dimension_values": []}
+        context = state["context"]
+        hints = probe_dimension_values(
+            question=request.question,
+            datasets=context.datasets,
+            superset_client=self.superset_client,
+            database_id=request.database_id,
+            catalog_name=request.catalog_name,
+            schema_name=request.schema_name,
+            max_queries=self.config.wren_dimension_value_probe_max_queries,
+        )
+        return {
+            **state,
+            "dimension_values": hints,
+            "trace": [
+                *state.get("trace", []),
+                TraceEvent(
+                    step="probe_dimension_values",
+                    summary=(
+                        f"Matched stored values for {len(hints)} quoted literal(s)."
+                        if hints
+                        else "No stored values matched the quoted literal(s)."
+                    ),
+                    details={"hints": hints},
+                ),
+            ],
+        }
+
+    def _doc_reranker(self):
+        """Build the B3 LLM reranker for doc-context candidates when enabled.
+
+        ``None`` (the default) keeps the first-stage hybrid/keyword order —
+        reranking adds one model call per query, so it is opt-in.
+        """
+
+        if not self.config.wren_rerank_enabled:
+            return None
+
+        def reranker(question: str, texts: list[str], k: int) -> list[int] | None:
+            return llm_rerank(self.model_client, question, texts, k)
+
+        return reranker
 
     def _recall_access(
         self, request: AgentQueryRequest, project: SemanticProject | None
@@ -790,7 +1000,34 @@ class TextToSqlGraph:
             validation_errors=[],
             recalled_examples=recalled,
             instructions=instructions,
+            document_context=state.get("document_context"),
+            dimension_values=state.get("dimension_values", []),
         )
+        # C3 (gated): also draft a raw-schema candidate and let a pairwise
+        # judge pick — candidate diversity + selection beats retry-on-error by
+        # ablation. Fires only when semantic context actually differentiates
+        # the two candidates.
+        selection_event: TraceEvent | None = None
+        wren_ctx = state.get("wren_context")
+        if (
+            self.config.wren_dual_candidate_enabled
+            and wren_ctx is not None
+            and wren_ctx.available
+            and wren_ctx.context_items
+        ):
+            raw_draft = self._call_sql_model(
+                request=request,
+                context=context,
+                wren_context=None,
+                validation_errors=[],
+                recalled_examples=recalled,
+                instructions=instructions,
+                document_context=state.get("document_context"),
+                dimension_values=state.get("dimension_values", []),
+            )
+            draft, selection_event = self._select_candidate(
+                request, semantic=draft, raw=raw_draft
+            )
         # Stamp how many learned examples were recalled so the UI can badge it.
         wren_context = state.get("wren_context")
         if wren_context is not None:
@@ -814,8 +1051,68 @@ class TextToSqlGraph:
                         "recalled_examples": compact_recalled_examples(recalled),
                     },
                 ),
+                *([selection_event] if selection_event is not None else []),
             ],
         }
+
+    def _select_candidate(
+        self,
+        request: AgentQueryRequest,
+        *,
+        semantic: SqlDraft,
+        raw: SqlDraft,
+    ) -> tuple[SqlDraft, TraceEvent]:
+        """Pick between the semantic and raw-schema drafts (C3).
+
+        Cheap validity check first (an invalid candidate never wins); a
+        pairwise LLM judge breaks the both-valid case, preferring the semantic
+        candidate on any failure. The decision is traced for the explain UI.
+        """
+
+        dialect = self.superset_client.get_database_dialect(request.database_id)
+
+        def _valid(draft: SqlDraft) -> bool:
+            if not (draft.sql or "").strip():
+                return False
+            return validate_read_only_sql(
+                draft.sql,
+                dialect=dialect,
+                default_limit=self.config.default_sql_limit,
+                policy_mode=self.config.sql_policy_mode,
+            ).is_valid
+
+        semantic_valid, raw_valid = _valid(semantic), _valid(raw)
+        if semantic_valid and not raw_valid:
+            choice, reason = "a", "Only the semantic-layer candidate validated."
+        elif raw_valid and not semantic_valid:
+            choice, reason = "b", "Only the raw-schema candidate validated."
+        elif not semantic_valid and not raw_valid:
+            choice, reason = "a", "Neither validated; kept the semantic candidate."
+        else:
+            choice, reason = llm_select_candidate(
+                self.model_client,
+                request.question,
+                semantic.sql,
+                raw.sql,
+            )
+        chosen = semantic if choice == "a" else raw
+        event = TraceEvent(
+            step="select_sql_candidate",
+            summary=(
+                "Selected the semantic-layer SQL candidate."
+                if choice == "a"
+                else "Selected the raw-schema SQL candidate."
+            ),
+            details={
+                "chosen": "semantic" if choice == "a" else "raw",
+                "reason": reason,
+                "semantic_sql": semantic.sql,
+                "raw_sql": raw.sql,
+                "semantic_valid": semantic_valid,
+                "raw_valid": raw_valid,
+            },
+        )
+        return chosen, event
 
     def _dry_plan_with_wren(self, state: AgentState) -> AgentState:
         if not self.config.wren_dry_plan_enabled:
@@ -968,6 +1265,8 @@ class TextToSqlGraph:
             validation_errors=repair_errors,
             recalled_examples=state.get("recalled_examples", []),
             instructions=state.get("instructions", []),
+            document_context=state.get("document_context"),
+            dimension_values=state.get("dimension_values", []),
         )
         return {
             **state,
@@ -1140,6 +1439,8 @@ class TextToSqlGraph:
             validation_errors=warnings,
             recalled_examples=state.get("recalled_examples", []),
             instructions=state.get("instructions", []),
+            document_context=state.get("document_context"),
+            dimension_values=state.get("dimension_values", []),
         )
         return {
             **state,
@@ -1169,6 +1470,8 @@ class TextToSqlGraph:
         validation_errors: list[str],
         recalled_examples: list[dict[str, Any]] | None = None,
         instructions: list[str] | None = None,
+        document_context: dict[str, Any] | None = None,
+        dimension_values: list[dict[str, Any]] | None = None,
     ) -> SqlDraft:
         prompt = get_prompt("text_to_sql")
         # Authoring-guidance flag (factors 1-2 only). Centralized in the engine
@@ -1193,6 +1496,13 @@ class TextToSqlGraph:
             "recalled_examples": recalled_examples or [],
             # User-authored guidance (Wren `instructions`) steers generation.
             "instructions": instructions or [],
+            # Advisory business context retrieved from uploaded BI documents
+            # (doc RAG, A1). The prompt's trust ladder ranks it below the
+            # semantic layer; it never authorizes new tables/columns.
+            "document_context": document_context,
+            # Stored-value evidence for quoted literals (C2): the exact
+            # dimension values found in the data for the question's strings.
+            "dimension_values": dimension_values or [],
         }
         schema = SqlDraft.model_json_schema()
         result = self.model_client.chat(

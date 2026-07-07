@@ -159,9 +159,7 @@ def test_dedup_is_project_scoped_across_users() -> None:
     store = _store()
     first = store.save_document(_doc("proj-1", "same-hash", "a.txt"), owner_id="user-a")
     # User B looks up by the same checksum in the same project → finds A's document.
-    found = store.find_document_by_checksum(
-        "proj-1", "same-hash", owner_id="user-b"
-    )
+    found = store.find_document_by_checksum("proj-1", "same-hash", owner_id="user-b")
     assert found is not None
     assert found.id == first.id
 

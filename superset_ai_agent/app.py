@@ -169,6 +169,10 @@ from superset_ai_agent.semantic_layer.access import (
     SemanticAccessService,
     SemanticPermission,
 )
+from superset_ai_agent.semantic_layer.consistency import (
+    ConsistencyReport,
+    lint_project_consistency,
+)
 from superset_ai_agent.semantic_layer.copilot.coverage import (
     CoverageCancelledError,
     CoverageDocument,
@@ -552,6 +556,10 @@ def create_app(  # noqa: C901
             memory=active_memory,
             retriever=active_retriever,
             instruction_store=active_instruction_store,
+            # Doc-RAG channel (A1): the SQL agent retrieves the resolved
+            # project's uploaded-document passages as advisory context.
+            semantic_layer_store=active_semantic_layer_store,
+            document_index=active_document_index,
         )
         service_conversation_graph = conversation_graph or ConversationGraph(
             config=app_config,
@@ -564,6 +572,9 @@ def create_app(  # noqa: C901
             mdl_file_store=active_mdl_file_store,
             memory=active_memory,
             retriever=active_retriever,
+            instruction_store=active_instruction_store,
+            semantic_layer_store=active_semantic_layer_store,
+            document_index=active_document_index,
         )
 
     api = FastAPI(title=app_config.app_name, version="0.1.0")
@@ -630,6 +641,8 @@ def create_app(  # noqa: C901
             memory=active_memory,
             retriever=active_retriever,
             instruction_store=active_instruction_store,
+            semantic_layer_store=active_semantic_layer_store,
+            document_index=active_document_index,
         )
 
     def build_conversation_graph(request: Request) -> Any:
@@ -654,6 +667,8 @@ def create_app(  # noqa: C901
             # Identical-behavior parity (D1b): the Copilot recalls the same
             # DB-tied instruction set the AI SQL agent does.
             instruction_store=active_instruction_store,
+            semantic_layer_store=active_semantic_layer_store,
+            document_index=active_document_index,
         )
 
     # Authorization derives a project's read/write level from the caller's *live*
@@ -924,9 +939,7 @@ def create_app(  # noqa: C901
             versions=versions,
         )
 
-    @api.post(
-        "/agent/admin/prompts/{name}/versions", response_model=PromptVersion
-    )
+    @api.post("/agent/admin/prompts/{name}/versions", response_model=PromptVersion)
     def create_prompt_version(
         name: str,
         body: PromptVersionCreateRequest,
@@ -1552,6 +1565,46 @@ def create_app(  # noqa: C901
         )
         return active_mdl_file_store.list(project_id, owner_id=identity.owner_id)
 
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}/consistency",
+        response_model=ConsistencyReport,
+    )
+    def project_consistency(
+        project_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> ConsistencyReport:
+        """Curation-time consistency lint across the project's grounding artifacts.
+
+        Deterministic, read-only (C4, plan_sql_agent_doc_grounding_spec.md):
+        stale golden-query references, conflicting golden duplicates,
+        cross-file metric conflicts, and instructions naming unknown
+        identifiers. Runtime never arbitrates these — the curator does.
+        """
+
+        project = authorize_semantic_project(
+            fastapi_request,
+            project_id,
+            owner_id=identity.owner_id,
+            permission="read",
+        )
+        active_files = [
+            file
+            for file in active_mdl_file_store.list(
+                project_id, owner_id=identity.owner_id
+            )
+            if file.status == "active" and file.deleted_at is None
+        ]
+        instructions = [
+            view.instruction
+            for view in _project_instruction_views(project, identity.owner_id)
+        ]
+        return lint_project_consistency(
+            project_id=project_id,
+            files=active_files,
+            instructions=instructions,
+        )
+
     def _emit_mdl_provenance(
         *,
         project: SemanticProject,
@@ -2092,9 +2145,7 @@ def create_app(  # noqa: C901
         # Pass 1 — coverage (gated by auto-coverage; recovery back-fill suppressed).
         if app_config.wren_coverage_auto_enabled:
             try:
-                projects = active_semantic_project_store.list(
-                    owner_id=DEFAULT_OWNER_ID
-                )
+                projects = active_semantic_project_store.list(owner_id=DEFAULT_OWNER_ID)
             except Exception:  # pylint: disable=broad-except
                 projects = []
                 logger.warning(
@@ -3886,9 +3937,7 @@ def create_app(  # noqa: C901
         try:
             benchmark = active_eval_store.get_benchmark(benchmark_id)
         except BenchmarkNotFoundError as ex:
-            raise HTTPException(
-                status_code=404, detail="Benchmark not found."
-            ) from ex
+            raise HTTPException(status_code=404, detail="Benchmark not found.") from ex
         if benchmark.project_id != project_id:
             raise HTTPException(status_code=404, detail="Benchmark not found.")
         return benchmark
@@ -4007,9 +4056,7 @@ def create_app(  # noqa: C901
             benchmark_id, name=request.name, description=request.description
         )
 
-    @api.delete(
-        "/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}"
-    )
+    @api.delete("/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}")
     def delete_benchmark(
         project_id: str,
         benchmark_id: str,
@@ -4363,9 +4410,7 @@ def create_app(  # noqa: C901
                                 execute=True,
                                 model=model,
                                 exclude_example_questions=(
-                                    [item.question]
-                                    if exclude_example_recall
-                                    else None
+                                    [item.question] if exclude_example_recall else None
                                 ),
                             ),
                             owner_id=owner_id,
@@ -4393,7 +4438,9 @@ def create_app(  # noqa: C901
                         reasons = [f"Run step failed: {ex}"]
                         scores = [
                             EvalScore(
-                                name="ex", value=0.0, label="error",
+                                name="ex",
+                                value=0.0,
+                                label="error",
                                 explanation=str(ex),
                             )
                         ]
@@ -4508,9 +4555,7 @@ def create_app(  # noqa: C901
             trials=trials,
             passed=sum(1 for v in item_verdicts.values() if v == "pass"),
             failed=sum(1 for v in item_verdicts.values() if v == "fail"),
-            needs_review=sum(
-                1 for v in item_verdicts.values() if v == "needs_review"
-            ),
+            needs_review=sum(1 for v in item_verdicts.values() if v == "needs_review"),
             errors=sum(1 for v in item_verdicts.values() if v == "error"),
             pass_hat_k=pass_hat_k(verdicts_by_item) if trials > 1 else None,
             by_capability=by_capability or None,
@@ -4539,9 +4584,10 @@ def create_app(  # noqa: C901
             logger.debug("Benchmark completion event failed.", exc_info=True)
 
         # Scientist v3 (flag-gated): auto-analyze completed runs with failures.
-        if app_config.wren_benchmark_auto_analyze_enabled and (
-            totals.failed + totals.errors + totals.needs_review
-        ) > 0:
+        if (
+            app_config.wren_benchmark_auto_analyze_enabled
+            and (totals.failed + totals.errors + totals.needs_review) > 0
+        ):
             active_job_runner.submit(
                 functools.partial(
                     _auto_analyze_benchmark_run, run_id, project, owner_id
@@ -4549,8 +4595,7 @@ def create_app(  # noqa: C901
             )
 
     @api.post(
-        "/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}"
-        "/runs",
+        "/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}/runs",
         response_model=BenchmarkRunSubmitted,
         status_code=202,
     )
@@ -4725,8 +4770,7 @@ def create_app(  # noqa: C901
         )
 
     @api.get(
-        "/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}"
-        "/runs",
+        "/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}/runs",
         response_model=list[EvalRun],
     )
     def list_benchmark_runs(
@@ -4742,9 +4786,7 @@ def create_app(  # noqa: C901
         _get_project_benchmark(project_id, benchmark_id)
         return active_eval_store.list_runs(benchmark_id)
 
-    def _get_benchmark_run(
-        project_id: str, benchmark_id: str, run_id: str
-    ) -> EvalRun:
+    def _get_benchmark_run(project_id: str, benchmark_id: str, run_id: str) -> EvalRun:
         try:
             run = active_eval_store.get_run(run_id)
         except EvalRunNotFoundError as ex:
@@ -4883,9 +4925,7 @@ def create_app(  # noqa: C901
             by_capability: dict[str, dict[str, int]] = {}
             for item_id, verdict_value in item_verdicts.items():
                 for tag in tags_by_item.get(item_id, []):
-                    bucket = by_capability.setdefault(
-                        tag, {"items": 0, "passed": 0}
-                    )
+                    bucket = by_capability.setdefault(tag, {"items": 0, "passed": 0})
                     bucket["items"] += 1
                     if verdict_value == "pass":
                         bucket["passed"] += 1
@@ -5004,9 +5044,7 @@ def create_app(  # noqa: C901
                 status_code=409, detail="Only completed runs can be handed off."
             )
         results = active_eval_store.list_results(run_id)
-        failures = [
-            r for r in results if r.effective_verdict in ("fail", "error")
-        ]
+        failures = [r for r in results if r.effective_verdict in ("fail", "error")]
         if not failures:
             raise HTTPException(
                 status_code=400,
@@ -5178,9 +5216,7 @@ def create_app(  # noqa: C901
             fastapi_request, project_id, owner_id=identity.owner_id
         )
         run = _get_benchmark_run(project_id, benchmark_id, run_id)
-        events = run_to_evaluation_events(
-            run, active_eval_store.list_results(run_id)
-        )
+        events = run_to_evaluation_events(run, active_eval_store.list_results(run_id))
         return {"events": events, "count": len(events)}
 
     @api.post(
@@ -6145,6 +6181,7 @@ def create_app(  # noqa: C901
             owner_id=identity.owner_id,
             store=active_semantic_layer_store,
             document_index=active_document_index,
+            config=app_config,
         )
 
     @api.get(
@@ -6618,9 +6655,7 @@ def create_app(  # noqa: C901
                     logger.warning("Coverage sweep tick failed.", exc_info=True)
                 time.sleep(sweep_interval)
 
-        threading.Thread(
-            target=_sweep_loop, name="coverage-sweep", daemon=True
-        ).start()
+        threading.Thread(target=_sweep_loop, name="coverage-sweep", daemon=True).start()
 
     return api
 

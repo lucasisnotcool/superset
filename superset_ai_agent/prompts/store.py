@@ -309,9 +309,7 @@ class SqlAlchemyPromptStore:
         with self.session_factory() as session:
             rows = (
                 session.execute(
-                    select(AiAgentPromptLabel).where(
-                        AiAgentPromptLabel.name == name
-                    )
+                    select(AiAgentPromptLabel).where(AiAgentPromptLabel.name == name)
                 )
                 .scalars()
                 .all()

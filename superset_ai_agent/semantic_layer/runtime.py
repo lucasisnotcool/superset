@@ -102,6 +102,16 @@ def select_relevant_models(
 ModelSelector = Callable[[list[str]], "list[str] | None"]
 
 
+def manifest_char_size(manifest_items: list[dict[str, Any]]) -> int:
+    """Total characters across the manifest chunks' texts (the B4 size gate)."""
+
+    return sum(
+        len(text)
+        for item in manifest_items
+        if isinstance(text := item.get("text"), str)
+    )
+
+
 def build_unified_context(
     *,
     wren_context: WrenContextArtifact,
@@ -111,6 +121,7 @@ def build_unified_context(
     model_selector: ModelSelector | None = None,
     manifest_items: list[dict[str, Any]] | None = None,
     join_closure_limit: int = 0,
+    dump_threshold_chars: int = 0,
 ) -> WrenContextArtifact:
     """Single post-retrieval context entrypoint (C1.2 / C1.3).
 
@@ -130,7 +141,31 @@ def build_unified_context(
     table-selection budget ahead of the legacy keyword ``fetch_context`` models —
     consistent with :func:`cap_context_items`, which prioritizes retriever chunks on
     overflow. Avoids regressing the better-ranked source when both are active.
+
+    **Size gate (B4, plan_sql_agent_doc_grounding_spec.md).** When the project's
+    FULL manifest serializes under ``dump_threshold_chars``, retrieval/selection
+    is skipped and the whole manifest ships (``retrieval_mode="dump"``): below
+    the context-collapse zone, pruning's recall loss outweighs the distractor
+    cost ("Death of Schema Linking"; a missing join partner is fatal, an extra
+    table only distracts). ``0`` disables the gate.
     """
+
+    if (
+        dump_threshold_chars > 0
+        and manifest_items
+        and manifest_char_size(manifest_items) <= dump_threshold_chars
+    ):
+        # Full-manifest dump: keep fetch_context's bundle items (relationships/
+        # views/metrics) alongside every manifest chunk; dedup only — the char
+        # threshold already bounds prompt size, so no count cap applies.
+        dumped = cap_context_items([*manifest_items, *wren_context.context_items], 0)
+        return wren_context.model_copy(
+            update={
+                "context_items": dumped,
+                "retrieval_mode": "dump",
+                "retrieved_item_count": 0,
+            }
+        )
 
     merged = [*retrieved_items, *wren_context.context_items]
     selected = _select_models(merged, table_selection_limit, model_selector)

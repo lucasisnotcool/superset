@@ -69,6 +69,10 @@ EXPERIMENTS = (
     "wren_bi",
     # Combined: enriched Wren layer AND the full glossary in the prompt.
     "wren_bi_context",
+    # v5: enriched layer + the SQL agent's doc-RAG channel retrieving glossary
+    # passages (WREN_SQL_DOC_CONTEXT_ENABLED) — the budgeted alternative to
+    # dumping the whole glossary (plan_sql_agent_doc_grounding_spec.md A4).
+    "wren_bi_rag",
 )
 
 

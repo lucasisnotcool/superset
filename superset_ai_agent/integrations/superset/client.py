@@ -133,6 +133,24 @@ class SupersetClient(Protocol):
     ) -> list[DatasetMetadata]:
         """List dataset metadata for text-to-SQL context."""
 
+    def introspect_schema(
+        self,
+        *,
+        database_id: int,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        limit: int = 100,
+        include_views: bool = True,
+    ) -> list[DatasetMetadata]:
+        """List a schema's physical tables/views straight from the connection.
+
+        Returns synthetic ``DatasetMetadata`` (no backing Superset dataset row)
+        so the modeling catalog works when no datasets are registered. Owner-
+        scoped and fail-closed: a caller who cannot see the database/table gets
+        nothing. Implementations return ``[]`` when introspection is
+        unavailable for the adapter or the engine.
+        """
+
     def get_agent_context(
         self,
         *,

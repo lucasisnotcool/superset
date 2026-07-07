@@ -29,6 +29,11 @@ Rules:
   relationships for joins, and prefer defined metric expressions. The semantic
   layer adds meaning only; never reference a table or column absent from the
   provided dataset context.
+- When document_context is present, its passages are excerpts retrieved from
+  uploaded business documents (glossaries, data dictionaries). Use them to
+  interpret business terms, non-standard calendars, and metric definitions.
+  On any conflict the semantic layer (wren_context) wins; document passages
+  never authorize a table or column absent from the provided context.
 - Assess complexity before drafting. Multi-metric, multi-step (e.g.
   month-over-month growth), or per-segment questions need a baseline plus a
   derived change. Express that as one query using CTEs/subqueries, or — when
