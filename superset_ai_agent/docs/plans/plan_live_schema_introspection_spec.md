@@ -66,7 +66,35 @@ walk.
   re-attach, validation tri-state, tool guards, find_tables cap, bulk
   onboard skip).
 
-## Problem
+## v2.1 — De-gate the catalog from datasets entirely (activation fix)
+
+Live-deploy finding: MDL grounded on live-only tables could be CREATED but not
+ACTIVATED (`schema_not_in_project` even though the schema was in the project).
+Two dataset-gates caused it; both removed:
+
+1. **Fallback → union.** `get_full_schema` introspected a schema only when its
+   dataset scan returned ZERO rows — one registered dataset shadowed every
+   live-only table (and could shadow whole schemas) in the index build. The
+   catalog is now **datasets ∪ live names** (dedup by (schema, table);
+   registered datasets win, keeping their synced columns). Datasets ENRICH,
+   never gate.
+2. **R1 anchored to the project, not to build luck.** The
+   `schema_not_in_project` check derived the "project schema set" from which
+   schemas happened to yield datasets/introspection during that (60s-cached)
+   build. `SchemaIndex.known_schemas` is now seeded from
+   `project.schema_names` (the set proven at resolve time under the DB-level
+   access model) on every index path (`_attach_index_column_loader`), and
+   `has_schema`/`schemas` include it — a member schema whose listing yielded
+   nothing can never read as out-of-scope.
+3. **Table-level tri-state.** When a scope's table list is unavailable
+   (`tables_listed()` false — listing failed or introspection disabled, no
+   datasets), an unresolvable `tableReference` degrades to a
+   `table_unverified` WARNING instead of a hard `unknown_table` error —
+   mirroring `columns_unverified`. Hard rejection still applies when the
+   schema's names ARE listed and the table is absent (R3 intact), and
+   referencing a schema outside the project set still hard-fails (R1 intact).
+
+## Problem (v1, historical)
 
 The agent's physical catalog (`SchemaIndex`) is built **only** from registered
 Superset *datasets*. In a BYO-connection deployment where users connect a
@@ -92,8 +120,9 @@ and MDL validation work against the real tables. Keep every existing contract
 
 ## Non-goals
 
-- Not replacing the dataset path — datasets stay authoritative when present;
-  introspection is a **fallback** only when the dataset scan is empty.
+- Not replacing the dataset path — a registered dataset stays authoritative
+  for ITS table's columns. (v1 made introspection a fallback gated on an empty
+  dataset scan; v2.1 replaced that with union semantics — see above.)
 - Not changing query-time (text-to-SQL) context — this targets modeling-time
   (`get_full_schema`) consumers: onboarding, enrichment, MDL validation,
   `get_physical_schema`, `find_tables`.

@@ -90,6 +90,13 @@ class SchemaIndex:
     #: registered dataset that genuinely has no columns keeps its legacy
     #: authoritative-empty meaning.
     pending_by_schema: dict[str, set[str]] = field(default_factory=dict)
+    #: Lowercased schemas the project's scope is PROVEN to contain
+    #: (``project.schema_names``, established at resolve time under the
+    #: DB-level access model). This — not "which schemas happened to yield
+    #: datasets/introspection during this build" — is the authority for the R1
+    #: schema-membership check; a live-only schema whose listing failed must
+    #: never read as "not in project scope".
+    known_schemas: set[str] = field(default_factory=set)
     #: Lazy-reflection state. Never serialized (snapshots persist data, not
     #: loaders); re-attached per request so a cached index always reflects under
     #: the CURRENT caller's session, and transient failures don't stick.
@@ -364,12 +371,32 @@ class SchemaIndex:
 
     @property
     def schemas(self) -> set[str]:
-        """Physical schemas this index knows about (empty on the snapshot path)."""
+        """Schemas in scope: proven project members ∪ schemas with listed tables.
 
-        return set(self.tables_by_schema)
+        ``known_schemas`` (seeded from ``project.schema_names``) keeps the R1
+        membership check anchored to the project's proven set even when a
+        schema's live listing yielded nothing this build.
+        """
+
+        return set(self.tables_by_schema) | self.known_schemas
 
     def has_schema(self, schema: str) -> bool:
-        return schema.lower() in self.tables_by_schema
+        schema_l = schema.lower()
+        return schema_l in self.tables_by_schema or schema_l in self.known_schemas
+
+    def tables_listed(self, schema: str | None = None) -> bool:
+        """Whether the table-NAME list for this scope is authoritative.
+
+        True only when the build actually listed tables for the scope (datasets
+        or live introspection). False means "we know nothing about this
+        schema's tables" — an unknown-table finding there must degrade to a
+        warning, never a hard rejection (the dataset catalog and a transient
+        listing failure must not gate MDL).
+        """
+
+        if schema and self.tables_by_schema:
+            return bool(self.tables_by_schema.get(schema.lower()))
+        return bool(self.tables)
 
     def has_table(self, table: str, schema: str | None = None) -> bool:
         if schema and self.tables_by_schema:
@@ -777,8 +804,10 @@ def _validate_models(
             and not schema_index.has_schema(schema)
         ):
             # R1: a model may only physically reference a schema in the project's
-            # proven set. ``schema_index.schemas`` is non-empty only on the live
-            # path, so this degrades closed on the names-only snapshot.
+            # proven set. ``schemas`` includes the seeded ``known_schemas``
+            # (project.schema_names), so a member schema whose live listing
+            # yielded nothing this build is still IN scope — this check rejects
+            # only schemas genuinely outside the project set.
             messages.append(
                 MdlValidationMessage(
                     message=(
@@ -789,16 +818,35 @@ def _validate_models(
                 )
             )
         elif schema_index is not None and not schema_index.has_table(table, schema):
-            messages.append(
-                MdlValidationMessage(
-                    message=(
-                        f"Model {name} references table "
-                        f"'{_qualified_table(schema, table)}' that does not "
-                        "exist in the schema."
-                    ),
-                    code="unknown_table",
+            if schema_index.tables_listed(schema):
+                messages.append(
+                    MdlValidationMessage(
+                        message=(
+                            f"Model {name} references table "
+                            f"'{_qualified_table(schema, table)}' that does not "
+                            "exist in the schema."
+                        ),
+                        code="unknown_table",
+                    )
                 )
-            )
+            else:
+                # The scope's table list is unavailable (no registered datasets
+                # AND the live listing failed or is disabled): the table's
+                # existence is UNKNOWN. Warn, never hard-block — the dataset
+                # catalog must not gate MDL, and a transient listing failure
+                # must not brick activation of a model grounded on real tables.
+                messages.append(
+                    MdlValidationMessage(
+                        severity="warning",
+                        message=(
+                            f"Model {name} references table "
+                            f"'{_qualified_table(schema, table)}' that could not "
+                            "be verified — the schema's table list is "
+                            "unavailable from the live catalog."
+                        ),
+                        code="table_unverified",
+                    )
+                )
 
         _validate_columns(name, model, table, schema, schema_index, messages)
     return seen_names

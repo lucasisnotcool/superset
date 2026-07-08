@@ -169,19 +169,33 @@ class SupersetMetadataContextProvider(ContextProvider):
             schema_name=request.schema_name,
             limit=max(self.config.wren_schema_table_scan_limit, 1),
         )
-        if not candidate_datasets:
-            # No registered Superset datasets for this schema: for a live / BYO
-            # connection the physical catalog still exists in the database. Source
-            # it straight from the connection (owner-scoped introspection) so
-            # onboarding and MDL validation work without forcing dataset
-            # registration into Superset.
-            candidate_datasets = self._introspect_schema(request)
+        # UNION, not fallback: the physical catalog is the live schema
+        # (owner-scoped names introspection) merged with any registered Superset
+        # datasets — datasets ENRICH a table with synced columns but never GATE
+        # the catalog. A fallback-only design let a single registered dataset
+        # shadow every live-only table (and schema) in scope, which blocked
+        # activation of MDL grounded on real, accessible tables.
+        introspected = self._introspect_schema(request)
+        if introspected:
+            registered = {
+                ((dataset.schema_name or "").lower(), dataset.table_name.lower())
+                for dataset in candidate_datasets
+            }
+            candidate_datasets = candidate_datasets + [
+                dataset
+                for dataset in introspected
+                if (
+                    (dataset.schema_name or "").lower(),
+                    dataset.table_name.lower(),
+                )
+                not in registered
+            ]
         if not candidate_datasets:
             return base_context
         return base_context.model_copy(update={"datasets": candidate_datasets})
 
     def _introspect_schema(self, request: AgentQueryRequest) -> list[DatasetMetadata]:
-        """Live-introspect the request's schema when the dataset catalog is empty.
+        """Live-introspect the request's schema (names-only, one call).
 
         Gated by ``wren_live_schema_introspection`` and the adapter actually
         implementing ``introspect_schema`` (the MCP adapter returns ``[]``).

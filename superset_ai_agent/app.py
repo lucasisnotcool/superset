@@ -2316,8 +2316,16 @@ def create_app(  # noqa: C901
         cached index never reflects under a stale session, and the per-turn
         reflect budget refills. Fail-soft: no adapter support → no loader →
         pending tables simply stay columns-unknown.
+
+        Also seeds ``known_schemas`` from the project's PROVEN schema set, so
+        the R1 schema-membership check is anchored to the project — a member
+        schema whose live listing yielded nothing this build must never be
+        rejected as "not part of the project's schema set".
         """
 
+        index.known_schemas.update(
+            schema.lower() for schema in project.schema_names if schema
+        )
         if project.default_database_id is None:
             return index
         try:

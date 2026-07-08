@@ -177,6 +177,49 @@ def test_provider_falls_back_to_introspection_when_no_datasets() -> None:
     assert [d.table_name for d in context.datasets] == ["tbl_fiscal_calendar"]
 
 
+def test_provider_unions_registered_datasets_with_live_introspection() -> None:
+    """A registered dataset must never shadow live-only tables (no dataset gating).
+
+    The catalog is datasets ∪ live names: the registered dataset keeps its synced
+    columns (enrichment), live-only tables still appear, and a table present in
+    both is not duplicated.
+    """
+
+    from superset_ai_agent.integrations.superset.client import ColumnSummary
+
+    registered = DatasetMetadata(
+        id=42,
+        table_name="tbl_registered",
+        schema_name="wlos_owner",
+        database_id=1,
+        columns=[ColumnSummary(name="ID", type="NUMBER")],
+        metrics=[],
+    )
+    overlap = DatasetMetadata(  # same table, introspected — must not duplicate
+        id=_synthetic_dataset_id("wlos_owner", "tbl_registered"),
+        table_name="tbl_registered",
+        schema_name="wlos_owner",
+        database_id=1,
+        columns=[],
+        metrics=[],
+    )
+
+    class _MixedClient(_FakeClient):
+        def list_datasets(self, **_: Any) -> list[DatasetMetadata]:
+            return [registered]
+
+    client = _MixedClient(introspect_result=[_live_dataset(), overlap])
+    provider = SupersetMetadataContextProvider(client, config=AgentConfig())
+
+    context = provider.get_full_schema(_request())
+
+    assert client.introspect_calls == 1  # introspection runs DESPITE datasets
+    names = sorted(d.table_name for d in context.datasets)
+    assert names == ["tbl_fiscal_calendar", "tbl_registered"]
+    kept = next(d for d in context.datasets if d.table_name == "tbl_registered")
+    assert kept.id == 42  # the registered dataset (with columns) wins the dedupe
+
+
 def test_provider_skips_introspection_when_flag_off() -> None:
     client = _FakeClient(introspect_result=[_live_dataset()])
     provider = SupersetMetadataContextProvider(
@@ -578,3 +621,86 @@ def test_bulk_onboarding_skips_names_only_datasets() -> None:
     # Only the column-bearing table reaches bulk generation.
     assert seen["datasets"] == ["tbl_loaded"]
     assert any("skipped by bulk onboarding" in w for w in result.warnings)
+
+
+# --- R1 anchored to the project's proven schema set (no dataset gating) ----------
+
+
+def _mdl(schema: str, table: str) -> str:
+    import json  # noqa: TID251 - standalone agent JSON contract
+
+    return json.dumps(
+        {
+            "models": [
+                {
+                    "name": table,
+                    "tableReference": {"schema": schema, "table": table},
+                    "columns": [{"name": "id", "type": "NUMBER"}],
+                }
+            ]
+        }
+    )
+
+
+def _index_with_one_listed_schema():
+    """Index where only schema 'a' yielded tables; 'b' is a proven member whose
+    listing yielded nothing (live-only schema on a failed/empty scan)."""
+
+    from superset_ai_agent.integrations.superset.client import ColumnSummary
+    from superset_ai_agent.semantic_layer.mdl_validator import SchemaIndex
+
+    context = AgentContext(
+        database=DatabaseSummary(id=1, name="oracle", backend="oracle"),
+        datasets=[
+            DatasetMetadata(
+                id=7,
+                table_name="orders",
+                schema_name="a",
+                database_id=1,
+                columns=[ColumnSummary(name="id", type="NUMBER")],
+                metrics=[],
+            )
+        ],
+    )
+    index = SchemaIndex.from_agent_context(context)
+    index.known_schemas.update({"a", "b"})  # the project's PROVEN schema set
+    return index
+
+
+def test_member_schema_without_listing_is_not_rejected() -> None:
+    """The reported bug: MDL referencing a proven member schema must not fail
+    R1 just because that schema contributed no datasets/listing this build."""
+
+    from superset_ai_agent.semantic_layer.mdl_validator import validate_mdl
+
+    result = validate_mdl(
+        _mdl("b", "tbl_live_only"), schema_index=_index_with_one_listed_schema()
+    )
+
+    codes = {m.code for m in result.messages}
+    assert "schema_not_in_project" not in codes
+    assert "unknown_table" not in codes
+    assert "table_unverified" in codes  # honest warning, not a hard block
+    assert result.valid is True
+
+
+def test_bogus_table_in_listed_schema_still_hard_fails() -> None:
+    from superset_ai_agent.semantic_layer.mdl_validator import validate_mdl
+
+    result = validate_mdl(
+        _mdl("a", "no_such_table"), schema_index=_index_with_one_listed_schema()
+    )
+
+    assert "unknown_table" in {m.code for m in result.messages}
+    assert result.valid is False
+
+
+def test_schema_outside_project_set_still_rejected() -> None:
+    from superset_ai_agent.semantic_layer.mdl_validator import validate_mdl
+
+    result = validate_mdl(
+        _mdl("z", "orders"), schema_index=_index_with_one_listed_schema()
+    )
+
+    assert "schema_not_in_project" in {m.code for m in result.messages}
+    assert result.valid is False
