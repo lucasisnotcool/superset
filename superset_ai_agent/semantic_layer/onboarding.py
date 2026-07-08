@@ -80,12 +80,33 @@ def onboard_schema_project(
     """
 
     schema_index = SchemaIndex.from_agent_context(superset_context)
+    warnings: list[str] = []
+    # Names-first live introspection (synthetic negative ids) lists tables
+    # WITHOUT columns; bulk onboarding every one of them would either emit
+    # column-less junk models or re-create the eager whole-schema reflection
+    # this path must never pay. Skip them here — selective, tool-driven
+    # onboarding via the Copilot is the intended route for a live catalog
+    # (agentic choice grounded in the BI). Registered datasets are untouched.
+    names_only = [d for d in superset_context.datasets if d.id < 0 and not d.columns]
+    if names_only:
+        skipped_ids = {d.id for d in names_only}
+        superset_context = superset_context.model_copy(
+            update={
+                "datasets": [
+                    d for d in superset_context.datasets if d.id not in skipped_ids
+                ]
+            }
+        )
+        warnings.append(
+            f"{len(names_only)} live table(s) were listed without column "
+            "metadata and skipped by bulk onboarding; onboard the specific "
+            "tables you need via the MDL Copilot instead."
+        )
     proposals = wren_client.generate_base_model(
         project=project,
         superset_context=superset_context,
     )
     files = []
-    warnings: list[str] = []
     if not superset_context.datasets:
         warnings.append("No permission-filtered datasets were found for this schema.")
     for proposal in proposals:

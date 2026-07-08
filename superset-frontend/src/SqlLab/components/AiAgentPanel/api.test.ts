@@ -61,6 +61,7 @@ import {
   queryAgent,
   resolveSemanticProject,
   sendConversationMessage,
+  streamCopilot,
   updateMdlFile,
   uploadMdlFile,
   uploadProjectSourceDocument,
@@ -1112,4 +1113,90 @@ test('duplicateSemanticProject defaults include_documents to false', async () =>
     name: null,
     include_documents: false,
   });
+});
+
+const COPILOT_STREAM_URL =
+  'http://agent.local/agent/semantic-layer/projects/p1/copilot/stream';
+
+// A text/event-stream Response whose body streams the given SSE frames (objects
+// are serialized as `data:` frames; strings are emitted verbatim, e.g. a
+// `: keep-alive` heartbeat comment).
+const sseResponse = (frames: unknown[]): Response => {
+  const encoder = new TextEncoder();
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      frames.forEach(frame => {
+        const line =
+          typeof frame === 'string'
+            ? frame
+            : `data: ${JSON.stringify(frame)}\n\n`;
+        controller.enqueue(encoder.encode(line));
+      });
+      controller.close();
+    },
+  });
+  return new Response(body, {
+    status: 200,
+    headers: { 'Content-Type': 'text/event-stream' },
+  });
+};
+
+test('streamCopilot resolves with the changeset and forwards progress steps', async () => {
+  fetchMock.post(
+    COPILOT_STREAM_URL,
+    sseResponse([
+      ': keep-alive\n\n',
+      { type: 'progress', agent_step: { id: 's1' } },
+      { type: 'complete', changeset: { items: [{ path: 'model:orders' }] } },
+    ]),
+  );
+  const steps: unknown[] = [];
+
+  const changeset = await streamCopilot('p1', { message: 'hi' }, step =>
+    steps.push(step),
+  );
+
+  expect(changeset.items).toHaveLength(1);
+  expect(steps).toHaveLength(1); // the heartbeat comment is ignored
+});
+
+test('streamCopilot surfaces a server error event verbatim', async () => {
+  fetchMock.post(
+    COPILOT_STREAM_URL,
+    sseResponse([{ type: 'error', detail: 'Onboarding failed: empty_root' }]),
+  );
+
+  await expect(streamCopilot('p1', { message: 'hi' })).rejects.toThrow(
+    'Onboarding failed: empty_root',
+  );
+});
+
+test('streamCopilot errors when the stream ends without a changeset', async () => {
+  fetchMock.post(
+    COPILOT_STREAM_URL,
+    sseResponse([{ type: 'progress', agent_step: { id: 's1' } }]),
+  );
+
+  await expect(streamCopilot('p1', { message: 'hi' })).rejects.toThrow(
+    /without returning a changeset/,
+  );
+});
+
+test('streamCopilot surfaces an HTTP error instead of hanging', async () => {
+  fetchMock.post(COPILOT_STREAM_URL, {
+    status: 404,
+    body: { detail: 'nope' },
+  });
+
+  await expect(streamCopilot('p1', { message: 'hi' })).rejects.toThrow();
+});
+
+test('streamCopilot reports an unreachable agent (network / TLS) distinctly', async () => {
+  fetchMock.post(COPILOT_STREAM_URL, {
+    throws: new TypeError('Failed to fetch'),
+  });
+
+  await expect(streamCopilot('p1', { message: 'hi' })).rejects.toThrow(
+    /Could not reach the AI agent/,
+  );
 });

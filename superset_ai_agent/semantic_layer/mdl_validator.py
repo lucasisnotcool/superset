@@ -28,6 +28,8 @@ validation and therefore cannot be activated (risk R1).
 from __future__ import annotations
 
 import json  # noqa: TID251 - standalone agent JSON contract
+import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -41,6 +43,13 @@ from superset_ai_agent.semantic_layer.schemas import (
     MdlValidationResult,
 )
 
+logger = logging.getLogger(__name__)
+
+#: Lazy column reflection callback: ``(schema, table) -> {column: type|None}``.
+#: Raises on failure (the index marks the table failed and degrades to
+#: columns-unknown); returning an empty mapping means the same.
+ColumnLoader = Callable[[str | None, str], dict[str, str | None]]
+
 
 @dataclass
 class SchemaIndex:
@@ -51,6 +60,18 @@ class SchemaIndex:
     *live* ``from_agent_context`` path — the persisted ``from_snapshot`` is names-only,
     so type grounding/checking degrades closed to the names-only behavior on a
     Superset outage (snapshot uniformity is intentionally preserved).
+
+    **Lazy columns**: a *pending* table is known by NAME (names-first live
+    introspection lists a schema in one call) but its columns have not been
+    reflected. Only live-introspected tables (synthetic negative dataset ids)
+    can be pending — a registered Superset dataset with zero columns keeps its
+    legacy meaning of an authoritative empty set. When a ``ColumnLoader`` is
+    attached, the targeted accessors (``has_column``/``column_type``/
+    ``columns_for``/``ensure_columns``) reflect a pending table's columns on
+    first touch, memoizing them on the index. Iteration surfaces
+    (``to_tables``/``schema_qualified_view``/``search``) never trigger
+    reflection — only per-table, agent-driven touches do, so the cost scales
+    with what the agent selects, not with the warehouse.
     """
 
     tables: dict[str, set[str]] = field(default_factory=dict)
@@ -64,6 +85,109 @@ class SchemaIndex:
     #: cross-schema lookup return the *right* schema's type; empty when types are
     #: unknown (names-only snapshot) or the index is unqualified.
     types_by_schema: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)
+    #: schema ('' when unqualified) → live-introspected tables whose columns are
+    #: not yet reflected. Explicit — NOT derived from an empty column set, so a
+    #: registered dataset that genuinely has no columns keeps its legacy
+    #: authoritative-empty meaning.
+    pending_by_schema: dict[str, set[str]] = field(default_factory=dict)
+    #: Lazy-reflection state. Never serialized (snapshots persist data, not
+    #: loaders); re-attached per request so a cached index always reflects under
+    #: the CURRENT caller's session, and transient failures don't stick.
+    column_loader: ColumnLoader | None = field(default=None, repr=False, compare=False)
+    reflect_budget: int = field(default=0, repr=False, compare=False)
+    _reflect_failed: set[tuple[str, str]] = field(
+        default_factory=set, repr=False, compare=False
+    )
+
+    def attach_column_loader(self, loader: ColumnLoader, *, budget: int) -> None:
+        """Arm lazy per-table column reflection for the current request.
+
+        Resets the failure memo — a table that failed under a previous
+        request's loader (stale session, transient outage) gets a fresh chance.
+        """
+
+        self.column_loader = loader
+        self.reflect_budget = max(budget, 0)
+        self._reflect_failed = set()
+
+    def _is_pending(self, table_l: str, schema_l: str | None) -> bool:
+        if schema_l is not None:
+            return table_l in self.pending_by_schema.get(schema_l, set())
+        return any(table_l in tables for tables in self.pending_by_schema.values())
+
+    def _pending_schema_for(self, table_l: str) -> str | None:
+        for schema_l, tables in self.pending_by_schema.items():
+            if table_l in tables:
+                return schema_l or None
+        return None
+
+    def columns_loaded(self, table: str, schema: str | None = None) -> bool:
+        """Whether this table's columns are known WITHOUT triggering reflection."""
+
+        return not self._is_pending(table.lower(), schema.lower() if schema else None)
+
+    def pending_tables_by_schema(self) -> dict[str, list[str]]:
+        """schema → live tables whose columns have not been reflected yet."""
+
+        return {
+            schema: sorted(tables)
+            for schema, tables in self.pending_by_schema.items()
+            if tables
+        }
+
+    def ensure_columns(self, table: str, schema: str | None = None) -> bool:
+        """Make ``table``'s columns available, reflecting lazily if needed.
+
+        Returns ``True`` when the columns are authoritative (loaded eagerly,
+        already reflected, or just reflected); ``False`` when the table is
+        unknown or its columns cannot be established (no loader, budget
+        exhausted, reflection failed) — callers must then treat the columns as
+        *unknown*, never as an empty set.
+        """
+
+        table_l = table.lower()
+        schema_l = schema.lower() if schema else None
+        if not self.has_table(table_l, schema_l):
+            return False
+        if not self._is_pending(table_l, schema_l):
+            return True
+        if schema_l is None:
+            schema_l = self._pending_schema_for(table_l)
+        key = (schema_l or "", table_l)
+        if (
+            self.column_loader is None
+            or key in self._reflect_failed
+            or self.reflect_budget <= 0
+        ):
+            return False
+        self.reflect_budget -= 1
+        try:
+            loaded = self.column_loader(schema_l, table_l)
+        except Exception:  # noqa: BLE001  # pylint: disable=broad-except
+            logger.warning(
+                "Lazy column reflection failed for %s.%s",
+                schema_l,
+                table_l,
+                exc_info=True,
+            )
+            self._reflect_failed.add(key)
+            return False
+        if not loaded:
+            self._reflect_failed.add(key)
+            return False
+        columns = {str(name).lower() for name in loaded}
+        types = {
+            str(name).lower(): str(type_) for name, type_ in loaded.items() if type_
+        }
+        self.tables[table_l] = columns
+        if types:
+            self.column_types[table_l] = types
+        if schema_l:
+            self.tables_by_schema.setdefault(schema_l, {})[table_l] = columns
+            if types:
+                self.types_by_schema.setdefault(schema_l, {})[table_l] = types
+        self.pending_by_schema.get(schema_l or "", set()).discard(table_l)
+        return True
 
     @classmethod
     def from_agent_context(cls, context: AgentContext) -> "SchemaIndex":
@@ -71,6 +195,7 @@ class SchemaIndex:
         column_types: dict[str, dict[str, str]] = {}
         tables_by_schema: dict[str, dict[str, set[str]]] = {}
         types_by_schema: dict[str, dict[str, dict[str, str]]] = {}
+        pending_by_schema: dict[str, set[str]] = {}
         for dataset in context.datasets:
             if not dataset.table_name:
                 continue
@@ -89,11 +214,18 @@ class SchemaIndex:
                 tables_by_schema.setdefault(schema, {})[table] = columns
                 if types:
                     types_by_schema.setdefault(schema, {})[table] = types
+            # Names-first live introspection (synthetic negative ids) lists
+            # tables without columns; mark them pending so their columns read
+            # as UNKNOWN until lazily reflected. A registered dataset (positive
+            # id) with zero columns keeps its authoritative-empty meaning.
+            if not columns and dataset.id < 0:
+                pending_by_schema.setdefault(schema, set()).add(table)
         return cls(
             tables=tables,
             column_types=column_types,
             tables_by_schema=tables_by_schema,
             types_by_schema=types_by_schema,
+            pending_by_schema=pending_by_schema,
         )
 
     @classmethod
@@ -158,6 +290,37 @@ class SchemaIndex:
             for schema, tables in self.tables_by_schema.items()
         }
 
+    def to_resolved_tables(self) -> dict[str, list[str]]:
+        """Snapshot serialization: only tables with AUTHORITATIVE columns.
+
+        A pending (names-only, unreflected) table must not be persisted with an
+        empty column list — ``from_snapshot`` would restore that as an
+        authoritative empty set and outage-fallback validation would then
+        falsely reject its real columns.
+        """
+
+        pending = {t for tables in self.pending_by_schema.values() for t in tables}
+        return {
+            table: sorted(columns)
+            for table, columns in self.tables.items()
+            if table not in pending
+        }
+
+    def to_resolved_tables_by_schema(self) -> dict[str, dict[str, list[str]]]:
+        """Schema-qualified twin of ``to_resolved_tables``."""
+
+        resolved: dict[str, dict[str, list[str]]] = {}
+        for schema, tables in self.tables_by_schema.items():
+            pending = self.pending_by_schema.get(schema, set())
+            kept = {
+                table: sorted(cols)
+                for table, cols in tables.items()
+                if table not in pending
+            }
+            if kept:
+                resolved[schema] = kept
+        return resolved
+
     def typed_tables_by_schema(self) -> dict[str, dict[str, dict[str, str]]]:
         """schema → table → {column: type}; empty when types are unknown."""
 
@@ -177,9 +340,14 @@ class SchemaIndex:
 
         view: dict[str, dict[str, dict[str, object]]] = {}
         for schema, tables in self.tables_by_schema.items():
+            pending = self.pending_by_schema.get(schema, set())
             view[schema] = {}
             for table, cols in tables.items():
                 entry: dict[str, object] = {"columns": sorted(cols)}
+                if table in pending:
+                    # Names-first introspection: the table exists but its columns
+                    # have not been reflected yet — signal "unknown", not "none".
+                    entry["columns_pending"] = True
                 types = self.types_by_schema.get(schema, {}).get(table)
                 if types:
                     entry["types"] = dict(types)
@@ -209,6 +377,7 @@ class SchemaIndex:
         return table.lower() in self.tables
 
     def has_column(self, table: str, column: str, schema: str | None = None) -> bool:
+        self.ensure_columns(table, schema)
         if schema and self.tables_by_schema:
             scoped = self.tables_by_schema.get(schema.lower(), {})
             return column.lower() in scoped.get(table.lower(), set())
@@ -225,6 +394,7 @@ class SchemaIndex:
         is correct for single-schema scopes and the names-only snapshot.
         """
 
+        self.ensure_columns(table, schema)
         if schema and self.types_by_schema:
             scoped = self.types_by_schema.get(schema.lower(), {})
             typed = scoped.get(table.lower())
@@ -233,8 +403,13 @@ class SchemaIndex:
         return self.column_types.get(table.lower(), {}).get(column.lower())
 
     def columns_for(self, table: str, schema: str | None = None) -> list[str]:
-        """Sorted column names for a (schema, table); empty when unknown."""
+        """Sorted column names for a (schema, table); empty when unknown.
 
+        Triggers lazy reflection for a pending table — use ``columns_loaded``
+        first when a cheap, non-reflecting peek is wanted.
+        """
+
+        self.ensure_columns(table, schema)
         if schema and self.tables_by_schema:
             scoped = self.tables_by_schema.get(schema.lower(), {})
             return sorted(scoped.get(table.lower(), set()))
@@ -653,6 +828,29 @@ def _validate_columns(
         and table is not None
         and schema_index.has_table(table, schema)
     )
+    # Names-first introspection: the table may be known by NAME while its
+    # columns are still unreflected. ``ensure_columns`` lazily reflects them
+    # here (bounded by the index's budget); when that is impossible the
+    # physical column checks are skipped with an explicit warning — unknown
+    # columns must never be treated as an authoritative empty set.
+    columns_known = bool(
+        table_known
+        and schema_index is not None
+        and table is not None
+        and schema_index.ensure_columns(table, schema)
+    )
+    if table_known and not columns_known:
+        messages.append(
+            MdlValidationMessage(
+                severity="warning",
+                message=(
+                    f"Columns of table '{_qualified_table(schema, table or '')}' "
+                    "could not be verified against the live catalog; physical "
+                    f"column checks were skipped for model {model_name}."
+                ),
+                code="columns_unverified",
+            )
+        )
     for column in columns:
         if not isinstance(column, dict):
             continue
@@ -679,7 +877,7 @@ def _validate_columns(
             column_name=column_name,
             table=table,
             schema=schema,
-            table_known=table_known,
+            columns_known=columns_known,
             schema_index=schema_index,
             messages=messages,
         )
@@ -692,11 +890,17 @@ def _validate_column_semantics(
     column_name: str,
     table: str | None,
     schema: str | None,
-    table_known: bool,
+    columns_known: bool,
     schema_index: SchemaIndex | None,
     messages: list[MdlValidationMessage],
 ) -> None:
-    """Per-column semantic checks: calculated, type presence, physical mapping (C3)."""
+    """Per-column semantic checks: calculated, type presence, physical mapping (C3).
+
+    ``columns_known`` gates the physical checks: it is True only when the
+    table's catalog columns are authoritative (loaded eagerly or reflected
+    lazily) — a name-only table skips existence/type checks rather than
+    rejecting every column against an unknown set.
+    """
 
     is_calculated = bool(column.get("isCalculated"))
     is_relationship = bool(column.get("relationship"))
@@ -733,7 +937,7 @@ def _validate_column_semantics(
                 code="column_without_type",
             )
         )
-    if not (table_known and table is not None and not is_relationship):
+    if not (columns_known and table is not None and not is_relationship):
         return
     if (
         not is_calculated and not schema_index.has_column(table, physical_name, schema)  # type: ignore[union-attr]

@@ -1709,23 +1709,74 @@ export const dismissCoverageRecovery = (projectId: string, runId: string) =>
  * Stream the agentic edit loop. Each `progress` event delivers an AgentStep via
  * `onStep`; resolves with the final Changeset carried by the `complete` event.
  */
+// No bytes from the Copilot stream for this long → treat it as stalled and
+// surface an error, so the panel never sits in "Agent is editing…" forever when
+// the connection silently drops, a proxy buffers it away, or the request hangs
+// before streaming starts. Generous enough to cover a slow *preflight* (which
+// streams no heartbeat until the worker starts — e.g. live-introspecting a large
+// Oracle schema) and long model/tool steps (kept alive by the server's
+// `: keep-alive` heartbeats once streaming begins, each of which resets this).
+const COPILOT_STREAM_INACTIVITY_MS = 90_000;
+
 export const streamCopilot = async (
   projectId: string,
   payload: CopilotTurnRequest,
   onStep?: (step: AgentStep) => void,
 ): Promise<Changeset> => {
-  const response = await fetch(
-    `${getAgentBaseUrl()}/agent/semantic-layer/projects/${projectId}/copilot/stream`,
-    {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    },
-  );
+  // A stall watchdog aborts the request when no bytes arrive for too long, so a
+  // hang (dead connection / buffering proxy / stuck preflight) becomes a thrown
+  // error the caller surfaces, instead of an awaited promise that never settles.
+  const controller = new AbortController();
+  let stalled = false;
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  const armWatchdog = () => {
+    if (watchdog) clearTimeout(watchdog);
+    watchdog = setTimeout(() => {
+      stalled = true;
+      controller.abort();
+    }, COPILOT_STREAM_INACTIVITY_MS);
+  };
+  const clearWatchdog = () => {
+    if (watchdog) clearTimeout(watchdog);
+    watchdog = undefined;
+  };
+
+  let response: Response;
+  armWatchdog(); // covers the preflight / time-to-first-byte (no heartbeat yet)
+  try {
+    response = await fetch(
+      `${getAgentBaseUrl()}/agent/semantic-layer/projects/${projectId}/copilot/stream`,
+      {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      },
+    );
+  } catch {
+    clearWatchdog();
+    if (stalled) {
+      throw new Error(
+        'The agent took too long to respond and the request timed out. It may ' +
+          'still be finishing in the background — reopen the conversation shortly ' +
+          'to check, or try again.',
+      );
+    }
+    // A rejected fetch that is NOT our abort is a transport failure: the agent
+    // could not be reached at all — commonly a network drop or an untrusted TLS
+    // certificate on the agent endpoint (the browser blocks the request). This
+    // is distinct from an agent-side error, which arrives as an `error` event.
+    throw new Error(
+      'Could not reach the AI agent. This is usually a network problem or an ' +
+        'untrusted TLS certificate for the agent endpoint — not an agent error.',
+    );
+  }
   if (!response.ok || !response.body) {
+    clearWatchdog();
     throw new Error(await getAgentErrorMessage(response));
   }
+  armWatchdog(); // fresh window for the streaming phase
 
   let changeset: Changeset | undefined;
   let streamError: string | undefined;
@@ -1753,24 +1804,46 @@ export const streamCopilot = async (
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
-  for (;;) {
-    // eslint-disable-next-line no-await-in-loop
-    const { value, done } = await reader.read();
-    if (done) {
-      break;
+  try {
+    for (;;) {
+      // eslint-disable-next-line no-await-in-loop
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
+      }
+      armWatchdog(); // any byte (incl. a `: keep-alive` heartbeat) = still alive
+      buffer += decoder.decode(value, { stream: true });
+      const { frames, rest } = splitSseFrames(buffer);
+      buffer = rest;
+      frames.forEach(handleFrame);
     }
-    buffer += decoder.decode(value, { stream: true });
-    const { frames, rest } = splitSseFrames(buffer);
-    buffer = rest;
-    frames.forEach(handleFrame);
+  } catch {
+    if (stalled) {
+      throw new Error(
+        'The agent stopped responding (the stream stalled). It may still be ' +
+          'finishing in the background — reopen the conversation shortly to check.',
+      );
+    }
+    // A non-timeout read failure means the connection dropped mid-turn.
+    throw new Error(
+      'The connection to the AI agent was lost mid-turn. Reopen the conversation ' +
+        'to see whether the change was saved.',
+    );
+  } finally {
+    clearWatchdog();
   }
   splitSseFrames(`${buffer}\n\n`).frames.forEach(handleFrame);
 
   if (streamError) {
+    // A server-emitted `error` event is a genuine agent failure — surface its
+    // detail verbatim.
     throw new Error(streamError);
   }
   if (!changeset) {
-    throw new Error('Copilot stream ended without a changeset.');
+    throw new Error(
+      'The agent finished without returning a changeset. Reopen the ' +
+        'conversation to check its status.',
+    );
   }
   return changeset;
 };

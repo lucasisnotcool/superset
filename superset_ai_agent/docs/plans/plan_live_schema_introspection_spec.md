@@ -1,10 +1,70 @@
 # Live schema introspection for dataset-free onboarding
 
-Status: IMPLEMENTED (default-on; awaiting live Oracle deploy verification).
-Steps 1–8 built with tests; 41 unit tests green (introspection + provider +
-config + onboarding + access), ruff/mypy clean on changed files. Default-on per
-the "no unnecessary dataset gating" directive. Remaining: live verification on
-the Windows/K8s Oracle deployment (get_physical_schema returns the tables).
+Status: IMPLEMENTED v2 — names-first + lazy per-table column reflection
+(default-on; awaiting live Oracle deploy verification). v1 (eager per-table
+reflection at preflight) is superseded: it hung the copilot stream on a real
+Oracle warehouse (~600 serial metadata round-trips per schema — confirmed by
+toggle-off test 2026-07-07). See "v2 — Names-first + lazy columns" below.
+Full unit suite green (1455 passed; the one failure,
+test_bulk_activate_fetches_live_schema_once_and_deactivate_zero, is a
+pre-existing HEAD failure unrelated to this work). Remaining: live
+verification on the Windows/K8s Oracle deployment.
+
+## v2 — Names-first + lazy columns (supersedes v1's eager reflection)
+
+Industry-standard two-step contract (LangChain SQL agents' list-tables →
+get-schema-per-table; Oracle Select AI's minimal-table-set guidance): the
+agent VIEWS the schema cheaply, then loads detail only for the tables it
+selects — an agentic decision grounded in the BI docs, never a whole-schema
+walk.
+
+- **Names-only preflight** — `introspect_schema(names_only=True)`
+  ([integrations/superset/rest.py](../../integrations/superset/rest.py)):
+  ONE `/tables/` call per schema (bounded by
+  `wren_introspection_names_limit`, default 2000 — no more silent 100-cap
+  truncation), returning synthetic `DatasetMetadata` with `columns=[]`.
+  Preflight cost for a 4-schema Oracle project: ~8 HTTP calls total.
+- **Explicit pending semantics** — `SchemaIndex.pending_by_schema`
+  ([semantic_layer/mdl_validator.py](../../semantic_layer/mdl_validator.py)):
+  only live-introspected tables (negative synthetic ids) with no columns are
+  *pending* (= columns UNKNOWN). A registered dataset with zero columns keeps
+  its legacy authoritative-empty meaning — no behavior change for the
+  dataset-backed path.
+- **Lazy reflection** — `SupersetRestClient.reflect_table_columns` (one
+  `/table_metadata/` call per table) is wired into the index as a per-request
+  `ColumnLoader` (`_attach_index_column_loader` in app.py — attached on cache
+  hit, fresh build, and snapshot fallback, always under the CURRENT caller's
+  session). Targeted accessors (`has_column`/`column_type`/`columns_for`/
+  `ensure_columns`) reflect a pending table on first touch and memoize on the
+  TTL-cached index; iteration surfaces (`to_tables`, `schema_qualified_view`,
+  `search`) NEVER trigger reflection. Bounded by
+  `wren_introspection_column_reflect_budget` (default 40/turn); failures are
+  memoized per attachment (no retry storms), reset on re-attach.
+- **Agent tools** — `get_physical_schema` lists every table name and flags
+  `columns_pending` (+ an explicit "empty means unknown, never invent" note);
+  `find_tables` reflects columns for only its top 5 candidates per call
+  (`_FIND_TABLES_REFLECT_LIMIT`), lower ranks return `columns_pending`;
+  `propose_onboard_table` reflects the ONE table being onboarded and
+  **refuses to stage** when columns cannot be established (anti-placeholder
+  guardrail — the emergent "placeholder view on empty catalog" fabrication is
+  cut off at the staging layer).
+- **Validation tri-state** — `_validate_columns` distinguishes
+  columns-authoritative (full physical checks, incl. lazily reflected) from
+  columns-unknown (skip column checks + emit `columns_unverified` warning).
+  `unknown_table`/R1 schema checks unchanged.
+- **Snapshots** — outage snapshots persist resolved tables only
+  (`to_resolved_tables*`), so a pending table is never restored as an
+  authoritative empty column set.
+- **Bulk onboarding** — `onboard_schema_project` skips names-only live tables
+  with a warning pointing at the Copilot (selective onboarding is the intended
+  route for a live catalog); registered datasets untouched.
+- **New env vars** (both in `.env.example`; defaults are sane):
+  `AI_AGENT_WREN_INTROSPECTION_NAMES_LIMIT=2000`,
+  `AI_AGENT_WREN_INTROSPECTION_COLUMN_REFLECT_BUDGET=40`.
+- Tests: `tests/unit_tests/superset_ai_agent/test_live_schema_introspection.py`
+  (names-only, reflect-one-table, lazy index memoize/budget/failure memo/
+  re-attach, validation tri-state, tool guards, find_tables cap, bulk
+  onboard skip).
 
 ## Problem
 

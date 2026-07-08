@@ -347,6 +347,12 @@ from superset_ai_agent.tools.sql import validate_read_only_sql
 SEMANTIC_EVENTS_POLL_INTERVAL_SECONDS = 2.0
 SEMANTIC_EVENTS_MAX_STREAM_SECONDS = 300.0
 SEMANTIC_EVENTS_RETRY_MS = 15000
+# Copilot stream heartbeat: how long the generator waits for the worker to
+# produce a progress event before emitting a keep-alive comment frame. Keeps the
+# connection (and any buffering proxy) alive during long model/tool steps and
+# lets the client's stall watchdog distinguish "still working" from a dead
+# stream. Must stay well under the client inactivity timeout.
+COPILOT_STREAM_HEARTBEAT_SECONDS = 10.0
 
 
 def _conversation_sse(event: dict[str, Any]) -> str:
@@ -2296,6 +2302,54 @@ def create_app(  # noqa: C901
             (project.id, tuple(sorted(project.schema_names)))
         )
 
+    def _attach_index_column_loader(
+        index: SchemaIndex,
+        project: SemanticProject,
+        fastapi_request: Request,
+    ) -> SchemaIndex:
+        """Arm lazy per-table column reflection on a (possibly cached) index.
+
+        Names-first live introspection lists table NAMES only; this loader is
+        how columns get reflected — one ``/table_metadata/`` call per table the
+        agent/validation actually touches, under the CURRENT caller's session
+        (owner-scoped, 404 on no access). Re-attached on every request so a
+        cached index never reflects under a stale session, and the per-turn
+        reflect budget refills. Fail-soft: no adapter support → no loader →
+        pending tables simply stay columns-unknown.
+        """
+
+        if project.default_database_id is None:
+            return index
+        try:
+            _, request_superset_client = build_superset_runtime(fastapi_request)
+        except Exception:  # pylint: disable=broad-except
+            return index
+        reflect = getattr(request_superset_client, "reflect_table_columns", None)
+        if reflect is None:
+            return index
+        database_id = project.default_database_id
+        catalog_name = project.catalog_name
+        fallback_schema = project.schema_name
+
+        def _loader(schema: str | None, table: str) -> dict[str, str | None]:
+            columns = reflect(
+                database_id=database_id,
+                schema_name=schema or fallback_schema,
+                table_name=table,
+                catalog_name=catalog_name,
+            )
+            if not isinstance(columns, list):
+                # Guards a misbehaving adapter (and MagicMock clients in tests,
+                # whose auto-attrs return mocks) — "unknown", never fabricated.
+                return {}
+            return {column.name: column.type for column in columns}
+
+        index.attach_column_loader(
+            _loader,
+            budget=app_config.wren_introspection_column_reflect_budget,
+        )
+        return index
+
     def _schema_index_for_project(  # noqa: C901
         project: SemanticProject,
         fastapi_request: Request,
@@ -2320,7 +2374,7 @@ def create_app(  # noqa: C901
             return None
         cache_key = (project.id, tuple(sorted(project.schema_names)))
         if (cached_index := _schema_index_cache.get(cache_key)) is not None:
-            return cached_index
+            return _attach_index_column_loader(cached_index, project, fastapi_request)
         try:
             request_context_provider, _ = build_superset_runtime(fastapi_request)
             # CR3: ground modeling/validation on the *complete* scope schema, not a
@@ -2358,9 +2412,13 @@ def create_app(  # noqa: C901
             snapshot = active_schema_snapshot_store.get(project.id)
             if snapshot is None:
                 return None
-            return SchemaIndex.from_snapshot(
-                snapshot.tables,
-                tables_by_schema=snapshot.tables_by_schema or None,
+            return _attach_index_column_loader(
+                SchemaIndex.from_snapshot(
+                    snapshot.tables,
+                    tables_by_schema=snapshot.tables_by_schema or None,
+                ),
+                project,
+                fastapi_request,
             )
         index = SchemaIndex.from_agent_context(context)
         try:
@@ -2370,17 +2428,19 @@ def create_app(  # noqa: C901
                     database_uri_fingerprint=project.database_uri_fingerprint,
                     catalog_name=project.catalog_name,
                     schema_name=project.schema_name,
-                    tables=index.to_tables(),
+                    # Resolved-only: a pending (names-only) live table must not be
+                    # snapshotted as an authoritative empty column set.
+                    tables=index.to_resolved_tables(),
                     # F3: persist the schema-qualified map too, so a multi-schema
                     # project's outage fallback stays schema-aware.
-                    tables_by_schema=index.to_tables_by_schema(),
+                    tables_by_schema=index.to_resolved_tables_by_schema(),
                 )
             )
         except Exception:  # noqa: S110  # pylint: disable=broad-except
             # Snapshotting is best-effort; never block validation on it.
             pass
         _schema_index_cache.set(cache_key, index)
-        return index
+        return _attach_index_column_loader(index, project, fastapi_request)
 
     def _project_has_models(project_id: str, *, owner_id: str) -> bool:
         """Whether the project has at least one non-deleted MDL model (CR2).
@@ -3756,7 +3816,19 @@ def create_app(  # noqa: C901
             worker.start()
             try:
                 while True:
-                    kind, payload = events.get()
+                    try:
+                        kind, payload = events.get(
+                            timeout=COPILOT_STREAM_HEARTBEAT_SECONDS
+                        )
+                    except queue.Empty:
+                        # No progress this interval: the worker is mid-step (a
+                        # model/tool call, or the pre-stream schema build for a
+                        # large live-introspected schema). Emit a keep-alive so
+                        # the connection stays open and the client's stall
+                        # watchdog resets. A comment frame carries no data event,
+                        # so the client's SSE parser ignores it.
+                        yield ": keep-alive\n\n"
+                        continue
                     if kind == "done":
                         break
                     if kind == "progress":

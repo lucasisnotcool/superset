@@ -409,6 +409,7 @@ class SupersetRestClient:
         schema_name: str | None = None,
         limit: int = 100,
         include_views: bool = True,
+        names_only: bool = False,
     ) -> list[DatasetMetadata]:
         """Introspect a schema's physical tables/views straight from the DB.
 
@@ -419,28 +420,37 @@ class SupersetRestClient:
         cannot be reflected is skipped rather than failing the whole scan, and a
         schema that cannot be listed yields ``[]`` — so the caller degrades to an
         empty catalog exactly as it did before, never worse.
+
+        ``names_only`` skips the per-table ``/table_metadata/`` reflection and
+        returns every table with ``columns=[]`` (columns unknown, to be
+        reflected lazily via ``reflect_table_columns``). One HTTP call per
+        schema regardless of table count — the only shape that scales to
+        warehouses with hundreds of tables per schema, where the eager per-table
+        walk is hundreds of serial engine round-trips.
         """
 
         if not schema_name:
             return []
-        try:
-            tables_payload = self.list_tables_raw(
-                database_id=database_id,
-                schema_name=schema_name,
-                catalog_name=catalog_name,
-            )
-        except SupersetAdapterError:
-            return []
-        allowed = {"table"}
-        if include_views:
-            allowed |= {"view", "materialized_view"}
-        names: list[str] = []
-        for item in _items(tables_payload, "result"):
-            value = item.get("value")
-            if value and item.get("type") in allowed:
-                names.append(str(value))
-            if len(names) >= max(limit, 1):
-                break
+        names = self._list_table_names(
+            database_id=database_id,
+            schema_name=schema_name,
+            catalog_name=catalog_name,
+            limit=limit,
+            include_views=include_views,
+        )
+        if names_only:
+            return [
+                DatasetMetadata(
+                    id=_synthetic_dataset_id(schema_name, table_name),
+                    table_name=table_name,
+                    schema_name=schema_name,
+                    database_id=database_id,
+                    description=None,
+                    columns=[],
+                    metrics=[],
+                )
+                for table_name in names
+            ]
         datasets: list[DatasetMetadata] = []
         for table_name in names:
             try:
@@ -467,6 +477,63 @@ class SupersetRestClient:
                 )
             )
         return datasets
+
+    def _list_table_names(
+        self,
+        *,
+        database_id: int,
+        schema_name: str,
+        catalog_name: str | None,
+        limit: int,
+        include_views: bool,
+    ) -> list[str]:
+        """Table/view names for a schema via ``/tables/`` (fail-soft to ``[]``)."""
+
+        try:
+            tables_payload = self.list_tables_raw(
+                database_id=database_id,
+                schema_name=schema_name,
+                catalog_name=catalog_name,
+            )
+        except SupersetAdapterError:
+            return []
+        allowed = {"table"}
+        if include_views:
+            allowed |= {"view", "materialized_view"}
+        names: list[str] = []
+        for item in _items(tables_payload, "result"):
+            value = item.get("value")
+            if value and item.get("type") in allowed:
+                names.append(str(value))
+            if len(names) >= max(limit, 1):
+                break
+        return names
+
+    def reflect_table_columns(
+        self,
+        *,
+        database_id: int,
+        schema_name: str | None,
+        table_name: str,
+        catalog_name: str | None = None,
+    ) -> list[ColumnSummary]:
+        """Reflect ONE table's columns via ``/table_metadata/`` (owner-scoped).
+
+        The lazy half of ``introspect_schema(names_only=True)``: the agent (or
+        validation) requests columns for exactly the tables it decided to work
+        with, instead of the whole schema. Raises ``SupersetAdapterError`` on a
+        transport/authz failure — callers treat that as "columns unknown".
+        """
+
+        if not schema_name:
+            return []
+        meta = self.get_table_metadata_raw(
+            database_id=database_id,
+            name=table_name,
+            schema_name=schema_name,
+            catalog_name=catalog_name,
+        )
+        return _normalize_introspected_columns(meta.get("columns"))
 
     def get_agent_context(
         self,

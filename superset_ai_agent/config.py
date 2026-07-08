@@ -146,6 +146,18 @@ class AgentConfig:
     # datasets exist. Default on; set the env var false to force the
     # dataset-only path.
     wren_live_schema_introspection: bool = True
+    # Live introspection is names-first: one ``/tables/`` call per schema lists
+    # up to this many table NAMES (columns are reflected lazily, per table the
+    # agent actually touches). Generous by design — a name-only listing is one
+    # HTTP call regardless of size, and truncating it hides the very tables a
+    # BI document may reference.
+    wren_introspection_names_limit: int = 2000
+    # Max lazy per-table column reflections per request/turn. Each reflection is
+    # one ``/table_metadata/`` call (several engine metadata queries on Oracle),
+    # so this bounds worst-case latency added by find_tables/onboarding/
+    # validation in a single turn. Reflected columns are memoized on the cached
+    # schema index, so the budget refills each request without re-paying.
+    wren_introspection_column_reflect_budget: int = 40
     wren_schema_table_candidate_limit: int = 12
     # Cross-schema query context: when grounding on a multi-schema project, the
     # dataset candidate scan unions every member schema (so the agent can rank +
@@ -701,6 +713,18 @@ class AgentConfig:
             wren_live_schema_introspection=_env_bool(
                 "AI_AGENT_WREN_LIVE_SCHEMA_INTROSPECTION",
                 cls.wren_live_schema_introspection,
+            ),
+            wren_introspection_names_limit=int(
+                os.getenv(
+                    "AI_AGENT_WREN_INTROSPECTION_NAMES_LIMIT",
+                    str(cls.wren_introspection_names_limit),
+                )
+            ),
+            wren_introspection_column_reflect_budget=int(
+                os.getenv(
+                    "AI_AGENT_WREN_INTROSPECTION_COLUMN_REFLECT_BUDGET",
+                    str(cls.wren_introspection_column_reflect_budget),
+                )
             ),
             wren_dry_plan_enabled=_env_bool(
                 "WREN_DRY_PLAN_ENABLED",

@@ -187,6 +187,12 @@ class SupersetMetadataContextProvider(ContextProvider):
         implementing ``introspect_schema`` (the MCP adapter returns ``[]``).
         Fail-soft: any adapter/engine error degrades to an empty catalog — the
         pre-introspection behavior, never worse.
+
+        Names-first: this lists table NAMES only (one call per schema, bounded
+        by ``wren_introspection_names_limit`` so nothing is silently truncated
+        on a real warehouse). Columns are reflected lazily per table — by the
+        schema index's column loader — only for the tables the agent actually
+        selects, never for the whole schema.
         """
 
         if not self.config.wren_live_schema_introspection:
@@ -199,7 +205,8 @@ class SupersetMetadataContextProvider(ContextProvider):
                 database_id=request.database_id,
                 catalog_name=request.catalog_name,
                 schema_name=request.schema_name,
-                limit=max(self.config.wren_schema_table_scan_limit, 1),
+                limit=max(self.config.wren_introspection_names_limit, 1),
+                names_only=True,
             )
             # Defensive: only a real list feeds the context (guards a misbehaving
             # adapter — and MagicMock clients in tests, which auto-return mocks).

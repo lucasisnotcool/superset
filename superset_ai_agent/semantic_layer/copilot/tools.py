@@ -86,6 +86,11 @@ logger = logging.getLogger(__name__)
 #: 200KB attach slice (this is the read-side equivalent, kept a touch smaller).
 _READ_DOCUMENT_MAX_CHARS = 100_000
 
+#: find_tables reflects columns for at most this many top-ranked candidates per
+#: call (each reflection is a live catalog round-trip on a names-first index);
+#: lower-ranked candidates return names-only with ``columns_pending``.
+_FIND_TABLES_REFLECT_LIMIT = 5
+
 
 class DocumentReader(Protocol):
     """The read-only document access the copilot toolset needs (project-scoped)."""
@@ -365,7 +370,10 @@ class MdlToolset:
                     "single-schema project the result is {tables, column_types}; for a "
                     "MULTI-SCHEMA project it is {schemas: {schema: {table: {columns, "
                     "types}}}} — author each model's tableReference with the schema "
-                    "the table is listed under."
+                    "the table is listed under. On a live-introspected catalog some "
+                    "tables are names-only (columns_pending): their columns load on "
+                    "demand via find_tables/propose_onboard_table — an empty column "
+                    "list there means unknown, never 'no columns'."
                 ),
                 parameters={"type": "object", "properties": {}},
             ),
@@ -376,8 +384,11 @@ class MdlToolset:
                     "free-text query — use it to map an entity a BI doc names "
                     "(e.g. 'customer orders') to the real tables to onboard, "
                     "instead of reading the whole schema. Returns only the top "
-                    "candidates with their columns/types; an empty result means "
-                    "no table in the project's accessible schemas matches."
+                    "candidates; the strongest few include live-reflected "
+                    "columns/types, lower-ranked ones may be names-only "
+                    "(columns_pending — re-query more specifically to load "
+                    "them). An empty result means no table in the project's "
+                    "accessible schemas matches."
                 ),
                 parameters={
                     "type": "object",
@@ -984,12 +995,20 @@ class MdlToolset:
         if self._schema_index is None:
             return {"tables": {}, "note": "No physical schema available."}
         index = self._schema_index
+        pending = index.pending_tables_by_schema()
+        pending_note = (
+            "Tables marked pending have NOT had their columns reflected yet — "
+            "an empty column list there means 'unknown', not 'no columns'. Use "
+            "find_tables (or propose_onboard_table) to load columns for the "
+            "specific tables the BI context calls for; never assume or invent "
+            "columns for a pending table."
+        )
         if index.is_multi_schema():
             # F1: a cross-schema project must surface each table UNDER its schema so
             # the agent can author a correct tableReference.schema, and same-named
             # tables across schemas don't collide. The flat `tables` shape drops the
             # schema and silently hides one of any collision.
-            return {
+            result: dict[str, Any] = {
                 "schemas": index.schema_qualified_view(),
                 "note": (
                     "This project spans multiple schemas. Each table is listed under "
@@ -997,9 +1016,17 @@ class MdlToolset:
                     'tableReference ({"schema": ..., "table": ...}).'
                 ),
             }
-        result: dict[str, Any] = {"tables": index.to_tables()}
+            if pending:
+                result["note"] = f"{result['note']} {pending_note}"
+            return result
+        result = {"tables": index.to_tables()}
         if index.has_types():
             result["column_types"] = index.typed_tables()
+        if pending:
+            result["columns_pending"] = sorted(
+                table for tables in pending.values() for table in tables
+            )
+            result["note"] = pending_note
         return result
 
     def _find_tables(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -1023,9 +1050,18 @@ class MdlToolset:
         limit = raw_limit if isinstance(raw_limit, int) and raw_limit > 0 else 10
         matches = self._schema_index.search(query, schema=schema, limit=limit)
         tables: list[dict[str, Any]] = []
-        for match_schema, table, score in matches:
+        for rank, (match_schema, table, score) in enumerate(matches):
+            # Lazy names-first catalog: reflect columns only for the strongest
+            # candidates (each reflection is a live catalog round-trip). Lower
+            # ranks stay names-only with an explicit pending marker, so one
+            # find_tables call can't burn the whole per-turn reflect budget.
+            reflect = rank < _FIND_TABLES_REFLECT_LIMIT
+            if reflect or self._schema_index.columns_loaded(table, match_schema):
+                column_names = self._schema_index.columns_for(table, match_schema)
+            else:
+                column_names = []
             columns: list[dict[str, Any]] = []
-            for column in self._schema_index.columns_for(table, match_schema):
+            for column in column_names:
                 entry: dict[str, Any] = {"name": column}
                 column_type = self._schema_index.column_type(
                     table, column, match_schema
@@ -1038,6 +1074,10 @@ class MdlToolset:
                 "columns": columns,
                 "score": round(score, 2),
             }
+            if not columns and not self._schema_index.columns_loaded(
+                table, match_schema
+            ):
+                candidate["columns_pending"] = True
             if match_schema:
                 candidate["schema"] = match_schema
             tables.append(candidate)
@@ -1159,6 +1199,21 @@ class MdlToolset:
                 "error": (
                     f"Table '{qualified}' is not in the project's accessible "
                     "schemas; add the schema to the project before onboarding it."
+                )
+            }
+        if not self._schema_index.ensure_columns(table, schema):
+            # Names-first catalog: the table exists but its columns could not be
+            # reflected (loader unavailable, budget exhausted, or the live
+            # catalog call failed). Refuse rather than stage a column-less
+            # placeholder model — report the failure honestly instead.
+            qualified = f"{schema}.{table}" if schema else table
+            return {
+                "error": (
+                    f"Columns for '{qualified}' could not be loaded from the "
+                    "live catalog, so it cannot be onboarded in this turn. Do "
+                    "NOT invent columns or stage a placeholder; report the "
+                    "reflection failure and retry, or ask the user to check "
+                    "the database connection."
                 )
             }
         table_ref: dict[str, Any] = {"table": table}
