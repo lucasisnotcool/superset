@@ -260,16 +260,21 @@ class SupersetRestClient:
         name: str,
         schema_name: str,
         catalog_name: str | None = None,
+        columns_only: bool = False,
     ) -> dict[str, Any]:
         """Return raw `GET /api/v1/database/{id}/table_metadata/` payload.
 
         Owner-scoped: ``raise_for_access`` maps a denied table to 404 (hides
         existence). ``columns`` items are ``{name, type, comment, ...}``.
+        ``columns_only`` requests the lightweight shape (a single
+        ``get_columns`` reflection, no pk/fk/index/comment/SELECT * lookups).
         """
 
         params: dict[str, Any] = {"name": name, "schema": schema_name}
         if catalog_name:
             params["catalog"] = catalog_name
+        if columns_only:
+            params["columns_only"] = "true"
         return self.request(
             "GET",
             f"/api/v1/database/{database_id}/table_metadata/",
@@ -523,16 +528,31 @@ class SupersetRestClient:
         validation) requests columns for exactly the tables it decided to work
         with, instead of the whole schema. Raises ``SupersetAdapterError`` on a
         transport/authz failure — callers treat that as "columns unknown".
+
+        Requests the lightweight ``columns_only`` shape first (one
+        ``get_columns`` reflection — no pk/fk/index/comment/SELECT * dictionary
+        lookups, which dominate latency on Oracle); if the deployed Superset
+        predates that parameter (its schema rejects unknown query args), falls
+        back to the full shape so a mixed-version rollout still reflects.
         """
 
         if not schema_name:
             return []
-        meta = self.get_table_metadata_raw(
-            database_id=database_id,
-            name=table_name,
-            schema_name=schema_name,
-            catalog_name=catalog_name,
-        )
+        try:
+            meta = self.get_table_metadata_raw(
+                database_id=database_id,
+                name=table_name,
+                schema_name=schema_name,
+                catalog_name=catalog_name,
+                columns_only=True,
+            )
+        except SupersetAdapterError:
+            meta = self.get_table_metadata_raw(
+                database_id=database_id,
+                name=table_name,
+                schema_name=schema_name,
+                catalog_name=catalog_name,
+            )
         return _normalize_introspected_columns(meta.get("columns"))
 
     def get_agent_context(

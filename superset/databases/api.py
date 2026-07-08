@@ -110,7 +110,7 @@ from superset.databases.schemas import (
     ValidateSQLRequest,
     ValidateSQLResponse,
 )
-from superset.databases.utils import get_table_metadata
+from superset.databases.utils import get_table_columns_metadata, get_table_metadata
 from superset.db_engine_specs import get_available_engine_specs
 from superset.errors import ErrorLevel, SupersetError, SupersetErrorType
 from superset.exceptions import (
@@ -1066,6 +1066,14 @@ class DatabaseRestApi(BaseSupersetModelRestApi):
             name: catalog
             description: >-
               Optional table catalog, if not passed default catalog will be used
+          - in: query
+            schema:
+              type: boolean
+            name: columns_only
+            description: >-
+              Return only column metadata, skipping the expensive auxiliary
+              sections (primary key, foreign keys, indexes, table comment,
+              SELECT *)
           responses:
             200:
               description: Table metadata information
@@ -1097,6 +1105,14 @@ class DatabaseRestApi(BaseSupersetModelRestApi):
         except SupersetSecurityException as ex:
             # instead of raising 403, raise 404 to hide table existence
             raise TableNotFoundException("No such table") from ex
+        if parameters.get("columns_only"):
+            # Lightweight reflection: one `get_columns` call, none of the
+            # auxiliary dictionary lookups (pk/fk/indexes/comment/SELECT *) —
+            # those dominate latency on warehouses like Oracle. Same authz as
+            # the full shape (checked above).
+            return self.response(
+                200, **get_table_columns_metadata(database, table)
+            )
         # `is_odps_partitioned_table` returns (False, []) for non-ODPS backends
         # and handles its own optional-dependency / network / auth failures
         # internally, so any exception escaping here is an unexpected programming

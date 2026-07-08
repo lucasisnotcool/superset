@@ -29,7 +29,9 @@ from __future__ import annotations
 
 import json  # noqa: TID251 - standalone agent JSON contract
 import logging
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -105,6 +107,12 @@ class SchemaIndex:
     _reflect_failed: set[tuple[str, str]] = field(
         default_factory=set, repr=False, compare=False
     )
+    #: Guards lazy-reflection state (budget, pending, failure memo, column maps)
+    #: against concurrent reflection — tool calls, batch reflection workers, and
+    #: the background MDL warm thread all mutate the same cached index.
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
 
     def attach_column_loader(self, loader: ColumnLoader, *, budget: int) -> None:
         """Arm lazy per-table column reflection for the current request.
@@ -113,9 +121,10 @@ class SchemaIndex:
         request's loader (stale session, transient outage) gets a fresh chance.
         """
 
-        self.column_loader = loader
-        self.reflect_budget = max(budget, 0)
-        self._reflect_failed = set()
+        with self._lock:
+            self.column_loader = loader
+            self.reflect_budget = max(budget, 0)
+            self._reflect_failed = set()
 
     def _is_pending(self, table_l: str, schema_l: str | None) -> bool:
         if schema_l is not None:
@@ -158,30 +167,155 @@ class SchemaIndex:
             return False
         if not self._is_pending(table_l, schema_l):
             return True
-        if schema_l is None:
-            schema_l = self._pending_schema_for(table_l)
-        key = (schema_l or "", table_l)
-        if (
-            self.column_loader is None
-            or key in self._reflect_failed
-            or self.reflect_budget <= 0
-        ):
-            return False
-        self.reflect_budget -= 1
-        try:
-            loaded = self.column_loader(schema_l, table_l)
-        except Exception:  # noqa: BLE001  # pylint: disable=broad-except
-            logger.warning(
-                "Lazy column reflection failed for %s.%s",
-                schema_l,
-                table_l,
-                exc_info=True,
-            )
-            self._reflect_failed.add(key)
-            return False
-        if not loaded:
-            self._reflect_failed.add(key)
-            return False
+        self.ensure_columns_many([(table, schema)])
+        return not self._is_pending(table_l, schema_l)
+
+    def ensure_columns_many(
+        self,
+        refs: Iterable[tuple[str, str | None]],
+        *,
+        max_workers: int = 5,
+        charge_budget: bool = True,
+    ) -> None:
+        """Reflect columns for several ``(table, schema)`` refs CONCURRENTLY.
+
+        Each reflection is an independent live-catalog HTTP call, so a batch
+        (find_tables' top candidates, a multi-table onboard, the background MDL
+        warm) runs them in a small worker pool — wall clock becomes the slowest
+        single call instead of the sum. Budget/failure/pending bookkeeping is
+        locked; the network calls run outside the lock. Fail-soft per table.
+
+        ``charge_budget=False`` exempts the batch from the per-turn reflect
+        budget (used by the background MDL warm, which must never starve the
+        agent's own find_tables/onboard reflections) — the caller then bounds
+        the batch size itself.
+        """
+
+        with self._lock:
+            loader = self.column_loader
+            if loader is None:
+                return
+            jobs = self._claim_reflection_jobs(refs, charge_budget=charge_budget)
+        if not jobs:
+            return
+
+        def _fetch(
+            job: tuple[str, str | None],
+        ) -> tuple[tuple[str, str | None], dict[str, str | None] | None]:
+            job_table, job_schema = job
+            try:
+                return job, loader(job_schema, job_table)
+            except Exception:  # noqa: BLE001  # pylint: disable=broad-except
+                logger.warning(
+                    "Lazy column reflection failed for %s.%s",
+                    job_schema,
+                    job_table,
+                    exc_info=True,
+                )
+                return job, None
+
+        if len(jobs) == 1:
+            results = [_fetch(jobs[0])]
+        else:
+            with ThreadPoolExecutor(
+                max_workers=max(1, min(max_workers, len(jobs)))
+            ) as pool:
+                results = list(pool.map(_fetch, jobs))
+        with self._lock:
+            for (table_l, schema_l), loaded in results:
+                if not loaded:
+                    self._reflect_failed.add((schema_l or "", table_l))
+                    continue
+                self._apply_loaded(table_l, schema_l, loaded)
+
+    def adopt_resolved_from(self, previous: "SchemaIndex") -> int:
+        """Carry a previous build's reflected columns into this fresh index.
+
+        A rebuilt names-first index starts with every live table pending; without
+        carry-over, every catalog-cache expiry re-pays the same per-table
+        reflections. Adopt columns/types from ``previous`` for tables that are
+        pending here and resolved there — but only for tables this build still
+        LISTS (a dropped table never resurrects). Returns the adopted count.
+        """
+
+        with previous._lock:  # noqa: SLF001 - same class
+            donor: list[tuple[str, str | None, dict[str, str | None]]] = []
+            for schema_l, tables in previous.tables_by_schema.items():
+                prev_pending = previous.pending_by_schema.get(schema_l, set())
+                for table_l, columns in tables.items():
+                    if not columns or table_l in prev_pending:
+                        continue
+                    types = previous.types_by_schema.get(schema_l, {}).get(table_l, {})
+                    donor.append(
+                        (
+                            table_l,
+                            schema_l,
+                            {column: types.get(column) for column in columns},
+                        )
+                    )
+            if not previous.tables_by_schema:
+                prev_pending = previous.pending_by_schema.get("", set())
+                for table_l, columns in previous.tables.items():
+                    if not columns or table_l in prev_pending:
+                        continue
+                    types = previous.column_types.get(table_l, {})
+                    donor.append(
+                        (
+                            table_l,
+                            None,
+                            {column: types.get(column) for column in columns},
+                        )
+                    )
+        adopted = 0
+        with self._lock:
+            for table_l, schema_l, loaded in donor:
+                if not self._is_pending(table_l, schema_l):
+                    continue
+                self._apply_loaded(table_l, schema_l, loaded)
+                adopted += 1
+        return adopted
+
+    def _claim_reflection_jobs(
+        self,
+        refs: Iterable[tuple[str, str | None]],
+        *,
+        charge_budget: bool,
+    ) -> list[tuple[str, str | None]]:
+        """Select the pending, unfailed, deduped refs to reflect (lock held).
+
+        Charges the reflect budget per claimed job unless exempted.
+        """
+
+        jobs: list[tuple[str, str | None]] = []
+        claimed: set[tuple[str, str]] = set()
+        for table, schema in refs:
+            table_l = table.lower()
+            schema_l = schema.lower() if schema else None
+            if not self.has_table(table_l, schema_l):
+                continue
+            if not self._is_pending(table_l, schema_l):
+                continue
+            if schema_l is None:
+                schema_l = self._pending_schema_for(table_l)
+            key = (schema_l or "", table_l)
+            if key in claimed or key in self._reflect_failed:
+                continue
+            if charge_budget:
+                if self.reflect_budget <= 0:
+                    break
+                self.reflect_budget -= 1
+            claimed.add(key)
+            jobs.append((table_l, schema_l))
+        return jobs
+
+    def _apply_loaded(
+        self,
+        table_l: str,
+        schema_l: str | None,
+        loaded: dict[str, str | None],
+    ) -> None:
+        """Memoize one table's reflected columns/types (caller holds the lock)."""
+
         columns = {str(name).lower() for name in loaded}
         types = {
             str(name).lower(): str(type_) for name, type_ in loaded.items() if type_
@@ -194,7 +328,6 @@ class SchemaIndex:
             if types:
                 self.types_by_schema.setdefault(schema_l, {})[table_l] = types
         self.pending_by_schema.get(schema_l or "", set()).discard(table_l)
-        return True
 
     @classmethod
     def from_agent_context(cls, context: AgentContext) -> "SchemaIndex":

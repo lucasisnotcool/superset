@@ -1478,3 +1478,14 @@ class QualifiedTableSchema(Schema):
         load_default=None,
         metadata={"description": "The table catalog"},
     )
+    columns_only = fields.Boolean(
+        required=False,
+        load_default=False,
+        metadata={
+            "description": (
+                "Return only column metadata, skipping the expensive auxiliary "
+                "sections (primary key, foreign keys, indexes, table comment, "
+                "SELECT *). A lightweight reflection for catalog browsing."
+            )
+        },
+    )

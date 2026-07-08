@@ -158,6 +158,18 @@ class AgentConfig:
     # validation in a single turn. Reflected columns are memoized on the cached
     # schema index, so the budget refills each request without re-paying.
     wren_introspection_column_reflect_budget: int = 40
+    # TTL of the PHYSICAL catalog (schema index) cache. Deliberately longer than
+    # the authorization cache (``wren_schema_index_cache_ttl_seconds``): table
+    # names/columns churn slowly, and every expiry re-pays the per-schema
+    # listing/dataset scans AND used to discard lazily reflected columns.
+    # Resolved columns additionally carry over across rebuilds (see
+    # ``SchemaIndex.adopt_resolved_from``), so reflection is a one-time cost per
+    # table per process.
+    wren_physical_catalog_cache_ttl_seconds: float = 600.0
+    # TTL of the per-(database, catalog, schema) live NAMES-listing cache. Table
+    # names churn slowly; caching the ``/tables/`` listing keeps catalog
+    # rebuilds from re-paying one listing per schema each time.
+    wren_introspection_names_cache_ttl_seconds: float = 600.0
     wren_schema_table_candidate_limit: int = 12
     # Cross-schema query context: when grounding on a multi-schema project, the
     # dataset candidate scan unions every member schema (so the agent can rank +
@@ -724,6 +736,18 @@ class AgentConfig:
                 os.getenv(
                     "AI_AGENT_WREN_INTROSPECTION_COLUMN_REFLECT_BUDGET",
                     str(cls.wren_introspection_column_reflect_budget),
+                )
+            ),
+            wren_physical_catalog_cache_ttl_seconds=float(
+                os.getenv(
+                    "AI_AGENT_WREN_PHYSICAL_CATALOG_CACHE_TTL_SECONDS",
+                    str(cls.wren_physical_catalog_cache_ttl_seconds),
+                )
+            ),
+            wren_introspection_names_cache_ttl_seconds=float(
+                os.getenv(
+                    "AI_AGENT_WREN_INTROSPECTION_NAMES_CACHE_TTL_SECONDS",
+                    str(cls.wren_introspection_names_cache_ttl_seconds),
                 )
             ),
             wren_dry_plan_enabled=_env_bool(

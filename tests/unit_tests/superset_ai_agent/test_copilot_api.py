@@ -229,6 +229,11 @@ def test_copilot_stream_emits_progress_then_complete(tmp_path) -> None:
 
     assert "event: progress" in body
     assert "event: complete" in body
+    # The catalog build is narrated INSIDE the stream (running → ready), so a
+    # slow live-warehouse listing is visible instead of a silent pre-stream gap.
+    assert "copilot_catalog" in body
+    assert "Building the physical schema catalog" in body
+    assert "Physical schema catalog ready" in body
     # the terminal frame carries the changeset
     complete = body.split("event: complete")[1]
     assert "models/moves.json" in complete

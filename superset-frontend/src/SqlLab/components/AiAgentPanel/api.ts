@@ -323,14 +323,62 @@ export type AgentStepDetail =
 
 export interface AgentStep {
   kind: string;
-  status: 'ok' | 'warning' | 'error';
+  /** `running` marks a transient in-flight event (a started tool / in-tool
+   * progress note); its completion re-emits the same `step_id` with a terminal
+   * status so the live list can replace the entry in place. */
+  status: 'ok' | 'warning' | 'error' | 'running';
   summary: string;
   started_at: string;
   duration_ms?: number | null;
+  /** Pairs a running step with its completion and progress notes. */
+  step_id?: string | null;
   attempt_index: number;
   artifact_id?: string | null;
   detail?: AgentStepDetail | null;
+  /** Client-side only: the latest in-tool progress note for a running step. */
+  progressNote?: string;
 }
+
+/**
+ * Fold one streamed step into the live-step list.
+ *
+ * - An in-tool progress note (`copilot_tool_progress`) updates the matching
+ *   running step's `progressNote` instead of appending a new row.
+ * - A step whose `step_id` matches an existing row of the same kind replaces
+ *   that row in place (running → completed, with duration).
+ * - Anything else appends.
+ */
+export const upsertLiveStep = (
+  prev: AgentStep[],
+  step: AgentStep,
+): AgentStep[] => {
+  if (step.step_id) {
+    if (step.kind === 'copilot_tool_progress') {
+      let matched = false;
+      const next = prev.map(existing => {
+        if (
+          existing.step_id === step.step_id &&
+          existing.kind !== 'copilot_tool_progress'
+        ) {
+          matched = true;
+          return { ...existing, progressNote: step.summary };
+        }
+        return existing;
+      });
+      return matched ? next : [...prev, step];
+    }
+    const index = prev.findIndex(
+      existing =>
+        existing.step_id === step.step_id && existing.kind === step.kind,
+    );
+    if (index >= 0) {
+      const next = [...prev];
+      next[index] = step;
+      return next;
+    }
+  }
+  return [...prev, step];
+};
 
 export interface AgentQueryRequest {
   question: string;

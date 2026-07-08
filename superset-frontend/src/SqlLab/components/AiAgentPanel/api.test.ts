@@ -63,6 +63,7 @@ import {
   sendConversationMessage,
   streamCopilot,
   updateMdlFile,
+  upsertLiveStep,
   uploadMdlFile,
   uploadProjectSourceDocument,
   uploadSemanticDocument,
@@ -1199,4 +1200,74 @@ test('streamCopilot reports an unreachable agent (network / TLS) distinctly', as
   await expect(streamCopilot('p1', { message: 'hi' })).rejects.toThrow(
     /Could not reach the AI agent/,
   );
+});
+
+// --- upsertLiveStep: live step-list folding for running/progress/completed ----
+
+const liveStep = (
+  overrides: Partial<import('./api').AgentStep>,
+): import('./api').AgentStep => ({
+  kind: 'copilot_tool',
+  status: 'ok',
+  summary: 'x',
+  started_at: '2026-07-08T00:00:00Z',
+  attempt_index: 0,
+  ...overrides,
+});
+
+test('upsertLiveStep replaces a running step with its completion in place', () => {
+  const running = liveStep({
+    status: 'running',
+    step_id: 's1',
+    summary: 'find_tables(query=wip)',
+  });
+  const other = liveStep({ kind: 'copilot_plan', summary: 'Planning' });
+  const completed = liveStep({
+    status: 'ok',
+    step_id: 's1',
+    summary: 'find_tables(query=wip) — 8 matched',
+    duration_ms: 1234,
+  });
+
+  const afterRunning = upsertLiveStep([other], running);
+  expect(afterRunning).toHaveLength(2);
+
+  const afterCompleted = upsertLiveStep(afterRunning, completed);
+  expect(afterCompleted).toHaveLength(2);
+  expect(afterCompleted[1].status).toBe('ok');
+  expect(afterCompleted[1].duration_ms).toBe(1234);
+  expect(afterCompleted[1].summary).toContain('8 matched');
+});
+
+test('upsertLiveStep folds progress notes into the running step', () => {
+  const running = liveStep({
+    status: 'running',
+    step_id: 's1',
+    summary: 'find_tables(query=wip)',
+  });
+  const note = liveStep({
+    kind: 'copilot_tool_progress',
+    status: 'running',
+    step_id: 's1',
+    summary: 'Reflecting live columns for 3 table(s)…',
+  });
+
+  const next = upsertLiveStep([running], note);
+
+  expect(next).toHaveLength(1); // no extra row — the note annotates the step
+  expect(next[0].progressNote).toContain('Reflecting live columns');
+});
+
+test('upsertLiveStep appends steps without ids and unmatched notes', () => {
+  const plain = liveStep({ kind: 'copilot_plan', summary: 'Planning' });
+  const orphanNote = liveStep({
+    kind: 'copilot_tool_progress',
+    status: 'running',
+    step_id: 'missing',
+    summary: 'note',
+  });
+
+  const next = upsertLiveStep(upsertLiveStep([], plain), orphanNote);
+
+  expect(next).toHaveLength(2);
 });

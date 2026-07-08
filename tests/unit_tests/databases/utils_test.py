@@ -21,7 +21,11 @@ import pytest
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.orm.session import Session
 
-from superset.databases.utils import get_table_metadata, make_url_safe
+from superset.databases.utils import (
+    get_table_columns_metadata,
+    get_table_metadata,
+    make_url_safe,
+)
 from superset.sql.parse import Table
 
 
@@ -117,6 +121,32 @@ def test_get_table_metadata_degrades_when_table_comment_fails() -> None:
     assert metadata["comment"] is None
     assert [col["name"] for col in metadata["columns"]] == ["id"]
     assert any("table comment" in warning for warning in metadata["warnings"])
+
+
+def test_get_table_columns_metadata_skips_auxiliary_lookups() -> None:
+    """The columns-only shape reflects columns with a single call and never
+    touches the expensive auxiliary sections (pk/fk/indexes/comment/SELECT *)."""
+    database = _mock_database()
+    metadata = get_table_columns_metadata(database, Table("t", "main"))
+    assert metadata["name"] == "t"
+    assert [col["name"] for col in metadata["columns"]] == ["id"]
+    assert metadata["columns"][0]["keys"] == []
+    assert metadata["selectStar"] == ""
+    assert metadata["warnings"] == []
+    database.get_columns.assert_called_once()
+    database.get_pk_constraint.assert_not_called()
+    database.get_foreign_keys.assert_not_called()
+    database.get_indexes.assert_not_called()
+    database.get_table_comment.assert_not_called()
+    database.select_star.assert_not_called()
+
+
+def test_get_table_columns_metadata_propagates_columns_failure() -> None:
+    """Columns stay essential in the lightweight shape too."""
+    database = _mock_database()
+    database.get_columns.side_effect = RuntimeError("boom")
+    with pytest.raises(RuntimeError):
+        get_table_columns_metadata(database, Table("t", "main"))
 
 
 def test_get_table_metadata_propagates_columns_failure() -> None:

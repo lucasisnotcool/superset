@@ -26,9 +26,11 @@ import queue
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from fastapi import (
     Depends,
@@ -158,6 +160,7 @@ from superset_ai_agent.prompts.store import (
 from superset_ai_agent.schemas import (
     AgentQueryRequest,
     AgentQueryResponse,
+    AgentStep,
     HealthResponse,
     LlmUsageSummary,
     ModelInfo,
@@ -353,6 +356,76 @@ SEMANTIC_EVENTS_RETRY_MS = 15000
 # lets the client's stall watchdog distinguish "still working" from a dead
 # stream. Must stay well under the client inactivity timeout.
 COPILOT_STREAM_HEARTBEAT_SECONDS = 10.0
+
+#: Cap on the background MDL-referenced column warm (per copilot turn). Warm
+#: reflections are budget-exempt, so this is the only bound on their count.
+MDL_COLUMN_WARM_LIMIT = 24
+
+
+def _mdl_referenced_tables(files: list[Any]) -> list[tuple[str, str | None]]:
+    """Distinct ``(table, schema)`` refs the project's MDL models point at.
+
+    Parsed from each non-deleted file's ``models[].tableReference`` — the
+    tables validation will touch, so warming their columns makes later
+    validation/activation hit memoized reflections.
+    """
+
+    refs: list[tuple[str, str | None]] = []
+    seen: set[tuple[str, str]] = set()
+    for file in files:
+        if getattr(file, "status", None) == "deleted":
+            continue
+        try:
+            payload = json.loads(file.content)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        for model in payload.get("models") or []:
+            if not isinstance(model, dict):
+                continue
+            table_ref = model.get("tableReference")
+            if not isinstance(table_ref, dict):
+                continue
+            table = table_ref.get("table")
+            if not isinstance(table, str) or not table:
+                continue
+            raw_schema = table_ref.get("schema")
+            schema = raw_schema if isinstance(raw_schema, str) and raw_schema else None
+            key = ((schema or "").lower(), table.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            refs.append((table, schema))
+    return refs
+
+
+def _warm_mdl_referenced_columns(schema_index: Any, files: list[Any]) -> None:
+    """Fire-and-forget: pre-reflect columns for tables the MDL references.
+
+    Runs in a daemon thread so the copilot turn starts immediately; the batch
+    is budget-EXEMPT (it must never starve the agent's own reflections) and
+    bounded by ``MDL_COLUMN_WARM_LIMIT``. Thread-safe: ``ensure_columns_many``
+    locks the shared index. Fail-soft — a warm failure just leaves tables
+    pending, exactly as if the warm had not run.
+    """
+
+    if schema_index is None:
+        return
+    ensure_many = getattr(schema_index, "ensure_columns_many", None)
+    if ensure_many is None:
+        return
+    refs = _mdl_referenced_tables(files)[:MDL_COLUMN_WARM_LIMIT]
+    if not refs:
+        return
+
+    def _warm() -> None:
+        try:
+            ensure_many(refs, charge_budget=False)
+        except Exception:  # pylint: disable=broad-except
+            logger.debug("MDL column warm failed; continuing.", exc_info=True)
+
+    threading.Thread(target=_warm, daemon=True, name="mdl-column-warm").start()
 
 
 def _conversation_sse(event: dict[str, Any]) -> str:
@@ -2285,9 +2358,15 @@ def create_app(  # noqa: C901
 
     # Shared across requests (the app factory runs once); keyed per project so an
     # unauthorized caller never reaches a cached entry (access is checked upstream).
+    # Uses the PHYSICAL-catalog TTL (longer than the authorization cache's — table
+    # names/columns churn slowly and rebuilds are expensive on a live warehouse).
     _schema_index_cache: TtlCache[tuple[str, tuple[str, ...]], SchemaIndex] = TtlCache(
-        ttl_seconds=app_config.wren_schema_index_cache_ttl_seconds,
+        ttl_seconds=app_config.wren_physical_catalog_cache_ttl_seconds,
     )
+    #: Last successfully built index per project (no TTL): the donor for
+    #: ``adopt_resolved_from`` so lazily reflected columns survive cache expiry —
+    #: reflection stays a one-time cost per table per process.
+    _last_schema_index: dict[tuple[str, tuple[str, ...]], SchemaIndex] = {}
 
     def _cached_schema_index(project: SemanticProject) -> SchemaIndex | None:
         """Warm-cache-only physical schema index for background jobs.
@@ -2407,12 +2486,26 @@ def create_app(  # noqa: C901
             # validates/generates against only its primary schema — so the R1
             # invariant wrongly rejects, and the Copilot is blind to, tables in the
             # project's secondary schemas even though their access is proven.
-            context = _fetch(project.schema_name)
+            # Fetches run CONCURRENTLY (independent per-schema listing + dataset
+            # scans — on a live warehouse each is seconds); merge order stays
+            # deterministic (primary first, then the project's schema order). Any
+            # failed fetch propagates so the snapshot fallback applies, unchanged.
+            ordered_schemas = [project.schema_name] + [
+                schema_name
+                for schema_name in project.schema_names
+                if schema_name != project.schema_name
+            ]
+            if len(ordered_schemas) == 1:
+                contexts = [_fetch(ordered_schemas[0])]
+            else:
+                with ThreadPoolExecutor(
+                    max_workers=min(4, len(ordered_schemas))
+                ) as pool:
+                    contexts = list(pool.map(_fetch, ordered_schemas))
+            context = contexts[0]
             seen = {dataset.id for dataset in context.datasets}
-            for schema_name in project.schema_names:
-                if schema_name == project.schema_name:
-                    continue
-                for dataset in _fetch(schema_name).datasets:
+            for fetched in contexts[1:]:
+                for dataset in fetched.datasets:
                     if dataset.id not in seen:
                         seen.add(dataset.id)
                         context.datasets.append(dataset)
@@ -2429,6 +2522,14 @@ def create_app(  # noqa: C901
                 fastapi_request,
             )
         index = SchemaIndex.from_agent_context(context)
+        # Carry over columns reflected under the previous build so a cache
+        # expiry never re-pays per-table reflection for tables still listed.
+        if (previous_index := _last_schema_index.get(cache_key)) is not None:
+            try:
+                index.adopt_resolved_from(previous_index)
+            except Exception:  # noqa: S110  # pylint: disable=broad-except
+                pass
+        _last_schema_index[cache_key] = index
         try:
             active_schema_snapshot_store.upsert(
                 SchemaSnapshot(
@@ -2449,6 +2550,50 @@ def create_app(  # noqa: C901
             pass
         _schema_index_cache.set(cache_key, index)
         return _attach_index_column_loader(index, project, fastapi_request)
+
+    def _build_catalog_with_progress(
+        project: SemanticProject,
+        fastapi_request: Request,
+        emit_step: Callable[[AgentStep], None],
+    ) -> SchemaIndex | None:
+        """Resolve the physical catalog, narrating it as a running→done step.
+
+        On a live warehouse the build is seconds; emitting the paired steps
+        keeps the copilot stream visibly alive instead of silently working.
+        """
+
+        step_id = uuid4().hex[:12]
+        emit_step(
+            AgentStep(
+                kind="copilot_catalog",
+                summary="Building the physical schema catalog…",
+                status="running",
+                step_id=step_id,
+            )
+        )
+        started = time.monotonic()
+        schema_index = _schema_index_for_project(project, fastapi_request)
+        if schema_index is not None:
+            schema_count = len(schema_index.tables_by_schema) or 1
+            summary = (
+                f"Physical schema catalog ready — {len(schema_index.tables)} "
+                f"tables across {schema_count} schema(s)"
+            )
+        else:
+            summary = (
+                "No physical schema catalog available; proceeding with "
+                "structural validation only"
+            )
+        emit_step(
+            AgentStep(
+                kind="copilot_catalog",
+                summary=summary,
+                status="ok" if schema_index is not None else "warning",
+                step_id=step_id,
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
+        )
+        return schema_index
 
     def _project_has_models(project_id: str, *, owner_id: str) -> bool:
         """Whether the project has at least one non-deleted MDL model (CR2).
@@ -3761,7 +3906,10 @@ def create_app(  # noqa: C901
             )
             _require_project_ready(project, identity.owner_id)
             files = active_mdl_file_store.list(project_id, owner_id=identity.owner_id)
-            schema_index = _schema_index_for_project(project, fastapi_request)
+            # NOTE: the physical schema catalog build (the slow part on a live
+            # warehouse — per-schema listings + dataset scans) happens INSIDE the
+            # stream worker so the user sees a running "building catalog" step
+            # instead of a silent pre-stream gap. Authorization stays here.
             instructions = _recalled_instructions(
                 project, identity.owner_id, request.message
             )
@@ -3791,6 +3939,15 @@ def create_app(  # noqa: C901
 
             def run() -> None:
                 try:
+                    # Build (or fetch from cache) the physical catalog with live
+                    # progress: on a big Oracle scope this is seconds — the user
+                    # must see it happening, not a frozen panel.
+                    schema_index = _build_catalog_with_progress(
+                        project, fastapi_request, on_step
+                    )
+                    # Warm the MDL-referenced columns in the background while
+                    # the model plans — later validation hits memoized columns.
+                    _warm_mdl_referenced_columns(schema_index, files)
                     holder["changeset"] = run_copilot(
                         model_client=active_model_client,
                         files=files,

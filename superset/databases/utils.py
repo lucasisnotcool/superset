@@ -91,6 +91,42 @@ def get_col_type(col: dict[Any, Any]) -> str:
     return dtype
 
 
+def get_table_columns_metadata(database: Any, table: Table) -> TableMetadataResponse:
+    """Columns-only table metadata (no keys/indexes/comment/``SELECT *``).
+
+    The auxiliary sections of :func:`get_table_metadata` are the expensive
+    dictionary lookups on warehouses like Oracle (constraint and index views).
+    Callers that only need the column list — e.g. the AI agent's lazy schema
+    reflection — request this shape via ``?columns_only=true`` to reflect a
+    table with a single ``get_columns`` call. Column reflection stays essential
+    and propagates on failure, matching the full endpoint's contract.
+    """
+
+    columns = database.get_columns(table)
+    payload_columns: list[TableMetadataColumnsResponse] = []
+    for col in columns:
+        dtype = get_col_type(col)
+        payload_columns.append(
+            {
+                "name": col["column_name"],
+                "type": dtype.split("(")[0] if "(" in dtype else dtype,
+                "longType": dtype,
+                "keys": [],
+                "comment": col.get("comment"),
+            }
+        )
+    return {
+        "name": table.table,
+        "columns": payload_columns,
+        "selectStar": "",
+        "primaryKey": {},
+        "foreignKeys": [],
+        "indexes": [],
+        "comment": None,
+        "warnings": [],
+    }
+
+
 def get_table_metadata(database: Any, table: Table) -> TableMetadataResponse:
     """
     Get table metadata information, including type, pk, fks.

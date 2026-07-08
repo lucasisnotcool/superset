@@ -52,6 +52,7 @@ import {
   SemanticProjectReadinessStatus,
   streamCopilot,
   updateCopilotConversationTitle,
+  upsertLiveStep,
 } from '../api';
 import {
   getDocumentStatusMeta,
@@ -59,6 +60,27 @@ import {
 } from './documentStatus';
 import AttachDocumentDialog from './AttachDocumentDialog';
 import CopilotInspectorDialog from './CopilotInspectorDialog';
+
+/** Live elapsed-seconds ticker for a running step (client receipt time). */
+function ElapsedSeconds() {
+  const [seconds, setSeconds] = useState(0);
+  useEffect(() => {
+    const startedAt = Date.now();
+    const timer = window.setInterval(
+      () => setSeconds(Math.floor((Date.now() - startedAt) / 1000)),
+      1000,
+    );
+    return () => window.clearInterval(timer);
+  }, []);
+  return seconds > 0 ? <> ({seconds}s)</> : null;
+}
+
+/** "1.2s" / "340ms" for a completed step's duration. */
+const formatDuration = (durationMs?: number | null): string | null => {
+  if (durationMs == null) return null;
+  if (durationMs >= 1000) return `${(durationMs / 1000).toFixed(1)}s`;
+  return `${durationMs}ms`;
+};
 
 /** Pull the persisted Copilot changeset off an assistant message, if any. */
 const changesetFromMessage = (
@@ -439,7 +461,7 @@ const CopilotPanel = ({
             conversation_id: id,
             attachments: attachments.length ? attachments : undefined,
           },
-          step => setLiveSteps(prev => [...prev, step]),
+          step => setLiveSteps(prev => upsertLiveStep(prev, step)),
         );
         setAttachedDocs([]);
         setAttachPollGaveUp(false);
@@ -1027,18 +1049,43 @@ const CopilotPanel = ({
                 <Typography.Text type="secondary">
                   <Icons.LoadingOutlined /> {t('Agent is editing…')}
                 </Typography.Text>
-                {liveSteps.map((step, index) => (
-                  <Typography.Text
-                    // eslint-disable-next-line react/no-array-index-key
-                    key={`live-${step.kind}-${index}`}
-                    type={step.status === 'error' ? 'danger' : 'secondary'}
-                    css={css`
-                      padding-left: ${theme.sizeUnit * 2}px;
-                    `}
-                  >
-                    {step.kind}: {step.summary}
-                  </Typography.Text>
-                ))}
+                {liveSteps.map((step, index) => {
+                  const running = step.status === 'running';
+                  const duration = formatDuration(step.duration_ms);
+                  return (
+                    <Typography.Text
+                      key={step.step_id || `live-${step.kind}-${index}`}
+                      type={step.status === 'error' ? 'danger' : 'secondary'}
+                      css={css`
+                        padding-left: ${theme.sizeUnit * 2}px;
+                      `}
+                    >
+                      {running ? (
+                        <>
+                          <Icons.LoadingOutlined /> {step.summary}
+                          <ElapsedSeconds />
+                        </>
+                      ) : (
+                        <>
+                          {step.summary}
+                          {duration ? ` — ${duration}` : null}
+                        </>
+                      )}
+                      {running && step.progressNote ? (
+                        <Typography.Text
+                          type="secondary"
+                          css={css`
+                            display: block;
+                            padding-left: ${theme.sizeUnit * 4}px;
+                            font-size: ${theme.fontSizeSM}px;
+                          `}
+                        >
+                          {step.progressNote}
+                        </Typography.Text>
+                      ) : null}
+                    </Typography.Text>
+                  );
+                })}
               </Flex>
             ) : null}
 
@@ -1070,6 +1117,9 @@ const CopilotPanel = ({
                             }
                           >
                             {step.kind}: {step.summary}
+                            {formatDuration(step.duration_ms)
+                              ? ` — ${formatDuration(step.duration_ms)}`
+                              : null}
                           </Typography.Text>
                         ))}
                       </Flex>

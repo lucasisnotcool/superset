@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.context.base import ContextProvider
@@ -26,6 +27,7 @@ from superset_ai_agent.integrations.superset.client import (
     DatasetMetadata,
     SupersetClient,
 )
+from superset_ai_agent.persistence.ttl_cache import TtlCache
 from superset_ai_agent.schemas import AgentQueryRequest
 from superset_ai_agent.semantic_layer.retrieval import (
     retrieve_schema_context,
@@ -33,6 +35,37 @@ from superset_ai_agent.semantic_layer.retrieval import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Process-level cache of live NAMES listings, keyed per (database, catalog,
+#: schema). Providers are per-request, so the cache lives at module level and
+#: is created lazily with the first config's TTL (one config per process).
+#: Trust model matches the shared schema-index cache: entries are table NAMES
+#: for scopes the caller has already been authorized against (DB-level access);
+#: results are read-only DatasetMetadata and never mutated by consumers.
+_names_cache: (
+    TtlCache[tuple[int, str | None, str | None], list[DatasetMetadata]] | None
+) = None
+_names_cache_guard = threading.Lock()
+
+
+def _names_listing_cache(
+    config: AgentConfig,
+) -> TtlCache[tuple[int, str | None, str | None], list[DatasetMetadata]]:
+    global _names_cache  # noqa: PLW0603
+    with _names_cache_guard:
+        if _names_cache is None:
+            _names_cache = TtlCache(
+                ttl_seconds=config.wren_introspection_names_cache_ttl_seconds
+            )
+        return _names_cache
+
+
+def reset_names_listing_cache() -> None:
+    """Drop the process-level names cache (test isolation)."""
+
+    global _names_cache  # noqa: PLW0603
+    with _names_cache_guard:
+        _names_cache = None
 
 
 class SupersetMetadataContextProvider(ContextProvider):
@@ -214,6 +247,14 @@ class SupersetMetadataContextProvider(ContextProvider):
         introspect = getattr(self.superset_client, "introspect_schema", None)
         if introspect is None:
             return []
+        cache = _names_listing_cache(self.config)
+        cache_key = (
+            request.database_id,
+            request.catalog_name,
+            request.schema_name,
+        )
+        if (cached := cache.get(cache_key)) is not None:
+            return list(cached)
         try:
             result = introspect(
                 database_id=request.database_id,
@@ -224,7 +265,13 @@ class SupersetMetadataContextProvider(ContextProvider):
             )
             # Defensive: only a real list feeds the context (guards a misbehaving
             # adapter — and MagicMock clients in tests, which auto-return mocks).
-            return result if isinstance(result, list) else []
+            if not isinstance(result, list):
+                return []
+            # Cache only a non-empty success: a failed/empty listing retries on
+            # the next build instead of pinning emptiness for the TTL.
+            if result:
+                cache.set(cache_key, list(result))
+            return result
         except Exception:  # noqa: BLE001  # pylint: disable=broad-except
             logger.warning(
                 "Live schema introspection failed for database %s schema %s",

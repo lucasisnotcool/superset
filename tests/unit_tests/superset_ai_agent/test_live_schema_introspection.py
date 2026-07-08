@@ -232,6 +232,34 @@ def test_provider_skips_introspection_when_flag_off() -> None:
     assert context.datasets == []
 
 
+def test_names_listing_is_cached_across_provider_builds() -> None:
+    """The `/tables/` names listing is cached per (db, catalog, schema): a
+    catalog rebuild within the TTL reuses it instead of re-listing."""
+
+    client = _FakeClient(introspect_result=[_live_dataset()])
+    provider = SupersetMetadataContextProvider(client, config=AgentConfig())
+
+    first = provider.get_full_schema(_request())
+    second = provider.get_full_schema(_request())
+
+    assert client.introspect_calls == 1  # second build served from the cache
+    assert [d.table_name for d in first.datasets] == [
+        d.table_name for d in second.datasets
+    ]
+
+
+def test_empty_names_listing_is_not_cached() -> None:
+    """A failed/empty listing must retry next build, not pin emptiness."""
+
+    client = _FakeClient(introspect_result=[])
+    provider = SupersetMetadataContextProvider(client, config=AgentConfig())
+
+    provider.get_full_schema(_request())
+    provider.get_full_schema(_request())
+
+    assert client.introspect_calls == 2
+
+
 def test_provider_ignores_non_list_introspection_result() -> None:
     # A misbehaving adapter returning a non-list degrades to empty, not a crash.
     class _BadClient(_FakeClient):
@@ -287,6 +315,50 @@ def test_introspect_schema_names_only_is_one_call_and_lists_everything() -> None
     assert calls == {"tables": 1, "table_metadata": 0}
     assert all(ds.columns == [] for ds in datasets)
     assert all(ds.id < 0 for ds in datasets)
+
+
+def test_reflect_table_columns_requests_columns_only_shape() -> None:
+    seen_params: list[dict[str, Any]] = []
+
+    def fake_request(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        assert path.endswith("/table_metadata/")
+        seen_params.append(kwargs["params"])
+        return {"name": "t", "columns": [{"name": "ID", "type": "NUMBER"}]}
+
+    client = _client()
+    client.request = fake_request  # type: ignore[method-assign]
+
+    columns = client.reflect_table_columns(
+        database_id=7, schema_name="wlos_owner", table_name="t"
+    )
+
+    assert [c.name for c in columns] == ["ID"]
+    assert seen_params[0]["columns_only"] == "true"
+
+
+def test_reflect_table_columns_falls_back_without_columns_only() -> None:
+    """A Superset that predates ``columns_only`` (400s on the unknown param)
+    still reflects via the full shape — mixed-version rollouts keep working."""
+    from superset_ai_agent.integrations.superset.client import SupersetAdapterError
+
+    calls: list[dict[str, Any]] = []
+
+    def fake_request(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs["params"])
+        if "columns_only" in kwargs["params"]:
+            raise SupersetAdapterError("400: unknown field columns_only")
+        return {"name": "t", "columns": [{"name": "ID", "type": "NUMBER"}]}
+
+    client = _client()
+    client.request = fake_request  # type: ignore[method-assign]
+
+    columns = client.reflect_table_columns(
+        database_id=7, schema_name="wlos_owner", table_name="t"
+    )
+
+    assert [c.name for c in columns] == ["ID"]
+    assert len(calls) == 2
+    assert "columns_only" not in calls[1]
 
 
 def test_reflect_table_columns_reflects_one_table() -> None:
@@ -576,6 +648,28 @@ def test_find_tables_reflects_only_top_candidates() -> None:
     assert len(pending) == 3
 
 
+def test_get_physical_schema_compacts_large_catalogs() -> None:
+    from superset_ai_agent.semantic_layer.copilot.tools import MdlToolset
+    from superset_ai_agent.semantic_layer.mdl_validator import SchemaIndex
+
+    tables = {f"tbl_{i:04d}": set() for i in range(500)}
+    index = SchemaIndex(
+        tables=dict(tables),
+        tables_by_schema={"wlos": dict(tables)},
+        pending_by_schema={"wlos": set(tables)},
+    )
+    toolset = MdlToolset([], schema_index=index)
+
+    result = toolset.dispatch("get_physical_schema", {})
+
+    assert result["truncated"] is True
+    assert result["total_tables"] == 500
+    summary = result["schemas_summary"]["wlos"]
+    assert summary["table_count"] == 500
+    assert len(summary["tables_sample"]) == 60
+    assert "find_tables" in result["note"]
+
+
 def test_get_physical_schema_flags_pending_tables() -> None:
     from superset_ai_agent.semantic_layer.copilot.tools import MdlToolset
     from superset_ai_agent.semantic_layer.mdl_validator import SchemaIndex
@@ -693,6 +787,175 @@ def test_bogus_table_in_listed_schema_still_hard_fails() -> None:
 
     assert "unknown_table" in {m.code for m in result.messages}
     assert result.valid is False
+
+
+def test_ensure_columns_many_reflects_concurrently_and_memoizes() -> None:
+    import threading
+    import time
+
+    from superset_ai_agent.semantic_layer.mdl_validator import SchemaIndex
+
+    tables = {f"tbl_{i}" for i in range(5)}
+    index = SchemaIndex(
+        tables={t: set() for t in tables},
+        tables_by_schema={"wlos": {t: set() for t in tables}},
+        pending_by_schema={"wlos": set(tables)},
+    )
+    in_flight = {"now": 0, "max": 0}
+    gauge = threading.Lock()
+
+    def loader(_schema: str | None, _table: str) -> dict[str, str | None]:
+        with gauge:
+            in_flight["now"] += 1
+            in_flight["max"] = max(in_flight["max"], in_flight["now"])
+        time.sleep(0.05)
+        with gauge:
+            in_flight["now"] -= 1
+        return {"ID": "NUMBER"}
+
+    index.attach_column_loader(loader, budget=10)
+    index.ensure_columns_many([(t, "wlos") for t in sorted(tables)])
+
+    # All five reflected, and they actually overlapped (parallel, not serial).
+    assert index.pending_tables_by_schema() == {}
+    assert in_flight["max"] > 1
+    # Memoized: a second batch does not re-fetch.
+    calls: list[str] = []
+    index.attach_column_loader(
+        lambda _s, t: calls.append(t) or {"ID": "NUMBER"}, budget=10
+    )
+    index.ensure_columns_many([(t, "wlos") for t in sorted(tables)])
+    assert calls == []
+
+
+def test_ensure_columns_many_respects_budget_and_dedupes() -> None:
+    from superset_ai_agent.semantic_layer.mdl_validator import SchemaIndex
+
+    index = SchemaIndex(
+        tables={"a": set(), "b": set(), "c": set()},
+        tables_by_schema={"wlos": {"a": set(), "b": set(), "c": set()}},
+        pending_by_schema={"wlos": {"a", "b", "c"}},
+    )
+    calls: list[str] = []
+
+    def loader(_schema: str | None, table: str) -> dict[str, str | None]:
+        calls.append(table)
+        return {"ID": "NUMBER"}
+
+    index.attach_column_loader(loader, budget=2)
+    # Duplicate refs collapse; only 2 fetches happen (budget), 1 stays pending.
+    index.ensure_columns_many(
+        [("a", "wlos"), ("a", "wlos"), ("b", "wlos"), ("c", "wlos")]
+    )
+
+    assert len(calls) == 2
+    assert index.pending_tables_by_schema() == {"wlos": ["c"]}
+
+
+def test_mdl_referenced_tables_extracts_and_dedupes() -> None:
+    import json  # noqa: TID251 - standalone agent JSON contract
+    from types import SimpleNamespace
+
+    from superset_ai_agent.app import _mdl_referenced_tables
+
+    files = [
+        SimpleNamespace(
+            status="active",
+            content=json.dumps(
+                {
+                    "models": [
+                        {
+                            "name": "orders",
+                            "tableReference": {"schema": "wlos", "table": "orders"},
+                        },
+                        {
+                            "name": "dup",
+                            "tableReference": {"schema": "WLOS", "table": "ORDERS"},
+                        },
+                        {"name": "no_ref"},
+                    ]
+                }
+            ),
+        ),
+        SimpleNamespace(status="deleted", content=json.dumps({"models": []})),
+        SimpleNamespace(status="draft", content="not json"),
+    ]
+
+    refs = _mdl_referenced_tables(files)
+
+    assert refs == [("orders", "wlos")]
+
+
+def test_warm_mdl_referenced_columns_reflects_without_budget() -> None:
+    import json  # noqa: TID251 - standalone agent JSON contract
+    import time
+    from types import SimpleNamespace
+
+    from superset_ai_agent.app import _warm_mdl_referenced_columns
+    from superset_ai_agent.semantic_layer.mdl_validator import SchemaIndex
+
+    index = SchemaIndex(
+        tables={"orders": set()},
+        tables_by_schema={"wlos": {"orders": set()}},
+        pending_by_schema={"wlos": {"orders"}},
+    )
+    # Budget 0: the warm must still reflect (budget-exempt by design).
+    index.attach_column_loader(lambda _s, _t: {"ID": "NUMBER"}, budget=0)
+    files = [
+        SimpleNamespace(
+            status="active",
+            content=json.dumps(
+                {
+                    "models": [
+                        {
+                            "name": "orders",
+                            "tableReference": {"schema": "wlos", "table": "orders"},
+                        }
+                    ]
+                }
+            ),
+        )
+    ]
+
+    _warm_mdl_referenced_columns(index, files)
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and not index.columns_loaded("orders", "wlos"):
+        time.sleep(0.01)
+    assert index.columns_loaded("orders", "wlos") is True
+    assert index.columns_for("orders", "wlos") == ["id"]
+
+
+def test_adopt_resolved_from_carries_reflections_across_rebuilds() -> None:
+    from superset_ai_agent.semantic_layer.mdl_validator import SchemaIndex
+
+    previous = SchemaIndex(
+        tables={"orders": set(), "moves": set(), "gone": set()},
+        tables_by_schema={"wlos": {"orders": set(), "moves": set(), "gone": set()}},
+        pending_by_schema={"wlos": {"orders", "moves", "gone"}},
+    )
+    previous.attach_column_loader(
+        lambda _s, t: {"ID": "NUMBER"} if t == "orders" else {}, budget=10
+    )
+    assert previous.ensure_columns("orders", "wlos") is True  # reflected
+    assert previous.ensure_columns("moves", "wlos") is False  # loader empty
+
+    # Fresh rebuild: 'gone' dropped from the live listing, the rest pending.
+    fresh = SchemaIndex(
+        tables={"orders": set(), "moves": set()},
+        tables_by_schema={"wlos": {"orders": set(), "moves": set()}},
+        pending_by_schema={"wlos": {"orders", "moves"}},
+    )
+
+    adopted = fresh.adopt_resolved_from(previous)
+
+    assert adopted == 1  # only the genuinely resolved table carries over
+    assert fresh.columns_loaded("orders", "wlos") is True
+    assert fresh.columns_for("orders", "wlos") == ["id"]
+    assert fresh.column_type("orders", "id", "wlos") == "NUMBER"
+    assert fresh.pending_tables_by_schema() == {"wlos": ["moves"]}
+    # A dropped table never resurrects.
+    assert fresh.has_table("gone", "wlos") is False
 
 
 def test_schema_outside_project_set_still_rejected() -> None:

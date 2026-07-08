@@ -306,6 +306,76 @@ def test_loop_emits_progress_via_on_step() -> None:
     assert "copilot_tool" in seen
 
 
+def test_tool_steps_pair_running_and_completed_with_duration() -> None:
+    from superset_ai_agent.schemas import AgentStep
+
+    model = ScriptedModel(
+        [_write_call("models/orders.json", VALID), ModelResult(content="ok")]
+    )
+    toolset = MdlToolset([], schema_index=SCHEMA)
+    seen: list[AgentStep] = []
+
+    changeset = run_copilot_loop(
+        model_client=model,
+        toolset=toolset,
+        user_message="model orders",
+        on_step=seen.append,
+    )
+
+    tool_steps = [s for s in seen if s.kind == "copilot_tool"]
+    # Started event streams BEFORE the tool runs; completion re-uses the id.
+    assert [s.status for s in tool_steps] == ["running", "ok"]
+    assert tool_steps[0].step_id
+    assert tool_steps[0].step_id == tool_steps[1].step_id
+    assert tool_steps[0].duration_ms is None
+    assert isinstance(tool_steps[1].duration_ms, int)
+    # Transient (running) events never enter the persisted changeset steps.
+    assert all(s.status != "running" for s in changeset.steps)
+
+
+def test_find_tables_step_streams_progress_notes_and_result_counts() -> None:
+    from superset_ai_agent.schemas import AgentStep
+
+    # A pending live table whose columns arrive via the (slow) loader —
+    # find_tables must narrate the reflection and summarize the outcome.
+    index = SchemaIndex(
+        tables={"tbl_wip": set()},
+        tables_by_schema={"wlos": {"tbl_wip": set()}},
+        pending_by_schema={"wlos": {"tbl_wip"}},
+    )
+    index.attach_column_loader(lambda _s, _t: {"ID": "NUMBER"}, budget=5)
+    model = ScriptedModel(
+        [
+            ModelResult(
+                content="",
+                tool_calls=[
+                    ToolCall(id="c1", name="find_tables", arguments={"query": "wip"})
+                ],
+            ),
+            ModelResult(content="done"),
+        ]
+    )
+    toolset = MdlToolset([], schema_index=index)
+    seen: list[AgentStep] = []
+
+    run_copilot_loop(
+        model_client=model,
+        toolset=toolset,
+        user_message="find wip",
+        on_step=seen.append,
+    )
+
+    notes = [s for s in seen if s.kind == "copilot_tool_progress"]
+    assert notes, "expected an in-tool progress note during reflection"
+    assert "Reflecting live columns" in notes[0].summary
+    started = next(s for s in seen if s.kind == "copilot_tool")
+    assert notes[0].step_id == started.step_id
+    completed = [s for s in seen if s.kind == "copilot_tool" and s.status != "running"][
+        0
+    ]
+    assert "matched" in completed.summary  # result-count note appended
+
+
 # --- B1: read results are not silently truncated into history ----------------
 
 

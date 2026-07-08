@@ -94,6 +94,67 @@ Two dataset-gates caused it; both removed:
    schema's names ARE listed and the table is absent (R3 intact), and
    referencing a schema outside the project set still hard-fails (R1 intact).
 
+## v2.2 — Latency + live feedback package (SHIPPED)
+
+Tool calls on a live warehouse are network-bound by design (lazy reflection);
+this package makes them fast AND visible. All items tested; full agent suite
+green (1481 passed; the 1 failure is the pre-existing bulk-activate
+fetch-count test broken by the TTL cache on HEAD).
+
+Feedback (SSE step protocol + UI):
+1. **tool_started / durations** — the loop emits a `copilot_tool` step with
+   `status="running"` + `step_id` BEFORE dispatch; completion re-emits the same
+   `step_id` with terminal status, `duration_ms`, and a result-count note
+   ("8 matched, 5 with columns"). Transient (running/progress) steps never
+   enter the persisted changeset steps. `AgentStep` gains `status="running"` +
+   `step_id`.
+2. **In-tool progress notes** — `MdlToolset.set_progress_sink` +
+   `_note(...)`: find_tables / onboard narrate "Reflecting live columns for N
+   table(s)…" as `copilot_tool_progress` events tied to the running step.
+3. **Catalog build narrated in-stream** — the slow `_schema_index_for_project`
+   moved from silent preflight into the stream worker
+   (`_build_catalog_with_progress`): "Building the physical schema catalog…" →
+   "ready — N tables across M schema(s) (X.Xs)". Authorization stays in
+   preflight (still a proper 4xx before streaming).
+4. **Frontend** — `upsertLiveStep` folds running→completed in place and
+   attaches progress notes; running steps render spinner + live elapsed
+   seconds; completed steps show durations (live list + changeset step list).
+
+Latency:
+5. **Parallel reflections** — `SchemaIndex.ensure_columns_many` (locked
+   bookkeeping, pooled fetches, ≤5 workers); find_tables reflects its top
+   candidates as one batch; onboard batches pre-warm; single `ensure_columns`
+   delegates. Index state is now thread-safe (`_lock`).
+6. **Parallel catalog build** — the per-schema fetch union in
+   `_schema_index_for_project` runs schemas concurrently (≤4 workers),
+   deterministic merge order preserved.
+7. **Reflections survive rebuilds** — new `wren_physical_catalog_cache_ttl_
+   seconds` (600s; the authz cache stays on its own 60s knob) + carry-over:
+   `_last_schema_index` keeps the last build per project and
+   `SchemaIndex.adopt_resolved_from` re-seeds resolved columns/types into the
+   fresh index (dropped tables never resurrect) — reflection is a one-time
+   cost per table per process.
+8. **columns_only reflection** — Superset core: `?columns_only=true` on
+   `/table_metadata/` (new `get_table_columns_metadata`, one `get_columns`
+   call — no pk/fk/index/comment/SELECT *; same authz). Agent requests it and
+   falls back to the full shape on a 400 (mixed-version rollouts safe).
+   ⚠️ Requires rebuilding the SUPERSET image too, not just the agent.
+9. **Compact get_physical_schema** — above 400 total tables the tool returns
+   per-schema counts + a 60-name sample + "use find_tables" guidance instead
+   of a full dump (protects model-step latency + tokens).
+10. **Names-listing cache** — process-level per-(db, catalog, schema) cache of
+    the `/tables/` listing (`wren_introspection_names_cache_ttl_seconds`,
+    600s; empty results never cached). Test isolation via
+    `reset_names_listing_cache` (autouse fixture in conftest).
+11. **Background MDL warm** — on each copilot turn, a daemon thread
+    pre-reflects the tables the project's MDL references
+    (`_warm_mdl_referenced_columns`, budget-EXEMPT, capped at 24), so
+    validation/activation later hit memoized columns.
+
+New env vars (in `.env.example`; defaults baked in):
+`AI_AGENT_WREN_PHYSICAL_CATALOG_CACHE_TTL_SECONDS=600`,
+`AI_AGENT_WREN_INTROSPECTION_NAMES_CACHE_TTL_SECONDS=600`.
+
 ## Problem (v1, historical)
 
 The agent's physical catalog (`SchemaIndex`) is built **only** from registered

@@ -91,6 +91,13 @@ _READ_DOCUMENT_MAX_CHARS = 100_000
 #: lower-ranked candidates return names-only with ``columns_pending``.
 _FIND_TABLES_REFLECT_LIMIT = 5
 
+#: get_physical_schema switches to a compact per-schema summary above this many
+#: total tables: a full dump of a real warehouse floods the model context (and
+#: slows every subsequent step); find_tables is the discovery tool at scale.
+_PHYSICAL_SCHEMA_MAX_TABLES = 400
+#: How many table names each schema samples in the compact summary.
+_PHYSICAL_SCHEMA_SAMPLE = 60
+
 
 class DocumentReader(Protocol):
     """The read-only document access the copilot toolset needs (project-scoped)."""
@@ -171,6 +178,25 @@ class MdlToolset:
         self._coverage_self_audit_limit = coverage_self_audit_limit
         self._coverage_audits_done = 0
         self._coverage_memo: dict[str, dict[str, Any]] = {}
+        #: Optional live-progress sink (set per tool call by the loop): slow
+        #: tools narrate sub-steps ("reflecting columns for X…") so the user
+        #: sees movement instead of a silent multi-second gap.
+        self._progress: Callable[[str], None] | None = None
+
+    def set_progress_sink(self, sink: Callable[[str], None] | None) -> None:
+        """Install (or clear) the live-progress callback for the current call."""
+
+        self._progress = sink
+
+    def _note(self, message: str) -> None:
+        """Emit a live progress note; never let a sink failure break the tool."""
+
+        if self._progress is None:
+            return
+        try:
+            self._progress(message)
+        except Exception:  # pylint: disable=broad-except
+            logger.debug("Copilot progress sink raised; continuing.", exc_info=True)
 
     @property
     def _documents_available(self) -> bool:
@@ -373,7 +399,10 @@ class MdlToolset:
                     "the table is listed under. On a live-introspected catalog some "
                     "tables are names-only (columns_pending): their columns load on "
                     "demand via find_tables/propose_onboard_table — an empty column "
-                    "list there means unknown, never 'no columns'."
+                    "list there means unknown, never 'no columns'. On a LARGE "
+                    "catalog the result is a compact per-schema summary "
+                    "({schemas_summary, total_tables, truncated}) — use "
+                    "find_tables to search the full catalog."
                 ),
                 parameters={"type": "object", "properties": {}},
             ),
@@ -995,6 +1024,43 @@ class MdlToolset:
         if self._schema_index is None:
             return {"tables": {}, "note": "No physical schema available."}
         index = self._schema_index
+        total_tables = (
+            sum(len(tables) for tables in index.tables_by_schema.values())
+            if index.tables_by_schema
+            else len(index.tables)
+        )
+        if total_tables > _PHYSICAL_SCHEMA_MAX_TABLES:
+            # A real warehouse: dumping thousands of names would flood the model
+            # context and slow every later step. Return per-schema counts + a
+            # bounded sample and point at find_tables for targeted discovery.
+            if index.tables_by_schema:
+                summary = {
+                    schema: {
+                        "table_count": len(tables),
+                        "tables_sample": sorted(tables)[:_PHYSICAL_SCHEMA_SAMPLE],
+                    }
+                    for schema, tables in index.tables_by_schema.items()
+                }
+            else:
+                summary = {
+                    "": {
+                        "table_count": len(index.tables),
+                        "tables_sample": sorted(index.tables)[:_PHYSICAL_SCHEMA_SAMPLE],
+                    }
+                }
+            return {
+                "schemas_summary": summary,
+                "total_tables": total_tables,
+                "truncated": True,
+                "note": (
+                    "This catalog is large, so only a sample of table names is "
+                    "listed per schema. Use find_tables(query) to discover the "
+                    "specific tables the BI context calls for — it searches the "
+                    "FULL catalog and loads live columns for the top matches. "
+                    "Never assume a table is absent because it is not in the "
+                    "sample."
+                ),
+            }
         pending = index.pending_tables_by_schema()
         pending_note = (
             "Tables marked pending have NOT had their columns reflected yet — "
@@ -1049,6 +1115,20 @@ class MdlToolset:
         raw_limit = args.get("limit")
         limit = raw_limit if isinstance(raw_limit, int) and raw_limit > 0 else 10
         matches = self._schema_index.search(query, schema=schema, limit=limit)
+        to_reflect = [
+            (table, match_schema)
+            for rank, (match_schema, table, _score) in enumerate(matches)
+            if rank < _FIND_TABLES_REFLECT_LIMIT
+            and not self._schema_index.columns_loaded(table, match_schema)
+        ]
+        if to_reflect:
+            self._note(
+                f"Reflecting live columns for {len(to_reflect)} table(s): "
+                + ", ".join(table for table, _ in to_reflect)
+            )
+            # Batch: the reflections are independent catalog calls — run them
+            # concurrently so the tool takes one round-trip, not the sum.
+            self._schema_index.ensure_columns_many(to_reflect)
         tables: list[dict[str, Any]] = []
         for rank, (match_schema, table, score) in enumerate(matches):
             # Lazy names-first catalog: reflect columns only for the strongest
@@ -1161,21 +1241,20 @@ class MdlToolset:
                     "{table, schema?} objects."
                 )
             }
+        parsed = _parse_onboard_items(items)
+        # Pre-warm columns for the whole batch concurrently (independent live
+        # catalog calls), so the per-table staging below hits memoized columns.
+        if self._schema_index is not None:
+            warm_refs = [
+                (table, schema) for _item, table, schema in parsed if table.strip()
+            ]
+            if warm_refs:
+                self._note(f"Reflecting live columns for {len(warm_refs)} table(s)…")
+                self._schema_index.ensure_columns_many(warm_refs)
         onboarded: list[dict[str, Any]] = []
         rejected: list[dict[str, Any]] = []
-        for item in items:
-            if isinstance(item, str):
-                table, schema = item, None
-            elif isinstance(item, dict):
-                raw_table = item.get("table")
-                table = raw_table if isinstance(raw_table, str) else ""
-                raw_schema = item.get("schema")
-                schema = (
-                    raw_schema
-                    if isinstance(raw_schema, str) and raw_schema.strip()
-                    else None
-                )
-            else:
+        for item, table, schema in parsed:
+            if not isinstance(item, (str, dict)):
                 rejected.append({"table": item, "error": "Invalid table entry."})
                 continue
             if not table.strip():
@@ -1201,6 +1280,9 @@ class MdlToolset:
                     "schemas; add the schema to the project before onboarding it."
                 )
             }
+        if not self._schema_index.columns_loaded(table, schema):
+            qualified_note = f"{schema}.{table}" if schema else table
+            self._note(f"Reflecting live columns for {qualified_note}…")
         if not self._schema_index.ensure_columns(table, schema):
             # Names-first catalog: the table exists but its columns could not be
             # reflected (loader unavailable, budget exhausted, or the live
@@ -1717,6 +1799,32 @@ def _overlay_entity_names(
                 target = matched if item["name"] in base_names else appended
                 target.add(item["name"])
     return matched, appended
+
+
+def _parse_onboard_items(items: list[Any]) -> list[tuple[Any, str, str | None]]:
+    """Normalize onboard-batch entries to ``(raw_item, table, schema)`` triples.
+
+    Invalid entries keep their raw item (with an empty table) so the caller can
+    reject them individually without dropping the rest of the batch.
+    """
+
+    parsed: list[tuple[Any, str, str | None]] = []
+    for item in items:
+        if isinstance(item, str):
+            parsed.append((item, item, None))
+        elif isinstance(item, dict):
+            raw_table = item.get("table")
+            table = raw_table if isinstance(raw_table, str) else ""
+            raw_schema = item.get("schema")
+            schema = (
+                raw_schema
+                if isinstance(raw_schema, str) and raw_schema.strip()
+                else None
+            )
+            parsed.append((item, table, schema))
+        else:
+            parsed.append((item, "", None))
+    return parsed
 
 
 def _safe_model_name(table: str) -> str:

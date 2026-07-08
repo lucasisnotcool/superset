@@ -532,10 +532,16 @@ class AgentStep(BaseModel):
     """One ordered step in the message->response explain-and-audit timeline."""
 
     kind: str
-    status: Literal["ok", "warning", "error"] = "ok"
+    #: ``running`` marks a transient in-flight event (a started tool, an in-tool
+    #: progress note); the paired completion re-emits the SAME ``step_id`` with a
+    #: terminal status so live UIs can replace the running entry in place.
+    status: Literal["ok", "warning", "error", "running"] = "ok"
     summary: str
     started_at: datetime = Field(default_factory=_utc_now)
     duration_ms: int | None = None
+    #: Pairs a running step with its completion (and its progress notes). Stable
+    #: within one turn; ``None`` for single-shot steps.
+    step_id: str | None = None
     #: Which SQL drafting cycle this step belongs to (0-based), so retries group.
     attempt_index: int = 0
     #: The SQL artifact this step produced/acted on, when it can be matched.

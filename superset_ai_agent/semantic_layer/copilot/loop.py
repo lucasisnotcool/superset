@@ -28,8 +28,10 @@ from __future__ import annotations
 
 import json  # noqa: TID251 - standalone agent JSON contract
 import logging
+import time
 from collections.abc import Callable
 from typing import Any, Literal
+from uuid import uuid4
 
 from superset_ai_agent.llm.base import ChatMessage, ModelClient
 from superset_ai_agent.prompts.registry import get_prompt
@@ -71,6 +73,82 @@ def _result_limit(tool_name: str, default: int) -> int | None:
     if tool_name in _HIGH_LIMIT_RESULT_TOOLS:
         return default * _HIGH_LIMIT_MULTIPLIER
     return default
+
+
+def _note_find_tables(output: dict[str, Any]) -> str | None:
+    tables = output.get("tables")
+    if not isinstance(tables, list):
+        return None
+    pending = sum(1 for t in tables if t.get("columns_pending"))
+    reflected = sum(1 for t in tables if t.get("columns"))
+    note = f"{len(tables)} matched, {reflected} with columns"
+    if pending:
+        note += f", {pending} names-only"
+    return note
+
+
+def _note_get_physical_schema(output: dict[str, Any]) -> str | None:
+    if isinstance(output.get("schemas_summary"), dict):
+        total = output.get("total_tables")
+        schema_count = len(output["schemas_summary"])
+        return f"{total} tables across {schema_count} schemas (sampled)"
+    if isinstance(output.get("schemas"), dict):
+        schemas = output["schemas"]
+        total = sum(len(tables) for tables in schemas.values())
+        return f"{total} tables across {len(schemas)} schemas"
+    if isinstance(output.get("tables"), dict):
+        note = f"{len(output['tables'])} tables"
+        pending = output.get("columns_pending")
+        if isinstance(pending, list) and pending:
+            note += f" ({len(pending)} names-only)"
+        return note
+    return None
+
+
+def _note_propose_onboard_tables(output: dict[str, Any]) -> str | None:
+    onboarded = output.get("onboarded")
+    rejected = output.get("rejected")
+    if not (isinstance(onboarded, list) and isinstance(rejected, list)):
+        return None
+    note = f"{len(onboarded)} onboarded"
+    if rejected:
+        note += f", {len(rejected)} rejected"
+    return note
+
+
+def _note_validate_project(output: dict[str, Any]) -> str | None:
+    messages = output.get("messages")
+    if not isinstance(messages, list):
+        return None
+    errors = sum(1 for m in messages if m.get("severity") == "error")
+    return "valid" if not errors else f"{errors} error(s)"
+
+
+_RESULT_NOTES: dict[str, Callable[[dict[str, Any]], str | None]] = {
+    "find_tables": _note_find_tables,
+    "get_physical_schema": _note_get_physical_schema,
+    "propose_onboard_tables": _note_propose_onboard_tables,
+    "validate_project": _note_validate_project,
+}
+
+
+def _result_note(tool_name: str, output: dict[str, Any]) -> str | None:
+    """A compact, human-readable outcome for a completed tool step.
+
+    Appended to the step summary so the live UI explains what the (possibly
+    slow) call actually did — counts, not payloads. Unknown tools return
+    ``None`` and keep the bare ``name(args)`` label.
+    """
+
+    if "error" in output:
+        return None  # the error status already colors the step
+    note_for = _RESULT_NOTES.get(tool_name)
+    if note_for is None:
+        return None
+    try:
+        return note_for(output)
+    except Exception:  # pylint: disable=broad-except
+        return None
 
 
 #: Active-mode banner injected into the system prompt so the agent knows which
@@ -148,7 +226,11 @@ def run_copilot_loop(  # noqa: C901 - a tool-call+correction loop is irreducibly
     steps: list[AgentStep] = []
 
     def emit(step: AgentStep) -> None:
-        steps.append(step)
+        # Transient events (a running tool, in-tool progress notes) stream to the
+        # live UI but stay OUT of the changeset's persisted step list — the
+        # completion step (same step_id, terminal status) is the durable record.
+        if step.status != "running":
+            steps.append(step)
         if on_step is not None:
             try:
                 on_step(step)
@@ -206,15 +288,50 @@ def run_copilot_loop(  # noqa: C901 - a tool-call+correction loop is irreducibly
                 )
             )
             for call in result.tool_calls:
-                output = toolset.dispatch(call.name, call.arguments)
-                status: Literal["ok", "warning", "error"] = (
-                    "error" if "error" in output else "ok"
-                )
+                step_id = uuid4().hex[:12]
+                label = f"{call.name}({_arg_label(call.arguments)})"
+                # Started event FIRST: a slow tool (live catalog reflection) must
+                # be visible while it runs, not only after it returns.
                 emit(
                     AgentStep(
                         kind="copilot_tool",
-                        summary=f"{call.name}({_arg_label(call.arguments)})",
+                        summary=label,
+                        status="running",
+                        step_id=step_id,
+                    )
+                )
+
+                def _progress(note: str, _sid: str = step_id) -> None:
+                    emit(
+                        AgentStep(
+                            kind="copilot_tool_progress",
+                            summary=note,
+                            status="running",
+                            step_id=_sid,
+                        )
+                    )
+
+                set_progress = getattr(toolset, "set_progress_sink", None)
+                if set_progress is not None:
+                    set_progress(_progress)
+                started = time.monotonic()
+                try:
+                    output = toolset.dispatch(call.name, call.arguments)
+                finally:
+                    if set_progress is not None:
+                        set_progress(None)
+                duration_ms = int((time.monotonic() - started) * 1000)
+                status: Literal["ok", "warning", "error"] = (
+                    "error" if "error" in output else "ok"
+                )
+                note = _result_note(call.name, output)
+                emit(
+                    AgentStep(
+                        kind="copilot_tool",
+                        summary=f"{label} — {note}" if note else label,
                         status=status,
+                        step_id=step_id,
+                        duration_ms=duration_ms,
                     )
                 )
                 messages.append(

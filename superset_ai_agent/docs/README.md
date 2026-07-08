@@ -88,6 +88,10 @@ The founding design corpus; code comments cite these by name and section.
   let relationships-only MDL files activate (Implemented Phases 1–5).
 - [plan_ai_sql_project_selection_spec.md](plans/plan_ai_sql_project_selection_spec.md):
   AI SQL agent MDL-project picker + per-conversation pin (Shipped Tier 1+2).
+- [plan_conversation_management_spec.md](plans/plan_conversation_management_spec.md):
+  edit & resend, regenerate, fork conversations for both agents — competitive
+  analysis + soft-rewrite/fork design with side-effect manifest (Proposal,
+  awaiting DP sign-off).
 
 ## MDL Copilot authoring
 
