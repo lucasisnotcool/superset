@@ -93,6 +93,10 @@ def _config(tmp_path) -> AgentConfig:
         semantic_layer_store="memory",
         wren_engine="passthrough",
         wren_core_validation_enabled=False,
+        # These tests count live schema fetches per request; the physical-catalog
+        # TTL cache would serve activation from the create-time build and hide
+        # the very fetch the assertions pin. Non-positive TTL disables it.
+        wren_physical_catalog_cache_ttl_seconds=0,
         agent_storage_dir=str(tmp_path),
     )
 
@@ -233,3 +237,322 @@ def test_model_in_an_out_of_set_schema_is_still_rejected(tmp_path) -> None:
     assert validation["valid"] is False
     codes = {message.get("code") for message in validation["messages"]}
     assert "schema_not_in_project" in codes, validation
+
+
+# ---------------------------------------------------------------------------
+# Cross-schema flat-map collision (same-named table in two member schemas).
+#
+# The index's flat ``tables`` map is keyed by bare table name; before the fix
+# it held whichever schema's copy was built/reflected LAST, so an unqualified
+# lookup (a model whose ``tableReference`` omits ``schema``) could check a real
+# column against the WRONG schema's copy and read "does not exist" — the
+# activation flip-flop. These tests pin the schema-qualified truth.
+# ---------------------------------------------------------------------------
+
+
+def _dataset(
+    dataset_id: int, schema: str, table: str, columns: dict[str, str]
+) -> DatasetMetadata:
+    return DatasetMetadata(
+        id=dataset_id,
+        table_name=table,
+        schema_name=schema,
+        database_id=1,
+        columns=[
+            ColumnSummary(name=name, type=type_) for name, type_ in columns.items()
+        ],
+        metrics=[],
+    )
+
+
+def _two_schema_index():
+    from superset_ai_agent.semantic_layer.mdl_validator import SchemaIndex
+
+    # `txn` exists in BOTH schemas with different columns; the DIM copy has
+    # `txn_dt_key`, the STG copy does not.
+    return SchemaIndex.from_agent_context(
+        AgentContext(
+            database=DatabaseSummary(id=1, name="oracle", backend="oracle"),
+            datasets=[
+                _dataset(
+                    1, "dim", "txn", {"txn_dt_key": "NUMBER", "status": "VARCHAR"}
+                ),
+                _dataset(2, "stg", "txn", {"raw_payload": "CLOB"}),
+            ],
+        )
+    )
+
+
+def test_same_named_table_in_two_schemas_keeps_per_schema_truth() -> None:
+    index = _two_schema_index()
+
+    # Qualified lookups are per-schema exact.
+    assert index.has_column("txn", "txn_dt_key", "dim") is True
+    assert index.has_column("txn", "txn_dt_key", "stg") is False
+    assert index.has_column("txn", "raw_payload", "stg") is True
+    # Unqualified lookups consult EVERY schema's copy (fail-open) — a real
+    # column must never read "does not exist" because the other schema's
+    # same-named table was indexed last.
+    assert index.has_column("txn", "txn_dt_key") is True
+    assert index.has_column("txn", "raw_payload") is True
+    assert index.has_column("txn", "made_up") is False
+    assert index.columns_for("txn") == ["raw_payload", "status", "txn_dt_key"]
+
+
+def test_reflection_order_does_not_flip_unqualified_lookups() -> None:
+    from superset_ai_agent.semantic_layer.mdl_validator import SchemaIndex
+
+    per_schema = {
+        "dim": {"TXN_DT_KEY": "NUMBER"},
+        "stg": {"RAW_PAYLOAD": "CLOB"},
+    }
+
+    def _build(order: list[str]) -> SchemaIndex:
+        # Names-first live introspection: both copies pending (negative ids).
+        index = SchemaIndex.from_agent_context(
+            AgentContext(
+                database=DatabaseSummary(id=1, name="oracle", backend="oracle"),
+                datasets=[
+                    _dataset(-1, "dim", "txn", {}),
+                    _dataset(-2, "stg", "txn", {}),
+                ],
+            )
+        )
+        index.attach_column_loader(
+            lambda schema, table: per_schema[schema or ""], budget=10
+        )
+        for schema in order:
+            index.ensure_columns("txn", schema)
+        return index
+
+    for order in (["dim", "stg"], ["stg", "dim"]):
+        index = _build(order)
+        # Whichever copy was reflected LAST, both columns resolve unqualified.
+        assert index.has_column("txn", "txn_dt_key") is True, order
+        assert index.has_column("txn", "raw_payload") is True, order
+
+
+def test_unqualified_ensure_reflects_every_pending_schema_copy() -> None:
+    from superset_ai_agent.semantic_layer.mdl_validator import SchemaIndex
+
+    index = SchemaIndex.from_agent_context(
+        AgentContext(
+            database=DatabaseSummary(id=1, name="oracle", backend="oracle"),
+            datasets=[
+                _dataset(-1, "dim", "txn", {}),
+                _dataset(-2, "stg", "txn", {}),
+            ],
+        )
+    )
+    calls: list[str | None] = []
+
+    def loader(schema: str | None, table: str) -> dict[str, str | None]:
+        calls.append(schema)
+        return {"dim": {"TXN_DT_KEY": "NUMBER"}, "stg": {"RAW_PAYLOAD": "CLOB"}}[
+            schema or ""
+        ]
+
+    index.attach_column_loader(loader, budget=10)
+    # An unqualified touch must resolve BOTH schemas' pending copies — leaving
+    # one pending would keep the unqualified lookup permanently unknown.
+    assert index.ensure_columns("txn") is True
+    assert sorted(c or "" for c in calls) == ["dim", "stg"]
+    assert index.has_column("txn", "txn_dt_key") is True
+    assert index.has_column("txn", "raw_payload") is True
+
+
+def test_column_type_cross_schema_disagreement_reads_unknown() -> None:
+    from superset_ai_agent.semantic_layer.mdl_validator import SchemaIndex
+
+    index = SchemaIndex.from_agent_context(
+        AgentContext(
+            database=DatabaseSummary(id=1, name="oracle", backend="oracle"),
+            datasets=[
+                _dataset(1, "dim", "txn", {"status": "VARCHAR", "amt": "NUMBER"}),
+                _dataset(2, "stg", "txn", {"status": "NUMBER"}),
+            ],
+        )
+    )
+    # Qualified: each schema's own type.
+    assert index.column_type("txn", "status", "dim") == "VARCHAR"
+    assert index.column_type("txn", "status", "stg") == "NUMBER"
+    # Unqualified + disagreement: unknown (skip type checks), never the wrong
+    # schema's type.
+    assert index.column_type("txn", "status") is None
+    # Unqualified + single home: that copy's type.
+    assert index.column_type("txn", "amt") == "NUMBER"
+
+
+# ---------------------------------------------------------------------------
+# Deterministic activation gate: the projected manifest's tables are reflected
+# eagerly and budget-EXEMPT before validation, so whether a phantom column is
+# caught no longer depends on the per-turn reflect budget's walk order, the
+# background warm daemon's progress, or prior cache state. Reflect budget is
+# pinned to 0 here — only the gate's exempt reflection can resolve columns.
+# ---------------------------------------------------------------------------
+
+
+class PendingSchemaProvider:
+    """Names-first live introspection: `txn` is listed WITHOUT columns."""
+
+    def get_context(self, request: AgentQueryRequest) -> AgentContext:
+        return AgentContext(
+            database=DatabaseSummary(id=request.database_id, name="examples"),
+            datasets=[
+                DatasetMetadata(
+                    id=-1,
+                    table_name="txn",
+                    schema_name=request.schema_name,
+                    database_id=request.database_id,
+                    columns=[],
+                    metrics=[],
+                )
+            ],
+        )
+
+
+class ReflectingSupersetClient:
+    """Fake Superset client exposing only per-table column reflection."""
+
+    def __init__(self, catalog: dict[str, dict[str, str]]) -> None:
+        self.catalog = catalog
+        self.reflect_calls: list[tuple[str | None, str]] = []
+
+    def reflect_table_columns(
+        self,
+        *,
+        database_id: int,
+        schema_name: str | None,
+        table_name: str,
+        catalog_name: str | None = None,
+    ) -> list[ColumnSummary]:
+        self.reflect_calls.append((schema_name, table_name))
+        return [
+            ColumnSummary(name=name, type=type_)
+            for name, type_ in self.catalog.get(table_name, {}).items()
+        ]
+
+
+def _pending_activation_client(
+    tmp_path,
+) -> tuple[TestClient, ReflectingSupersetClient]:
+    config = AgentConfig(
+        identity_provider="static",
+        superset_auth_mode="service_account",
+        conversation_store="memory",
+        semantic_layer_store="memory",
+        wren_engine="passthrough",
+        wren_core_validation_enabled=False,
+        # Zero per-turn budget: lazy reflection inside validation can never
+        # run, so column resolution happens ONLY via the activation gate's
+        # budget-exempt eager pass — the behavior under test.
+        wren_introspection_column_reflect_budget=0,
+        agent_storage_dir=str(tmp_path),
+    )
+    fake = ReflectingSupersetClient({"txn": {"TXN_DT_KEY": "NUMBER"}})
+    app = create_app(
+        config=config,
+        model_client=_FakeModelClient(),
+        text_to_sql_graph=object(),
+        conversation_graph=object(),
+        conversation_store=InMemoryConversationStore(),
+        semantic_layer_store=InMemorySemanticLayerStore(),
+        document_storage=LocalDocumentStorage(str(tmp_path)),
+        context_provider=PendingSchemaProvider(),
+        superset_client=fake,
+        job_runner=InlineJobRunner(),
+    )
+    return TestClient(app), fake
+
+
+def _create_txn_model(client: TestClient, pid: str, column: str) -> str:
+    response = client.post(
+        f"/agent/semantic-layer/projects/{pid}/mdl-files",
+        json={
+            "path": "models/txn.json",
+            "content": json.dumps(
+                {
+                    "models": [
+                        {
+                            "name": "txn",
+                            "tableReference": {"schema": "ops", "table": "txn"},
+                            "columns": [{"name": column, "type": "integer"}],
+                        }
+                    ]
+                }
+            ),
+        },
+    )
+    assert response.status_code in (200, 201), response.text
+    return response.json()["id"]
+
+
+def test_activation_catches_phantom_column_with_zero_reflect_budget(tmp_path) -> None:
+    client, fake = _pending_activation_client(tmp_path)
+    project = _resolve_single_schema(client, "ops")
+    pid = project["id"]
+    _create_txn_model(client, pid, "made_up_col")
+    bulk = f"/agent/semantic-layer/projects/{pid}/mdl-files/bulk-status"
+
+    # The gate must reflect `txn` budget-exempt and catch the phantom — with
+    # budget 0, only the eager gate reflection could have resolved columns.
+    first = client.post(bulk, json={"status": "active"})
+    assert first.status_code == 422, first.text
+    detail = first.json()["detail"]
+    codes = {m.get("code") for m in detail["validation"]["messages"]}
+    assert "unknown_column" in codes, detail
+    assert ("ops", "txn") in fake.reflect_calls
+
+    # Deterministic: the second attempt (memoized columns, no timing effects)
+    # fails identically instead of flip-flopping to a pass.
+    second = client.post(bulk, json={"status": "active"})
+    assert second.status_code == 422, second.text
+
+
+def test_activation_of_real_column_is_stable_across_toggles(tmp_path) -> None:
+    client, _fake = _pending_activation_client(tmp_path)
+    project = _resolve_single_schema(client, "ops")
+    pid = project["id"]
+    _create_txn_model(client, pid, "txn_dt_key")
+    bulk = f"/agent/semantic-layer/projects/{pid}/mdl-files/bulk-status"
+
+    for _ in range(2):
+        activate = client.post(bulk, json={"status": "active"})
+        assert activate.status_code == 200, activate.text
+        deactivate = client.post(bulk, json={"status": "draft"})
+        assert deactivate.status_code == 200, deactivate.text
+
+
+def test_single_file_activation_uses_the_same_deterministic_gate(tmp_path) -> None:
+    client, _fake = _pending_activation_client(tmp_path)
+    project = _resolve_single_schema(client, "ops")
+    pid = project["id"]
+    file_id = _create_txn_model(client, pid, "made_up_col")
+
+    response = client.patch(
+        f"/agent/semantic-layer/projects/{pid}/mdl-files/{file_id}",
+        json={"status": "active"},
+    )
+    assert response.status_code == 422, response.text
+
+
+def test_unqualified_model_validates_against_any_schema_copy() -> None:
+    from superset_ai_agent.semantic_layer.mdl_validator import validate_mdl
+
+    index = _two_schema_index()
+    content = json.dumps(
+        {
+            "models": [
+                {
+                    "name": "txn",
+                    # No schema in the tableReference — the collidable case.
+                    "tableReference": {"table": "txn"},
+                    "columns": [{"name": "txn_dt_key", "type": "integer"}],
+                }
+            ]
+        }
+    )
+    validation = validate_mdl(content, schema_index=index)
+    codes = {message.code for message in validation.messages}
+    assert "unknown_column" not in codes, validation
+    assert validation.valid is True, validation

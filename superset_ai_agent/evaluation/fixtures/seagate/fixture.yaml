@@ -1,0 +1,19 @@
+# Seagate multi-schema fixture, expressed for the reusable rig (Phase 6 parity).
+# The question corpus was generated from the legacy test_queries.md + the hardcoded
+# seagate_scoring.EXPECTED via rig.corpus.from_markdown_and_expected — same ground
+# truth, new format. Proves the general rig reproduces the bespoke Seagate runner.
+id: seagate_multi_rig
+database_name: examples
+schemas:
+  - seagate_core
+  - seagate_ops
+  - seagate_supply
+onboard_mode: manual
+context_docs:
+  - context/bi_glossary.md
+corpus: questions.csv
+grounding_modes:
+  - basic
+  - context_dump
+  - wren_bi
+  - wren_bi_context

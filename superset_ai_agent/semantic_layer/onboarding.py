@@ -34,11 +34,17 @@ from superset_ai_agent.semantic_layer.mdl_files import (
     MdlFileStore,
     MdlFileValidationError,
 )
-from superset_ai_agent.semantic_layer.mdl_validator import SchemaIndex, validate_mdl
+from superset_ai_agent.semantic_layer.mdl_validator import (
+    SchemaIndex,
+    validate_mdl,
+    validate_project_manifest,
+)
 from superset_ai_agent.semantic_layer.schemas import (
     MdlEnrichmentProposal,
+    MdlFile,
     MdlFileCreateRequest,
     MdlFileUpdateRequest,
+    MdlValidationResult,
     OnboardingResult,
     SemanticProject,
 )
@@ -64,6 +70,7 @@ def onboard_schema_project(
     mdl_file_store: MdlFileStore,
     owner_id: str = DEFAULT_OWNER_ID,
     auto_activate: bool = True,
+    deep_validate: bool = False,
 ) -> OnboardingResult:
     """Generate base MDL files for a schema project.
 
@@ -72,11 +79,14 @@ def onboard_schema_project(
     queryable; a model that fails validation stays draft with a warning. Set
     ``auto_activate=False`` to keep the legacy draft-only behavior (review-first).
 
-    Note: activation here uses structural + physical (schema) validation — which
-    already rejects hallucinated columns/tables — but does **not** run the optional
-    deep wren-core compile gate enforced on the manual activation route. Introspected
-    base models (plain tables, no relationships) compile reliably, so this is a
-    deliberate, low-risk deviation for the onboarding path.
+    Activation runs the SAME project-manifest gate as the manual activation
+    route (``validate_project_manifest`` over the full to-be-activated set,
+    with the deep wren-core compile pass when ``deep_validate`` is set — the
+    caller passes the manual route's condition). Previously onboarding
+    auto-activated on per-file validation only, so a file could activate here
+    yet be un-reactivatable later on the manual route. When the whole set
+    fails, each file is gated alone (base models are per-table independent);
+    offenders stay draft with a warning instead of poisoning the active set.
     """
 
     schema_index = SchemaIndex.from_agent_context(superset_context)
@@ -106,7 +116,9 @@ def onboard_schema_project(
         project=project,
         superset_context=superset_context,
     )
-    files = []
+    files: list[MdlFile] = []
+    #: (index into ``files``, per-file validation) for each activation candidate.
+    staged: list[tuple[int, MdlValidationResult]] = []
     if not superset_context.datasets:
         warnings.append("No permission-filtered datasets were found for this schema.")
     for proposal in proposals:
@@ -139,22 +151,20 @@ def onboard_schema_project(
                 )
             )
         elif auto_activate:
-            # Activate the freshly seeded model so the layer is queryable at once.
-            # Only valid models reach here; the store's activation gate is a final
-            # structural safety net, so a surprise failure degrades to draft.
-            try:
-                created = mdl_file_store.update(
-                    created.id,
-                    MdlFileUpdateRequest(status="active"),
-                    owner_id=owner_id,
-                    validation=validation,
-                )
-            except MdlFileValidationError as ex:
-                warnings.append(
-                    f"{proposal.proposed_path} could not be auto-activated: {ex}"
-                )
+            staged.append((len(files), validation))
         files.append(created)
         warnings.extend(proposal.warnings)
+
+    if staged:
+        _activate_staged(
+            files=files,
+            staged=staged,
+            schema_index=schema_index,
+            deep_validate=deep_validate,
+            mdl_file_store=mdl_file_store,
+            owner_id=owner_id,
+            warnings=warnings,
+        )
 
     activated = sum(1 for file in files if file.status == "active")
     return OnboardingResult(
@@ -164,3 +174,67 @@ def onboard_schema_project(
         activated_count=activated,
         warnings=list(dict.fromkeys(warnings)),
     )
+
+
+def _activate_staged(
+    *,
+    files: list[MdlFile],
+    staged: list[tuple[int, MdlValidationResult]],
+    schema_index: SchemaIndex,
+    deep_validate: bool,
+    mdl_file_store: MdlFileStore,
+    owner_id: str,
+    warnings: list[str],
+) -> None:
+    """Activate staged onboarding files through the project-manifest gate.
+
+    Parity with the manual activation route: the WHOLE projected active set is
+    validated as one manifest (cross-file references, keep-last dedup, optional
+    deep wren-core compile) before anything activates. When the set fails, each
+    file is gated alone — base models are per-table independent, so a solo pass
+    isolates the offender(s); they stay draft with a warning instead of
+    poisoning the active set. Mutates ``files`` (activated rows are replaced)
+    and ``warnings`` in place.
+    """
+
+    manifest_validation = validate_project_manifest(
+        [files[index].content for index, _ in staged],
+        schema_index=schema_index,
+        deep_validate=deep_validate,
+        dedup_models=True,
+    )
+    if not manifest_validation.valid:
+        approved: list[tuple[int, MdlValidationResult]] = []
+        for index, validation in staged:
+            solo = validate_project_manifest(
+                [files[index].content],
+                schema_index=schema_index,
+                deep_validate=deep_validate,
+                dedup_models=True,
+            )
+            if solo.valid:
+                approved.append((index, validation))
+            else:
+                warnings.append(
+                    f"{files[index].path} failed the project-manifest "
+                    "activation gate and stays draft: "
+                    + "; ".join(
+                        message.message
+                        for message in solo.messages
+                        if message.severity == "error"
+                    )
+                )
+        staged = approved
+    for index, validation in staged:
+        # Activate the freshly seeded model so the layer is queryable at once.
+        # The store's activation gate is a final structural safety net, so a
+        # surprise failure degrades to draft.
+        try:
+            files[index] = mdl_file_store.update(
+                files[index].id,
+                MdlFileUpdateRequest(status="active"),
+                owner_id=owner_id,
+                validation=validation,
+            )
+        except MdlFileValidationError as ex:
+            warnings.append(f"{files[index].path} could not be auto-activated: {ex}")

@@ -25,7 +25,7 @@ import logging
 import queue
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -391,13 +391,21 @@ def _mdl_referenced_tables(files: list[Any]) -> list[tuple[str, str | None]]:
     validation/activation hit memoized reflections.
     """
 
+    return _mdl_referenced_tables_from_contents(
+        file.content for file in files if getattr(file, "status", None) != "deleted"
+    )
+
+
+def _mdl_referenced_tables_from_contents(
+    contents: Iterable[str],
+) -> list[tuple[str, str | None]]:
+    """Distinct ``(table, schema)`` refs across raw MDL file contents."""
+
     refs: list[tuple[str, str | None]] = []
     seen: set[tuple[str, str]] = set()
-    for file in files:
-        if getattr(file, "status", None) == "deleted":
-            continue
+    for content in contents:
         try:
-            payload = json.loads(file.content)
+            payload = json.loads(content)
         except (ValueError, TypeError):
             continue
         if not isinstance(payload, dict):
@@ -2877,6 +2885,23 @@ def create_app(  # noqa: C901
                     "WREN_ACTIVATION_REQUIRES_ENGINE."
                 ),
             )
+        # Deterministic gate: reflect the columns of EVERY table the projected
+        # manifest references up front, budget-exempt. Without this, whether a
+        # phantom column is caught depended on the per-turn reflect budget's
+        # walk order, the background warm daemon's progress, and prior cache
+        # state — the same manifest could 422 on one attempt and activate on
+        # the next. Reflections are concurrent, memoized on the shared index,
+        # and fail-soft: a table whose reflection fails degrades to the
+        # explicit ``columns_unverified`` warning exactly as before.
+        if schema_index is not None:
+            try:
+                schema_index.ensure_columns_many(
+                    _mdl_referenced_tables_from_contents(contents),
+                    charge_budget=False,
+                )
+            except Exception:  # noqa: S110  # pylint: disable=broad-except
+                # Fail-soft: unresolved tables surface as columns_unverified.
+                pass
         validation = validate_project_manifest(
             contents,
             schema_index=schema_index,
@@ -6250,6 +6275,13 @@ def create_app(  # noqa: C901
                     wren_client=active_wren_client,
                     mdl_file_store=active_mdl_file_store,
                     owner_id=owner_id,
+                    # Parity with the manual activation gate's deep-validation
+                    # condition — onboarding-activated files must pass the same
+                    # bar they will face on the next manual (re)activation.
+                    deep_validate=(
+                        app_config.wren_core_validation_enabled
+                        or app_config.wren_activation_requires_engine
+                    ),
                 )
             except Exception as ex:  # pylint: disable=broad-except
                 active_job_store.fail(job.id, str(ex))

@@ -131,11 +131,14 @@ class SchemaIndex:
             return table_l in self.pending_by_schema.get(schema_l, set())
         return any(table_l in tables for tables in self.pending_by_schema.values())
 
-    def _pending_schema_for(self, table_l: str) -> str | None:
-        for schema_l, tables in self.pending_by_schema.items():
-            if table_l in tables:
-                return schema_l or None
-        return None
+    def _schemas_containing(self, table_l: str) -> list[str]:
+        """Schemas (lowercased) whose qualified map lists ``table_l``."""
+
+        return [
+            schema_l
+            for schema_l, tables in self.tables_by_schema.items()
+            if table_l in tables
+        ]
 
     def columns_loaded(self, table: str, schema: str | None = None) -> bool:
         """Whether this table's columns are known WITHOUT triggering reflection."""
@@ -296,16 +299,26 @@ class SchemaIndex:
             if not self._is_pending(table_l, schema_l):
                 continue
             if schema_l is None:
-                schema_l = self._pending_schema_for(table_l)
-            key = (schema_l or "", table_l)
-            if key in claimed or key in self._reflect_failed:
-                continue
-            if charge_budget:
-                if self.reflect_budget <= 0:
-                    break
-                self.reflect_budget -= 1
-            claimed.add(key)
-            jobs.append((table_l, schema_l))
+                # An unqualified ref reflects EVERY schema's pending copy of the
+                # table — resolving only the first would leave the others pending
+                # and the unqualified lookup permanently columns-unknown.
+                homes: list[str | None] = [
+                    home or None
+                    for home, tables in self.pending_by_schema.items()
+                    if table_l in tables
+                ]
+            else:
+                homes = [schema_l]
+            for home in homes:
+                key = (home or "", table_l)
+                if key in claimed or key in self._reflect_failed:
+                    continue
+                if charge_budget:
+                    if self.reflect_budget <= 0:
+                        return jobs
+                    self.reflect_budget -= 1
+                claimed.add(key)
+                jobs.append((table_l, home))
         return jobs
 
     def _apply_loaded(
@@ -320,13 +333,25 @@ class SchemaIndex:
         types = {
             str(name).lower(): str(type_) for name, type_ in loaded.items() if type_
         }
-        self.tables[table_l] = columns
-        if types:
-            self.column_types[table_l] = types
         if schema_l:
             self.tables_by_schema.setdefault(schema_l, {})[table_l] = columns
             if types:
                 self.types_by_schema.setdefault(schema_l, {})[table_l] = types
+        # The flat map is keyed by bare table name, so same-named tables in two
+        # schemas would otherwise collide last-write-wins — a real column could
+        # then read "does not exist" because the entry holds the OTHER schema's
+        # copy. Store the union across every schema's copy instead (fail-open;
+        # the schema-qualified map keeps the per-schema truth).
+        homes = self._schemas_containing(table_l)
+        if len(homes) > 1:
+            merged: set[str] = set()
+            for home in homes:
+                merged |= self.tables_by_schema[home][table_l]
+            self.tables[table_l] = merged
+        else:
+            self.tables[table_l] = columns
+        if types:
+            self.column_types[table_l] = types
         self.pending_by_schema.get(schema_l or "", set()).discard(table_l)
 
     @classmethod
@@ -341,7 +366,10 @@ class SchemaIndex:
                 continue
             table = dataset.table_name.lower()
             columns = {column.name.lower() for column in dataset.columns if column.name}
-            tables[table] = columns
+            # Union, not overwrite: same-named tables in two schemas must not
+            # clobber each other's flat entry (the qualified map below keeps
+            # the per-schema truth).
+            tables[table] = tables.get(table, set()) | columns
             types = {
                 column.name.lower(): column.type
                 for column in dataset.columns
@@ -538,10 +566,23 @@ class SchemaIndex:
 
     def has_column(self, table: str, column: str, schema: str | None = None) -> bool:
         self.ensure_columns(table, schema)
+        table_l = table.lower()
+        column_l = column.lower()
         if schema and self.tables_by_schema:
             scoped = self.tables_by_schema.get(schema.lower(), {})
-            return column.lower() in scoped.get(table.lower(), set())
-        return column.lower() in self.tables.get(table.lower(), set())
+            return column_l in scoped.get(table_l, set())
+        if self.tables_by_schema:
+            # Unqualified lookup on a qualified index: consult EVERY schema's
+            # copy of the table — the flat map is collidable (same-named tables
+            # across schemas), so a column present in ANY copy counts.
+            # Fail-open on ambiguity; never a false "does not exist".
+            homes = self._schemas_containing(table_l)
+            if homes:
+                return any(
+                    column_l in self.tables_by_schema[home].get(table_l, set())
+                    for home in homes
+                )
+        return column_l in self.tables.get(table_l, set())
 
     def column_type(
         self, table: str, column: str, schema: str | None = None
@@ -550,17 +591,33 @@ class SchemaIndex:
 
         With a ``schema`` (and a qualified index) the type comes from that schema's
         table, so two same-named tables in different schemas no longer return each
-        other's types. Without one it falls back to the flat (collidable) map, which
-        is correct for single-schema scopes and the names-only snapshot.
+        other's types. Without one, a qualified index is consulted across every
+        schema holding the table: a unique agreed type is returned, a cross-schema
+        disagreement reads as *unknown* (``None``) so type checks skip rather than
+        fire on the wrong schema's copy. The flat (collidable) map remains the
+        fallback for single-schema scopes and the names-only snapshot.
         """
 
         self.ensure_columns(table, schema)
+        table_l = table.lower()
+        column_l = column.lower()
         if schema and self.types_by_schema:
             scoped = self.types_by_schema.get(schema.lower(), {})
-            typed = scoped.get(table.lower())
+            typed = scoped.get(table_l)
             if typed is not None:
-                return typed.get(column.lower())
-        return self.column_types.get(table.lower(), {}).get(column.lower())
+                return typed.get(column_l)
+        if not schema and self.types_by_schema:
+            candidates = {
+                typed[column_l]
+                for typed_by_table in self.types_by_schema.values()
+                if (typed := typed_by_table.get(table_l)) is not None
+                and column_l in typed
+            }
+            if len(candidates) == 1:
+                return next(iter(candidates))
+            if candidates:
+                return None
+        return self.column_types.get(table_l, {}).get(column_l)
 
     def columns_for(self, table: str, schema: str | None = None) -> list[str]:
         """Sorted column names for a (schema, table); empty when unknown.
@@ -570,10 +627,20 @@ class SchemaIndex:
         """
 
         self.ensure_columns(table, schema)
+        table_l = table.lower()
         if schema and self.tables_by_schema:
             scoped = self.tables_by_schema.get(schema.lower(), {})
-            return sorted(scoped.get(table.lower(), set()))
-        return sorted(self.tables.get(table.lower(), set()))
+            return sorted(scoped.get(table_l, set()))
+        if self.tables_by_schema:
+            # Unqualified on a qualified index: union across the table's home
+            # schemas (the flat map is collidable — see ``has_column``).
+            homes = self._schemas_containing(table_l)
+            if homes:
+                merged: set[str] = set()
+                for home in homes:
+                    merged |= self.tables_by_schema[home].get(table_l, set())
+                return sorted(merged)
+        return sorted(self.tables.get(table_l, set()))
 
     def search(
         self, query: str, *, schema: str | None = None, limit: int = 10

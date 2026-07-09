@@ -154,8 +154,10 @@ def test_column_type_resolves_by_schema_on_collision() -> None:
     )
     assert index.column_type("orders", "amount", "sales") == "DOUBLE"
     assert index.column_type("orders", "amount", "archive") == "BIGINT"
-    # Without a schema it falls back to the flat map (single-schema/snapshot behaviour).
-    assert index.column_type("orders", "amount") in {"DOUBLE", "BIGINT"}
+    # Without a schema, a cross-schema type DISAGREEMENT reads as unknown
+    # (None) so type checks skip — never an arbitrary schema's type, which
+    # could flag a false mismatch against the other schema's copy.
+    assert index.column_type("orders", "amount") is None
 
 
 def test_schema_qualified_view_groups_tables_under_schemas() -> None:

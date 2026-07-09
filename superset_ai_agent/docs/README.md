@@ -252,6 +252,15 @@ The founding design corpus; code comments cite these by name and section.
   testing & evaluation platform — benchmarks, run job, prompt registry, judge,
   Scientist (**Active** — P0+P1 shipped, P2/P3 in progress; spec at
   [../evaluation/TESTING_PLATFORM_SPEC.md](../evaluation/TESTING_PLATFORM_SPEC.md)).
+- [plan_eval_rig_reusable_impl.md](plans/plan_eval_rig_reusable_impl.md):
+  generalise the Seagate research rig (`evaluation/`) into fixture-agnostic,
+  CSV-driven, DB-agnostic infra — a two-tier pipeline where provided agent-driven
+  *prepare* scripts turn dumped `inputs/` (CSVs + context) into BI docs + a
+  ground-truth-validated question corpus + tags + target schemas, then a reusable
+  harness runs experiments (reused in-app scorers + LLM judge) against real Oracle
+  data (**Implemented offline** — `evaluation/{rig,prepare}/`, `run_rig.py`,
+  `RIG_RUNBOOK.md`; 176 tests, ruff clean; live Seagate-parity + Oracle smoke pending
+  a stack).
 
 ## Reference (as-built & audits)
 

@@ -27,4 +27,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+# Directory itself: lets test modules ``import eval_common`` / ``import rig.corpus``
+# the way the notebooks and runners do.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# Repo root (superset/): lets the reusable rig import the agent's own scoring/judge/
+# model-client primitives (``superset_ai_agent.evals.*`` / ``.llm.factory``). The
+# rig deliberately crosses the "pure HTTP client" boundary — see
+# docs/plans/plan_eval_rig_reusable_impl.md §4.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
