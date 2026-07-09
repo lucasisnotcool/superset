@@ -87,6 +87,7 @@ import SemanticLayerStateBadge from '../SemanticLayerStateBadge';
 import useDocumentIngestion from '../useDocumentIngestion';
 import InstructionsPanel from './InstructionsPanel';
 import GoldenQueriesPanel from './GoldenQueriesPanel';
+import AuthoringPanel from './AuthoringPanel';
 import BenchmarksPanel from './BenchmarksPanel';
 import NewProjectModal from './NewProjectModal';
 import CopilotPanel, { type CopilotKickstart } from './CopilotPanel';
@@ -1826,6 +1827,16 @@ export default function SemanticLayerEditor({
                     label: t('Benchmarks'),
                     children: (
                       <BenchmarksPanel
+                        projectId={project?.id ?? ''}
+                        canWrite={canWrite}
+                      />
+                    ),
+                  },
+                  {
+                    key: 'authoring',
+                    label: t('Authoring'),
+                    children: (
+                      <AuthoringPanel
                         projectId={project?.id ?? ''}
                         canWrite={canWrite}
                       />

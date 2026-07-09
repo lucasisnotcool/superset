@@ -89,7 +89,8 @@ class RunTotals(BaseModel):
     #: Reliability score when trials > 1 (fraction of items passing ALL trials).
     pass_hat_k: float | None = None
     #: Diagnostic breakdown per capability tag: tag -> {"items": n, "passed": n}.
-    #: The config × capability scoreboard's per-run half (spec F5/P2.3).
+    #: The capability scoreboard for this run (single-config paradigm: compared
+    #: across runs over time, never across config arms).
     by_capability: dict[str, dict[str, int]] | None = None
 
 
@@ -200,15 +201,17 @@ class BenchmarkItemUpdateRequest(BaseModel):
 
 
 class BenchmarkRunRequest(BaseModel):
+    """Single-config run submission (plan_benchmark_authoring_agent_impl.md §1.1).
+
+    The benchmark always tests the agent **as-is** — its configured model and
+    grounding, with each item's own golden example excluded from recall (the
+    anti-cheat invariant). The former per-run ``model`` override and
+    ``exclude_example_recall`` toggle were multi-config residue and are gone.
+    """
+
     trials: int = Field(default=1, ge=1, le=5)
     item_ids: list[str] | None = None
     execute: bool = True
-    #: Per-run model override (F7 sweeps); None = the agent's configured model.
-    model: str | None = None
-    #: Exclude each item's own golden example from recall while answering it
-    #: (leakage guard, P2.4). Off = measure the exemplar-assisted path — the
-    #: run config records which mode produced the score.
-    exclude_example_recall: bool = True
 
 
 class BenchmarkRunSubmitted(BaseModel):
@@ -256,30 +259,26 @@ class GoldenImportResponse(BaseModel):
     skipped_duplicates: int
 
 
-class MatrixRunConfig(BaseModel):
-    """One arm of a matrix submission (F5/P2.3)."""
+class BenchmarkAuthorRequest(BaseModel):
+    """One authoring pass over uploaded CSV/context text (plan P3.1, DP-B3)."""
 
-    label: str | None = Field(default=None, max_length=64)
-    model: str | None = None
-    exclude_example_recall: bool = True
-
-    def effective_label(self) -> str:
-        return self.label or self.model or "default"
-
-
-class BenchmarkMatrixRunRequest(BaseModel):
-    """Fan out one run per config arm (all sharing trials/item subset)."""
-
-    configs: list[MatrixRunConfig] = Field(min_length=1, max_length=6)
-    trials: int = Field(default=1, ge=1, le=5)
-    item_ids: list[str] | None = None
+    csv_text: str = Field(min_length=1)
+    #: Extra business context (e.g. an uploaded .md), appended verbatim to the
+    #: CSV's own context rows for doc assembly and prompt grounding.
+    context_text: str | None = None
+    mode: Literal["extract", "generate", "both"] = "extract"
+    generate_count: int = Field(default=5, ge=1, le=25)
 
 
-class MatrixRunSubmitted(BaseModel):
-    run_id: str
-    label: str
+class BenchmarkItemsImportRequest(BaseModel):
+    """Bulk import of REVIEWED authored items (plan P3.2, DP-B7)."""
+
+    items: list[BenchmarkItemCreateRequest] = Field(
+        min_length=1, max_length=MAX_ITEMS_PER_BENCHMARK
+    )
 
 
-class BenchmarkMatrixSubmitted(BaseModel):
-    runs: list[MatrixRunSubmitted]
-    total_items: int
+class BenchmarkItemsImportResponse(BaseModel):
+    created: int
+    skipped_duplicates: int
+    errors: list[str] = Field(default_factory=list)

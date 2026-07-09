@@ -325,6 +325,15 @@ class AgentConfig:
     # completes with failures (persisted as a `scientist` conversation +
     # `benchmark_analysis_ready` event). Off by default (recovery-agent parity).
     wren_benchmark_auto_analyze_enabled: bool = False
+    # Benchmark Authoring Agent (plan_benchmark_authoring_agent_impl.md): turns
+    # uploaded CSV/context documents into a reviewable draft of benchmark items.
+    # Off by default until the surface is verified end-to-end; drafts are never
+    # auto-committed regardless of this flag (human review gate, DP-B4/R4).
+    wren_benchmark_authoring_enabled: bool = False
+    # Authoring-agent model override; None = the agent's default model.
+    wren_benchmark_author_model: str | None = None
+    # Tool-loop step budget for one authoring pass (mirrors the Copilot loop cap).
+    wren_benchmark_author_max_steps: int = 8
     # Ceiling for inline conversation attachments (long-context, no RAG). Oversize
     # text is truncated with a visible warning rather than rejected.
     wren_copilot_attachment_max_chars: int = 200_000
@@ -981,6 +990,21 @@ class AgentConfig:
             wren_benchmark_auto_analyze_enabled=_env_bool(
                 "WREN_BENCHMARK_AUTO_ANALYZE_ENABLED",
                 cls.wren_benchmark_auto_analyze_enabled,
+            ),
+            wren_benchmark_authoring_enabled=_env_bool(
+                "WREN_BENCHMARK_AUTHORING_ENABLED",
+                cls.wren_benchmark_authoring_enabled,
+            ),
+            wren_benchmark_author_model=os.getenv(
+                "WREN_BENCHMARK_AUTHOR_MODEL",
+                cls.wren_benchmark_author_model,
+            )
+            or None,
+            wren_benchmark_author_max_steps=int(
+                os.getenv(
+                    "WREN_BENCHMARK_AUTHOR_MAX_STEPS",
+                    str(cls.wren_benchmark_author_max_steps),
+                )
             ),
             wren_copilot_attachment_max_chars=int(
                 os.getenv(

@@ -261,9 +261,22 @@ The founding design corpus; code comments cite these by name and section.
   data (**Implemented offline** — `evaluation/{rig,prepare}/`, `run_rig.py`,
   `RIG_RUNBOOK.md`; 176 tests, ruff clean; live Seagate-parity + Oracle smoke pending
   a stack).
+- [plan_benchmark_authoring_agent_impl.md](plans/plan_benchmark_authoring_agent_impl.md):
+  the in-app twin of the eval rig ("Track B") — a NEW authoring agent that turns
+  dumped CSV + context into reviewable **in-app benchmark items** (gold-SQL /
+  eval-note / expected-values, capability-tagged), driven through the shipped
+  Benchmarks platform (`evals/` + BenchmarksPanel) with anti-cheat runs and
+  **native-Superset results charts** (**Implemented** — all phases done except the
+  Oracle live smoke (P7, blocked on the Oracle Superset connection); single-config
+  paradigm §1.1 enforced: legacy matrix/model-override surface removed;
+  complements, does not supersede, plan_eval_rig_reusable_impl.md).
 
 ## Reference (as-built & audits)
 
+- [benchmark_results_surfacing.md](reference/benchmark_results_surfacing.md):
+  benchmark results in native Superset — the `ai_agent_eval_reporting` view
+  (migration 0022), read-only connection/dataset setup, chart recipes
+  (single-config paradigm).
 - [MDL_LAB.md](reference/MDL_LAB.md): MDL Lab as-built reference — what
   exists, symbols, tests.
 - [MDL_PROVENANCE_AND_COVERAGE.md](reference/MDL_PROVENANCE_AND_COVERAGE.md):

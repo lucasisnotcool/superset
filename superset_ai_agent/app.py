@@ -85,17 +85,24 @@ from superset_ai_agent.conversations.store import (
     DEFAULT_OWNER_ID,
 )
 from superset_ai_agent.conversations.turns import ConversationTurnService
+from superset_ai_agent.evals.authoring.author_agent import (
+    run_authoring,
+    schema_summary_from_tables,
+    SqlProbe,
+)
+from superset_ai_agent.evals.authoring.corpus_csv import DraftContext, parse_corpus_csv
 from superset_ai_agent.evals.comparator import compare_result_sets
 from superset_ai_agent.evals.judge import judge_eval_note
 from superset_ai_agent.evals.otel_export import run_to_evaluation_events
 from superset_ai_agent.evals.schemas import (
     Benchmark,
+    BenchmarkAuthorRequest,
     BenchmarkCreateRequest,
     BenchmarkItem,
     BenchmarkItemCreateRequest,
+    BenchmarkItemsImportRequest,
+    BenchmarkItemsImportResponse,
     BenchmarkItemUpdateRequest,
-    BenchmarkMatrixRunRequest,
-    BenchmarkMatrixSubmitted,
     BenchmarkRunRequest,
     BenchmarkRunSubmitted,
     BenchmarkUpdateRequest,
@@ -104,7 +111,6 @@ from superset_ai_agent.evals.schemas import (
     EvalRun,
     EvalScore,
     GoldenImportResponse,
-    MatrixRunSubmitted,
     MAX_ITEMS_PER_BENCHMARK,
     PREVIEW_ROW_CAP,
     ResultOverrideRequest,
@@ -5124,10 +5130,14 @@ def create_app(  # noqa: C901
         database_id: int,
         graph: Any,
         run_superset_client: Any,
-        model: str | None = None,
-        exclude_example_recall: bool = True,
     ) -> None:
-        """Background body: claim → (item × trial) agent+gold+score → persist."""
+        """Background body: claim → (item × trial) agent+gold+score → persist.
+
+        Single-config invariant (§1.1): the agent answers with its configured
+        model (no per-run override) and each item's own golden example is
+        ALWAYS excluded from recall (anti-cheat) — these were request knobs
+        once; they are deliberately not parameters any more.
+        """
 
         if not active_eval_store.claim_run(run_id):
             return
@@ -5161,10 +5171,7 @@ def create_app(  # noqa: C901
                                 schema_name=project.schema_name,
                                 project_id=project.id,
                                 execute=True,
-                                model=model,
-                                exclude_example_questions=(
-                                    [item.question] if exclude_example_recall else None
-                                ),
+                                exclude_example_questions=[item.question],
                             ),
                             owner_id=owner_id,
                         )
@@ -5200,17 +5207,20 @@ def create_app(  # noqa: C901
                     execution = getattr(response, "execution_result", None)
                     wren_context = getattr(response, "wren_context", None)
                     recalled = getattr(wren_context, "recalled_example_count", 0) or 0
-                    if recalled and item.use_as_example and not exclude_example_recall:
-                        # Exclusion was deliberately off: flag the exemplar-
-                        # assisted score so it is never mistaken for unaided
-                        # accuracy (I-6 detection; P2.4 prevention is the flag).
+                    if recalled and item.use_as_example:
+                        # Own-example exclusion is invariant (§1.1), so recall
+                        # firing on an item that is itself a golden example is
+                        # worth a human glance (I-6): sibling examples are
+                        # benign; a failed exclusion is a leak.
                         scores.append(
                             EvalScore(
                                 name="leakage_suspected",
                                 label="golden_example_recalled",
                                 explanation=(
-                                    "This item is also a golden example and "
-                                    "example recall was active for this answer."
+                                    "Example recall surfaced entries while "
+                                    "answering an item that is itself a golden "
+                                    "example; own-example exclusion was "
+                                    "requested — review for self-recall."
                                 ),
                             )
                         )
@@ -5394,11 +5404,16 @@ def create_app(  # noqa: C901
                 project_id=project_id,
                 owner_id=identity.owner_id,
                 trials=request.trials,
+                # Descriptive provenance of the ONE tested config (§1.1 /
+                # DP-B4) — never a selectable arm. Run-vs-run comparison is
+                # same-config-over-time.
                 config={
                     "execute": request.execute,
                     "item_ids": request.item_ids,
-                    "model": request.model,
-                    "exclude_example_recall": request.exclude_example_recall,
+                    "agent_config": "as-is",
+                    "model": app_config.default_model(),
+                    "layer": "wren_bi",
+                    "exclude_own_example": True,
                 },
                 mdl_checksum=mdl_checksum,
                 benchmark_checksum=compute_benchmark_checksum(items),
@@ -5416,110 +5431,10 @@ def create_app(  # noqa: C901
                 database_id,
                 graph,
                 run_superset_client,
-                model=request.model,
-                exclude_example_recall=request.exclude_example_recall,
             )
         )
         return BenchmarkRunSubmitted(
             run_id=run.id, status="pending", total_items=len(items)
-        )
-
-    @api.post(
-        "/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}"
-        "/matrix-runs",
-        response_model=BenchmarkMatrixSubmitted,
-        status_code=202,
-    )
-    def start_benchmark_matrix(
-        project_id: str,
-        benchmark_id: str,
-        request: BenchmarkMatrixRunRequest,
-        fastapi_request: Request,
-        identity: AgentIdentity = identity_dependency,
-    ) -> BenchmarkMatrixSubmitted:
-        """Fan out one labeled run per config arm (F5 matrix, P2.3).
-
-        Sibling runs of a batch never supersede each other; the batch as a
-        whole supersedes any earlier in-flight run. Each arm records its label
-        in the run config, so the capability-matrix view can pivot
-        capability x config from stored runs alone.
-        """
-
-        _require_benchmarks_enabled()
-        project = authorize_semantic_project(
-            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
-        )
-        _get_project_benchmark(project_id, benchmark_id)
-        labels = [config.effective_label() for config in request.configs]
-        if len(set(labels)) != len(labels):
-            raise HTTPException(
-                status_code=400, detail="Matrix config labels must be unique."
-            )
-        items = active_eval_store.list_items(benchmark_id)
-        if request.item_ids is not None:
-            wanted = set(request.item_ids)
-            items = [item for item in items if item.id in wanted]
-        if not items:
-            raise HTTPException(
-                status_code=400, detail="Benchmark has no items to run."
-            )
-        database_id = _resolve_benchmark_database_id(
-            fastapi_request, project, identity.owner_id
-        )
-        try:
-            mdl_checksum = _active_mdl_checksum(project.id, identity.owner_id)
-        except Exception:  # pylint: disable=broad-except - best-effort stamp
-            mdl_checksum = None
-        checksum = compute_benchmark_checksum(items)
-        graph = build_text_to_sql_graph(fastapi_request)
-        _, run_superset_client = build_superset_runtime(fastapi_request)
-        created: list[tuple[Any, Any]] = []
-        for config in request.configs:
-            run = active_eval_store.create_run(
-                EvalRun(
-                    benchmark_id=benchmark_id,
-                    project_id=project_id,
-                    owner_id=identity.owner_id,
-                    trials=request.trials,
-                    config={
-                        "execute": True,
-                        "item_ids": request.item_ids,
-                        "model": config.model,
-                        "exclude_example_recall": config.exclude_example_recall,
-                        "label": config.effective_label(),
-                        "matrix": True,
-                    },
-                    mdl_checksum=mdl_checksum,
-                    benchmark_checksum=checksum,
-                    database_id=database_id,
-                )
-            )
-            created.append((run, config))
-        active_eval_store.supersede_runs(
-            benchmark_id, except_run_ids=[run.id for run, _ in created]
-        )
-        for run, config in created:
-            active_job_runner.submit(
-                functools.partial(
-                    _run_benchmark_job,
-                    run.id,
-                    project,
-                    identity.owner_id,
-                    items,
-                    request.trials,
-                    database_id,
-                    graph,
-                    run_superset_client,
-                    model=config.model,
-                    exclude_example_recall=config.exclude_example_recall,
-                )
-            )
-        return BenchmarkMatrixSubmitted(
-            runs=[
-                MatrixRunSubmitted(run_id=run.id, label=config.effective_label())
-                for run, config in created
-            ],
-            total_items=len(items),
         )
 
     @api.get(
@@ -5604,7 +5519,12 @@ def create_app(  # noqa: C901
         fastapi_request: Request,
         identity: AgentIdentity = identity_dependency,
     ) -> RunComparisonResponse:
-        """Paired comparison of two runs — delta always carries its CI (§16)."""
+        """Paired comparison of two runs — delta always carries its CI (§16).
+
+        Single-config paradigm: both runs tested the SAME agent-as-is config,
+        so this is a regression check over time, never a config-A-vs-config-B
+        arm comparison.
+        """
 
         _require_benchmarks_enabled()
         authorize_semantic_project(
@@ -6096,6 +6016,266 @@ def create_app(  # noqa: C901
             created += 1
             position += 1
         return GoldenImportResponse(created=created, skipped_duplicates=skipped)
+
+    def _require_authoring_enabled() -> None:
+        _require_benchmarks_enabled()
+        if not app_config.wren_benchmark_authoring_enabled:
+            raise HTTPException(
+                status_code=404, detail="Benchmark authoring is disabled."
+            )
+
+    def _authoring_preflight(
+        project_id: str,
+        benchmark_id: str,
+        request: BenchmarkAuthorRequest,
+        fastapi_request: Request,
+        identity: AgentIdentity,
+    ) -> tuple[SemanticProject, Any, int, Any]:
+        """Auth + CSV validation + runtime resolution, in request scope.
+
+        A StreamingResponse commits 200 once its body iterator starts, so every
+        failure must surface as a normal HTTP error BEFORE streaming (same
+        rationale as the Copilot stream preflight).
+        """
+
+        try:
+            _require_authoring_enabled()
+            project = authorize_semantic_project(
+                fastapi_request,
+                project_id,
+                owner_id=identity.owner_id,
+                permission="write",
+            )
+            _get_project_benchmark(project_id, benchmark_id)
+            corpus = parse_corpus_csv(request.csv_text)
+            if not corpus.ok:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "message": "CSV failed validation",
+                        "errors": corpus.errors,
+                    },
+                )
+            if request.context_text and request.context_text.strip():
+                corpus.contexts.append(
+                    DraftContext(text=request.context_text.strip(), source_row=0)
+                )
+            database_id = _resolve_benchmark_database_id(
+                fastapi_request, project, identity.owner_id
+            )
+            _, run_superset_client = build_superset_runtime(fastapi_request)
+        except HTTPException:
+            raise
+        except Exception as ex:  # pylint: disable=broad-except
+            logger.exception(
+                "Authoring stream preflight failed for benchmark %s", benchmark_id
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"Authoring preflight failed: {type(ex).__name__}: {ex}",
+            ) from ex
+        return project, corpus, database_id, run_superset_client
+
+    def _candidate_sql_probe(
+        project: SemanticProject, database_id: int, run_superset_client: Any
+    ) -> Callable[[str], SqlProbe]:
+        """Build the DP-B4/R2 gold-SQL probe (read-only gate; never raises)."""
+
+        def _execute_candidate_sql(sql: str) -> SqlProbe:
+            checked = validate_read_only_sql(
+                sql, policy_mode=app_config.sql_policy_mode
+            )
+            if not checked.is_read_only:
+                return SqlProbe(
+                    ok=False, error=f"not read-only: {checked.reason or 'rejected'}"
+                )
+            try:
+                result = run_superset_client.execute_sql(
+                    database_id=database_id,
+                    sql=sql,
+                    catalog_name=project.catalog_name or None,
+                    schema_name=project.schema_name,
+                    limit=PREVIEW_ROW_CAP,
+                )
+            except Exception as ex:  # pylint: disable=broad-except - probe result
+                return SqlProbe(ok=False, error=str(ex))
+            return SqlProbe(
+                ok=True,
+                row_count=result.row_count or 0,
+                columns=tuple(result.columns or ()),
+                rows_preview=tuple((result.rows or [])[:5]),
+            )
+
+        return _execute_candidate_sql
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}"
+        "/author/stream"
+    )
+    def stream_benchmark_authoring(
+        project_id: str,
+        benchmark_id: str,
+        request: BenchmarkAuthorRequest,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> StreamingResponse:
+        """Stream one authoring pass: ``progress`` steps, then a draft (P3.1).
+
+        The terminal ``complete`` event carries the reviewable draft — items are
+        NEVER persisted here (review gate, R4); the panel imports approved rows
+        via the bulk import route below.
+        """
+
+        project, corpus, database_id, run_superset_client = _authoring_preflight(
+            project_id, benchmark_id, request, fastapi_request, identity
+        )
+        _execute_candidate_sql = _candidate_sql_probe(
+            project, database_id, run_superset_client
+        )
+
+        def event_stream() -> Any:
+            events: queue.Queue[tuple[str, Any]] = queue.Queue()
+            holder: dict[str, Any] = {}
+
+            def on_step(step: AgentStep) -> None:
+                events.put(("progress", step))
+
+            def run() -> None:
+                try:
+                    try:
+                        schema_index = _build_catalog_with_progress(
+                            project, fastapi_request, on_step
+                        )
+                    except Exception:  # pylint: disable=broad-except - optional
+                        # Grounding is best-effort: authoring proceeds without a
+                        # catalog (the SQL probe still validates candidates).
+                        schema_index = None
+                    summary = (
+                        schema_summary_from_tables(schema_index.tables_by_schema)
+                        if schema_index is not None
+                        else ""
+                    )
+                    holder["draft"] = run_authoring(
+                        corpus=corpus,
+                        model_client=active_model_client,
+                        execute_sql=_execute_candidate_sql,
+                        schema_summary=summary,
+                        mode=request.mode,
+                        generate_count=request.generate_count,
+                        max_steps=app_config.wren_benchmark_author_max_steps,
+                        model=app_config.wren_benchmark_author_model,
+                        on_step=on_step,
+                    )
+                except Exception as ex:  # pylint: disable=broad-except
+                    holder["error"] = str(ex)
+                finally:
+                    events.put(("done", None))
+
+            worker = threading.Thread(target=run, daemon=True)
+            worker.start()
+            while True:
+                try:
+                    kind, payload = events.get(
+                        timeout=COPILOT_STREAM_HEARTBEAT_SECONDS
+                    )
+                except queue.Empty:
+                    yield ": keep-alive\n\n"
+                    continue
+                if kind == "done":
+                    break
+                yield _conversation_sse(
+                    {
+                        "type": "progress",
+                        "agent_step": payload.model_dump(mode="json"),
+                    }
+                )
+            worker.join()
+            if "error" in holder:
+                yield _conversation_sse({"type": "error", "detail": holder["error"]})
+            else:
+                yield _conversation_sse(
+                    {
+                        "type": "complete",
+                        "draft": holder["draft"].model_dump(mode="json"),
+                    }
+                )
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/benchmarks/{benchmark_id}"
+        "/items/import",
+        response_model=BenchmarkItemsImportResponse,
+    )
+    def import_benchmark_items(
+        project_id: str,
+        benchmark_id: str,
+        request: BenchmarkItemsImportRequest,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> BenchmarkItemsImportResponse:
+        """Bulk-create REVIEWED items (P3.2, DP-B7): per-row, dedup, never abort.
+
+        Mirrors ``import_golden_queries_as_items``: duplicates (casefolded
+        question) skip, a bad row records an error and the rest proceed, and the
+        per-benchmark cap is enforced across the whole batch.
+        """
+
+        _require_benchmarks_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
+        )
+        benchmark = _get_project_benchmark(project_id, benchmark_id)
+        existing_questions = {
+            item.question.strip().casefold()
+            for item in active_eval_store.list_items(benchmark_id)
+        }
+        created = 0
+        skipped = 0
+        errors: list[str] = []
+        position = benchmark.item_count
+        verified_stamp = identity.username or identity.email or identity.owner_id
+        for index, row in enumerate(request.items):
+            key = row.question.strip().casefold()
+            if not key:
+                errors.append(f"item {index}: empty question")
+                continue
+            if key in existing_questions:
+                skipped += 1
+                continue
+            if position >= MAX_ITEMS_PER_BENCHMARK:
+                errors.append(
+                    f"item {index}: benchmark is at its "
+                    f"{MAX_ITEMS_PER_BENCHMARK}-item cap"
+                )
+                continue
+            try:
+                spec = _validated_answer_spec(row.answer_type, row.answer_spec)
+            except HTTPException as ex:
+                errors.append(f"item {index} ({row.question[:60]!r}): {ex.detail}")
+                continue
+            active_eval_store.add_item(
+                BenchmarkItem(
+                    benchmark_id=benchmark_id,
+                    position=position,
+                    question=row.question.strip(),
+                    answer_type=row.answer_type,
+                    answer_spec=spec,
+                    capability_tags=row.capability_tags,
+                    use_as_example=row.use_as_example,
+                    verified_by=verified_stamp if row.verified else None,
+                    verified_at=(
+                        datetime.now(timezone.utc) if row.verified else None
+                    ),
+                    created_by=identity.owner_id,
+                )
+            )
+            existing_questions.add(key)
+            created += 1
+            position += 1
+        return BenchmarkItemsImportResponse(
+            created=created, skipped_duplicates=skipped, errors=errors
+        )
 
     @api.post(
         "/agent/semantic-layer/projects/{project_id}/materialize",

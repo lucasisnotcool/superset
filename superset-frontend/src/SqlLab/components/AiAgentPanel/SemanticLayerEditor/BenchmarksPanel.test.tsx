@@ -326,29 +326,6 @@ test('run rows show the capability breakdown tags', async () => {
   expect(await screen.findByText('metric 1/3')).toBeInTheDocument();
 });
 
-test('model override is sent with the run request', async () => {
-  fetchMock.post(`${BASE}/bm-1/runs`, {
-    run_id: 'run-2',
-    status: 'pending',
-    total_items: 1,
-  });
-  renderPanel();
-  await screen.findByText('Revenue by region?');
-  await userEvent.type(screen.getByTestId('model-override'), 'gpt-5.2-mini');
-  await userEvent.click(screen.getByTestId('run-benchmark'));
-  await waitFor(() =>
-    expect(
-      fetchMock.callHistory.calls(`${BASE}/bm-1/runs`, { method: 'POST' }),
-    ).toHaveLength(1),
-  );
-  const [call] = fetchMock.callHistory.calls(`${BASE}/bm-1/runs`, {
-    method: 'POST',
-  });
-  expect(JSON.parse(String(call.options.body))).toMatchObject({
-    model: 'gpt-5.2-mini',
-  });
-});
-
 test('analyze failures renders the scientist report', async () => {
   fetchMock.get(`${BASE}/bm-1/runs/run-1/results`, [FAILED_RESULT]);
   fetchMock.post(`${BASE}/bm-1/runs/run-1/analyze`, {
@@ -382,36 +359,7 @@ test('analyze failures renders the scientist report', async () => {
   expect(report).toHaveTextContent('Relate sales to regions on region_id.');
 });
 
-test('comma-separated models submit a matrix of labeled runs', async () => {
-  fetchMock.post(`${BASE}/bm-1/matrix-runs`, {
-    runs: [
-      { run_id: 'run-a', label: 'small' },
-      { run_id: 'run-b', label: 'big' },
-    ],
-    total_items: 1,
-  });
-  renderPanel();
-  await screen.findByText('Revenue by region?');
-  await userEvent.type(screen.getByTestId('model-override'), 'small, big');
-  await userEvent.click(screen.getByTestId('run-benchmark'));
-
-  await waitFor(() =>
-    expect(
-      fetchMock.callHistory.calls(`${BASE}/bm-1/matrix-runs`, {
-        method: 'POST',
-      }),
-    ).toHaveLength(1),
-  );
-  const [call] = fetchMock.callHistory.calls(`${BASE}/bm-1/matrix-runs`, {
-    method: 'POST',
-  });
-  expect(JSON.parse(String(call.options.body)).configs).toEqual([
-    { model: 'small', exclude_example_recall: true },
-    { model: 'big', exclude_example_recall: true },
-  ]);
-});
-
-test('unchecking the exemplar guard is sent with the run', async () => {
+test('a run submits the single as-is config (no override knobs)', async () => {
   fetchMock.post(`${BASE}/bm-1/runs`, {
     run_id: 'run-2',
     status: 'pending',
@@ -419,7 +367,9 @@ test('unchecking the exemplar guard is sent with the run', async () => {
   });
   renderPanel();
   await screen.findByText('Revenue by region?');
-  await userEvent.click(screen.getByTestId('exclude-exemplars'));
+  // The legacy sweep knobs are gone from the surface entirely.
+  expect(screen.queryByTestId('model-override')).not.toBeInTheDocument();
+  expect(screen.queryByTestId('exclude-exemplars')).not.toBeInTheDocument();
   await userEvent.click(screen.getByTestId('run-benchmark'));
 
   await waitFor(() =>
@@ -430,9 +380,8 @@ test('unchecking the exemplar guard is sent with the run', async () => {
   const [call] = fetchMock.callHistory.calls(`${BASE}/bm-1/runs`, {
     method: 'POST',
   });
-  expect(JSON.parse(String(call.options.body))).toMatchObject({
-    exclude_example_recall: false,
-  });
+  const body = JSON.parse(String(call.options.body));
+  expect(body).toEqual({ trials: 1 });
 });
 
 test('propose MDL fixes renders the staged changeset', async () => {

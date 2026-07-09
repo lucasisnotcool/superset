@@ -191,6 +191,15 @@ Each feature: **what**, **why/user intent**, **pros/cons**, **enterprise-adoptio
 
 ### F5 — Experiment configuration & comparison UI
 
+> **DESCOPED for the product (single-config directive, 2026-07-01 —
+> plan_benchmark_authoring_agent_impl.md §1.1):** the in-app benchmarks
+> platform tests exactly one configuration — the agent as-is (auto-onboard +
+> BI enrichment + Wren). The config/grounding/onboard sweep described below
+> lives ONLY in the offline research rig (`run_eval_v4/v5`,
+> plan_eval_rig_reusable_impl.md); the product's latent matrix surface was
+> removed (P4B). Run-vs-run comparison remains, as same-config-over-time.
+
+
 - **What:** define an Experiment in the UI — pick Dataset(version), pick the **variables to sweep** (prompt version(s), model/provider, grounding mode, onboard mode, trials), attach Evaluators, run. Then a **comparison view**: run-vs-run and matrix (config × capability) with deltas, min–max, and drill-down to per-example SQL/trace. This is the `run_eval_v4` matrix, made interactive.
 - **User intent:** "Set up an experiment (like the 8-config matrix) and see exactly what improved."
 - **Pros:** turns the crown-jewel `run_eval_v4` into a first-class, repeatable, shareable product; capability × config is *better than most SaaS* (they give one score). **Cons:** async job orchestration (runs are long — minutes); live progress UI (we already have SSE patterns — `/copilot/stream`, `/events`).
@@ -210,6 +219,12 @@ Each feature: **what**, **why/user intent**, **pros/cons**, **enterprise-adoptio
 - **Recommendation:** **P3.**
 
 ### F7 — Model & provider sweeps
+
+> **DESCOPED for the product (single-config directive, 2026-07-01):** per-run
+> model overrides were removed with the matrix surface (P4B); the agent always
+> answers with its configured model. Model comparisons belong to the offline
+> research rig. (The separate judge-model override, a grading concern, stays.)
+
 
 - **What:** make model/provider a first-class Experiment variable (not just `.env`): run the same Dataset across `gpt-4.1-mini` / a local Ollama model / Azure, compare quality×cost×latency (we already capture tokens+duration via `MeteredModelClient`).
 - **User intent:** "Is the cheaper/local model good enough for my questions?"

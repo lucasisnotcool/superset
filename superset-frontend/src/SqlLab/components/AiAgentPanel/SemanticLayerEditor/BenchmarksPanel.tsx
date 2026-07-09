@@ -64,7 +64,6 @@ import {
   overrideBenchmarkResult,
   promoteBenchmarkItem,
   ScientistReport,
-  startBenchmarkMatrix,
   startBenchmarkRun,
 } from '../api';
 
@@ -125,8 +124,6 @@ export default function BenchmarksPanel({
   const [useAsExample, setUseAsExample] = useState(false);
 
   const [trials, setTrials] = useState(1);
-  const [modelOverride, setModelOverride] = useState('');
-  const [excludeExemplars, setExcludeExemplars] = useState(true);
   const [activeRun, setActiveRun] = useState<BenchmarkRun | undefined>(
     undefined,
   );
@@ -318,44 +315,21 @@ export default function BenchmarksPanel({
     }
   };
 
+  // Single-config paradigm (plan_benchmark_authoring_agent_impl.md §1.1): a
+  // run always tests the agent as-is — no model override, no config arms.
   const onStartRun = async () => {
     if (!benchmarkId) {
       return;
     }
     try {
-      const models = modelOverride
-        .split(',')
-        .map(value => value.trim())
-        .filter(Boolean);
-      if (models.length > 1) {
-        const submitted = await startBenchmarkMatrix(projectId, benchmarkId, {
-          trials,
-          configs: models.map(model => ({
-            model,
-            exclude_example_recall: excludeExemplars,
-          })),
-        });
-        dispatch(
-          addSuccessToast(
-            t(
-              'Matrix started: %s runs x %s questions.',
-              submitted.runs.length,
-              submitted.total_items,
-            ),
-          ),
-        );
-      } else {
-        const submitted = await startBenchmarkRun(projectId, benchmarkId, {
-          trials,
-          model: models[0] || undefined,
-          exclude_example_recall: excludeExemplars,
-        });
-        dispatch(
-          addSuccessToast(
-            t('Benchmark run started (%s questions).', submitted.total_items),
-          ),
-        );
-      }
+      const submitted = await startBenchmarkRun(projectId, benchmarkId, {
+        trials,
+      });
+      dispatch(
+        addSuccessToast(
+          t('Benchmark run started (%s questions).', submitted.total_items),
+        ),
+      );
       await refreshBenchmark();
     } catch (ex) {
       toastError(ex, t('Unable to start benchmark run'));
@@ -566,22 +540,6 @@ export default function BenchmarksPanel({
                 {t('Import golden queries')}
               </Button>
             )}
-            <Input
-              data-test="model-override"
-              css={css`
-                width: 180px;
-              `}
-              placeholder={t('Model override (optional)')}
-              value={modelOverride}
-              onChange={event => setModelOverride(event.target.value)}
-            />
-            <Checkbox
-              data-test="exclude-exemplars"
-              checked={excludeExemplars}
-              onChange={event => setExcludeExemplars(event.target.checked)}
-            >
-              {t('Hide golden exemplars')}
-            </Checkbox>
             <Select
               data-test="trials-select"
               value={trials}

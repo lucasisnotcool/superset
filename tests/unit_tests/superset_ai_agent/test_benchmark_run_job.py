@@ -326,9 +326,15 @@ def test_empty_run_request_is_rejected(tmp_path) -> None:
     assert response.status_code == 400
 
 
-def test_exclusion_on_passes_item_question_and_suppresses_leakage_flag(
+def test_single_config_run_is_ungrounded_and_always_excludes_own_example(
     tmp_path,
 ) -> None:
+    """P4.1 anti-cheat pin (plan_benchmark_authoring_agent_impl.md §1.1).
+
+    The run must call the agent AS-IS: the bare question (no BI/context dump),
+    no model override, and the item's own golden example always excluded.
+    """
+
     graph = FakeGraph(answers={"Q?": GOLD_RESULT})
     client = make_client(
         tmp_path, superset_client=_gold_superset(), text_to_sql_graph=graph
@@ -341,40 +347,43 @@ def test_exclusion_on_passes_item_question_and_suppresses_leakage_flag(
         f"/items/{item_id}/promote-example"
     )
 
-    run_id = _start_run(client, pid, bid)  # exclude_example_recall defaults True
-    results = _results(client, pid, bid, run_id)
-    names = {s["name"] for s in results[0]["scores"]}
-    assert "leakage_suspected" not in names
-    # The graph received the leakage-guard field (P2.4 pass-through).
-    assert graph.requests[0].exclude_example_questions == ["Q?"]
+    run_id = _start_run(client, pid, bid)
+    sent = graph.requests[0]
+    assert sent.question == "Q?"  # bare question — nothing prepended
+    assert sent.model is None  # the agent's own configured model
+    assert sent.exclude_example_questions == ["Q?"]  # invariant, not a knob
 
-
-def test_exclusion_off_flags_leakage_on_golden_items(tmp_path) -> None:
-    graph = FakeGraph(answers={"Q?": GOLD_RESULT})
-    client = make_client(
-        tmp_path, superset_client=_gold_superset(), text_to_sql_graph=graph
-    )
-    pid = resolve_project(client)
-    bid = create_benchmark(client, pid)
-    item_id = add_gold_item(client, pid, bid, question="Q?")
-    client.post(
-        f"/agent/semantic-layer/projects/{pid}/benchmarks/{bid}"
-        f"/items/{item_id}/promote-example"
-    )
-
-    response = client.post(
-        f"/agent/semantic-layer/projects/{pid}/benchmarks/{bid}/runs",
-        json={"exclude_example_recall": False},
-    )
-    assert response.status_code == 202
-    run_id = response.json()["run_id"]
+    # FakeGraph reports recall despite the requested exclusion: on an item
+    # that is itself an example this is flagged for review (I-6 detection).
     results = _results(client, pid, bid, run_id)
     names = {s["name"] for s in results[0]["scores"]}
     assert "leakage_suspected" in names
-    assert graph.requests[0].exclude_example_questions is None
+
+    # Fixed-config provenance (P4.2): descriptive, never a selectable arm.
+    run = _get_run(client, pid, bid, run_id)
+    assert run["config"]["agent_config"] == "as-is"
+    assert run["config"]["exclude_own_example"] is True
+    assert run["config"]["layer"] == "wren_bi"
 
 
-def test_model_override_is_threaded_to_the_agent(tmp_path) -> None:
+def test_recall_on_non_example_items_is_not_flagged(tmp_path) -> None:
+    graph = FakeGraph(answers={"Q?": GOLD_RESULT})
+    client = make_client(
+        tmp_path, superset_client=_gold_superset(), text_to_sql_graph=graph
+    )
+    pid = resolve_project(client)
+    bid = create_benchmark(client, pid)
+    add_gold_item(client, pid, bid, question="Q?")  # NOT promoted as example
+
+    run_id = _start_run(client, pid, bid)
+    results = _results(client, pid, bid, run_id)
+    names = {s["name"] for s in results[0]["scores"]}
+    assert "leakage_suspected" not in names
+
+
+def test_legacy_sweep_knobs_are_ignored(tmp_path) -> None:
+    """The removed model/exclusion knobs must not resurface via the API."""
+
     graph = FakeGraph(answers={"Q?": GOLD_RESULT})
     client = make_client(
         tmp_path, superset_client=_gold_superset(), text_to_sql_graph=graph
@@ -385,12 +394,13 @@ def test_model_override_is_threaded_to_the_agent(tmp_path) -> None:
 
     response = client.post(
         f"/agent/semantic-layer/projects/{pid}/benchmarks/{bid}/runs",
-        json={"model": "gpt-5.2-mini"},
+        json={"model": "gpt-9-max", "exclude_example_recall": False},
     )
-    assert response.status_code == 202
+    assert response.status_code == 202  # unknown fields ignored, run proceeds
+    assert graph.requests[0].model is None
+    assert graph.requests[0].exclude_example_questions == ["Q?"]
     run = _get_run(client, pid, bid, response.json()["run_id"])
-    assert run["config"]["model"] == "gpt-5.2-mini"
-    assert graph.requests[0].model == "gpt-5.2-mini"
+    assert "exclude_example_recall" not in run["config"]
 
 
 def test_compare_runs_reports_paired_ci_and_direction(tmp_path) -> None:
@@ -533,48 +543,9 @@ def test_new_run_supersedes_pending_run(tmp_path) -> None:
     assert _results(client, pid, bid, first) == []
 
 
-def test_matrix_runs_fan_out_labeled_arms_without_mutual_supersession(
-    tmp_path,
-) -> None:
-    graph = FakeGraph(answers={"Q?": GOLD_RESULT})
-    client = make_client(
-        tmp_path, superset_client=_gold_superset(), text_to_sql_graph=graph
-    )
-    pid = resolve_project(client)
-    bid = create_benchmark(client, pid)
-    add_gold_item(client, pid, bid, question="Q?")
+def test_matrix_route_is_gone_single_config_only(tmp_path) -> None:
+    """P4B.1: the multi-config matrix surface was removed (§1.1)."""
 
-    response = client.post(
-        f"/agent/semantic-layer/projects/{pid}/benchmarks/{bid}/matrix-runs",
-        json={
-            "configs": [
-                {"model": "small-model"},
-                {"model": "big-model"},
-                {"label": "no-guard", "exclude_example_recall": False},
-            ]
-        },
-    )
-    assert response.status_code == 202, response.text
-    body = response.json()
-    assert [arm["label"] for arm in body["runs"]] == [
-        "small-model",
-        "big-model",
-        "no-guard",
-    ]
-
-    # All three arms completed (InlineJobRunner) — none superseded a sibling.
-    for arm in body["runs"]:
-        run = _get_run(client, pid, bid, arm["run_id"])
-        assert run["status"] == "complete"
-        assert run["config"]["label"] == arm["label"]
-    # Each arm's model reached the agent.
-    assert [r.model for r in graph.requests] == ["small-model", "big-model", None]
-    # The no-guard arm ran without exclusion.
-    assert graph.requests[2].exclude_example_questions is None
-    assert graph.requests[0].exclude_example_questions == ["Q?"]
-
-
-def test_matrix_rejects_duplicate_labels(tmp_path) -> None:
     client = make_client(
         tmp_path, superset_client=_gold_superset(), text_to_sql_graph=FakeGraph({})
     )
@@ -583,9 +554,9 @@ def test_matrix_rejects_duplicate_labels(tmp_path) -> None:
     add_gold_item(client, pid, bid, question="Q?")
     response = client.post(
         f"/agent/semantic-layer/projects/{pid}/benchmarks/{bid}/matrix-runs",
-        json={"configs": [{"model": "m"}, {"model": "m"}]},
+        json={"configs": [{"model": "m"}]},
     )
-    assert response.status_code == 400
+    assert response.status_code in (404, 405)
 
 
 def test_override_recomputes_capability_breakdown(tmp_path) -> None:

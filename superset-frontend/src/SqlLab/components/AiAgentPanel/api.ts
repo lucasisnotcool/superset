@@ -2900,25 +2900,6 @@ export const analyzeBenchmarkRun = (
     { method: 'POST' },
   );
 
-export interface MatrixRunConfig {
-  label?: string;
-  model?: string | null;
-  exclude_example_recall?: boolean;
-}
-
-export const startBenchmarkMatrix = (
-  projectId: string,
-  benchmarkId: string,
-  body: { configs: MatrixRunConfig[]; trials?: number; item_ids?: string[] },
-) =>
-  requestJson<{
-    runs: { run_id: string; label: string }[];
-    total_items: number;
-  }>(`${benchmarksBase(projectId)}/${benchmarkId}/matrix-runs`, {
-    method: 'POST',
-    body: JSON.stringify(body),
-  });
-
 export interface CopilotHandoffResponse {
   changeset: {
     message?: string | null;
@@ -2937,4 +2918,157 @@ export const handoffBenchmarkRunToCopilot = (
   requestJson<CopilotHandoffResponse>(
     `${benchmarksBase(projectId)}/${benchmarkId}/runs/${runId}/handoff-copilot`,
     { method: 'POST' },
+  );
+
+// --- Benchmark authoring agent (plan_benchmark_authoring_agent_impl.md P3) ---
+
+export type AuthoredItemOrigin = 'human' | 'extracted' | 'generated';
+export type AuthoredItemValidation = 'verified' | 'needs_review';
+export type AuthoringMode = 'extract' | 'generate' | 'both';
+
+export interface AuthoredItem {
+  question: string;
+  answer_type: BenchmarkAnswerType;
+  answer_spec: Record<string, unknown>;
+  capability_tags: string[];
+  target_schema?: string | null;
+  notes?: string | null;
+  source_row?: number | null;
+  origin: AuthoredItemOrigin;
+  validation: AuthoredItemValidation;
+  problems: string[];
+}
+
+export interface AuthoringDraft {
+  items: AuthoredItem[];
+  context_doc?: string | null;
+  warnings: string[];
+  steps_taken: number;
+  model_failed: boolean;
+}
+
+export interface BenchmarkAuthorRequestBody {
+  csv_text: string;
+  context_text?: string | null;
+  mode?: AuthoringMode;
+  generate_count?: number;
+}
+
+/**
+ * Stream one authoring pass over uploaded CSV/context text. Progress steps are
+ * surfaced through `onProgress`; the resolved value is the reviewable draft —
+ * nothing is persisted server-side (review gate): approved rows go through
+ * {@link importBenchmarkItems}.
+ */
+export const streamBenchmarkAuthoring = async (
+  projectId: string,
+  benchmarkId: string,
+  body: BenchmarkAuthorRequestBody,
+  options: {
+    onProgress?: (step: AgentStep) => void;
+    signal?: AbortSignal;
+  } = {},
+): Promise<AuthoringDraft> => {
+  const response = await fetch(
+    `${getAgentBaseUrl()}${benchmarksBase(projectId)}/${benchmarkId}/author/stream`,
+    {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'text/event-stream',
+      },
+      body: JSON.stringify(body),
+      signal: options.signal,
+    },
+  );
+  if (!response.ok) {
+    let detail = `Authoring failed: ${response.status}`;
+    try {
+      const parsed = await response.json();
+      detail =
+        typeof parsed?.detail === 'string'
+          ? parsed.detail
+          : JSON.stringify(parsed?.detail ?? detail);
+    } catch {
+      // keep the status-based message
+    }
+    throw new AgentApiError(detail, response.status);
+  }
+
+  let draft: AuthoringDraft | undefined;
+  let streamError: string | undefined;
+  const handleFrame = (frame: string) => {
+    const data = parseSseData(frame) as
+      | {
+          type?: string;
+          agent_step?: AgentStep;
+          draft?: AuthoringDraft;
+          detail?: string;
+        }
+      | undefined;
+    if (!data || typeof data !== 'object') {
+      return;
+    }
+    if (data.type === 'progress' && data.agent_step) {
+      options.onProgress?.(data.agent_step);
+    } else if (data.type === 'complete' && data.draft) {
+      draft = data.draft;
+    } else if (data.type === 'error') {
+      streamError = data.detail || 'Authoring failed';
+    }
+  };
+
+  const reader = response.body?.getReader ? response.body.getReader() : null;
+  if (reader) {
+    const decoder = new TextDecoder();
+    let buffer = '';
+    for (;;) {
+      // eslint-disable-next-line no-await-in-loop
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      const { frames, rest } = splitSseFrames(buffer);
+      buffer = rest;
+      frames.forEach(handleFrame);
+    }
+    splitSseFrames(`${buffer}\n\n`).frames.forEach(handleFrame);
+  } else {
+    // jsdom / fetch polyfills without streaming bodies: parse the buffered text.
+    const raw = await response.text();
+    splitSseFrames(`${raw}\n\n`).frames.forEach(handleFrame);
+  }
+
+  if (streamError) {
+    throw new Error(streamError);
+  }
+  if (!draft) {
+    throw new Error('The authoring stream ended unexpectedly.');
+  }
+  return draft;
+};
+
+export interface BenchmarkItemsImportResult {
+  created: number;
+  skipped_duplicates: number;
+  errors: string[];
+}
+
+export const importBenchmarkItems = (
+  projectId: string,
+  benchmarkId: string,
+  items: {
+    question: string;
+    answer_type: BenchmarkAnswerType;
+    answer_spec: Record<string, unknown>;
+    capability_tags?: string[];
+    use_as_example?: boolean;
+    verified?: boolean;
+  }[],
+) =>
+  requestJson<BenchmarkItemsImportResult>(
+    `${benchmarksBase(projectId)}/${benchmarkId}/items/import`,
+    { method: 'POST', body: JSON.stringify({ items }) },
   );
