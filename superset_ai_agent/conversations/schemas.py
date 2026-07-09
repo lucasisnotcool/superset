@@ -97,6 +97,10 @@ class ConversationArtifact(BaseModel):
 
     id: str = Field(default_factory=_new_id)
     type: str = "sql"
+    #: A forked copy of another thread's artifact. Inert artifacts render as
+    #: history but are never actionable (a fork must not re-apply the parent
+    #: thread's changeset or re-execute its approvals).
+    inert: bool = False
     #: SQL text for ``type="sql"`` artifacts; ``None`` for non-SQL agent artifacts.
     sql: str | None = None
     #: Opaque per-agent payload for artifacts whose shape is not SQL (e.g. a
@@ -141,6 +145,11 @@ class Conversation(BaseModel):
     #: Semantic project binding for project-scoped agents (the Copilot). ``None`` for
     #: database-scoped SQL threads.
     project_id: str | None = None
+    #: Fork back-link: the thread this one was branched from ("Branch from
+    #: here") and the source-message sequence the copy stopped at. ``None`` for
+    #: threads that are not forks.
+    parent_conversation_id: str | None = None
+    forked_from_sequence: int | None = None
     scope: ConversationScope
     messages: list[ConversationMessage] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=_utc_now)
@@ -185,6 +194,15 @@ class ConversationTurnRequest(BaseModel):
     approved_artifact_id: str | None = None
     model: str | None = None
     max_steps: int = Field(default=8, ge=2, le=16)
+    #: Edit & resend / regenerate (rewind-then-re-prompt): when set, the turn
+    #: first soft-truncates the thread from this user message (inclusive), then
+    #: runs normally with ``message`` as the replacement content. Regenerate is
+    #: the same primitive with the original content unchanged.
+    rewrite_from_message_id: str | None = None
+    #: When rewriting, also delete the learning-loop examples the truncated
+    #: turns produced (provenance-matched). Default on: the user is rewriting
+    #: because the answer was wrong, so the learned example is suspect too.
+    remove_learned_examples: bool = True
 
     def resolved_execution_mode(self) -> ExecutionMode:
         """Return the execution policy after applying legacy request fields."""
@@ -192,6 +210,63 @@ class ConversationTurnRequest(BaseModel):
         if self.execution_mode != "manual" or self.execute is None:
             return self.execution_mode
         return "read_only" if self.execute else "manual"
+
+
+class ConversationTruncation(BaseModel):
+    """Result of soft-truncating a thread from an anchor message."""
+
+    conversation: Conversation
+    #: The soft-deleted messages, in sequence order (anchor first).
+    removed_messages: list[ConversationMessage] = Field(default_factory=list)
+
+
+class AppliedChangesetItemPreview(BaseModel):
+    """One applied MDL changeset item a rewrite would leave behind."""
+
+    op: str
+    path: str
+    file_id: str | None = None
+
+
+class RewritePreview(BaseModel):
+    """Side-effect manifest for a prospective rewrite (edit/regenerate).
+
+    Drives the confirm dialog: name exactly what the truncation removes and
+    which durable side effects it cannot remove (Claude Code's limitations-first
+    pattern). Empty manifest → the client may skip confirmation entirely.
+    """
+
+    removed_message_count: int = 0
+    #: Learning-loop examples whose confirming turn falls in the cut range
+    #: (removable via ``remove_learned_examples``).
+    memory_write_count: int = 0
+    #: Changeset items applied (persisted as drafts) by turns in the cut range.
+    #: These stay applied unless explicitly reverted — the dialog must say so.
+    applied_changeset_items: list[AppliedChangesetItemPreview] = Field(
+        default_factory=list
+    )
+    #: Groups the applied items belong to (Phase 2 revert handles).
+    apply_group_ids: list[str] = Field(default_factory=list)
+    #: True when the cut range contains "Applied N drafts." turns predating
+    #: apply snapshots — something was applied but the items are unknown.
+    unknown_applies: bool = False
+    #: Read-only executions in the cut range (informational; replay-safe).
+    executed_sql_count: int = 0
+
+
+class ConversationForkRequest(BaseModel):
+    """Fork ("Branch from here") a conversation at a message."""
+
+    #: Anchor message id (fork copies messages up to and including it). ``None``
+    #: forks the whole thread (branch-from-last ≈ duplicate).
+    message_id: str | None = None
+
+
+class MessageFeedbackRequest(BaseModel):
+    """Persist a thumbs rating on an assistant message."""
+
+    rating: Literal["up", "down"]
+    comment: str | None = Field(default=None, max_length=2000)
 
 
 class ConversationSqlExecutionRequest(BaseModel):

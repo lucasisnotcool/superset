@@ -56,6 +56,11 @@ class AiAgentConversation(Base):
     #: Semantic project binding for project-scoped agents (the Copilot). Plain
     #: column, not a FK — conversations outlive projects.
     project_id = Column(String(36), nullable=True, index=True)
+    #: Fork back-link ("Branch from here"): the conversation this one was forked
+    #: from, plus the source-message sequence the copy stopped at. Plain columns,
+    #: not FKs — a fork must survive its parent's deletion.
+    parent_conversation_id = Column(String(36), nullable=True)
+    forked_from_sequence = Column(Integer, nullable=True)
     database_id = Column(Integer, nullable=False)
     catalog_name = Column(String(255), nullable=True)
     schema_name = Column(String(255), nullable=True)
@@ -99,6 +104,14 @@ class AiAgentMessage(Base):
     content = Column(Text, nullable=False)
     sequence = Column(Integer, nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False)
+    #: Message soft-delete: a rewrite (edit & resend / regenerate) truncates the
+    #: visible thread by stamping this instead of deleting rows, so undo and the
+    #: prior-attempt pager keep working. Live reads filter on ``IS NULL``.
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+    #: Rewrite batch marker: every row soft-deleted by one rewrite carries the
+    #: anchor user message's id (the anchor marks itself). Undo restores the
+    #: batch; the attempt pager finds superseded assistant turns through it.
+    superseded_by_message_id = Column(String(36), nullable=True, index=True)
 
     conversation = relationship(
         "AiAgentConversation",
@@ -448,6 +461,63 @@ class AiAgentNlSqlExample(Base):
     referenced_schemas = Column(JSON, nullable=True)
     result_meta = Column(JSON, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False)
+    #: Provenance of the confirming turn, so a conversation rewrite (edit &
+    #: resend / regenerate) can remove or replace the example that turn produced
+    #: instead of silently keeping/duplicating it. NULL on legacy rows and on
+    #: writes from non-conversation paths (the one-shot graph, evals).
+    source_conversation_id = Column(String(36), nullable=True)
+    source_message_id = Column(String(36), nullable=True, index=True)
+
+
+class AiAgentMessageFeedback(Base):
+    """Persisted per-message thumbs feedback.
+
+    Regeneration analytics ride on this too: which turns users regenerate or
+    down-vote is free eval signal for the golden-queries loop. ``message_id`` is
+    a plain column (no FK) so feedback survives message soft-deletes.
+    """
+
+    __tablename__ = "ai_agent_message_feedback"
+
+    id = Column(String(36), primary_key=True)
+    conversation_id = Column(String(36), index=True, nullable=False)
+    message_id = Column(String(36), index=True, nullable=False)
+    owner_id = Column(String(255), nullable=False)
+    rating = Column(String(16), nullable=False)
+    comment = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class AiAgentMdlApplySnapshot(Base):
+    """Before-image of one MDL file captured when a changeset item is applied.
+
+    The Copilot's analog of an IDE agent's file checkpoint: applying a changeset
+    records, per item, what the file looked like *before* the apply (or that it
+    did not exist), so "revert applied drafts" can restore it. One apply action
+    shares an ``apply_group_id``. ``reverted_at`` marks consumed snapshots.
+    """
+
+    __tablename__ = "ai_agent_mdl_apply_snapshots"
+
+    id = Column(String(36), primary_key=True)
+    apply_group_id = Column(String(36), index=True, nullable=False)
+    project_id = Column(String(36), index=True, nullable=False)
+    conversation_id = Column(String(36), index=True, nullable=True)
+    #: The "Applied N drafts." assistant turn recorded for this apply, which is
+    #: how a rewrite preview attributes applied items to the messages it would
+    #: truncate. NULL for stateless (thread-less) applies.
+    message_id = Column(String(36), nullable=True)
+    owner_id = Column(String(255), nullable=False)
+    #: Changeset op that produced this snapshot: create | update | delete.
+    op = Column(String(16), nullable=False)
+    path = Column(String(512), nullable=False)
+    #: The touched file's id (the created file's id for ``create``).
+    file_id = Column(String(36), nullable=True)
+    #: File content before the apply; NULL for ``create`` (file did not exist).
+    before_content = Column(Text, nullable=True)
+    before_status = Column(String(32), nullable=True)
+    applied_at = Column(DateTime(timezone=True), nullable=False)
+    reverted_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class AiAgentInstruction(Base):

@@ -35,6 +35,7 @@ import { Icons } from '@superset-ui/core/components/Icons';
 import {
   AgentApiError,
   AgentStep,
+  ApplyGroupSummary,
   applyCopilotChangeset,
   Changeset,
   ChangesetItem,
@@ -43,17 +44,25 @@ import {
   CopilotInspector,
   createCopilotConversation,
   deleteCopilotConversation,
+  forkCopilotConversation,
   getCopilotConversation,
   getCopilotInspector,
+  getCopilotRewritePreview,
   getSemanticDocument,
+  listCopilotApplies,
   listCopilotConversations,
   MessageAttachment,
+  revertCopilotApply,
+  RewritePreview,
   SemanticDocument,
   SemanticProjectReadinessStatus,
   streamCopilot,
+  undoCopilotRewrite,
   updateCopilotConversationTitle,
   upsertLiveStep,
 } from '../api';
+import RewriteConfirmModal from '../RewriteConfirmModal';
+import copyTextToClipboard from 'src/utils/copy';
 import {
   getDocumentStatusMeta,
   isPendingDocumentStatus,
@@ -212,6 +221,25 @@ const CopilotPanel = ({
   // re-render read-only from message artifacts on resume (no stale Apply).
   const [changeset, setChangeset] = useState<Changeset | null>(null);
   const [decisions, setDecisions] = useState<Record<string, Decision>>({});
+  // Fork back-link of the active thread ("Branch from here"), if it is one.
+  const [parentConversationId, setParentConversationId] = useState<
+    string | null
+  >(null);
+  // Inline edit & resend state (which user message; the draft replacement).
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [editingValue, setEditingValue] = useState('');
+  // Pending rewrite awaiting the side-effect confirm dialog.
+  const [rewriteConfirm, setRewriteConfirm] = useState<{
+    anchorId: string;
+    message: string;
+    preview: RewritePreview;
+  } | null>(null);
+  // Anchor of the last completed rewrite — single-step Undo until next turn.
+  const [undoAnchorId, setUndoAnchorId] = useState<string | null>(null);
+  // This thread's apply history (before-image groups) — drives the per-turn
+  // Revert affordance on "Applied N drafts." messages.
+  const [applies, setApplies] = useState<ApplyGroupSummary[]>([]);
+  const [revertNotice, setRevertNotice] = useState<string | null>(null);
   const [isRunning, setIsRunning] = useState(false);
   const [isApplying, setIsApplying] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -256,6 +284,24 @@ const CopilotPanel = ({
     }
   }, [projectId]);
 
+  // Apply history (Revert affordances) — non-critical, fail-open to empty.
+  const refreshApplies = useCallback(
+    async (id: string | null) => {
+      if (!id) {
+        setApplies([]);
+        return;
+      }
+      try {
+        const groups = await listCopilotApplies(projectId, id);
+        // Defensive: an older backend may not expose the route (proxy 200s).
+        setApplies(Array.isArray(groups) ? groups : []);
+      } catch {
+        setApplies([]);
+      }
+    },
+    [projectId],
+  );
+
   const resumeConversation = useCallback(
     async (id: string, { closeHistory = true } = {}) => {
       setError(null);
@@ -264,7 +310,11 @@ const CopilotPanel = ({
         const conversation = await getCopilotConversation(projectId, id);
         setConversationId(conversation.id);
         setMessages(conversation.messages);
+        setParentConversationId(conversation.parent_conversation_id ?? null);
         setPendingUser(null);
+        setUndoAnchorId(null);
+        setEditingMessageId(null);
+        refreshApplies(conversation.id);
         // Auto-resume (on open) must not yank a history panel the user just
         // opened; only an explicit history-item resume closes it.
         if (closeHistory) setIsHistoryOpen(false);
@@ -281,17 +331,22 @@ const CopilotPanel = ({
         setError(caught instanceof Error ? caught.message : String(caught));
       }
     },
-    [projectId, resetProposal],
+    [projectId, refreshApplies, resetProposal],
   );
 
   const startNewChat = useCallback(() => {
     setConversationId(null);
     setMessages([]);
+    setParentConversationId(null);
     setPendingUser(null);
     setInput('');
     setAttachedDocs([]);
     setAttachPollGaveUp(false);
     setError(null);
+    setUndoAnchorId(null);
+    setEditingMessageId(null);
+    setApplies([]);
+    setRevertNotice(null);
     resetProposal();
     setIsHistoryOpen(false);
     localStorage.removeItem(activeThreadKey(projectId));
@@ -446,20 +501,33 @@ const CopilotPanel = ({
   // Shared by the manual Send and the Auto-onboard kickstart so both paths apply
   // identical optimistic-bubble, reload-from-server, and accept-default logic.
   const submitTurn = useCallback(
-    async (message: string, attachments: MessageAttachment[]) => {
+    async (
+      message: string,
+      attachments: MessageAttachment[],
+      options: {
+        /** Target thread when it differs from state (e.g. a fresh branch). */
+        conversationIdOverride?: string;
+        /** Edit & resend / regenerate: truncate from this user message first. */
+        rewriteFromMessageId?: string;
+      } = {},
+    ) => {
       setError(null);
       resetProposal();
       setPendingUser(message);
       setIsRunning(true);
       setLiveSteps([]);
+      setUndoAnchorId(null);
+      setEditingMessageId(null);
       try {
-        const id = await ensureConversation();
+        const id =
+          options.conversationIdOverride ?? (await ensureConversation());
         const result = await streamCopilot(
           projectId,
           {
             message,
             conversation_id: id,
             attachments: attachments.length ? attachments : undefined,
+            rewrite_from_message_id: options.rewriteFromMessageId ?? undefined,
           },
           step => setLiveSteps(prev => upsertLiveStep(prev, step)),
         );
@@ -470,6 +538,9 @@ const CopilotPanel = ({
         const conversation = await getCopilotConversation(projectId, id);
         setMessages(conversation.messages);
         setPendingUser(null);
+        if (options.rewriteFromMessageId) {
+          setUndoAnchorId(options.rewriteFromMessageId);
+        }
         // Default valid items to accepted (the common "apply all" flow), but
         // auto-exclude items that failed validation so a known-bad draft is never
         // applied — and so the per-item Accept becomes a meaningful opt-in for
@@ -498,6 +569,147 @@ const CopilotPanel = ({
     setInput('');
     await submitTurn(message, attachmentsForSend());
   }, [attachmentsForSend, attachmentBlocksSend, input, isRunning, submitTurn]);
+
+  // "Branch from here": copy the thread up to the message into a new thread and
+  // switch to it. Branches share the project's files and drafts; copied
+  // changesets are inert (history only).
+  const handleBranchFrom = useCallback(
+    async (messageId?: string | null) => {
+      if (!conversationId) return;
+      try {
+        const fork = await forkCopilotConversation(
+          projectId,
+          conversationId,
+          messageId ?? null,
+        );
+        setConversationId(fork.id);
+        setMessages(fork.messages);
+        setParentConversationId(fork.parent_conversation_id ?? null);
+        setUndoAnchorId(null);
+        setEditingMessageId(null);
+        resetProposal();
+        localStorage.setItem(activeThreadKey(projectId), fork.id);
+        refreshSummaries();
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : String(caught));
+      }
+    },
+    [conversationId, projectId, refreshSummaries, resetProposal],
+  );
+
+  // Execute a rewrite (edit & resend / regenerate) on the active thread.
+  const runRewriteTurn = useCallback(
+    async (anchorId: string, message: string) => {
+      if (!conversationId) return;
+      setRewriteConfirm(null);
+      await submitTurn(message, [], {
+        conversationIdOverride: conversationId,
+        rewriteFromMessageId: anchorId,
+      });
+    },
+    [conversationId, submitTurn],
+  );
+
+  // Entry point for edit & resend / regenerate: consult the side-effect
+  // manifest first (applied drafts stay in the project — the dialog says so).
+  const beginRewrite = useCallback(
+    async (anchorId: string, message: string) => {
+      if (!conversationId || isRunning || !message.trim()) return;
+      try {
+        const preview = await getCopilotRewritePreview(
+          projectId,
+          conversationId,
+          anchorId,
+        );
+        const hasSideEffects =
+          preview.applied_changeset_items.length > 0 ||
+          preview.unknown_applies ||
+          preview.memory_write_count > 0;
+        if (!hasSideEffects) {
+          await runRewriteTurn(anchorId, message.trim());
+          return;
+        }
+        setRewriteConfirm({ anchorId, message: message.trim(), preview });
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : String(caught));
+      }
+    },
+    [conversationId, isRunning, projectId, runRewriteTurn],
+  );
+
+  // "Branch instead" from the rewrite dialog: keep this thread intact; fork up
+  // to the turn before the anchor (or start fresh) and send the message there.
+  const branchInsteadOfRewrite = useCallback(
+    async (anchorId: string, message: string) => {
+      if (!conversationId) return;
+      setRewriteConfirm(null);
+      setEditingMessageId(null);
+      const anchorIndex = messages.findIndex(item => item.id === anchorId);
+      try {
+        let targetId: string;
+        if (anchorIndex > 0) {
+          const fork = await forkCopilotConversation(
+            projectId,
+            conversationId,
+            messages[anchorIndex - 1].id,
+          );
+          setConversationId(fork.id);
+          setMessages(fork.messages);
+          setParentConversationId(fork.parent_conversation_id ?? null);
+          localStorage.setItem(activeThreadKey(projectId), fork.id);
+          targetId = fork.id;
+        } else {
+          const created = await createCopilotConversation(projectId);
+          setConversationId(created.id);
+          setMessages([]);
+          setParentConversationId(null);
+          localStorage.setItem(activeThreadKey(projectId), created.id);
+          targetId = created.id;
+        }
+        resetProposal();
+        await submitTurn(message, [], { conversationIdOverride: targetId });
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : String(caught));
+      }
+    },
+    [conversationId, messages, projectId, resetProposal, submitTurn],
+  );
+
+  // Single-step undo of the last rewrite (until the next turn starts).
+  const handleUndoRewrite = useCallback(async () => {
+    if (!conversationId || !undoAnchorId || isRunning) return;
+    try {
+      const restored = await undoCopilotRewrite(
+        projectId,
+        conversationId,
+        undoAnchorId,
+      );
+      setMessages(restored.messages);
+      setUndoAnchorId(null);
+      resetProposal();
+      refreshSummaries();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    }
+  }, [
+    conversationId,
+    isRunning,
+    projectId,
+    refreshSummaries,
+    resetProposal,
+    undoAnchorId,
+  ]);
+
+  // Regenerate = rewrite of the last turn with unchanged content.
+  const handleRegenerate = useCallback(() => {
+    if (isRunning) return;
+    const lastUser = [...messages]
+      .reverse()
+      .find(message => message.role === 'user');
+    if (lastUser?.content) {
+      beginRewrite(lastUser.id, lastUser.content);
+    }
+  }, [beginRewrite, isRunning, messages]);
 
   // Auto-onboard kickstart: attach the chosen documents and send the templated
   // message as one turn. Builds the attachment payload directly from the passed
@@ -559,6 +771,7 @@ const CopilotPanel = ({
         );
         setMessages(conversation.messages);
         refreshSummaries();
+        refreshApplies(conversationId);
       }
       resetProposal();
       onApplied?.();
@@ -573,9 +786,58 @@ const CopilotPanel = ({
     conversationId,
     onApplied,
     projectId,
+    refreshApplies,
     refreshSummaries,
     resetProposal,
   ]);
+
+  // Restore an apply group's before-images ("Revert" on an Applied turn, or
+  // the rewrite dialog's revert option). Excluded files are reported, never
+  // silently clobbered.
+  const handleRevertApply = useCallback(
+    async (applyGroupId: string) => {
+      if (!conversationId || isRunning || isApplying) return;
+      setError(null);
+      setRevertNotice(null);
+      try {
+        const result = await revertCopilotApply(
+          projectId,
+          conversationId,
+          applyGroupId,
+        );
+        if (result.excluded.length) {
+          setRevertNotice(
+            t(
+              'Reverted %s draft(s). Kept: %s',
+              result.reverted_count,
+              result.excluded
+                .map(item => `${item.path} (${item.reason})`)
+                .join('; '),
+            ),
+          );
+        }
+        const conversation = await getCopilotConversation(
+          projectId,
+          conversationId,
+        );
+        setMessages(conversation.messages);
+        refreshApplies(conversationId);
+        refreshSummaries();
+        onApplied?.();
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : String(caught));
+      }
+    },
+    [
+      conversationId,
+      isApplying,
+      isRunning,
+      onApplied,
+      projectId,
+      refreshApplies,
+      refreshSummaries,
+    ],
+  );
 
   const handleRename = useCallback(async () => {
     if (!conversationId) return;
@@ -772,6 +1034,17 @@ const CopilotPanel = ({
                 {projectName}
               </Tag>
             </Tooltip>
+          ) : null}
+          {parentConversationId ? (
+            <Button
+              buttonSize="small"
+              buttonStyle="link"
+              data-test="copilot-branch-backlink"
+              onClick={() => resumeConversation(parentConversationId)}
+              icon={<Icons.BranchesOutlined iconSize="s" />}
+            >
+              {t('Branched — open original')}
+            </Button>
           ) : null}
         </Flex>
         {/* Coverage + Inspector operate on an active semantic layer, so they are
@@ -1000,6 +1273,8 @@ const CopilotPanel = ({
               // message; render that one in the actionable block below instead.
               const showPast =
                 pastChangeset && !(changeset && message.id === lastAssistantId);
+              const isEditing =
+                message.role === 'user' && editingMessageId === message.id;
               return (
                 <Flex vertical gap={theme.sizeUnit} key={message.id}>
                   <Flex
@@ -1007,21 +1282,153 @@ const CopilotPanel = ({
                       message.role === 'user' ? 'flex-end' : 'flex-start'
                     }
                   >
-                    <div
-                      css={css`
-                        max-width: 90%;
-                        padding: ${theme.sizeUnit * 2}px;
-                        border-radius: ${theme.borderRadius}px;
-                        background: ${message.role === 'user'
-                          ? theme.colorPrimaryBg
-                          : theme.colorBgLayout};
-                        white-space: pre-wrap;
-                      `}
-                      data-test={`copilot-message-${message.role}`}
-                    >
-                      {message.content}
-                    </div>
+                    {isEditing ? (
+                      <Flex
+                        vertical
+                        gap={theme.sizeUnit}
+                        css={css`
+                          width: 90%;
+                        `}
+                        data-test="copilot-message-edit-form"
+                      >
+                        <Input.TextArea
+                          autoFocus
+                          autoSize={{ minRows: 2, maxRows: 8 }}
+                          value={editingValue}
+                          onChange={event =>
+                            setEditingValue(event.target.value)
+                          }
+                          onKeyDown={event => {
+                            if (event.key === 'Enter' && !event.shiftKey) {
+                              event.preventDefault();
+                              beginRewrite(message.id, editingValue);
+                            }
+                            if (event.key === 'Escape') {
+                              setEditingMessageId(null);
+                            }
+                          }}
+                        />
+                        <Flex gap={theme.sizeUnit} justify="flex-end">
+                          <Button
+                            buttonSize="small"
+                            buttonStyle="tertiary"
+                            onClick={() => setEditingMessageId(null)}
+                          >
+                            {t('Cancel')}
+                          </Button>
+                          <Button
+                            buttonSize="small"
+                            buttonStyle="primary"
+                            disabled={!editingValue.trim() || isRunning}
+                            onClick={() =>
+                              beginRewrite(message.id, editingValue)
+                            }
+                            data-test="copilot-message-edit-save"
+                          >
+                            {t('Save & resend')}
+                          </Button>
+                        </Flex>
+                      </Flex>
+                    ) : (
+                      <div
+                        css={css`
+                          max-width: 90%;
+                          padding: ${theme.sizeUnit * 2}px;
+                          border-radius: ${theme.borderRadius}px;
+                          background: ${message.role === 'user'
+                            ? theme.colorPrimaryBg
+                            : theme.colorBgLayout};
+                          white-space: pre-wrap;
+                        `}
+                        data-test={`copilot-message-${message.role}`}
+                      >
+                        {message.content}
+                      </div>
+                    )}
                   </Flex>
+                  {!isEditing && canWrite ? (
+                    <Flex
+                      justify={
+                        message.role === 'user' ? 'flex-end' : 'flex-start'
+                      }
+                      gap={0}
+                    >
+                      {message.content.trim() && (
+                        <Button
+                          aria-label={t('Copy message')}
+                          tooltip={t('Copy message')}
+                          buttonSize="small"
+                          buttonStyle="link"
+                          onClick={() =>
+                            copyTextToClipboard(() =>
+                              Promise.resolve(message.content),
+                            ).catch(() => {})
+                          }
+                          icon={<Icons.CopyOutlined iconSize="s" />}
+                        />
+                      )}
+                      {message.role === 'assistant' &&
+                        (() => {
+                          const applyGroup = applies.find(
+                            group =>
+                              group.message_id === message.id &&
+                              !group.reverted,
+                          );
+                          return applyGroup ? (
+                            <Button
+                              buttonSize="small"
+                              buttonStyle="link"
+                              disabled={isRunning || isApplying}
+                              onClick={() =>
+                                handleRevertApply(applyGroup.apply_group_id)
+                              }
+                              icon={<Icons.UndoOutlined iconSize="s" />}
+                              data-test="copilot-revert-apply"
+                            >
+                              {t('Revert')}
+                            </Button>
+                          ) : null;
+                        })()}
+                      {message.role === 'user' && (
+                        <Button
+                          aria-label={t('Edit message')}
+                          tooltip={t('Edit & resend')}
+                          buttonSize="small"
+                          buttonStyle="link"
+                          disabled={isRunning}
+                          onClick={() => {
+                            setEditingMessageId(message.id);
+                            setEditingValue(message.content);
+                          }}
+                          icon={<Icons.EditOutlined iconSize="s" />}
+                        />
+                      )}
+                      {message.role === 'assistant' &&
+                        message.id === lastAssistantId && (
+                          <Button
+                            aria-label={t('Regenerate')}
+                            tooltip={t('Regenerate response')}
+                            buttonSize="small"
+                            buttonStyle="link"
+                            disabled={isRunning}
+                            onClick={handleRegenerate}
+                            icon={<Icons.ReloadOutlined iconSize="s" />}
+                          />
+                        )}
+                      <Button
+                        aria-label={t('Branch from here')}
+                        tooltip={t(
+                          'Branch from here — continue in a copy of this ' +
+                            'thread up to this message',
+                        )}
+                        buttonSize="small"
+                        buttonStyle="link"
+                        disabled={isRunning}
+                        onClick={() => handleBranchFrom(message.id)}
+                        icon={<Icons.BranchesOutlined iconSize="s" />}
+                      />
+                    </Flex>
+                  ) : null}
                   {showPast
                     ? renderChangesetReview(pastChangeset, false)
                     : null}
@@ -1093,6 +1500,17 @@ const CopilotPanel = ({
               <Alert type="error" showIcon message={error} closable />
             ) : null}
 
+            {revertNotice ? (
+              <Alert
+                type="info"
+                showIcon
+                message={revertNotice}
+                closable
+                onClose={() => setRevertNotice(null)}
+                data-test="copilot-revert-notice"
+              />
+            ) : null}
+
             {changeset?.warnings?.map(warning => (
               <Alert key={warning} type="warning" showIcon message={warning} />
             ))}
@@ -1129,6 +1547,32 @@ const CopilotPanel = ({
               />
             ) : null}
           </Flex>
+
+          {undoAnchorId && !isRunning ? (
+            <Flex
+              align="center"
+              justify="space-between"
+              gap={theme.sizeUnit}
+              css={css`
+                border-top: 1px solid ${theme.colorBorderSecondary};
+                padding: ${theme.sizeUnit}px ${theme.sizeUnit * 2}px;
+                background: ${theme.colorBgLayout};
+              `}
+              data-test="copilot-rewrite-undo-bar"
+            >
+              <Typography.Text type="secondary">
+                {t('Conversation edited — earlier turns were replaced.')}
+              </Typography.Text>
+              <Button
+                buttonSize="small"
+                buttonStyle="link"
+                onClick={handleUndoRewrite}
+                icon={<Icons.UndoOutlined iconSize="s" />}
+              >
+                {t('Undo')}
+              </Button>
+            </Flex>
+          ) : null}
 
           <Flex
             vertical
@@ -1254,6 +1698,37 @@ const CopilotPanel = ({
         </>
       )}
 
+      <RewriteConfirmModal
+        open={Boolean(rewriteConfirm)}
+        preview={rewriteConfirm?.preview ?? null}
+        canRevertApplied={Boolean(
+          rewriteConfirm?.preview.apply_group_ids.length,
+        )}
+        onConfirm={async (_removeLearned, revertApplied) => {
+          if (!rewriteConfirm) {
+            return;
+          }
+          if (revertApplied) {
+            // Restore before-images first so the rewritten turn starts from
+            // the pre-apply project state (sequential; failures surface).
+            // eslint-disable-next-line no-restricted-syntax
+            for (const groupId of rewriteConfirm.preview.apply_group_ids) {
+              // eslint-disable-next-line no-await-in-loop
+              await handleRevertApply(groupId);
+            }
+          }
+          runRewriteTurn(rewriteConfirm.anchorId, rewriteConfirm.message);
+        }}
+        onBranch={() => {
+          if (rewriteConfirm) {
+            branchInsteadOfRewrite(
+              rewriteConfirm.anchorId,
+              rewriteConfirm.message,
+            );
+          }
+        }}
+        onCancel={() => setRewriteConfirm(null)}
+      />
       <CopilotInspectorDialog
         open={inspectorOpen}
         inspector={inspector}

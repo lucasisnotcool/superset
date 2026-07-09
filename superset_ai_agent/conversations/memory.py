@@ -18,6 +18,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import List
+from uuid import uuid4
 
 from superset_ai_agent.conversations.schemas import (
     Conversation,
@@ -25,10 +27,13 @@ from superset_ai_agent.conversations.schemas import (
     ConversationMessage,
     ConversationScope,
     ConversationSummary,
+    ConversationTruncation,
 )
 from superset_ai_agent.conversations.store import (
     ConversationArtifactNotFoundError,
+    ConversationMessageNotFoundError,
     ConversationNotFoundError,
+    ConversationRewriteError,
     DEFAULT_OWNER_ID,
 )
 
@@ -38,6 +43,11 @@ class InMemoryConversationStore:
 
     def __init__(self) -> None:
         self._conversations: dict[str, Conversation] = {}
+        #: Rewrite bookkeeping mirroring the SQL store's soft-delete markers:
+        #: ``(conversation_id, anchor_message_id) -> (cut_index, removed batch)``.
+        self._truncations: dict[
+            tuple[str, str], tuple[int, list[ConversationMessage]]
+        ] = {}
 
     def create(
         self,
@@ -164,6 +174,122 @@ class InMemoryConversationStore:
         self._find(conversation_id, owner_id=owner_id)
         del self._conversations[conversation_id]
 
+    def truncate_from(
+        self,
+        conversation_id: str,
+        message_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> ConversationTruncation:
+        conversation = self._find(conversation_id, owner_id=owner_id)
+        cut_index = next(
+            (
+                index
+                for index, message in enumerate(conversation.messages)
+                if message.id == message_id
+            ),
+            None,
+        )
+        if cut_index is None:
+            raise ConversationMessageNotFoundError(message_id)
+        if conversation.messages[cut_index].role != "user":
+            raise ConversationRewriteError("A rewrite must anchor on a user message.")
+        removed = conversation.messages[cut_index:]
+        conversation.messages = conversation.messages[:cut_index]
+        conversation.updated_at = _utc_now()
+        self._truncations[(conversation_id, message_id)] = (
+            cut_index,
+            [message.model_copy(deep=True) for message in removed],
+        )
+        return ConversationTruncation(
+            conversation=conversation.model_copy(deep=True),
+            removed_messages=[message.model_copy(deep=True) for message in removed],
+        )
+
+    def undo_truncate(
+        self,
+        conversation_id: str,
+        anchor_message_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> Conversation:
+        conversation = self._find(conversation_id, owner_id=owner_id)
+        record = self._truncations.pop((conversation_id, anchor_message_id), None)
+        if record is None:
+            raise ConversationRewriteError(
+                "No rewrite batch to restore for this message."
+            )
+        cut_index, batch = record
+        replacement = conversation.messages[cut_index:]
+        replacement_anchor = next(
+            (message for message in replacement if message.role == "user"),
+            None,
+        )
+        if replacement_anchor is not None:
+            self._truncations[(conversation_id, replacement_anchor.id)] = (
+                cut_index,
+                [message.model_copy(deep=True) for message in replacement],
+            )
+        conversation.messages = conversation.messages[:cut_index] + batch
+        conversation.updated_at = _utc_now()
+        return conversation.model_copy(deep=True)
+
+    def fork(
+        self,
+        conversation_id: str,
+        message_id: str | None = None,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> Conversation:
+        source = self._find(conversation_id, owner_id=owner_id)
+        cut_index = len(source.messages) - 1
+        if message_id is not None:
+            anchor_index = next(
+                (
+                    index
+                    for index, message in enumerate(source.messages)
+                    if message.id == message_id
+                ),
+                None,
+            )
+            if anchor_index is None:
+                raise ConversationMessageNotFoundError(message_id)
+            cut_index = anchor_index
+        fork = Conversation(
+            title=f"{source.title} (branch)",
+            owner_id=owner_id,
+            kind=source.kind,
+            project_id=source.project_id,
+            parent_conversation_id=source.id,
+            forked_from_sequence=cut_index if source.messages else None,
+            scope=source.scope.model_copy(deep=True),
+            messages=[
+                _copy_message_for_fork(message)
+                for message in source.messages[: cut_index + 1]
+            ],
+        )
+        self._conversations[fork.id] = fork
+        return fork.model_copy(deep=True)
+
+    def list_attempts(
+        self,
+        conversation_id: str,
+        anchor_message_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+        # ``List`` (not ``list``): the class's own ``list`` method shadows the
+        # builtin inside this class body.
+    ) -> List[ConversationMessage]:
+        self._find(conversation_id, owner_id=owner_id)
+        record = self._truncations.get((conversation_id, anchor_message_id))
+        if record is None:
+            return []
+        return [
+            message.model_copy(deep=True)
+            for message in record[1]
+            if message.role == "assistant"
+        ]
+
     def _find(
         self,
         conversation_id: str,
@@ -174,6 +300,25 @@ class InMemoryConversationStore:
         if conversation is None or conversation.owner_id != owner_id:
             raise ConversationNotFoundError(conversation_id)
         return conversation
+
+
+def _copy_message_for_fork(message: ConversationMessage) -> ConversationMessage:
+    """Fresh-id copy for a forked thread; changeset artifacts become inert."""
+
+    return ConversationMessage(
+        role=message.role,
+        content=message.content,
+        created_at=message.created_at,
+        artifacts=[
+            artifact.model_copy(
+                update={
+                    "id": str(uuid4()),
+                    "inert": artifact.inert or artifact.type == "changeset",
+                }
+            )
+            for artifact in message.artifacts
+        ],
+    )
 
 
 def _utc_now() -> datetime:

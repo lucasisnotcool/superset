@@ -27,12 +27,18 @@ from __future__ import annotations
 import logging
 from typing import Protocol
 
+from pydantic import BaseModel, Field
+
 from superset_ai_agent.conversations.schemas import (
     Conversation,
     ConversationArtifact,
 )
 from superset_ai_agent.llm.base import ChatMessage, ModelClient
 from superset_ai_agent.llm.embeddings import Embedder
+from superset_ai_agent.semantic_layer.apply_snapshots import (
+    ApplySnapshot,
+    ApplySnapshotEntry,
+)
 from superset_ai_agent.semantic_layer.copilot.loop import (
     build_system_prompt,
     run_copilot_loop,
@@ -70,6 +76,8 @@ COPILOT_SKILLS = ("onboarding", "generate-mdl", "enrich-context")
 
 
 class _MdlFileStoreLike(Protocol):
+    def get(self, file_id: str, *, owner_id: str = ...) -> MdlFile: ...
+
     def create(
         self,
         project_id: str,
@@ -189,12 +197,36 @@ def apply_changeset_items(
     project_id: str,
     items: list[ChangesetItem],
     owner_id: str,
+    snapshot_sink: list[ApplySnapshotEntry] | None = None,
 ) -> list[MdlFile]:
     """Persist accepted changeset items as drafts via the existing CRUD.
 
     Activation/Deploy stays a separate, human action — created/updated files land
     as drafts (the store's default status).
+
+    ``snapshot_sink``, when provided, collects one before-image per persisted
+    item (the file's pre-apply content/status; ``None`` content for creates) so
+    the caller can record apply snapshots for the rewrite preview and "revert
+    applied drafts" (plan_conversation_management_spec.md §3.4). Capture is
+    best-effort: a failed before-read never blocks the apply.
     """
+
+    def _before_image(op: str, path: str, file_id: str) -> None:
+        if snapshot_sink is None:
+            return
+        try:
+            before = store.get(file_id, owner_id=owner_id)
+            snapshot_sink.append(
+                ApplySnapshotEntry(
+                    op=op,
+                    path=path or before.path,
+                    file_id=file_id,
+                    before_content=before.content,
+                    before_status=before.status,
+                )
+            )
+        except Exception:  # pylint: disable=broad-except - best-effort capture
+            snapshot_sink.append(ApplySnapshotEntry(op=op, path=path, file_id=file_id))
 
     applied: list[MdlFile] = []
     for item in items:
@@ -207,22 +239,30 @@ def apply_changeset_items(
         if item.op == "create":
             if not item.proposed_content:
                 continue
-            applied.append(
-                store.create(
-                    project_id,
-                    MdlFileCreateRequest(
-                        path=item.path,
-                        content=item.proposed_content,
-                        source_type=source_type,
-                        source_document_id=item.source_document_id,
-                    ),
-                    owner_id=owner_id,
-                    validation=item.validation,
-                )
+            created = store.create(
+                project_id,
+                MdlFileCreateRequest(
+                    path=item.path,
+                    content=item.proposed_content,
+                    source_type=source_type,
+                    source_document_id=item.source_document_id,
+                ),
+                owner_id=owner_id,
+                validation=item.validation,
             )
+            applied.append(created)
+            if snapshot_sink is not None:
+                snapshot_sink.append(
+                    ApplySnapshotEntry(
+                        op="create",
+                        path=item.path,
+                        file_id=created.id,
+                    )
+                )
         elif item.op == "update":
             if not item.file_id or not item.proposed_content:
                 continue
+            _before_image("update", item.path, item.file_id)
             applied.append(
                 store.update(
                     item.file_id,
@@ -240,8 +280,120 @@ def apply_changeset_items(
         elif item.op == "delete":
             if not item.file_id:
                 continue
+            _before_image("delete", item.path, item.file_id)
             store.delete(item.file_id, owner_id=owner_id)
     return applied
+
+
+class ApplyRevertExclusion(BaseModel):
+    """One applied item a revert could not safely restore."""
+
+    op: str
+    path: str
+    file_id: str | None = None
+    reason: str
+
+
+class ApplyRevertResult(BaseModel):
+    """Outcome of reverting one apply group's before-images."""
+
+    apply_group_id: str
+    reverted_count: int = 0
+    excluded: list[ApplyRevertExclusion] = Field(default_factory=list)
+
+
+#: Clock slack between an apply and the file timestamps it produced. A file
+#: whose ``updated_at`` is later than the snapshot's ``applied_at`` by more
+#: than this was edited after the apply and is excluded from revert.
+_REVERT_MODIFIED_TOLERANCE_SECONDS = 5.0
+
+
+def revert_apply_group(
+    store: _MdlFileStoreLike,
+    snapshots: list[ApplySnapshot],
+    *,
+    apply_group_id: str,
+    project_id: str,
+    owner_id: str,
+) -> ApplyRevertResult:
+    """Restore the before-images captured when a changeset group was applied.
+
+    The Copilot analog of an IDE agent's checkpoint restore, with the same
+    explicit irreversibility boundary (plan_conversation_management_spec.md
+    §3.4): drafts revert; anything **activated** or **edited since the apply**
+    is excluded and named, never silently clobbered.
+
+    - ``create`` → soft-delete the created file.
+    - ``update`` → restore the prior content.
+    - ``delete`` → re-create the file from its before-image (as a draft;
+      activation stays a human action).
+    """
+
+    result = ApplyRevertResult(apply_group_id=apply_group_id)
+
+    def _exclude(snapshot: ApplySnapshot, reason: str) -> None:
+        result.excluded.append(
+            ApplyRevertExclusion(
+                op=snapshot.op,
+                path=snapshot.path,
+                file_id=snapshot.file_id,
+                reason=reason,
+            )
+        )
+
+    for snapshot in snapshots:
+        if snapshot.reverted_at is not None:
+            continue
+        try:
+            if snapshot.op == "delete":
+                if snapshot.before_content is None:
+                    _exclude(snapshot, "No before-image was captured.")
+                    continue
+                store.create(
+                    project_id,
+                    MdlFileCreateRequest(
+                        path=snapshot.path,
+                        content=snapshot.before_content,
+                        source_type="copilot",
+                    ),
+                    owner_id=owner_id,
+                )
+                result.reverted_count += 1
+                continue
+            if not snapshot.file_id:
+                _exclude(snapshot, "The applied file id is unknown.")
+                continue
+            current = store.get(snapshot.file_id, owner_id=owner_id)
+            if snapshot.op == "create":
+                if current.status == "active":
+                    _exclude(snapshot, "The file was activated after the apply.")
+                    continue
+                store.delete(snapshot.file_id, owner_id=owner_id)
+                result.reverted_count += 1
+            elif snapshot.op == "update":
+                if current.status == "active":
+                    _exclude(snapshot, "The file was activated after the apply.")
+                    continue
+                modified_after = (
+                    current.updated_at - snapshot.applied_at
+                ).total_seconds() > _REVERT_MODIFIED_TOLERANCE_SECONDS
+                if modified_after:
+                    _exclude(snapshot, "The file was edited after the apply.")
+                    continue
+                if snapshot.before_content is None:
+                    _exclude(snapshot, "No before-image was captured.")
+                    continue
+                store.update(
+                    snapshot.file_id,
+                    MdlFileUpdateRequest(content=snapshot.before_content),
+                    owner_id=owner_id,
+                )
+                result.reverted_count += 1
+            else:
+                _exclude(snapshot, f"Unknown apply op {snapshot.op!r}.")
+        except Exception as ex:  # pylint: disable=broad-except - per-item guard
+            _exclude(snapshot, f"{type(ex).__name__}: {ex}")
+    return result
 
 
 def changeset_from_conversation(conversation: Conversation) -> Changeset | None:
@@ -256,6 +408,10 @@ def changeset_from_conversation(conversation: Conversation) -> Changeset | None:
     for message in reversed(conversation.messages):
         for artifact in reversed(message.artifacts):
             if artifact.type == CHANGESET_ARTIFACT_TYPE:
+                # A forked thread carries the parent's changeset as an inert
+                # copy — history, not a live proposal. Never applicable.
+                if artifact.inert:
+                    continue
                 try:
                     return Changeset.model_validate(artifact.payload)
                 except (ValueError, TypeError):
@@ -315,8 +471,7 @@ def apply_provenance_payload(
     }
     if actor_name:
         detail["actor_name"] = actor_name
-    records = tool_calls or []
-    if records:
+    if records := tool_calls or []:
         # Roll up over the FULL ledger (before any cap) so counts stay honest.
         action_summary: dict[str, int] = {}
         for record in records:

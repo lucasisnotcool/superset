@@ -118,10 +118,12 @@ logger = logging.getLogger(__name__)
 _SEMANTIC_SQL_GUIDANCE = (
     "Semantic-SQL mode is ON. Write SQL against the semantic models by their "
     "MDL model names (see wren_context.matched_models and context_items), "
-    "referencing model columns, defined relationships, and metrics. Do not "
+    "referencing model columns and defined relationships. Do not "
     "hand-write physical joins for defined relationships; the semantic engine "
-    "rewrites your query into native SQL. Never reference tables or columns "
-    "absent from the provided semantic context."
+    "rewrites your query into native SQL. A metric is a formula, NOT a "
+    "selectable column: substitute its measure expression inline (e.g. write "
+    "SUM(amount) AS total_revenue), never SELECT the metric by its name. "
+    "Never reference tables or columns absent from the provided semantic context."
 )
 
 
@@ -1205,6 +1207,7 @@ class TextToSqlGraph:
                         "native_sql": result.native_sql,
                         "referenced_tables": result.referenced_tables,
                         "warnings": result.warnings,
+                        "inlined_metrics": result.inlined_metrics,
                     },
                 ),
             ],

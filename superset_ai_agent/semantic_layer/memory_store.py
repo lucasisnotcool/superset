@@ -67,6 +67,10 @@ class NlSqlPair(BaseModel):
     referenced_tables: list[str] = Field(default_factory=list)
     referenced_schemas: list[str] = Field(default_factory=list)
     result_meta: dict[str, Any] = Field(default_factory=dict)
+    #: Id of the conversation user message whose confirmed turn produced this
+    #: pair. Lets a conversation rewrite delete/replace the example it created
+    #: (``delete_by_source``). ``None`` for non-conversation writes.
+    source_message_id: str | None = None
 
 
 def qualify_table_refs(
@@ -452,8 +456,21 @@ class Memory(Protocol):
         referenced_schemas: list[str] | None = None,
         result_meta: dict[str, Any] | None = None,
         database_uri_fingerprint: str | None = None,
+        source_conversation_id: str | None = None,
+        source_message_id: str | None = None,
     ) -> None:
         """Persist a confirmed NL->SQL pair for future recall."""
+
+    def delete_by_source(self, source_message_ids: list[str]) -> int:
+        """Delete examples produced by the given conversation user messages.
+
+        Called when a rewrite truncates the turns that confirmed them (DP-2:
+        the user is rewriting because the answer was wrong, so the learned
+        example is suspect too). Returns the number of examples removed.
+        """
+
+    def count_by_source(self, source_message_ids: list[str]) -> int:
+        """Count examples produced by the given turns (rewrite preview)."""
 
 
 class NullMemory:
@@ -472,6 +489,12 @@ class NullMemory:
 
     def store_confirmed(self, **kwargs: Any) -> None:
         return None
+
+    def delete_by_source(self, source_message_ids: list[str]) -> int:
+        return 0
+
+    def count_by_source(self, source_message_ids: list[str]) -> int:
+        return 0
 
 
 class InMemoryMemory:
@@ -510,6 +533,8 @@ class InMemoryMemory:
         referenced_schemas: list[str] | None = None,
         result_meta: dict[str, Any] | None = None,
         database_uri_fingerprint: str | None = None,
+        source_conversation_id: str | None = None,
+        source_message_id: str | None = None,
     ) -> None:
         pair = NlSqlPair(
             question=question,
@@ -518,6 +543,7 @@ class InMemoryMemory:
             referenced_tables=referenced_tables or [],
             referenced_schemas=referenced_schemas or [],
             result_meta=result_meta or {},
+            source_message_id=source_message_id,
         )
         bucket = self._pairs.setdefault(
             _pool_key(database_id, database_uri_fingerprint), []
@@ -531,6 +557,28 @@ class InMemoryMemory:
         # Decay: keep only the most recent ``max_examples`` (oldest evicted).
         if self.max_examples > 0 and len(bucket) > self.max_examples:
             del bucket[: len(bucket) - self.max_examples]
+
+    def delete_by_source(self, source_message_ids: list[str]) -> int:
+        targets = set(source_message_ids)
+        if not targets:
+            return 0
+        removed = 0
+        for key, bucket in self._pairs.items():
+            kept = [pair for pair in bucket if pair.source_message_id not in targets]
+            removed += len(bucket) - len(kept)
+            self._pairs[key] = kept
+        return removed
+
+    def count_by_source(self, source_message_ids: list[str]) -> int:
+        targets = set(source_message_ids)
+        if not targets:
+            return 0
+        return sum(
+            1
+            for bucket in self._pairs.values()
+            for pair in bucket
+            if pair.source_message_id in targets
+        )
 
 
 class SqlAlchemyMemory:
@@ -629,6 +677,8 @@ class SqlAlchemyMemory:
         referenced_schemas: list[str] | None = None,
         result_meta: dict[str, Any] | None = None,
         database_uri_fingerprint: str | None = None,
+        source_conversation_id: str | None = None,
+        source_message_id: str | None = None,
     ) -> None:
         key = _dedup_key(question, native_sql)
         with self.session_factory() as session:
@@ -652,6 +702,11 @@ class SqlAlchemyMemory:
                     # fingerprint joins the DB-tied pool.
                     if database_uri_fingerprint is not None:
                         row.database_uri_fingerprint = database_uri_fingerprint
+                    # The refreshed example now belongs to the confirming turn,
+                    # so a rewrite of that turn can find and remove it.
+                    if source_message_id is not None:
+                        row.source_conversation_id = source_conversation_id
+                        row.source_message_id = source_message_id
                     session.commit()
                     return
             session.add(
@@ -671,10 +726,37 @@ class SqlAlchemyMemory:
                     referenced_schemas=referenced_schemas or [],
                     result_meta=result_meta or {},
                     created_at=datetime.now(timezone.utc),
+                    source_conversation_id=source_conversation_id,
+                    source_message_id=source_message_id,
                 )
             )
             session.commit()
             self._evict_old(session, database_id, database_uri_fingerprint)
+
+    def delete_by_source(self, source_message_ids: list[str]) -> int:
+        if not source_message_ids:
+            return 0
+        with self.session_factory() as session:
+            rows = session.scalars(
+                select(AiAgentNlSqlExample).where(
+                    AiAgentNlSqlExample.source_message_id.in_(source_message_ids)
+                )
+            ).all()
+            for row in rows:
+                session.delete(row)
+            session.commit()
+            return len(rows)
+
+    def count_by_source(self, source_message_ids: list[str]) -> int:
+        if not source_message_ids:
+            return 0
+        with self.session_factory() as session:
+            rows = session.scalars(
+                select(AiAgentNlSqlExample.id).where(
+                    AiAgentNlSqlExample.source_message_id.in_(source_message_ids)
+                )
+            ).all()
+            return len(rows)
 
     def _evict_old(
         self,
@@ -737,6 +819,8 @@ class LanceDbMemory:
         referenced_schemas: list[str] | None = None,
         result_meta: dict[str, Any] | None = None,
         database_uri_fingerprint: str | None = None,
+        source_conversation_id: str | None = None,
+        source_message_id: str | None = None,
     ) -> None:
         self.inner.store_confirmed(
             question=question,
@@ -749,12 +833,22 @@ class LanceDbMemory:
             referenced_schemas=referenced_schemas,
             result_meta=result_meta,
             database_uri_fingerprint=database_uri_fingerprint,
+            source_conversation_id=source_conversation_id,
+            source_message_id=source_message_id,
         )
         self.cache.upsert(
             scope_key=self._scope_key(database_id, database_uri_fingerprint),
             row_id=_cache_id(question, native_sql),
             text=question,
         )
+
+    def delete_by_source(self, source_message_ids: list[str]) -> int:
+        # SQL rows are the source of truth; orphaned cache vectors map to
+        # nothing at recall time and are inert (same contract as eviction).
+        return self.inner.delete_by_source(source_message_ids)
+
+    def count_by_source(self, source_message_ids: list[str]) -> int:
+        return self.inner.count_by_source(source_message_ids)
 
     def recall_examples(
         self,

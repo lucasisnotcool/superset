@@ -429,6 +429,9 @@ export interface ConversationArtifact {
   // Free-form agent discriminator: 'sql' for the AI SQL agent, 'changeset' for
   // the MDL Copilot. Non-SQL agents carry their data in `payload`.
   type: string;
+  /** A forked copy of another thread's artifact — rendered as history but never
+   * actionable (a branch must not re-apply the parent's changeset). */
+  inert?: boolean;
   sql?: string | null;
   // Opaque per-agent payload (e.g. a serialized Copilot Changeset).
   payload?: Record<string, unknown> | null;
@@ -528,6 +531,10 @@ export interface Conversation {
   owner_id: string;
   kind: string;
   project_id?: string | null;
+  /** Fork back-link ("Branch from here"): the thread this one was branched
+   * from. Absent/null for threads that are not branches. */
+  parent_conversation_id?: string | null;
+  forked_from_sequence?: number | null;
   scope: ConversationScope;
   messages: ConversationMessage[];
   created_at: string;
@@ -554,6 +561,12 @@ export interface ConversationTurnRequest {
   execute?: boolean;
   approved_sql?: string | null;
   model?: string | null;
+  /** Edit & resend / regenerate (rewind-then-re-prompt): soft-truncate the
+   * thread from this user message before running the turn. */
+  rewrite_from_message_id?: string | null;
+  /** When rewriting, also delete the learned NL→SQL examples the truncated
+   * turns produced (backend default: true). */
+  remove_learned_examples?: boolean;
 }
 
 export interface ConversationSqlExecutionRequest {
@@ -1196,6 +1209,94 @@ export const deleteConversation = (conversationId: string) =>
     method: 'DELETE',
   });
 
+// -- Conversation management: edit & resend / regenerate / fork ---------------
+// (plan_conversation_management_spec.md — shared by both agents; the Copilot
+// twins live under the project-scoped copilot paths.)
+
+export interface AppliedChangesetItemPreview {
+  op: string;
+  path: string;
+  file_id?: string | null;
+}
+
+/**
+ * Side-effect manifest for a prospective rewrite (edit/regenerate). Drives the
+ * confirm dialog: what the truncation removes and which durable side effects
+ * stay behind. An empty manifest lets the client skip confirmation.
+ */
+export interface RewritePreview {
+  removed_message_count: number;
+  memory_write_count: number;
+  applied_changeset_items: AppliedChangesetItemPreview[];
+  apply_group_ids: string[];
+  unknown_applies: boolean;
+  executed_sql_count: number;
+}
+
+export interface MessageFeedback {
+  id: string;
+  conversation_id: string;
+  message_id: string;
+  owner_id: string;
+  rating: string;
+  comment?: string | null;
+  created_at: string;
+}
+
+export const getRewritePreview = (
+  conversationId: string,
+  fromMessageId: string,
+) =>
+  requestJson<RewritePreview>(
+    `/agent/conversations/${conversationId}/rewrite-preview?from_message_id=${encodeURIComponent(
+      fromMessageId,
+    )}`,
+    { method: 'GET' },
+  );
+
+export const undoConversationRewrite = (
+  conversationId: string,
+  anchorMessageId: string,
+) =>
+  requestJson<Conversation>(
+    `/agent/conversations/${conversationId}/rewrites/${anchorMessageId}/undo`,
+    { method: 'POST' },
+  );
+
+export const forkConversation = (
+  conversationId: string,
+  messageId?: string | null,
+) =>
+  requestJson<Conversation>(`/agent/conversations/${conversationId}/fork`, {
+    method: 'POST',
+    body: JSON.stringify({ message_id: messageId ?? null }),
+  });
+
+/** Superseded assistant attempts for a rewrite anchor (the `< n/m >` pager).
+ * `messageId` is the USER message that anchored the rewrite(s). */
+export const getMessageAttempts = (
+  conversationId: string,
+  messageId: string,
+) =>
+  requestJson<ConversationMessage[]>(
+    `/agent/conversations/${conversationId}/messages/${messageId}/attempts`,
+    { method: 'GET' },
+  );
+
+export const submitMessageFeedback = (
+  conversationId: string,
+  messageId: string,
+  rating: 'up' | 'down',
+  comment?: string | null,
+) =>
+  requestJson<MessageFeedback>(
+    `/agent/conversations/${conversationId}/messages/${messageId}/feedback`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ rating, comment: comment ?? null }),
+    },
+  );
+
 export const uploadSemanticDocument = (
   scope: ConversationScope,
   file: File,
@@ -1435,6 +1536,9 @@ export interface CopilotTurnRequest {
   conversation_id?: string | null;
   model?: string | null;
   max_steps?: number;
+  /** Edit & resend / regenerate: soft-truncate the thread from this user
+   * message before running the turn (requires `conversation_id`). */
+  rewrite_from_message_id?: string | null;
 }
 
 export interface CopilotToolDescriptor {
@@ -1521,6 +1625,88 @@ export const deleteCopilotConversation = (
   requestJson<{ deleted: boolean }>(
     `${copilotConversationsPath(projectId)}/${conversationId}`,
     { method: 'DELETE' },
+  );
+
+export const getCopilotRewritePreview = (
+  projectId: string,
+  conversationId: string,
+  fromMessageId: string,
+) =>
+  requestJson<RewritePreview>(
+    `${copilotConversationsPath(projectId)}/${conversationId}/rewrite-preview` +
+      `?from_message_id=${encodeURIComponent(fromMessageId)}`,
+    { method: 'GET' },
+  );
+
+export const undoCopilotRewrite = (
+  projectId: string,
+  conversationId: string,
+  anchorMessageId: string,
+) =>
+  requestJson<Conversation>(
+    `${copilotConversationsPath(projectId)}/${conversationId}/rewrites/` +
+      `${anchorMessageId}/undo`,
+    { method: 'POST' },
+  );
+
+export const forkCopilotConversation = (
+  projectId: string,
+  conversationId: string,
+  messageId?: string | null,
+) =>
+  requestJson<Conversation>(
+    `${copilotConversationsPath(projectId)}/${conversationId}/fork`,
+    { method: 'POST', body: JSON.stringify({ message_id: messageId ?? null }) },
+  );
+
+/** One applied changeset item's before-image summary (no content). */
+export interface ApplySnapshotItem {
+  op: string;
+  path: string;
+  file_id?: string | null;
+}
+
+/** One apply action recorded on a Copilot thread (grouped snapshots). */
+export interface ApplyGroupSummary {
+  apply_group_id: string;
+  conversation_id?: string | null;
+  /** The "Applied N drafts." assistant turn this apply produced. */
+  message_id?: string | null;
+  applied_at: string;
+  reverted: boolean;
+  items: ApplySnapshotItem[];
+}
+
+export interface ApplyRevertExclusion {
+  op: string;
+  path: string;
+  file_id?: string | null;
+  reason: string;
+}
+
+export interface ApplyRevertResult {
+  apply_group_id: string;
+  reverted_count: number;
+  excluded: ApplyRevertExclusion[];
+}
+
+/** The thread's apply history — drives the per-turn Revert affordance. */
+export const listCopilotApplies = (projectId: string, conversationId: string) =>
+  requestJson<ApplyGroupSummary[]>(
+    `${copilotConversationsPath(projectId)}/${conversationId}/applies`,
+    { method: 'GET' },
+  );
+
+/** Restore the before-images captured when a changeset group was applied. */
+export const revertCopilotApply = (
+  projectId: string,
+  conversationId: string,
+  applyGroupId: string,
+) =>
+  requestJson<ApplyRevertResult>(
+    `${copilotConversationsPath(projectId)}/${conversationId}/applies/` +
+      `${applyGroupId}/revert`,
+    { method: 'POST' },
   );
 
 export type CoverageClaimKind =

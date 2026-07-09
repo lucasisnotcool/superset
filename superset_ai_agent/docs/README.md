@@ -71,6 +71,10 @@ The founding design corpus; code comments cite these by name and section.
 - [wren_mdl_copilot.md](plans/wren_mdl_copilot.md): MDL Copilot — agentic
   CRUD editor over MDL projects — plan and as-built log (Shipped; §AB is the
   as-built reference).
+- [plan_metric_semantic_translation_impl.md](plans/plan_metric_semantic_translation_impl.md):
+  fix for MDL `metrics` throwing Oracle ORA-00904 — wren_core 0.7.1 drops the
+  `metrics` key, so metric names reach the DB unresolved; Layers 1–3 = inline
+  metric expressions + don't forward engine-rejected SQL + correct prompt guidance.
 
 ## MDL Lab & semantic projects
 
@@ -88,10 +92,12 @@ The founding design corpus; code comments cite these by name and section.
   let relationships-only MDL files activate (Implemented Phases 1–5).
 - [plan_ai_sql_project_selection_spec.md](plans/plan_ai_sql_project_selection_spec.md):
   AI SQL agent MDL-project picker + per-conversation pin (Shipped Tier 1+2).
-- [plan_conversation_management_spec.md](plans/plan_conversation_management_spec.md):
+- [plan_conversation_management_spec.md](plans/plan_conversation_management_spec.md)
+  / [plan_conversation_management_impl.md](plans/plan_conversation_management_impl.md):
   edit & resend, regenerate, fork conversations for both agents — competitive
-  analysis + soft-rewrite/fork design with side-effect manifest (Proposal,
-  awaiting DP sign-off).
+  analysis + soft-rewrite/fork design with side-effect manifest, apply
+  before-image revert, attempt pager, persisted feedback (Shipped 2026-07-09;
+  residual gaps in the impl doc's Final report).
 
 ## MDL Copilot authoring
 

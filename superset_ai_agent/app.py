@@ -55,20 +55,32 @@ from superset_ai_agent.auth import (
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.context.superset_metadata import SupersetMetadataContextProvider
 from superset_ai_agent.conversation_graph import ConversationGraph
+from superset_ai_agent.conversations.feedback import (
+    InMemoryMessageFeedbackStore,
+    MessageFeedback,
+    MessageFeedbackStore,
+)
 from superset_ai_agent.conversations.memory import InMemoryConversationStore
+from superset_ai_agent.conversations.rewrites import build_rewrite_preview
 from superset_ai_agent.conversations.schemas import (
     Conversation,
     ConversationCreateRequest,
+    ConversationForkRequest,
+    ConversationMessage,
     ConversationScope,
     ConversationSqlExecutionRequest,
     ConversationSummary,
     ConversationTitleUpdateRequest,
     ConversationTurnRequest,
     ConversationTurnResponse,
+    MessageFeedbackRequest,
+    RewritePreview,
 )
 from superset_ai_agent.conversations.sqlalchemy_store import SqlAlchemyConversationStore
 from superset_ai_agent.conversations.store import (
+    ConversationMessageNotFoundError,
     ConversationNotFoundError,
+    ConversationRewriteError,
     ConversationStore,
     DEFAULT_OWNER_ID,
 )
@@ -172,6 +184,13 @@ from superset_ai_agent.semantic_layer.access import (
     SemanticAccessService,
     SemanticPermission,
 )
+from superset_ai_agent.semantic_layer.apply_snapshots import (
+    ApplyGroupSummary,
+    ApplySnapshotEntry,
+    ApplySnapshotStore,
+    group_snapshots,
+    NullApplySnapshotStore,
+)
 from superset_ai_agent.semantic_layer.consistency import (
     ConsistencyReport,
     lint_project_consistency,
@@ -202,10 +221,12 @@ from superset_ai_agent.semantic_layer.copilot.schemas import (
 from superset_ai_agent.semantic_layer.copilot.service import (
     apply_changeset_items,
     apply_provenance_payload,
+    ApplyRevertResult,
     build_deploy_preview,
     build_inspector,
     changeset_from_conversation,
     changeset_to_artifact,
+    revert_apply_group,
     run_copilot,
 )
 from superset_ai_agent.semantic_layer.copilot.workspace import build_workspace_tree
@@ -468,6 +489,7 @@ def create_app(  # noqa: C901
     schema_snapshot_store: SchemaSnapshotStore | None = None,
     retriever: Any | None = None,
     llm_call_store: LlmUsageStore | None = None,
+    apply_snapshot_store: Any | None = None,
 ) -> FastAPI:
     """Create the standalone AI agent API.
 
@@ -509,6 +531,20 @@ def create_app(  # noqa: C901
     active_conversation_store = conversation_store or _create_conversation_store(
         app_config,
         session_factory=session_factory,
+    )
+    # Before-images for Copilot changeset applies (rewrite preview + revert).
+    # Durable only with an agent DB; otherwise a no-op (previews degrade to
+    # ``unknown_applies`` on legacy "Applied N drafts." turns).
+    active_apply_snapshot_store = apply_snapshot_store or (
+        ApplySnapshotStore(session_factory)
+        if session_factory is not None
+        else NullApplySnapshotStore()
+    )
+    # Persisted per-message thumbs feedback (replaces the frontend-only stub).
+    active_feedback_store = (
+        MessageFeedbackStore(session_factory)
+        if session_factory is not None
+        else InMemoryMessageFeedbackStore()
     )
     active_semantic_layer_store = semantic_layer_store or _create_semantic_layer_store(
         app_config, session_factory=session_factory
@@ -583,8 +619,7 @@ def create_app(  # noqa: C901
     _prompt_cache: TtlCache[str, str] = TtlCache(ttl_seconds=5.0)
 
     def _resolve_prompt_override(name: str) -> str | None:
-        cached = _prompt_cache.get(name)
-        if cached is not None:
+        if (cached := _prompt_cache.get(name)) is not None:
             return cached
         version = active_prompt_store.get_labeled(name, PRODUCTION_LABEL)
         if version is None:
@@ -1166,7 +1201,11 @@ def create_app(  # noqa: C901
         fastapi_request: Request,
         identity: AgentIdentity = identity_dependency,
     ) -> ConversationTurnResponse:
-        """Append a user message and run a conversational agent turn."""
+        """Append a user message and run a conversational agent turn.
+
+        ``rewrite_from_message_id`` turns this into an edit & resend /
+        regenerate: the thread is soft-truncated from that user message first.
+        """
 
         try:
             return build_conversation_graph(fastapi_request).run(
@@ -1174,6 +1213,10 @@ def create_app(  # noqa: C901
                 request=request,
                 owner_id=identity.owner_id,
             )
+        except ConversationMessageNotFoundError as ex:
+            raise HTTPException(status_code=404, detail="Message not found.") from ex
+        except ConversationRewriteError as ex:
+            raise HTTPException(status_code=409, detail=str(ex)) from ex
         except ConversationNotFoundError as ex:
             raise HTTPException(
                 status_code=404,
@@ -1235,6 +1278,23 @@ def create_app(  # noqa: C901
             ) from ex
 
         graph = build_conversation_graph(fastapi_request)
+
+        # Consume a rewrite directive (edit & resend / regenerate) before the
+        # stream commits its 200: a bad anchor must be an HTTP status, and the
+        # truncation must not run lazily on first body read.
+        if request.rewrite_from_message_id:
+            try:
+                request = graph.prepare_rewrite(
+                    conversation_id=conversation_id,
+                    request=request,
+                    owner_id=identity.owner_id,
+                )
+            except ConversationMessageNotFoundError as ex:
+                raise HTTPException(
+                    status_code=404, detail="Message not found."
+                ) from ex
+            except ConversationRewriteError as ex:
+                raise HTTPException(status_code=409, detail=str(ex)) from ex
 
         def event_stream() -> Any:
             try:
@@ -1310,6 +1370,163 @@ def create_app(  # noqa: C901
                 detail="Conversation not found.",
             ) from ex
         return {"deleted": True}
+
+    def _load_conversation_or_404(
+        conversation_id: str,
+        owner_id: str,
+    ) -> Conversation:
+        try:
+            return active_conversation_store.get(
+                conversation_id,
+                owner_id=owner_id,
+            )
+        except ConversationNotFoundError as ex:
+            raise HTTPException(
+                status_code=404,
+                detail="Conversation not found.",
+            ) from ex
+
+    def _rewrite_preview_for(
+        conversation: Conversation,
+        from_message_id: str,
+    ) -> RewritePreview:
+        try:
+            return build_rewrite_preview(
+                conversation,
+                from_message_id,
+                memory=active_memory,
+                snapshots=active_apply_snapshot_store,
+            )
+        except ConversationMessageNotFoundError as ex:
+            raise HTTPException(
+                status_code=404,
+                detail="Message not found.",
+            ) from ex
+
+    @api.get(
+        "/agent/conversations/{conversation_id}/rewrite-preview",
+        response_model=RewritePreview,
+    )
+    def preview_conversation_rewrite(
+        conversation_id: str,
+        from_message_id: str,
+        identity: AgentIdentity = identity_dependency,
+    ) -> RewritePreview:
+        """Side-effect manifest for editing/regenerating from a message.
+
+        Read-only: reports what a rewrite anchored at ``from_message_id`` would
+        remove (messages, learned examples) and which durable side effects
+        would stay behind. The client renders this in the confirm dialog and
+        may skip confirmation entirely when the manifest is empty.
+        """
+
+        conversation = _load_conversation_or_404(conversation_id, identity.owner_id)
+        return _rewrite_preview_for(conversation, from_message_id)
+
+    @api.post(
+        "/agent/conversations/{conversation_id}/rewrites/{message_id}/undo",
+        response_model=Conversation,
+    )
+    def undo_conversation_rewrite(
+        conversation_id: str,
+        message_id: str,
+        identity: AgentIdentity = identity_dependency,
+    ) -> Conversation:
+        """Restore the turns removed by a rewrite anchored at ``message_id``.
+
+        Single-step undo, intended to be offered only until the next turn
+        starts. Learned examples deleted by the rewrite are not restored (the
+        pair re-learns on the next confirmed run).
+        """
+
+        _load_conversation_or_404(conversation_id, identity.owner_id)
+        try:
+            return active_conversation_store.undo_truncate(
+                conversation_id,
+                message_id,
+                owner_id=identity.owner_id,
+            )
+        except ConversationRewriteError as ex:
+            raise HTTPException(status_code=409, detail=str(ex)) from ex
+
+    @api.post(
+        "/agent/conversations/{conversation_id}/fork",
+        response_model=Conversation,
+    )
+    def fork_conversation(
+        conversation_id: str,
+        request: ConversationForkRequest,
+        identity: AgentIdentity = identity_dependency,
+    ) -> Conversation:
+        """Branch from here: copy the thread up to a message into a new one.
+
+        Non-destructive (the source is untouched). Copied changeset artifacts
+        are inert in the fork. SQL threads only on this route — Copilot threads
+        fork through their project-scoped twin.
+        """
+
+        conversation = _load_conversation_or_404(conversation_id, identity.owner_id)
+        if conversation.kind != "sql":
+            raise HTTPException(
+                status_code=409,
+                detail="This route forks SQL threads only.",
+            )
+        try:
+            return active_conversation_store.fork(
+                conversation_id,
+                request.message_id,
+                owner_id=identity.owner_id,
+            )
+        except ConversationMessageNotFoundError as ex:
+            raise HTTPException(
+                status_code=404,
+                detail="Message not found.",
+            ) from ex
+
+    @api.get(
+        "/agent/conversations/{conversation_id}/messages/{message_id}/attempts",
+        response_model=list[ConversationMessage],
+    )
+    def list_message_attempts(
+        conversation_id: str,
+        message_id: str,
+        identity: AgentIdentity = identity_dependency,
+    ) -> list[ConversationMessage]:
+        """Superseded assistant attempts for a rewrite anchor (the `< n/m >` pager).
+
+        ``message_id`` is the USER message that anchored the rewrite(s); returns
+        the assistant turns those rewrites replaced, oldest first.
+        """
+
+        _load_conversation_or_404(conversation_id, identity.owner_id)
+        return active_conversation_store.list_attempts(
+            conversation_id,
+            message_id,
+            owner_id=identity.owner_id,
+        )
+
+    @api.post(
+        "/agent/conversations/{conversation_id}/messages/{message_id}/feedback",
+        response_model=MessageFeedback,
+    )
+    def submit_message_feedback(
+        conversation_id: str,
+        message_id: str,
+        request: MessageFeedbackRequest,
+        identity: AgentIdentity = identity_dependency,
+    ) -> MessageFeedback:
+        """Persist a thumbs rating on an assistant message (upsert per owner)."""
+
+        conversation = _load_conversation_or_404(conversation_id, identity.owner_id)
+        if all(message.id != message_id for message in conversation.messages):
+            raise HTTPException(status_code=404, detail="Message not found.")
+        return active_feedback_store.upsert(
+            conversation_id=conversation_id,
+            message_id=message_id,
+            owner_id=identity.owner_id,
+            rating=request.rating,
+            comment=request.comment,
+        )
 
     @api.post(
         "/agent/semantic-layer/documents",
@@ -3734,6 +3951,217 @@ def create_app(  # noqa: C901
         active_conversation_store.delete(conversation_id, owner_id=identity.owner_id)
         return {"deleted": True}
 
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}/copilot/conversations/"
+        "{conversation_id}/rewrite-preview",
+        response_model=RewritePreview,
+    )
+    def preview_copilot_rewrite(
+        project_id: str,
+        conversation_id: str,
+        from_message_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> RewritePreview:
+        """Side-effect manifest for rewriting a Copilot thread.
+
+        Names the changeset items already applied by turns the rewrite would
+        remove — those drafts stay in the project unless explicitly reverted,
+        and the dialog must say so.
+        """
+
+        _require_copilot_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="read"
+        )
+        conversation = _require_copilot_conversation(
+            project_id, conversation_id, identity.owner_id
+        )
+        return _rewrite_preview_for(conversation, from_message_id)
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/copilot/conversations/"
+        "{conversation_id}/rewrites/{message_id}/undo",
+        response_model=Conversation,
+    )
+    def undo_copilot_rewrite(
+        project_id: str,
+        conversation_id: str,
+        message_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> Conversation:
+        """Restore the turns removed by a Copilot-thread rewrite (transcript only)."""
+
+        _require_copilot_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
+        )
+        _require_copilot_conversation(project_id, conversation_id, identity.owner_id)
+        try:
+            return active_conversation_store.undo_truncate(
+                conversation_id,
+                message_id,
+                owner_id=identity.owner_id,
+            )
+        except ConversationRewriteError as ex:
+            raise HTTPException(status_code=409, detail=str(ex)) from ex
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/copilot/conversations/"
+        "{conversation_id}/fork",
+        response_model=Conversation,
+    )
+    def fork_copilot_conversation(
+        project_id: str,
+        conversation_id: str,
+        request: ConversationForkRequest,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> Conversation:
+        """Branch a Copilot thread from a message.
+
+        The fork shares the project's files and drafts (nothing project-scoped
+        is copied or forked); copied changeset artifacts are inert. Recovery
+        threads are excluded — they are id-linked from coverage runs and a fork
+        would dangle.
+        """
+
+        _require_copilot_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
+        )
+        _require_copilot_conversation(project_id, conversation_id, identity.owner_id)
+        try:
+            return active_conversation_store.fork(
+                conversation_id,
+                request.message_id,
+                owner_id=identity.owner_id,
+            )
+        except ConversationMessageNotFoundError as ex:
+            raise HTTPException(
+                status_code=404,
+                detail="Message not found.",
+            ) from ex
+
+    @api.get(
+        "/agent/semantic-layer/projects/{project_id}/copilot/conversations/"
+        "{conversation_id}/applies",
+        response_model=list[ApplyGroupSummary],
+    )
+    def list_copilot_applies(
+        project_id: str,
+        conversation_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> list[ApplyGroupSummary]:
+        """This thread's apply history (grouped before-image snapshots).
+
+        Drives the per-turn "Revert" affordance on "Applied N drafts." turns.
+        Empty for threads whose applies predate apply snapshots.
+        """
+
+        _require_copilot_enabled()
+        authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="read"
+        )
+        _require_copilot_conversation(
+            project_id,
+            conversation_id,
+            identity.owner_id,
+            kinds=("copilot", "recovery"),
+        )
+        return group_snapshots(
+            active_apply_snapshot_store.list_for_conversation(
+                conversation_id, include_reverted=True
+            )
+        )
+
+    @api.post(
+        "/agent/semantic-layer/projects/{project_id}/copilot/conversations/"
+        "{conversation_id}/applies/{apply_group_id}/revert",
+        response_model=ApplyRevertResult,
+    )
+    def revert_copilot_apply(
+        project_id: str,
+        conversation_id: str,
+        apply_group_id: str,
+        fastapi_request: Request,
+        identity: AgentIdentity = identity_dependency,
+    ) -> ApplyRevertResult:
+        """Restore the before-images captured when a changeset was applied.
+
+        Drafts only, with an explicit irreversibility boundary: activated or
+        since-edited files are excluded and named in the result rather than
+        silently clobbered. Records a "Reverted…" turn + provenance event and
+        reschedules coverage (mirror of the apply path).
+        """
+
+        _require_copilot_enabled()
+        project = authorize_semantic_project(
+            fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
+        )
+        _require_copilot_conversation(
+            project_id,
+            conversation_id,
+            identity.owner_id,
+            kinds=("copilot", "recovery"),
+        )
+        snapshots = active_apply_snapshot_store.list_group(apply_group_id)
+        if not snapshots or any(
+            snapshot.conversation_id != conversation_id
+            or snapshot.project_id != project_id
+            for snapshot in snapshots
+        ):
+            raise HTTPException(status_code=404, detail="Apply group not found.")
+        if all(snapshot.reverted_at is not None for snapshot in snapshots):
+            raise HTTPException(
+                status_code=409, detail="This apply was already reverted."
+            )
+        result = revert_apply_group(
+            active_mdl_file_store,
+            snapshots,
+            apply_group_id=apply_group_id,
+            project_id=project_id,
+            owner_id=identity.owner_id,
+        )
+        active_apply_snapshot_store.mark_reverted(apply_group_id)
+
+        # Mirror the apply path: record the action as an assistant turn and a
+        # provenance event, then reschedule coverage (all best-effort).
+        count = result.reverted_count
+        noun = "draft" if count == 1 else "drafts"
+        try:
+            _copilot_turn_service().commit_turn(
+                conversation_id,
+                assistant_content=f"Reverted {count} applied {noun}.",
+                owner_id=identity.owner_id,
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.warning("Failed to record the revert turn.", exc_info=True)
+        try:
+            _append_semantic_event(
+                store=active_semantic_layer_store,
+                owner_id=identity.owner_id,
+                event_type="mdl_agent_edit",  # type: ignore[arg-type]
+                scope=_scope_from_project(project),
+                document_id=None,
+                message=f"Reverted {count} applied {noun}.",
+                project_id=project_id,
+                detail={
+                    "actor": identity.owner_id,
+                    "source_type": "copilot",
+                    "conversation_id": conversation_id,
+                    "summary": f"Reverted {count} applied {noun}.",
+                    "revert_of_apply_group": apply_group_id,
+                    "excluded": [item.model_dump() for item in result.excluded],
+                },
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.warning("Failed to record revert provenance.", exc_info=True)
+        _schedule_coverage(project, identity.owner_id)
+        return result
+
     def _require_copilot_conversation(
         project_id: str,
         conversation_id: str,
@@ -3767,6 +4195,7 @@ def create_app(  # noqa: C901
         project: SemanticProject,
         message: str,
         owner_id: str,
+        rewrite_from_message_id: str | None = None,
     ) -> tuple[list[ChatMessage] | None, Callable[..., None]]:
         """Open a persistent turn: append the user message, return (history, commit).
 
@@ -3776,12 +4205,30 @@ def create_app(  # noqa: C901
         — the changeset summary + artifact on success, or a plain error/cancel note
         — so the stored transcript never ends on a dangling user message (mirrors
         the AI SQL agent's stream contract).
+
+        ``rewrite_from_message_id`` (edit & resend / regenerate) soft-truncates
+        the thread from that user message first. Runs in preflight, so anchor
+        errors surface as HTTP statuses even on the streaming route. Applied
+        drafts from truncated turns stay in the project (revert is explicit).
         """
 
         if not conversation_id:
             return None, lambda *_args, **_kwargs: None
 
         _require_copilot_conversation(project.id, conversation_id, owner_id)
+        if rewrite_from_message_id:
+            try:
+                active_conversation_store.truncate_from(
+                    conversation_id,
+                    rewrite_from_message_id,
+                    owner_id=owner_id,
+                )
+            except ConversationMessageNotFoundError as ex:
+                raise HTTPException(
+                    status_code=404, detail="Message not found."
+                ) from ex
+            except ConversationRewriteError as ex:
+                raise HTTPException(status_code=409, detail=str(ex)) from ex
         turn_service = _copilot_turn_service()
         conversation = turn_service.begin_turn(
             conversation_id,
@@ -3834,7 +4281,11 @@ def create_app(  # noqa: C901
             files = active_mdl_file_store.list(project_id, owner_id=identity.owner_id)
             schema_index = _schema_index_for_project(project, fastapi_request)
             history, commit = _copilot_thread_turn(
-                request.conversation_id, project, request.message, identity.owner_id
+                request.conversation_id,
+                project,
+                request.message,
+                identity.owner_id,
+                rewrite_from_message_id=request.rewrite_from_message_id,
             )
         except HTTPException:
             raise
@@ -3917,7 +4368,11 @@ def create_app(  # noqa: C901
             # Append the user turn + assemble history in request scope (the worker
             # thread has no Request access); ``commit`` persists the result after.
             history, commit = _copilot_thread_turn(
-                request.conversation_id, project, request.message, identity.owner_id
+                request.conversation_id,
+                project,
+                request.message,
+                identity.owner_id,
+                rewrite_from_message_id=request.rewrite_from_message_id,
             )
         except HTTPException:
             raise
@@ -4046,12 +4501,37 @@ def create_app(  # noqa: C901
         project = authorize_semantic_project(
             fastapi_request, project_id, owner_id=identity.owner_id, permission="write"
         )
+        # Double-apply guard: a forked thread carries the parent's changeset as
+        # an inert copy; applying against a fork whose latest changeset is inert
+        # is a stale/copied proposal, never a live one.
+        if request.conversation_id:
+            thread = _require_copilot_conversation(
+                project_id,
+                request.conversation_id,
+                identity.owner_id,
+                kinds=("copilot", "recovery"),
+            )
+            if changeset_from_conversation(thread) is None and any(
+                artifact.type == "changeset" and artifact.inert
+                for message in thread.messages
+                for artifact in message.artifacts
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "This thread only carries a changeset copied from the "
+                        "conversation it was branched from; run the Copilot "
+                        "here to produce a new proposal."
+                    ),
+                )
+        snapshot_entries: list[ApplySnapshotEntry] = []
         try:
             applied = apply_changeset_items(
                 active_mdl_file_store,
                 project_id=project_id,
                 items=request.items,
                 owner_id=identity.owner_id,
+                snapshot_sink=snapshot_entries,
             )
         except MdlFileNotFoundError as ex:
             raise HTTPException(status_code=404, detail="MDL file not found.") from ex
@@ -4073,20 +4553,31 @@ def create_app(  # noqa: C901
         # proposal was applied (parity with the SQL agent's execute-sql turn). The
         # recovery agent persists its changeset on a ``recovery`` thread, so the
         # apply route accepts that kind too (not just interactive ``copilot``).
+        applied_turn_message_id: str | None = None
         if request.conversation_id:
-            _require_copilot_conversation(
-                project_id,
-                request.conversation_id,
-                identity.owner_id,
-                kinds=("copilot", "recovery"),
-            )
             count = len(applied)
             noun = "draft" if count == 1 else "drafts"
-            _copilot_turn_service().commit_turn(
+            committed = _copilot_turn_service().commit_turn(
                 request.conversation_id,
                 assistant_content=f"Applied {count} {noun}.",
                 owner_id=identity.owner_id,
             )
+            if committed.messages:
+                applied_turn_message_id = committed.messages[-1].id
+
+        # Before-images for the rewrite preview + "revert applied drafts"
+        # (best-effort: snapshot failure never blocks an apply).
+        if snapshot_entries:
+            try:
+                active_apply_snapshot_store.record(
+                    project_id=project_id,
+                    owner_id=identity.owner_id,
+                    entries=snapshot_entries,
+                    conversation_id=request.conversation_id,
+                    message_id=applied_turn_message_id,
+                )
+            except Exception:  # pylint: disable=broad-except
+                logger.warning("Failed to record apply snapshots.", exc_info=True)
 
         # An apply that touched active files (update/delete of an active file, or a
         # create the user later activates) moves the active-set version, which

@@ -184,6 +184,9 @@ def test_metrics_are_chunked_with_definition_and_synonyms() -> None:
     assert "SUM(good_units) / SUM(total_units)" in metric.text
     assert "first pass yield" in metric.text
     assert "Share of good units" in metric.text
+    # The chunk marks the metric non-physical so the drafter inlines the formula
+    # rather than selecting the metric name (wren_core has no metrics concept).
+    assert "not a selectable column" in metric.text
 
 
 def test_metric_chunk_tolerates_minimal_shapes() -> None:

@@ -152,6 +152,20 @@ def test_wren_core_rewrites_model_to_physical_table() -> None:
     assert planned.rewritten is True
     # The logical model `deals` is expanded to the physical `sales.deals`.
     assert "sales.deals" in planned.native_sql
+    # A clean rewrite is NOT correctable — nothing for a re-draft to fix.
+    assert planned.correctable_warnings == []
+
+
+@requires_wren_core
+def test_wren_core_rejects_unknown_field_as_correctable() -> None:
+    # An unresolvable identifier (e.g. a dropped metric name or a hallucinated
+    # column) must be flagged correctable so the re-draft loop fixes it, never
+    # forwarded verbatim to the physical DB (which raises e.g. Oracle ORA-00904).
+    engine = WrenCoreEngine()
+    planned = engine.plan_sql("SELECT total_revenue FROM deals", _manifest(), dialect="postgres")
+    assert planned.rewritten is False
+    assert planned.correctable_warnings
+    assert any("rejected" in w.lower() for w in planned.correctable_warnings)
 
 
 _CALC_MDL = json.dumps(

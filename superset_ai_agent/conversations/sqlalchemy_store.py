@@ -18,7 +18,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import cast
+from typing import cast, List
+from uuid import uuid4
 
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload, Session, sessionmaker
@@ -30,10 +31,13 @@ from superset_ai_agent.conversations.schemas import (
     ConversationRole,
     ConversationScope,
     ConversationSummary,
+    ConversationTruncation,
 )
 from superset_ai_agent.conversations.store import (
     ConversationArtifactNotFoundError,
+    ConversationMessageNotFoundError,
     ConversationNotFoundError,
+    ConversationRewriteError,
     DEFAULT_OWNER_ID,
 )
 from superset_ai_agent.persistence.models import (
@@ -198,7 +202,15 @@ class SqlAlchemyConversationStore:
                 conversation_id,
                 owner_id=owner_id,
             )
-            sequence = len(conversation.messages)
+            # max+1 over ALL rows (soft-deleted included): a rewrite leaves
+            # soft-deleted rows behind, so len() would collide on the sequence.
+            sequence = (
+                max(
+                    (existing.sequence for existing in conversation.messages),
+                    default=-1,
+                )
+                + 1
+            )
             message_model = AiAgentMessage(
                 id=message.id,
                 conversation_id=conversation.id,
@@ -282,6 +294,213 @@ class SqlAlchemyConversationStore:
             conversation.updated_at = conversation.deleted_at
             session.commit()
 
+    def truncate_from(
+        self,
+        conversation_id: str,
+        message_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> ConversationTruncation:
+        with self.session_factory() as session:
+            conversation = self._get_model(
+                session,
+                conversation_id,
+                owner_id=owner_id,
+            )
+            anchor = next(
+                (
+                    message
+                    for message in conversation.messages
+                    if message.id == message_id and message.deleted_at is None
+                ),
+                None,
+            )
+            if anchor is None:
+                raise ConversationMessageNotFoundError(message_id)
+            if anchor.role != "user":
+                raise ConversationRewriteError(
+                    "A rewrite must anchor on a user message."
+                )
+            now = _utc_now()
+            removed = sorted(
+                (
+                    message
+                    for message in conversation.messages
+                    if message.deleted_at is None
+                    and message.sequence >= anchor.sequence
+                ),
+                key=lambda item: item.sequence,
+            )
+            for message in removed:
+                message.deleted_at = now
+                message.superseded_by_message_id = anchor.id
+            conversation.updated_at = now
+            removed_schemas = [_message_from_model(message) for message in removed]
+            session.commit()
+        return ConversationTruncation(
+            conversation=self.get(conversation_id, owner_id=owner_id),
+            removed_messages=removed_schemas,
+        )
+
+    def undo_truncate(
+        self,
+        conversation_id: str,
+        anchor_message_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> Conversation:
+        with self.session_factory() as session:
+            conversation = self._get_model(
+                session,
+                conversation_id,
+                owner_id=owner_id,
+            )
+            batch = [
+                message
+                for message in conversation.messages
+                if message.deleted_at is not None
+                and message.superseded_by_message_id == anchor_message_id
+            ]
+            if not batch:
+                raise ConversationRewriteError(
+                    "No rewrite batch to restore for this message."
+                )
+            anchor_sequence = min(message.sequence for message in batch)
+            replacement = sorted(
+                (
+                    message
+                    for message in conversation.messages
+                    if message.deleted_at is None
+                    and message.sequence >= anchor_sequence
+                ),
+                key=lambda item: item.sequence,
+            )
+            now = _utc_now()
+            # The rewritten turn gets the same marker discipline (its own user
+            # message anchors it), so a later rewrite of the same original
+            # anchor cannot resurrect it by accident.
+            replacement_anchor_id = next(
+                (message.id for message in replacement if message.role == "user"),
+                anchor_message_id,
+            )
+            for message in replacement:
+                message.deleted_at = now
+                message.superseded_by_message_id = replacement_anchor_id
+            for message in batch:
+                message.deleted_at = None
+                message.superseded_by_message_id = None
+            conversation.updated_at = now
+            session.commit()
+        return self.get(conversation_id, owner_id=owner_id)
+
+    def fork(
+        self,
+        conversation_id: str,
+        message_id: str | None = None,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> Conversation:
+        source = self.get(conversation_id, owner_id=owner_id)
+        cut_index = len(source.messages) - 1
+        if message_id is not None:
+            anchor_index = next(
+                (
+                    index
+                    for index, message in enumerate(source.messages)
+                    if message.id == message_id
+                ),
+                None,
+            )
+            if anchor_index is None:
+                raise ConversationMessageNotFoundError(message_id)
+            cut_index = anchor_index
+        copied = [
+            _copy_message_for_fork(message)
+            for message in source.messages[: cut_index + 1]
+        ]
+        now = _utc_now()
+        fork = Conversation(
+            title=f"{source.title} (branch)",
+            owner_id=owner_id,
+            kind=source.kind,
+            project_id=source.project_id,
+            parent_conversation_id=source.id,
+            forked_from_sequence=cut_index if source.messages else None,
+            scope=source.scope,
+        )
+        with self.session_factory() as session:
+            model = AiAgentConversation(
+                id=fork.id,
+                owner_id=owner_id,
+                title=fork.title,
+                kind=fork.kind,
+                project_id=fork.project_id,
+                parent_conversation_id=source.id,
+                forked_from_sequence=fork.forked_from_sequence,
+                database_id=source.scope.database_id,
+                catalog_name=source.scope.catalog_name,
+                schema_name=source.scope.schema_name,
+                scope=source.scope.model_dump(mode="json"),
+                created_at=now,
+                updated_at=now,
+                deleted_at=None,
+            )
+            session.add(model)
+            for sequence, message in enumerate(copied):
+                session.add(
+                    AiAgentMessage(
+                        id=message.id,
+                        conversation_id=fork.id,
+                        owner_id=owner_id,
+                        role=message.role,
+                        content=message.content,
+                        sequence=sequence,
+                        created_at=message.created_at,
+                    )
+                )
+                for artifact in message.artifacts:
+                    session.add(
+                        AiAgentArtifact(
+                            id=artifact.id,
+                            message_id=message.id,
+                            owner_id=owner_id,
+                            type=artifact.type,
+                            sql=artifact.sql,
+                            payload=artifact.model_dump(mode="json"),
+                            created_at=now,
+                            updated_at=now,
+                        )
+                    )
+            session.commit()
+        return self.get(fork.id, owner_id=owner_id)
+
+    def list_attempts(
+        self,
+        conversation_id: str,
+        anchor_message_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+        # ``List`` (not ``list``): the store's own ``list`` method shadows the
+        # builtin inside this class body.
+    ) -> List[ConversationMessage]:
+        with self.session_factory() as session:
+            conversation = self._get_model(
+                session,
+                conversation_id,
+                owner_id=owner_id,
+            )
+            attempts = sorted(
+                (
+                    message
+                    for message in conversation.messages
+                    if message.deleted_at is not None
+                    and message.superseded_by_message_id == anchor_message_id
+                    and message.role == "assistant"
+                ),
+                key=lambda item: item.sequence,
+            )
+            return [_message_from_model(message) for message in attempts]
+
     @staticmethod
     def _get_model(
         session: Session,
@@ -311,22 +530,52 @@ class SqlAlchemyConversationStore:
         return conversation
 
 
+def _message_from_model(message: AiAgentMessage) -> ConversationMessage:
+    return ConversationMessage(
+        id=message.id,
+        role=cast(ConversationRole, message.role),
+        content=message.content,
+        created_at=message.created_at,
+        artifacts=[
+            ConversationArtifact.model_validate(artifact.payload)
+            for artifact in sorted(
+                message.artifacts,
+                key=lambda item: item.created_at,
+            )
+        ],
+    )
+
+
+def _copy_message_for_fork(message: ConversationMessage) -> ConversationMessage:
+    """Fresh-id copy of a message for a forked thread.
+
+    Changeset artifacts become ``inert``: the fork renders them as history but
+    must never re-apply the parent thread's proposals (double-apply guard).
+    """
+
+    return ConversationMessage(
+        role=message.role,
+        content=message.content,
+        created_at=message.created_at,
+        artifacts=[
+            artifact.model_copy(
+                update={
+                    "id": str(uuid4()),
+                    "inert": artifact.inert or artifact.type == "changeset",
+                }
+            )
+            for artifact in message.artifacts
+        ],
+    )
+
+
 def _conversation_from_model(model: AiAgentConversation) -> Conversation:
+    # Live rows only: soft-deleted messages (rewrite history) never reach the
+    # transcript, the model window, or changeset/apply eligibility.
     messages = [
-        ConversationMessage(
-            id=message.id,
-            role=cast(ConversationRole, message.role),
-            content=message.content,
-            created_at=message.created_at,
-            artifacts=[
-                ConversationArtifact.model_validate(artifact.payload)
-                for artifact in sorted(
-                    message.artifacts,
-                    key=lambda item: item.created_at,
-                )
-            ],
-        )
+        _message_from_model(message)
         for message in sorted(model.messages, key=lambda item: item.sequence)
+        if message.deleted_at is None
     ]
     return Conversation(
         id=model.id,
@@ -334,6 +583,8 @@ def _conversation_from_model(model: AiAgentConversation) -> Conversation:
         owner_id=model.owner_id,
         kind=model.kind,
         project_id=model.project_id,
+        parent_conversation_id=model.parent_conversation_id,
+        forked_from_sequence=model.forked_from_sequence,
         scope=ConversationScope.model_validate(model.scope),
         messages=messages,
         created_at=model.created_at,
@@ -342,7 +593,10 @@ def _conversation_from_model(model: AiAgentConversation) -> Conversation:
 
 
 def _summarize_model(model: AiAgentConversation) -> ConversationSummary:
-    messages = sorted(model.messages, key=lambda item: item.sequence)
+    messages = sorted(
+        (message for message in model.messages if message.deleted_at is None),
+        key=lambda item: item.sequence,
+    )
     last_message = messages[-1].content if messages else None
     return ConversationSummary(
         id=model.id,

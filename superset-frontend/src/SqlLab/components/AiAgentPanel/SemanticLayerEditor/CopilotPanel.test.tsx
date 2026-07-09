@@ -186,7 +186,24 @@ const threadAfterTurn = conversation([
   },
 ]);
 
-const installFetch = (opts: { history?: unknown[]; thread?: unknown } = {}) => {
+const emptyPreview = {
+  removed_message_count: 2,
+  memory_write_count: 0,
+  applied_changeset_items: [],
+  apply_group_ids: [],
+  unknown_applies: false,
+  executed_sql_count: 0,
+};
+
+const installFetch = (
+  opts: {
+    history?: unknown[];
+    thread?: unknown;
+    preview?: unknown;
+    fork?: unknown;
+    applies?: unknown[];
+  } = {},
+) => {
   const fetchMockFn = jest.fn(
     (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
@@ -199,6 +216,27 @@ const installFetch = (opts: { history?: unknown[]; thread?: unknown } = {}) => {
       }
       if (url.includes('/copilot/inspector')) {
         return Promise.resolve(jsonResponse(inspector));
+      }
+      if (url.includes('/rewrite-preview')) {
+        return Promise.resolve(jsonResponse(opts.preview ?? emptyPreview));
+      }
+      if (url.endsWith('/applies')) {
+        return Promise.resolve(jsonResponse(opts.applies ?? []));
+      }
+      if (/\/applies\/[^/]+\/revert$/.test(url)) {
+        return Promise.resolve(
+          jsonResponse({
+            apply_group_id: 'group-1',
+            reverted_count: 1,
+            excluded: [],
+          }),
+        );
+      }
+      if (url.endsWith('/fork')) {
+        return Promise.resolve(jsonResponse(opts.fork ?? threadAfterTurn));
+      }
+      if (/\/rewrites\/[^/]+\/undo$/.test(url)) {
+        return Promise.resolve(jsonResponse(opts.thread ?? threadAfterTurn));
       }
       // A single conversation: GET resume, PATCH rename, DELETE.
       if (/\/copilot\/conversations\/[^/]+$/.test(url)) {
@@ -1153,4 +1191,186 @@ test('a kickstart notifies the parent so it can be cleared (no refire)', async (
 
   await screen.findByText('Created the orders model.');
   expect(onKickstartHandled).toHaveBeenCalledTimes(1);
+});
+
+const historyEntry = {
+  id: 'conv-1',
+  title: 'model the orders table',
+  owner_id: 'local',
+  kind: 'copilot',
+  project_id: 'project-1',
+  database_id: 1,
+  updated_at: '2026-06-19T00:00:00Z',
+  last_message: 'Created the orders model.',
+};
+
+test('regenerate reruns the last turn as a truncating rewrite', async () => {
+  const fetchMockFn = installFetch({ history: [historyEntry] });
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+    />,
+  );
+  // The panel auto-resumes the latest thread on open.
+  expect(
+    await screen.findByText('Created the orders model.'),
+  ).toBeInTheDocument();
+
+  await userEvent.click(screen.getByRole('button', { name: 'Regenerate' }));
+
+  // Empty manifest → straight to the stream with the rewrite anchor.
+  await waitFor(() => {
+    const streamCall = fetchMockFn.mock.calls.find(([request]) =>
+      String(request).includes('/copilot/stream'),
+    );
+    expect(streamCall).toBeTruthy();
+    expect(JSON.parse(String(streamCall?.[1]?.body))).toMatchObject({
+      message: 'model the orders table',
+      conversation_id: 'conv-1',
+      rewrite_from_message_id: 'm-user',
+    });
+  });
+  // The rewrite exposes single-step undo once the turn completes.
+  expect(
+    await screen.findByTestId('copilot-rewrite-undo-bar'),
+  ).toBeInTheDocument();
+});
+
+test('rewrite with applied drafts downstream opens the side-effect dialog', async () => {
+  installFetch({
+    history: [historyEntry],
+    preview: {
+      removed_message_count: 3,
+      memory_write_count: 0,
+      applied_changeset_items: [
+        { op: 'create', path: 'models/orders.json', file_id: 'file-1' },
+      ],
+      apply_group_ids: ['group-1'],
+      unknown_applies: false,
+      executed_sql_count: 0,
+    },
+  });
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+    />,
+  );
+  expect(
+    await screen.findByText('Created the orders model.'),
+  ).toBeInTheDocument();
+
+  // Edit the user message → the manifest is non-empty → the dialog names the
+  // applied draft that will stay in the project.
+  await userEvent.click(screen.getByRole('button', { name: 'Edit message' }));
+  await userEvent.click(screen.getByTestId('copilot-message-edit-save'));
+  expect(
+    await screen.findByText('Rewrite this conversation?'),
+  ).toBeInTheDocument();
+  expect(screen.getByTestId('rewrite-applied-items')).toHaveTextContent(
+    'models/orders.json',
+  );
+});
+
+test('branch from a message forks the thread and shows the back-link', async () => {
+  const fork = {
+    ...conversation([
+      {
+        id: 'fork-user',
+        role: 'user',
+        content: 'model the orders table',
+        created_at: '2026-06-19T00:00:00Z',
+        artifacts: [],
+      },
+    ]),
+    id: 'conv-2',
+    title: 'model the orders table (branch)',
+    parent_conversation_id: 'conv-1',
+    forked_from_sequence: 0,
+  };
+  const fetchMockFn = installFetch({ history: [historyEntry], fork });
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+    />,
+  );
+  expect(
+    await screen.findByText('Created the orders model.'),
+  ).toBeInTheDocument();
+
+  const branchButtons = screen.getAllByRole('button', {
+    name: 'Branch from here',
+  });
+  await userEvent.click(branchButtons[0]);
+
+  // Switched to the fork: back-link shows; the fork call targeted the message.
+  expect(
+    await screen.findByTestId('copilot-branch-backlink'),
+  ).toBeInTheDocument();
+  const forkCall = fetchMockFn.mock.calls.find(([request]) =>
+    String(request).endsWith('/fork'),
+  );
+  expect(JSON.parse(String(forkCall?.[1]?.body))).toMatchObject({
+    message_id: 'm-user',
+  });
+  expect(
+    localStorage.getItem('sqllab:mdl-copilot:conversation:project-1'),
+  ).toBe('conv-2');
+});
+
+test('an Applied turn with snapshots offers Revert and reverts on click', async () => {
+  const threadWithApply = {
+    ...threadAfterTurn,
+    messages: [
+      ...threadAfterTurn.messages,
+      {
+        id: 'm-applied',
+        role: 'assistant',
+        content: 'Applied 1 draft.',
+        created_at: '2026-06-19T00:00:02Z',
+        artifacts: [],
+      },
+    ],
+  };
+  const fetchMockFn = installFetch({
+    history: [historyEntry],
+    thread: threadWithApply,
+    applies: [
+      {
+        apply_group_id: 'group-1',
+        conversation_id: 'conv-1',
+        message_id: 'm-applied',
+        applied_at: '2026-06-19T00:00:02Z',
+        reverted: false,
+        items: [{ op: 'create', path: 'models/orders.json', file_id: 'f1' }],
+      },
+    ],
+  });
+  render(
+    <CopilotPanel
+      projectId="project-1"
+      canWrite
+      readinessStatus="ready"
+      onOnboard={jest.fn()}
+    />,
+  );
+  expect(await screen.findByText('Applied 1 draft.')).toBeInTheDocument();
+
+  await userEvent.click(await screen.findByTestId('copilot-revert-apply'));
+
+  await waitFor(() => {
+    const revertCall = fetchMockFn.mock.calls.find(([request]) =>
+      /\/applies\/group-1\/revert$/.test(String(request)),
+    );
+    expect(revertCall).toBeTruthy();
+    expect(revertCall?.[1]?.method).toBe('POST');
+  });
 });

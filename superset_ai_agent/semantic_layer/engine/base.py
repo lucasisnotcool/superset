@@ -81,6 +81,12 @@ class PlannedSql(BaseModel):
     rewritten: bool = False
     referenced_tables: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    #: Subset of ``warnings`` a model re-draft could plausibly fix. A wren-core
+    #: *rejection* (``transform_sql`` raised a schema/plan error — the SQL is
+    #: invalid against the manifest) is correctable and must NOT be forwarded to
+    #: the physical DB unchanged. A *degrade* (engine absent / unmapped dialect)
+    #: is not correctable — a re-draft cannot fix it.
+    correctable_warnings: list[str] = Field(default_factory=list)
 
 
 class SemanticEngine(Protocol):

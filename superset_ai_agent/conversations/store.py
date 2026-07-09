@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import List, Protocol
 
 from superset_ai_agent.conversations.schemas import (
     Conversation,
@@ -25,6 +25,7 @@ from superset_ai_agent.conversations.schemas import (
     ConversationMessage,
     ConversationScope,
     ConversationSummary,
+    ConversationTruncation,
 )
 
 DEFAULT_OWNER_ID = "local"
@@ -36,6 +37,18 @@ class ConversationNotFoundError(KeyError):
 
 class ConversationArtifactNotFoundError(KeyError):
     """Raised when an artifact cannot be found in a conversation."""
+
+
+class ConversationMessageNotFoundError(KeyError):
+    """Raised when a message cannot be found (live) in a conversation."""
+
+
+class ConversationRewriteError(ValueError):
+    """Raised when a rewrite/undo request is structurally invalid.
+
+    E.g. the truncation anchor is not a user message, or an undo targets a
+    message that never anchored a rewrite.
+    """
 
 
 class ConversationStore(Protocol):
@@ -135,3 +148,60 @@ class ConversationStore(Protocol):
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> None:
         """Delete a conversation."""
+
+    def truncate_from(
+        self,
+        conversation_id: str,
+        message_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> ConversationTruncation:
+        """Soft-delete a user message and everything after it (rewrite cut).
+
+        The anchor must be a live *user* message (``ConversationRewriteError``
+        otherwise). Every removed row is marked with the anchor's id so
+        :meth:`undo_truncate` can restore the batch and the attempt pager can
+        find superseded assistant turns. Returns the truncated thread plus the
+        removed messages (whose provenance the caller may need to clean up).
+        """
+
+    def undo_truncate(
+        self,
+        conversation_id: str,
+        anchor_message_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> Conversation:
+        """Restore the batch removed by ``truncate_from(anchor_message_id)``.
+
+        Messages appended after the truncation (the rewritten turn) are
+        soft-deleted in the same marker discipline. Single-step: intended to be
+        offered only until the next turn starts.
+        """
+
+    def fork(
+        self,
+        conversation_id: str,
+        message_id: str | None = None,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> Conversation:
+        """Copy live messages up to (and including) the anchor into a new thread.
+
+        Non-destructive "Branch from here": the source thread is untouched; the
+        fork records ``parent_conversation_id``/``forked_from_sequence`` and
+        copies scope + project binding. Copied changeset artifacts are marked
+        ``inert`` so a fork can never re-apply the parent's proposals.
+        ``message_id=None`` forks the whole thread.
+        """
+
+    def list_attempts(
+        self,
+        conversation_id: str,
+        anchor_message_id: str,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+        # ``List`` (not ``list``): the protocol's own ``list`` method shadows
+        # the builtin inside this class body.
+    ) -> List[ConversationMessage]:
+        """Superseded assistant attempts for a rewrite anchor (pager history)."""

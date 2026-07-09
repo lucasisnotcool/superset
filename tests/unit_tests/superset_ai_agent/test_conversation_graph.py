@@ -1361,3 +1361,268 @@ def test_conversation_model_payload_carries_document_context() -> None:
     )
     assert "Yield rate is good over total units." in sent
     assert '"document_context"' in sent
+
+
+# -- Rewrite turns: edit & resend / regenerate (conversation-management 1b) ---
+
+
+def _answer_model(message: str) -> FakeModelClient:
+    return FakeModelClient(
+        {
+            "response_type": "answer",
+            "message": message,
+            "sql": "",
+            "explanation": None,
+        }
+    )
+
+
+def test_rewrite_turn_truncates_then_reruns() -> None:
+    store = InMemoryConversationStore()
+    scope = ConversationScope(database_id=1, dataset_ids=[16])
+    conversation = store.create(scope)
+
+    def _graph(reply: str) -> ConversationGraph:
+        return ConversationGraph(
+            config=AgentConfig(),
+            model_client=_answer_model(reply),
+            context_provider=FakeContextProvider(),
+            superset_client=FakeSupersetClient(),
+            conversation_store=store,
+        )
+
+    _graph("First answer.").run(
+        conversation_id=conversation.id,
+        request=ConversationTurnRequest(message="first question", scope=scope),
+    )
+    _graph("Second answer.").run(
+        conversation_id=conversation.id,
+        request=ConversationTurnRequest(message="second question", scope=scope),
+    )
+    thread = store.get(conversation.id)
+    anchor = thread.messages[2]
+    assert anchor.content == "second question"
+
+    response = _graph("Edited answer.").run(
+        conversation_id=conversation.id,
+        request=ConversationTurnRequest(
+            message="second question (edited)",
+            scope=scope,
+            rewrite_from_message_id=anchor.id,
+        ),
+    )
+
+    assert [m.content for m in response.conversation.messages] == [
+        "first question",
+        "First answer.",
+        "second question (edited)",
+        "Edited answer.",
+    ]
+    # The superseded turn stays retrievable for the attempt pager.
+    attempts = store.list_attempts(conversation.id, anchor.id)
+    assert [m.content for m in attempts] == ["Second answer."]
+
+
+def test_regenerate_is_rewrite_with_unchanged_content() -> None:
+    store = InMemoryConversationStore()
+    scope = ConversationScope(database_id=1, dataset_ids=[16])
+    conversation = store.create(scope)
+    graph = ConversationGraph(
+        config=AgentConfig(),
+        model_client=_answer_model("Take two."),
+        context_provider=FakeContextProvider(),
+        superset_client=FakeSupersetClient(),
+        conversation_store=store,
+    )
+    ConversationGraph(
+        config=AgentConfig(),
+        model_client=_answer_model("Take one."),
+        context_provider=FakeContextProvider(),
+        superset_client=FakeSupersetClient(),
+        conversation_store=store,
+    ).run(
+        conversation_id=conversation.id,
+        request=ConversationTurnRequest(message="the question", scope=scope),
+    )
+    anchor = store.get(conversation.id).messages[0]
+
+    response = graph.run(
+        conversation_id=conversation.id,
+        request=ConversationTurnRequest(
+            message="the question",
+            scope=scope,
+            rewrite_from_message_id=anchor.id,
+        ),
+    )
+
+    # In place: still one user + one assistant turn, not an appended duplicate.
+    assert [m.content for m in response.conversation.messages] == [
+        "the question",
+        "Take two.",
+    ]
+
+
+def _sql_then_answer_model() -> FakeModelClient:
+    return FakeModelClient(
+        [
+            {
+                "response_type": "sql",
+                "message": "Running it.",
+                "sql": (
+                    "SELECT name, SUM(num) AS total_births "
+                    "FROM birth_names GROUP BY name LIMIT 10"
+                ),
+                "explanation": "Groups names.",
+            },
+            {
+                "outcome": "answer",
+                "message": "Michael is top.",
+                "retry_feedback": None,
+            },
+        ]
+    )
+
+
+def test_memory_write_carries_source_provenance() -> None:
+    from superset_ai_agent.semantic_layer.memory_store import InMemoryMemory
+
+    store = InMemoryConversationStore()
+    memory = InMemoryMemory()
+    scope = ConversationScope(database_id=1, dataset_ids=[16])
+    conversation = store.create(scope)
+    graph = ConversationGraph(
+        config=AgentConfig(),
+        model_client=_sql_then_answer_model(),
+        context_provider=FakeContextProvider(),
+        superset_client=FakeSupersetClient(),
+        conversation_store=store,
+        memory=memory,
+    )
+    graph.run(
+        conversation_id=conversation.id,
+        request=ConversationTurnRequest(
+            message="top names", scope=scope, execution_mode="read_only"
+        ),
+    )
+
+    user_message = store.get(conversation.id).messages[0]
+    pairs = memory.recall_examples("top names", database_id=1, k=5)
+    assert len(pairs) == 1
+    assert pairs[0].source_message_id == user_message.id
+
+
+def test_rewrite_deletes_learned_examples_by_default() -> None:
+    from superset_ai_agent.semantic_layer.memory_store import InMemoryMemory
+
+    store = InMemoryConversationStore()
+    memory = InMemoryMemory()
+    scope = ConversationScope(database_id=1, dataset_ids=[16])
+    conversation = store.create(scope)
+
+    def _graph(model_client: FakeModelClient) -> ConversationGraph:
+        return ConversationGraph(
+            config=AgentConfig(),
+            model_client=model_client,
+            context_provider=FakeContextProvider(),
+            superset_client=FakeSupersetClient(),
+            conversation_store=store,
+            memory=memory,
+        )
+
+    _graph(_sql_then_answer_model()).run(
+        conversation_id=conversation.id,
+        request=ConversationTurnRequest(
+            message="top names", scope=scope, execution_mode="read_only"
+        ),
+    )
+    anchor = store.get(conversation.id).messages[0]
+    assert memory.recall_examples("top names", database_id=1, k=5)
+
+    # The rewritten turn answers without SQL, so no fresh example is written;
+    # the stale one from the truncated turn must be gone (DP-2 default ON).
+    _graph(_answer_model("No SQL this time.")).run(
+        conversation_id=conversation.id,
+        request=ConversationTurnRequest(
+            message="top names (edited)",
+            scope=scope,
+            rewrite_from_message_id=anchor.id,
+        ),
+    )
+    assert memory.recall_examples("top names", database_id=1, k=5) == []
+
+
+def test_rewrite_keeps_learned_examples_when_opted_out() -> None:
+    from superset_ai_agent.semantic_layer.memory_store import InMemoryMemory
+
+    store = InMemoryConversationStore()
+    memory = InMemoryMemory()
+    scope = ConversationScope(database_id=1, dataset_ids=[16])
+    conversation = store.create(scope)
+
+    def _graph(model_client: FakeModelClient) -> ConversationGraph:
+        return ConversationGraph(
+            config=AgentConfig(),
+            model_client=model_client,
+            context_provider=FakeContextProvider(),
+            superset_client=FakeSupersetClient(),
+            conversation_store=store,
+            memory=memory,
+        )
+
+    _graph(_sql_then_answer_model()).run(
+        conversation_id=conversation.id,
+        request=ConversationTurnRequest(
+            message="top names", scope=scope, execution_mode="read_only"
+        ),
+    )
+    anchor = store.get(conversation.id).messages[0]
+
+    _graph(_answer_model("Answer only.")).run(
+        conversation_id=conversation.id,
+        request=ConversationTurnRequest(
+            message="top names (edited)",
+            scope=scope,
+            rewrite_from_message_id=anchor.id,
+            remove_learned_examples=False,
+        ),
+    )
+    assert len(memory.recall_examples("top names", database_id=1, k=5)) == 1
+
+
+def test_run_stream_honors_rewrite_directive() -> None:
+    store = InMemoryConversationStore()
+    scope = ConversationScope(database_id=1, dataset_ids=[16])
+    conversation = store.create(scope)
+    ConversationGraph(
+        config=AgentConfig(),
+        model_client=_answer_model("Original."),
+        context_provider=FakeContextProvider(),
+        superset_client=FakeSupersetClient(),
+        conversation_store=store,
+    ).run(
+        conversation_id=conversation.id,
+        request=ConversationTurnRequest(message="q", scope=scope),
+    )
+    anchor = store.get(conversation.id).messages[0]
+
+    graph = ConversationGraph(
+        config=AgentConfig(),
+        model_client=_answer_model("Regenerated."),
+        context_provider=FakeContextProvider(),
+        superset_client=FakeSupersetClient(),
+        conversation_store=store,
+    )
+    events = list(
+        graph.run_stream(
+            conversation_id=conversation.id,
+            request=ConversationTurnRequest(
+                message="q",
+                scope=scope,
+                rewrite_from_message_id=anchor.id,
+            ),
+        )
+    )
+    complete = [event for event in events if event.get("type") == "complete"]
+    assert complete
+    final = complete[0]["response"].conversation
+    assert [m.content for m in final.messages] == ["q", "Regenerated."]

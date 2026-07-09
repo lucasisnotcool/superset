@@ -132,10 +132,12 @@ logger = logging.getLogger(__name__)
 _SEMANTIC_SQL_GUIDANCE = (
     "Semantic-SQL mode is ON. Write SQL against the semantic models by their "
     "MDL model names (see wren_context.matched_models and context_items), "
-    "referencing model columns, defined relationships, and metrics. Do not "
+    "referencing model columns and defined relationships. Do not "
     "hand-write physical joins for defined relationships; the semantic engine "
-    "rewrites your query into native SQL. Never reference tables or columns "
-    "absent from the provided semantic context."
+    "rewrites your query into native SQL. A metric is a formula, NOT a "
+    "selectable column: substitute its measure expression inline (e.g. write "
+    "SUM(amount) AS total_revenue), never SELECT the metric by its name. "
+    "Never reference tables or columns absent from the provided semantic context."
 )
 
 
@@ -194,6 +196,9 @@ class SqlReflection(BaseModel):
 class ConversationState(TypedDict, total=False):
     conversation_id: str
     owner_id: str
+    #: Id of the user message this turn answers — the learning-loop write's
+    #: provenance, so a later rewrite of the turn can remove/replace it.
+    user_message_id: str | None
     request: ConversationTurnRequest
     conversation: Conversation
     context: AgentContext
@@ -317,6 +322,45 @@ class ConversationGraph:
         )
         return scope_hashes(resolved)
 
+    def prepare_rewrite(
+        self,
+        *,
+        conversation_id: str,
+        request: ConversationTurnRequest,
+        owner_id: str = DEFAULT_OWNER_ID,
+    ) -> ConversationTurnRequest:
+        """Consume a turn's rewrite directive (edit & resend / regenerate).
+
+        Soft-truncates the thread from the anchor user message and (by default)
+        deletes the learning-loop examples the truncated turns produced — the
+        user is rewriting because the answer was wrong, so the learned example
+        is suspect too (DP-2). Returns the request with the directive cleared
+        so the turn then runs the normal path. Call sites that stream must call
+        this pre-stream so anchor errors surface as HTTP statuses, not events.
+        """
+
+        if not request.rewrite_from_message_id:
+            return request
+        truncation = self.conversation_store.truncate_from(
+            conversation_id,
+            request.rewrite_from_message_id,
+            owner_id=owner_id,
+        )
+        if request.remove_learned_examples:
+            removed_user_ids = [
+                message.id
+                for message in truncation.removed_messages
+                if message.role == "user"
+            ]
+            try:
+                self.memory.delete_by_source(removed_user_ids)
+            except Exception:  # pylint: disable=broad-except - fail-open memory
+                logger.warning(
+                    "Failed to delete learning-loop examples for a rewrite.",
+                    exc_info=True,
+                )
+        return request.model_copy(update={"rewrite_from_message_id": None})
+
     def run(
         self,
         *,
@@ -324,6 +368,11 @@ class ConversationGraph:
         request: ConversationTurnRequest,
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> ConversationTurnResponse:
+        request = self.prepare_rewrite(
+            conversation_id=conversation_id,
+            request=request,
+            owner_id=owner_id,
+        )
         user_message = ConversationMessage(role="user", content=request.message)
         self.conversation_store.update_scope(
             conversation_id,
@@ -340,6 +389,7 @@ class ConversationGraph:
             conversation_id=conversation_id,
             request=request,
             owner_id=owner_id,
+            user_message_id=user_message.id,
         )
         assistant_message = self._assistant_message_from_state(state)
         conversation = self.conversation_store.append(
@@ -520,10 +570,12 @@ class ConversationGraph:
         conversation_id: str,
         request: ConversationTurnRequest,
         owner_id: str,
+        user_message_id: str | None = None,
     ) -> ConversationState:
         return {
             "conversation_id": conversation_id,
             "owner_id": owner_id,
+            "user_message_id": user_message_id,
             "request": request,
             "trace": [],
             "repair_attempts": 0,
@@ -558,11 +610,13 @@ class ConversationGraph:
         conversation_id: str,
         request: ConversationTurnRequest,
         owner_id: str,
+        user_message_id: str | None = None,
     ) -> ConversationState:
         initial_state = self._initial_state(
             conversation_id=conversation_id,
             request=request,
             owner_id=owner_id,
+            user_message_id=user_message_id,
         )
         try:
             return self.graph.invoke(
@@ -600,6 +654,14 @@ class ConversationGraph:
         because the HTTP status is already committed once streaming begins.
         """
 
+        # NOTE: any rewrite directive must already be consumed (the HTTP route
+        # calls ``prepare_rewrite`` pre-stream so anchor errors surface as
+        # statuses); a directive that reaches here is still honored.
+        request = self.prepare_rewrite(
+            conversation_id=conversation_id,
+            request=request,
+            owner_id=owner_id,
+        )
         user_message = ConversationMessage(role="user", content=request.message)
         self.conversation_store.update_scope(
             conversation_id,
@@ -616,6 +678,7 @@ class ConversationGraph:
             conversation_id=conversation_id,
             request=request,
             owner_id=owner_id,
+            user_message_id=user_message.id,
         )
         final_state: ConversationState = initial_state
         emitted = 0
@@ -1455,6 +1518,7 @@ class ConversationGraph:
                         "native_sql": result.native_sql,
                         "referenced_tables": result.referenced_tables,
                         "warnings": result.warnings,
+                        "inlined_metrics": result.inlined_metrics,
                     },
                 ),
             ],
@@ -1742,6 +1806,10 @@ class ConversationGraph:
                     referenced_schemas=referenced_schemas,
                     result_meta={"row_count": result.row_count},
                     database_uri_fingerprint=self._scope_fingerprint(request.scope),
+                    # Provenance: lets a rewrite of this turn remove/replace the
+                    # example instead of silently keeping/duplicating it.
+                    source_conversation_id=state.get("conversation_id"),
+                    source_message_id=state.get("user_message_id"),
                 )
             except Exception as ex:  # pylint: disable=broad-except - best-effort
                 logger.warning("Failed to store learning-loop example: %s", ex)
@@ -2087,8 +2155,7 @@ class ConversationGraph:
         state: ConversationState,
     ) -> list[ConversationArtifact]:
         artifacts = list(state.get("artifacts", []))
-        pending_artifact = state.get("pending_artifact")
-        if pending_artifact:
+        if pending_artifact := state.get("pending_artifact"):
             artifacts.append(
                 pending_artifact.model_copy(update={"trace": state.get("trace", [])})
             )
@@ -2308,8 +2375,7 @@ def _artifact_with_execution_state(
 
 
 def _latest_state_artifact(state: ConversationState) -> ConversationArtifact | None:
-    artifacts = state.get("artifacts", [])
-    if artifacts:
+    if artifacts := state.get("artifacts", []):
         return artifacts[-1]
     return state.get("pending_artifact")
 

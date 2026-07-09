@@ -208,12 +208,20 @@ def _metric_items(metrics: list[dict[str, Any]]) -> list[SchemaItem]:
         if not name:
             continue
         base = str(metric.get("baseObject") or "")
-        parts: list[str] = [f"metric {name}"]
+        # A metric is an aggregate formula, not a physical column — the engine
+        # (wren_core) has no ``metrics`` concept and will not resolve the name.
+        # The chunk states this so the drafter inlines the expression instead of
+        # selecting the metric name (which fails at the DB). See
+        # plan_metric_semantic_translation_impl.md.
+        parts: list[str] = [
+            f"metric {name} (aggregate measure — inline its formula, "
+            "not a selectable column)"
+        ]
         if base:
             parts.append(f"on {base}")
         definition = _metric_definition_text(metric)
         if definition:
-            parts.append(f"defined as {definition}")
+            parts.append(f"computed as {definition}")
         dimensions = metric.get("dimension")
         if isinstance(dimensions, list) and dimensions:
             dim_names = ", ".join(

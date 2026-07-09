@@ -25,6 +25,7 @@ import {
   screen,
   userEvent,
   waitFor,
+  within,
 } from 'spec/helpers/testing-library';
 import { initialState } from 'src/SqlLab/fixtures';
 import AiAgentPanel from '.';
@@ -872,7 +873,25 @@ test('renders per-message affordances and regenerates the last user prompt', asy
   expect(
     screen.getAllByRole('button', { name: 'Copy message' }).length,
   ).toBeGreaterThan(0);
+  // Both roles expose branching; user messages expose edit & resend.
+  expect(
+    screen.getAllByRole('button', { name: 'Branch from here' }).length,
+  ).toBeGreaterThan(0);
+  expect(screen.getByRole('button', { name: 'Edit message' })).toBeTruthy();
 
+  // Regenerate consults the side-effect manifest first; an empty manifest
+  // proceeds straight to a truncating rewrite anchored on the user message.
+  fetchMock.get(
+    'http://agent.local/agent/conversations/conversation-1/rewrite-preview?from_message_id=message-1',
+    {
+      removed_message_count: 2,
+      memory_write_count: 0,
+      applied_changeset_items: [],
+      apply_group_ids: [],
+      unknown_applies: false,
+      executed_sql_count: 0,
+    },
+  );
   await userEvent.click(screen.getByRole('button', { name: 'Regenerate' }));
   await waitFor(() => {
     expect(
@@ -886,6 +905,7 @@ test('renders per-message affordances and regenerates the last user prompt', asy
   );
   expect(JSON.parse(String(regenerateCall.options.body))).toMatchObject({
     message: 'Show top names',
+    rewrite_from_message_id: 'message-1',
   });
 });
 
@@ -962,8 +982,9 @@ test('renames the active conversation via the header title', async () => {
   await userEvent.click(screen.getByRole('button', { name: 'Send' }));
   await screen.findByText('Here are the top names.');
 
-  // antd Typography renders an inline "Edit" affordance for editable titles.
-  await userEvent.click(screen.getByRole('button', { name: /edit/i }));
+  // antd Typography renders an inline "Edit" affordance for editable titles
+  // (exact-name query: user messages carry their own "Edit message" button).
+  await userEvent.click(screen.getByRole('button', { name: /^edit$/i }));
   // The edit field is seeded with the current title; pick the visible textbox
   // holding it (role queries exclude the aria-hidden autosize mirror, and the
   // composer textarea is empty after sending).
@@ -1439,4 +1460,311 @@ test('switching the semantic layer mid-conversation starts a fresh chat', async 
   await waitFor(() => {
     expect(screen.queryByText('Grounded answer.')).not.toBeInTheDocument();
   });
+});
+
+test('edits a user message, resends as a rewrite, and offers a working undo', async () => {
+  const { conversation, completedConversation } = buildTurn();
+  const rewrittenConversation = {
+    ...completedConversation,
+    messages: [
+      {
+        id: 'message-3',
+        role: 'user',
+        content: 'Show top surnames',
+        created_at: '2026-06-19T00:01:00Z',
+        artifacts: [],
+      },
+      {
+        id: 'message-4',
+        role: 'assistant',
+        content: 'Here are the top surnames.',
+        created_at: '2026-06-19T00:01:00Z',
+        artifacts: [],
+      },
+    ],
+  };
+  fetchMock.post('http://agent.local/agent/conversations', conversation);
+  fetchMock.post(
+    'http://agent.local/agent/conversations/conversation-1/messages/stream',
+    404,
+  );
+  fetchMock.post(
+    'http://agent.local/agent/conversations/conversation-1/messages',
+    () => {
+      const calls = fetchMock.callHistory.calls(
+        'http://agent.local/agent/conversations/conversation-1/messages',
+      );
+      const isRewrite = calls.length > 1;
+      const payload = isRewrite ? rewrittenConversation : completedConversation;
+      return {
+        status: 'ok',
+        conversation_id: 'conversation-1',
+        message: payload.messages[1],
+        artifacts: [],
+        trace: [],
+        conversation: payload,
+      };
+    },
+  );
+  fetchMock.get(
+    'http://agent.local/agent/conversations/conversation-1/rewrite-preview?from_message_id=message-1',
+    {
+      removed_message_count: 2,
+      memory_write_count: 0,
+      applied_changeset_items: [],
+      apply_group_ids: [],
+      unknown_applies: false,
+      executed_sql_count: 0,
+    },
+  );
+  fetchMock.post(
+    'http://agent.local/agent/conversations/conversation-1/rewrites/message-1/undo',
+    completedConversation,
+  );
+
+  render(<AiAgentPanel />, { useRedux: true, initialState });
+  await userEvent.type(
+    screen.getByPlaceholderText('Ask about this database'),
+    'Show top names',
+  );
+  await userEvent.click(screen.getByRole('button', { name: 'Send' }));
+  await screen.findByText('Here are the top names.');
+
+  // Pencil opens the inline editor seeded with the original content.
+  await userEvent.click(screen.getByRole('button', { name: 'Edit message' }));
+  const editor = within(screen.getByTestId('message-edit-form')).getByRole(
+    'textbox',
+  );
+  await userEvent.clear(editor);
+  await userEvent.type(editor, 'Show top surnames');
+  await userEvent.click(screen.getByRole('button', { name: 'Save & resend' }));
+
+  // The rewrite replaced the turn in place.
+  await screen.findByText('Here are the top surnames.');
+  expect(screen.queryByText('Here are the top names.')).not.toBeInTheDocument();
+  const calls = fetchMock.callHistory.calls(
+    'http://agent.local/agent/conversations/conversation-1/messages',
+  );
+  expect(JSON.parse(String(calls[1].options.body))).toMatchObject({
+    message: 'Show top surnames',
+    rewrite_from_message_id: 'message-1',
+    remove_learned_examples: true,
+  });
+
+  // Single-step undo restores the original turns.
+  const undoBar = await screen.findByTestId('rewrite-undo-bar');
+  await userEvent.click(within(undoBar).getByRole('button', { name: /undo/i }));
+  await screen.findByText('Here are the top names.');
+  expect(
+    screen.queryByText('Here are the top surnames.'),
+  ).not.toBeInTheDocument();
+});
+
+test('non-empty rewrite manifest opens the side-effect dialog before resending', async () => {
+  const { conversation, completedConversation } = buildTurn();
+  fetchMock.post('http://agent.local/agent/conversations', conversation);
+  fetchMock.post(
+    'http://agent.local/agent/conversations/conversation-1/messages/stream',
+    404,
+  );
+  fetchMock.post(
+    'http://agent.local/agent/conversations/conversation-1/messages',
+    {
+      status: 'ok',
+      conversation_id: 'conversation-1',
+      message: completedConversation.messages[1],
+      artifacts: [],
+      trace: [],
+      conversation: completedConversation,
+    },
+  );
+  fetchMock.get(
+    'http://agent.local/agent/conversations/conversation-1/rewrite-preview?from_message_id=message-1',
+    {
+      removed_message_count: 2,
+      memory_write_count: 1,
+      applied_changeset_items: [],
+      apply_group_ids: [],
+      unknown_applies: false,
+      executed_sql_count: 1,
+    },
+  );
+
+  render(<AiAgentPanel />, { useRedux: true, initialState });
+  await userEvent.type(
+    screen.getByPlaceholderText('Ask about this database'),
+    'Show top names',
+  );
+  await userEvent.click(screen.getByRole('button', { name: 'Send' }));
+  await screen.findByText('Here are the top names.');
+
+  await userEvent.click(screen.getByRole('button', { name: 'Regenerate' }));
+
+  // The dialog names the side effects and offers the learned-example cleanup.
+  await screen.findByText('Rewrite this conversation?');
+  expect(screen.getByTestId('rewrite-remove-learned')).toBeInTheDocument();
+  await userEvent.click(screen.getByTestId('rewrite-confirm'));
+  await waitFor(() => {
+    expect(
+      fetchMock.callHistory.calls(
+        'http://agent.local/agent/conversations/conversation-1/messages',
+      ),
+    ).toHaveLength(2);
+  });
+  const [, rewriteCall] = fetchMock.callHistory.calls(
+    'http://agent.local/agent/conversations/conversation-1/messages',
+  );
+  expect(JSON.parse(String(rewriteCall.options.body))).toMatchObject({
+    rewrite_from_message_id: 'message-1',
+    remove_learned_examples: true,
+  });
+});
+
+test('branches from a message into a new conversation with a back-link', async () => {
+  const { conversation, completedConversation } = buildTurn();
+  const fork = {
+    ...completedConversation,
+    id: 'conversation-2',
+    title: 'Top names (branch)',
+    parent_conversation_id: 'conversation-1',
+    forked_from_sequence: 0,
+    messages: [completedConversation.messages[0]].map(message => ({
+      ...message,
+      id: 'fork-message-1',
+    })),
+  };
+  fetchMock.post('http://agent.local/agent/conversations', conversation);
+  fetchMock.post(
+    'http://agent.local/agent/conversations/conversation-1/messages/stream',
+    404,
+  );
+  fetchMock.post(
+    'http://agent.local/agent/conversations/conversation-1/messages',
+    {
+      status: 'ok',
+      conversation_id: 'conversation-1',
+      message: completedConversation.messages[1],
+      artifacts: [],
+      trace: [],
+      conversation: completedConversation,
+    },
+  );
+  fetchMock.post(
+    'http://agent.local/agent/conversations/conversation-1/fork',
+    fork,
+  );
+
+  render(<AiAgentPanel />, { useRedux: true, initialState });
+  await userEvent.type(
+    screen.getByPlaceholderText('Ask about this database'),
+    'Show top names',
+  );
+  await userEvent.click(screen.getByRole('button', { name: 'Send' }));
+  await screen.findByText('Here are the top names.');
+
+  const branchButtons = screen.getAllByRole('button', {
+    name: 'Branch from here',
+  });
+  await userEvent.click(branchButtons[0]);
+
+  // Panel switched to the fork: branch title + back-link, original reply gone.
+  await waitFor(() => {
+    expect(screen.getByRole('heading', { level: 5 }).textContent).toContain(
+      'Top names (branch)',
+    );
+  });
+  expect(screen.getByTestId('branch-backlink')).toBeInTheDocument();
+  expect(screen.queryByText('Here are the top names.')).not.toBeInTheDocument();
+  const [forkCall] = fetchMock.callHistory.calls(
+    'http://agent.local/agent/conversations/conversation-1/fork',
+  );
+  expect(JSON.parse(String(forkCall.options.body))).toMatchObject({
+    message_id: 'message-1',
+  });
+});
+
+test('after a regenerate, the attempt pager exposes the replaced answer', async () => {
+  const { conversation, completedConversation } = buildTurn();
+  const regenerated = {
+    ...completedConversation,
+    messages: [
+      completedConversation.messages[0],
+      {
+        id: 'message-4',
+        role: 'assistant',
+        content: 'Second take.',
+        created_at: '2026-06-19T00:01:00Z',
+        artifacts: [],
+      },
+    ],
+  };
+  fetchMock.post('http://agent.local/agent/conversations', conversation);
+  fetchMock.post(
+    'http://agent.local/agent/conversations/conversation-1/messages/stream',
+    404,
+  );
+  fetchMock.post(
+    'http://agent.local/agent/conversations/conversation-1/messages',
+    () => {
+      const calls = fetchMock.callHistory.calls(
+        'http://agent.local/agent/conversations/conversation-1/messages',
+      );
+      const payload = calls.length > 1 ? regenerated : completedConversation;
+      return {
+        status: 'ok',
+        conversation_id: 'conversation-1',
+        message: payload.messages[1],
+        artifacts: [],
+        trace: [],
+        conversation: payload,
+      };
+    },
+  );
+  fetchMock.get(
+    'http://agent.local/agent/conversations/conversation-1/rewrite-preview?from_message_id=message-1',
+    {
+      removed_message_count: 2,
+      memory_write_count: 0,
+      applied_changeset_items: [],
+      apply_group_ids: [],
+      unknown_applies: false,
+      executed_sql_count: 0,
+    },
+  );
+  // Attempts for the anchor: empty after the first turn, one after the rewrite.
+  fetchMock.get(
+    'http://agent.local/agent/conversations/conversation-1/messages/message-1/attempts',
+    () => {
+      const rewriteHappened =
+        fetchMock.callHistory.calls(
+          'http://agent.local/agent/conversations/conversation-1/messages',
+        ).length > 1;
+      return rewriteHappened ? [completedConversation.messages[1]] : [];
+    },
+  );
+
+  render(<AiAgentPanel />, { useRedux: true, initialState });
+  await userEvent.type(
+    screen.getByPlaceholderText('Ask about this database'),
+    'Show top names',
+  );
+  await userEvent.click(screen.getByRole('button', { name: 'Send' }));
+  await screen.findByText('Here are the top names.');
+  expect(screen.queryByTestId('attempt-pager')).not.toBeInTheDocument();
+
+  await userEvent.click(screen.getByRole('button', { name: 'Regenerate' }));
+  await screen.findByText('Second take.');
+
+  // The pager shows the live answer as 2/2; stepping back shows attempt 1.
+  const pager = await screen.findByTestId('attempt-pager');
+  expect(pager).toHaveTextContent('2 / 2');
+  await userEvent.click(
+    within(pager).getByRole('button', { name: 'Previous attempt' }),
+  );
+  expect(await screen.findByTestId('attempt-viewing-note')).toBeInTheDocument();
+  expect(screen.getByText('Here are the top names.')).toBeInTheDocument();
+  await userEvent.click(
+    within(pager).getByRole('button', { name: 'Next attempt' }),
+  );
+  expect(screen.getByText('Second take.')).toBeInTheDocument();
 });

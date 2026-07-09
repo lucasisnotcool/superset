@@ -61,10 +61,12 @@ import {
   createConversation,
   deleteConversation,
   executeConversationSql,
+  forkConversation,
   getAgentBaseUrl,
   getAgentHealth,
   getConversation,
   getProjectSemanticLayerState,
+  getRewritePreview,
   getSemanticModeStatus,
   listConversations,
   listSemanticProjects,
@@ -73,16 +75,23 @@ import {
   streamExecuteConversationSql,
   StreamInterruptedError,
   StreamUnavailableError,
+  submitMessageFeedback,
+  undoConversationRewrite,
   updateConversationTitle,
+  getMessageAttempts,
   type AgentStep,
+  type ConversationMessage as ConversationMessageType,
   type ConversationProgressEvent,
+  type ConversationTurnRequest,
   type ConversationTurnResponse,
   type ExecutionMode,
+  type RewritePreview,
   type SemanticLayerState,
   type SemanticModeStatus,
   type SemanticProject,
   type SqlClassification,
 } from './api';
+import RewriteConfirmModal from './RewriteConfirmModal';
 import AiChartPreview from './AiChartPreview';
 import AuditInfoPanel from './AuditInfoPanel';
 import ExplainDialog from './ExplainDialog';
@@ -396,6 +405,18 @@ const Composer = styled.div`
   `}
 `;
 
+const UndoBar = styled.div`
+  ${({ theme }) => css`
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: ${theme.sizeUnit * 2}px;
+    padding: ${theme.sizeUnit}px ${theme.sizeUnit * 3}px;
+    border-top: 1px solid ${theme.colorBorderSecondary};
+    background: ${theme.colorBgLayout};
+  `}
+`;
+
 const pulseGlow = keyframes`
   0% {
     opacity: 0.9;
@@ -702,6 +723,24 @@ const AiAgentPanel = () => {
   } | null>(null);
   const [isPinnedToBottom, setIsPinnedToBottom] = useState(true);
   const [feedback, setFeedback] = useState<Record<string, 'up' | 'down'>>({});
+  // Inline edit & resend state: which user message is being edited, and the
+  // draft replacement text.
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [editingValue, setEditingValue] = useState('');
+  // Pending rewrite awaiting the side-effect confirm dialog (non-empty manifest).
+  const [rewriteConfirm, setRewriteConfirm] = useState<{
+    anchorId: string;
+    message: string;
+    preview: RewritePreview;
+  } | null>(null);
+  // Anchor of the last completed rewrite — powers the single-step "Undo" bar
+  // until the next turn starts.
+  const [undoAnchorId, setUndoAnchorId] = useState<string | null>(null);
+  // Superseded assistant attempts for the LAST turn (Claude.ai-style pager):
+  // `attempts` are the replaced answers (oldest first); `attemptIndex` is the
+  // one being viewed (`null` = the live answer).
+  const [attempts, setAttempts] = useState<ConversationMessageType[]>([]);
+  const [attemptIndex, setAttemptIndex] = useState<number | null>(null);
   const [semanticLayerState, setSemanticLayerState] =
     useState<SemanticLayerState | null>(null);
   // Whether the agent will actually apply semantic rewrite in the current scope,
@@ -1015,6 +1054,8 @@ const AiAgentPanel = () => {
     setError(null);
     setProgress(null);
     setLiveSteps([]);
+    // A fresh turn invalidates the single-step rewrite undo.
+    setUndoAnchorId(null);
     // Show the user's message immediately instead of a placeholder while the
     // agent works; it is reconciled once the turn response arrives.
     setPendingUserMessage(message);
@@ -1035,6 +1076,7 @@ const AiAgentPanel = () => {
         controller.signal,
       );
       setConversation(result.conversation);
+      refreshAttempts(result.conversation);
       // Surface a server-side grounding fallback. The backend honors the pinned
       // project_id only when it covers the schema; otherwise it grounds on a
       // different covering project and pins the conversation to THAT one. Re-sync
@@ -1135,6 +1177,8 @@ const AiAgentPanel = () => {
     try {
       const result = await getConversation(conversationId);
       setConversation(result);
+      setUndoAnchorId(null);
+      refreshAttempts(result);
       // Restore the project this thread was pinned to so its grounding stays
       // stable across reopen (the probe preserves a pin that still covers the
       // schema; an out-of-scope pin falls back to the heuristic default).
@@ -1197,7 +1241,222 @@ const AiAgentPanel = () => {
       .catch(() => dispatch(addInfoToast(t('Copy failed.'))));
   };
 
-  // Re-run the most recent user prompt to produce a fresh assistant turn.
+  // Refresh the last turn's superseded-attempt list (the `< n/m >` pager).
+  // Fail-open: attempts are an enrichment, never a blocker.
+  const refreshAttempts = async (target: Conversation | null) => {
+    setAttemptIndex(null);
+    if (!target || target.messages.length < 2) {
+      setAttempts([]);
+      return;
+    }
+    const last = target.messages[target.messages.length - 1];
+    if (last.role !== 'assistant') {
+      setAttempts([]);
+      return;
+    }
+    const anchor = [...target.messages]
+      .slice(0, -1)
+      .reverse()
+      .find(item => item.role === 'user');
+    if (!anchor) {
+      setAttempts([]);
+      return;
+    }
+    try {
+      setAttempts(await getMessageAttempts(target.id, anchor.id));
+    } catch {
+      setAttempts([]);
+    }
+  };
+
+  // Run one turn on an explicit conversation id with the shared loading /
+  // pending-bubble / error choreography. Used by rewrite and branch flows,
+  // which target a conversation other than (or ahead of) the `conversation`
+  // state at call time.
+  const runTurnOn = async (
+    conversationId: string,
+    payload: ConversationTurnRequest,
+    { onSuccess }: { onSuccess?: () => void } = {},
+  ) => {
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setIsLoading(true);
+    setError(null);
+    setProgress(null);
+    setLiveSteps([]);
+    setPendingUserMessage(payload.message);
+    try {
+      const result = await runConversationTurn(
+        conversationId,
+        payload,
+        controller.signal,
+      );
+      setConversation(result.conversation);
+      onSuccess?.();
+      refreshAttempts(result.conversation);
+      await refreshConversationSummaries();
+      if (result.status === 'error') {
+        dispatch(addDangerToast(t('The agent could not complete the turn.')));
+      }
+    } catch (ex) {
+      await handleTurnError(ex, conversationId, t('Agent request failed'));
+    } finally {
+      abortRef.current = null;
+      setIsLoading(false);
+      setProgress(null);
+      setPendingUserMessage(null);
+    }
+  };
+
+  // Execute a rewrite (edit & resend / regenerate): soft-truncate from the
+  // anchor user message and run the turn with the (possibly edited) content.
+  const runRewriteTurn = async (
+    anchorId: string,
+    message: string,
+    removeLearnedExamples: boolean,
+  ) => {
+    if (!conversation || !currentScope) {
+      return;
+    }
+    setEditingMessageId(null);
+    setRewriteConfirm(null);
+    setUndoAnchorId(null);
+    await runTurnOn(
+      conversation.id,
+      {
+        message,
+        scope: currentScope,
+        execution_mode: executionMode,
+        rewrite_from_message_id: anchorId,
+        remove_learned_examples: removeLearnedExamples,
+      },
+      { onSuccess: () => setUndoAnchorId(anchorId) },
+    );
+  };
+
+  // Entry point for edit & resend / regenerate: consult the side-effect
+  // manifest first. A clean rewrite runs without ceremony; anything that
+  // leaves durable side effects behind gets the confirm dialog.
+  const beginRewrite = async (anchorId: string, message: string) => {
+    if (!conversation || isLoading || !message.trim()) {
+      return;
+    }
+    try {
+      const preview = await getRewritePreview(conversation.id, anchorId);
+      const hasSideEffects =
+        preview.memory_write_count > 0 ||
+        preview.applied_changeset_items.length > 0 ||
+        preview.unknown_applies;
+      if (!hasSideEffects) {
+        await runRewriteTurn(anchorId, message.trim(), true);
+        return;
+      }
+      setRewriteConfirm({ anchorId, message: message.trim(), preview });
+    } catch (ex) {
+      dispatch(
+        addDangerToast(
+          ex instanceof Error ? ex.message : t('Could not prepare the edit.'),
+        ),
+      );
+    }
+  };
+
+  // "Branch from here": copy the thread up to (and including) the message into
+  // a new conversation and switch to it — the source thread stays untouched.
+  const onBranchFrom = async (messageId?: string | null) => {
+    if (!conversation) {
+      return;
+    }
+    try {
+      const fork = await forkConversation(conversation.id, messageId ?? null);
+      setConversation(fork);
+      setUndoAnchorId(null);
+      setEditingMessageId(null);
+      await refreshConversationSummaries();
+      dispatch(
+        addInfoToast(
+          t(
+            'Branched into “%s” — the original conversation is unchanged.',
+            fork.title,
+          ),
+        ),
+      );
+    } catch (ex) {
+      dispatch(
+        addDangerToast(
+          ex instanceof Error ? ex.message : t('Branching failed.'),
+        ),
+      );
+    }
+  };
+
+  // "Branch instead" from the rewrite dialog: leave this thread alone; fork up
+  // to the turn before the anchor and send the (edited) message there.
+  const branchInsteadOfRewrite = async (anchorId: string, message: string) => {
+    if (!conversation || !currentScope) {
+      return;
+    }
+    setRewriteConfirm(null);
+    setEditingMessageId(null);
+    const anchorIndex = messages.findIndex(item => item.id === anchorId);
+    try {
+      let targetId: string;
+      if (anchorIndex > 0) {
+        const fork = await forkConversation(
+          conversation.id,
+          messages[anchorIndex - 1].id,
+        );
+        setConversation(fork);
+        targetId = fork.id;
+      } else {
+        // Editing the first message: a branch shares no history — fresh thread.
+        const created = await createConversation(currentScope);
+        setConversation(created);
+        storeExecutionMode(created.id, executionMode);
+        targetId = created.id;
+      }
+      setUndoAnchorId(null);
+      await runTurnOn(targetId, {
+        message,
+        scope: currentScope,
+        execution_mode: executionMode,
+      });
+    } catch (ex) {
+      dispatch(
+        addDangerToast(
+          ex instanceof Error ? ex.message : t('Branching failed.'),
+        ),
+      );
+    }
+  };
+
+  // Single-step undo of the last rewrite (offered until the next turn starts).
+  const onUndoRewrite = async () => {
+    if (!conversation || !undoAnchorId || isLoading) {
+      return;
+    }
+    try {
+      const restored = await undoConversationRewrite(
+        conversation.id,
+        undoAnchorId,
+      );
+      setConversation(restored);
+      setUndoAnchorId(null);
+      refreshAttempts(restored);
+      await refreshConversationSummaries();
+      dispatch(addInfoToast(t('Rewrite undone — previous turns restored.')));
+    } catch (ex) {
+      dispatch(
+        addDangerToast(
+          ex instanceof Error ? ex.message : t('Undo failed.'),
+        ),
+      );
+    }
+  };
+
+  // Regenerate = rewrite of the last turn with its content unchanged
+  // (rewind-then-re-prompt). Replaces the earlier append-based behavior, which
+  // grew the thread with duplicate turns.
   const onRegenerate = () => {
     if (isLoading) {
       return;
@@ -1206,22 +1465,34 @@ const AiAgentPanel = () => {
       .reverse()
       .find(message => message.role === 'user');
     if (lastUserMessage?.content) {
-      onSend(lastUserMessage.content);
+      beginRewrite(lastUserMessage.id, lastUserMessage.content);
     }
   };
 
-  // Lightweight feedback hook: records the rating locally and acknowledges it.
-  // A backend feedback endpoint can later consume this signal.
+  const onStartEditMessage = (messageId: string, content: string) => {
+    if (isLoading) {
+      return;
+    }
+    setEditingMessageId(messageId);
+    setEditingValue(content);
+  };
+
+  // Persist the rating (upsert per user) and mirror it locally for instant UI.
   const onFeedback = (messageId: string, rating: 'up' | 'down') => {
+    const cleared = feedback[messageId] === rating;
     setFeedback(previous => {
       const next = { ...previous };
-      if (next[messageId] === rating) {
+      if (cleared) {
         delete next[messageId];
       } else {
         next[messageId] = rating;
       }
       return next;
     });
+    if (!cleared && conversation) {
+      // Fire-and-forget: feedback must never interrupt the conversation.
+      submitMessageFeedback(conversation.id, messageId, rating).catch(() => {});
+    }
     dispatch(addInfoToast(t('Thanks for the feedback.')));
   };
 
@@ -1323,6 +1594,21 @@ const AiAgentPanel = () => {
           <Tooltip title={getAgentBaseUrl()}>
             <MetaText>{healthLabel}</MetaText>
           </Tooltip>
+          {conversation?.parent_conversation_id && (
+            <Button
+              buttonSize="small"
+              buttonStyle="link"
+              data-test="branch-backlink"
+              onClick={() =>
+                onOpenConversation(
+                  conversation.parent_conversation_id as string,
+                )
+              }
+              icon={<Icons.BranchesOutlined iconSize="s" />}
+            >
+              {t('Branched — open original')}
+            </Button>
+          )}
         </Flex>
         <HeaderActions>
           <Button
@@ -1600,19 +1886,79 @@ const AiAgentPanel = () => {
             return (
               <MessageBlock key={message.id} data-message-role={message.role}>
                 {renderArtifactsBeforeMessage && artifactBlocks}
-                {message.content.trim() && (
-                  <MessageBubble data-message-role={message.role}>
-                    {message.role === 'assistant' ? (
-                      <MarkdownContent>
-                        <SafeMarkdown
-                          source={message.content}
-                          components={markdownComponents}
-                        />
-                      </MarkdownContent>
-                    ) : (
-                      message.content
-                    )}
+                {message.role === 'user' && editingMessageId === message.id ? (
+                  <MessageBubble
+                    data-message-role="user"
+                    data-test="message-edit-form"
+                  >
+                    <Flex vertical gap="small">
+                      <Input.TextArea
+                        autoFocus
+                        autoSize={{ minRows: 2, maxRows: 8 }}
+                        value={editingValue}
+                        onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
+                          setEditingValue(event.target.value)
+                        }
+                        onKeyDown={(
+                          event: KeyboardEvent<HTMLTextAreaElement>,
+                        ) => {
+                          if (event.key === 'Enter' && !event.shiftKey) {
+                            event.preventDefault();
+                            beginRewrite(message.id, editingValue);
+                          }
+                          if (event.key === 'Escape') {
+                            setEditingMessageId(null);
+                          }
+                        }}
+                      />
+                      <Flex gap="small" justify="end">
+                        <Button
+                          buttonSize="small"
+                          buttonStyle="tertiary"
+                          onClick={() => setEditingMessageId(null)}
+                        >
+                          {t('Cancel')}
+                        </Button>
+                        <Button
+                          buttonSize="small"
+                          buttonStyle="primary"
+                          disabled={!editingValue.trim() || isLoading}
+                          onClick={() => beginRewrite(message.id, editingValue)}
+                          data-test="message-edit-save"
+                        >
+                          {t('Save & resend')}
+                        </Button>
+                      </Flex>
+                    </Flex>
                   </MessageBubble>
+                ) : (
+                  message.content.trim() && (
+                    <MessageBubble data-message-role={message.role}>
+                      {message.role === 'assistant' ? (
+                        <MarkdownContent>
+                          {isLastMessage &&
+                            attemptIndex !== null &&
+                            attempts[attemptIndex] && (
+                              <MetaText data-test="attempt-viewing-note">
+                                {t('Previous attempt (read-only)')}
+                              </MetaText>
+                            )}
+                          <SafeMarkdown
+                            source={
+                              isLastMessage &&
+                              attemptIndex !== null &&
+                              attempts[attemptIndex]
+                                ? attempts[attemptIndex].content
+                                : message.content
+                            }
+                            components={markdownComponents}
+                          />
+                        </MarkdownContent>
+                      ) : (
+                        message.content
+                      )}
+                    </MessageBubble>
+                  )
                 )}
                 {!renderArtifactsBeforeMessage && artifactBlocks}
                 <MessageMeta data-message-role={message.role}>
@@ -1632,6 +1978,31 @@ const AiAgentPanel = () => {
                         icon={<Icons.CopyOutlined iconSize="s" />}
                       />
                     )}
+                    {message.role === 'user' && (
+                      <Button
+                        aria-label={t('Edit message')}
+                        tooltip={t('Edit & resend')}
+                        buttonSize="small"
+                        buttonStyle="link"
+                        disabled={isLoading}
+                        onClick={() =>
+                          onStartEditMessage(message.id, message.content)
+                        }
+                        icon={<Icons.EditOutlined iconSize="s" />}
+                      />
+                    )}
+                    <Button
+                      aria-label={t('Branch from here')}
+                      tooltip={t(
+                        'Branch from here — continue in a copy of this ' +
+                          'conversation up to this message',
+                      )}
+                      buttonSize="small"
+                      buttonStyle="link"
+                      disabled={isLoading}
+                      onClick={() => onBranchFrom(message.id)}
+                      icon={<Icons.BranchesOutlined iconSize="s" />}
+                    />
                     {message.role === 'assistant' && (
                       <>
                         <Button
@@ -1672,6 +2043,52 @@ const AiAgentPanel = () => {
                             onClick={onRegenerate}
                             icon={<Icons.ReloadOutlined iconSize="s" />}
                           />
+                        )}
+                        {isLastMessage && attempts.length > 0 && (
+                          <Flex
+                            align="center"
+                            gap={0}
+                            data-test="attempt-pager"
+                          >
+                            <Button
+                              aria-label={t('Previous attempt')}
+                              tooltip={t('Previous attempt')}
+                              buttonSize="small"
+                              buttonStyle="link"
+                              disabled={attemptIndex === 0}
+                              onClick={() =>
+                                setAttemptIndex(previous =>
+                                  previous === null
+                                    ? attempts.length - 1
+                                    : Math.max(0, previous - 1),
+                                )
+                              }
+                              icon={<Icons.CaretLeftOutlined iconSize="s" />}
+                            />
+                            <MetaText>
+                              {`${
+                                attemptIndex === null
+                                  ? attempts.length + 1
+                                  : attemptIndex + 1
+                              } / ${attempts.length + 1}`}
+                            </MetaText>
+                            <Button
+                              aria-label={t('Next attempt')}
+                              tooltip={t('Next attempt')}
+                              buttonSize="small"
+                              buttonStyle="link"
+                              disabled={attemptIndex === null}
+                              onClick={() =>
+                                setAttemptIndex(previous =>
+                                  previous === null ||
+                                  previous >= attempts.length - 1
+                                    ? null
+                                    : previous + 1,
+                                )
+                              }
+                              icon={<Icons.CaretRightOutlined iconSize="s" />}
+                            />
+                          </Flex>
                         )}
                       </>
                     )}
@@ -1731,6 +2148,45 @@ const AiAgentPanel = () => {
         userMessage={explainTarget?.message}
         steps={explainTarget?.live ? liveSteps : (explainTarget?.steps ?? [])}
       />
+
+      <RewriteConfirmModal
+        open={Boolean(rewriteConfirm)}
+        preview={rewriteConfirm?.preview ?? null}
+        onConfirm={removeLearned => {
+          if (rewriteConfirm) {
+            runRewriteTurn(
+              rewriteConfirm.anchorId,
+              rewriteConfirm.message,
+              removeLearned,
+            );
+          }
+        }}
+        onBranch={() => {
+          if (rewriteConfirm) {
+            branchInsteadOfRewrite(
+              rewriteConfirm.anchorId,
+              rewriteConfirm.message,
+            );
+          }
+        }}
+        onCancel={() => setRewriteConfirm(null)}
+      />
+
+      {undoAnchorId && !isLoading && (
+        <UndoBar data-test="rewrite-undo-bar">
+          <MetaText>
+            {t('Conversation edited — earlier turns were replaced.')}
+          </MetaText>
+          <Button
+            buttonSize="small"
+            buttonStyle="link"
+            onClick={onUndoRewrite}
+            icon={<Icons.UndoOutlined iconSize="s" />}
+          >
+            {t('Undo')}
+          </Button>
+        </UndoBar>
+      )}
 
       <Composer>
         <ComposerInput data-loading={isLoading}>

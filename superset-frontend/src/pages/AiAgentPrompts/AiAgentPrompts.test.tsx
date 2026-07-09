@@ -115,7 +115,6 @@ test('promote posts the version id', async () => {
 });
 
 test('permission errors surface as a readable alert', async () => {
-  fetchMock.get(LIST_URL, 403, { overwriteRoutes: false });
   fetchMock.removeRoutes({ names: undefined });
   fetchMock.clearHistory();
   fetchMock.get(LIST_URL, 403);

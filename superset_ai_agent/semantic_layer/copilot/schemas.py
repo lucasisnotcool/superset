@@ -217,6 +217,11 @@ class CopilotTurnRequest(BaseModel):
     # When omitted, the server falls back to AgentConfig.wren_copilot_max_steps
     # (env WREN_COPILOT_MAX_STEPS). An explicit value still overrides per-request.
     max_steps: int | None = Field(default=None, ge=2, le=24)
+    #: Edit & resend / regenerate (rewind-then-re-prompt): when set (requires
+    #: ``conversation_id``), the thread is soft-truncated from this user message
+    #: before the turn runs with ``message`` as the replacement content. Drafts
+    #: already applied by truncated turns stay applied (revert is explicit).
+    rewrite_from_message_id: str | None = None
 
 
 class ChangesetApplyRequest(BaseModel):

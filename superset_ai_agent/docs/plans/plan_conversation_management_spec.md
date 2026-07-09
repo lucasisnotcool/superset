@@ -1,6 +1,8 @@
 =# Conversation Management Spec — Edit & Resend, Regenerate, Fork (AI SQL agent + MDL Copilot)
 
-Status: PROPOSAL — awaiting sign-off on decision points DP-1..DP-7.
+Status: SHIPPED (2026-07-09) — all DPs taken at their recommended option; built per
+[plan_conversation_management_impl.md](plan_conversation_management_impl.md) (incl.
+Phase 2 revert/pager/feedback); residual gaps in that doc's Final report.
 Scope: both agent surfaces (SqlLab `AiAgentPanel`, Semantic Layer `CopilotPanel`) and the shared
 conversation store in `superset_ai_agent`.
 

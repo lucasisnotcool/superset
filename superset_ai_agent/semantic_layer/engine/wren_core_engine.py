@@ -107,12 +107,26 @@ class WrenCoreEngine:
                 manifest.to_base64_json(),
                 data_source=resolved,
             )
-            native_sql = ctx.transform_sql(semantic_sql)  # type: ignore[misc]
         except Exception as ex:  # pylint: disable=broad-except
+            # Manifest failed to load — an engine/manifest problem, not a problem
+            # with this SQL. A re-draft cannot fix it, so degrade (non-correctable).
             return _degraded(
                 semantic_sql,
                 dialect,
-                f"wren-core could not plan the SQL: {ex}",
+                f"wren-core could not load the manifest: {ex}",
+            )
+        try:
+            native_sql = ctx.transform_sql(semantic_sql)  # type: ignore[misc]
+        except Exception as ex:  # pylint: disable=broad-except
+            # wren-core REJECTED the SQL (e.g. unknown field/model). The SQL is
+            # invalid against the manifest — forwarding it to the physical DB
+            # would raise an opaque driver error (e.g. Oracle ORA-00904). Mark it
+            # correctable so the engine-feedback re-draft loop (1.4) fixes it
+            # rather than executing invalid SQL.
+            return _rejected(
+                semantic_sql,
+                dialect,
+                f"wren-core rejected the SQL: {ex}",
             )
         return PlannedSql(
             native_sql=native_sql,
@@ -124,7 +138,11 @@ class WrenCoreEngine:
 
 
 def _degraded(semantic_sql: str, dialect: str | None, reason: str) -> PlannedSql:
-    """Fall back to returning the input SQL unchanged, with a warning."""
+    """Fall back to returning the input SQL unchanged, with a warning.
+
+    Used when the engine cannot run at all (absent / unmapped dialect / bad
+    manifest). Not correctable — a semantic re-draft cannot change the outcome.
+    """
 
     return PlannedSql(
         native_sql=semantic_sql,
@@ -132,4 +150,22 @@ def _degraded(semantic_sql: str, dialect: str | None, reason: str) -> PlannedSql
         rewritten=False,
         referenced_tables=extract_referenced_tables(semantic_sql, dialect=dialect),
         warnings=[reason],
+    )
+
+
+def _rejected(semantic_sql: str, dialect: str | None, reason: str) -> PlannedSql:
+    """Engine rejected the SQL as invalid against the manifest (correctable).
+
+    The input SQL is returned unchanged (the engine produced nothing), but the
+    reason is flagged correctable so the re-draft loop engages instead of
+    forwarding invalid SQL to the physical database.
+    """
+
+    return PlannedSql(
+        native_sql=semantic_sql,
+        engine="wren_core",
+        rewritten=False,
+        referenced_tables=extract_referenced_tables(semantic_sql, dialect=dialect),
+        warnings=[reason],
+        correctable_warnings=[reason],
     )
