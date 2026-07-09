@@ -102,11 +102,18 @@ const rowsPreviewText = (rows?: Record<string, unknown>[] | null) => {
 export interface BenchmarksPanelProps {
   projectId: string;
   canWrite: boolean;
+  /**
+   * Whether the pane is visible. Tabs keep hidden panes mounted, so data
+   * loaded at mount goes stale when a sibling tab (e.g. Authoring) imports
+   * items — refetch every time the pane becomes active.
+   */
+  active?: boolean;
 }
 
 export default function BenchmarksPanel({
   projectId,
   canWrite,
+  active = true,
 }: BenchmarksPanelProps) {
   const dispatch = useDispatch();
   const [benchmarks, setBenchmarks] = useState<Benchmark[]>([]);
@@ -159,7 +166,13 @@ export default function BenchmarksPanel({
     try {
       const loaded = await listBenchmarks(projectId);
       setBenchmarks(loaded);
-      setBenchmarkId(current => current ?? loaded[0]?.id);
+      // Keep the selection only while it still exists (it may have been
+      // deleted elsewhere, or belong to a previously selected project).
+      setBenchmarkId(current =>
+        current && loaded.some(benchmark => benchmark.id === current)
+          ? current
+          : loaded[0]?.id,
+      );
     } catch (ex) {
       toastError(ex, t('Unable to load benchmarks'));
     } finally {
@@ -189,12 +202,16 @@ export default function BenchmarksPanel({
   }, [projectId, benchmarkId, toastError]);
 
   useEffect(() => {
-    refreshBenchmarks();
-  }, [refreshBenchmarks]);
+    if (active) {
+      refreshBenchmarks();
+    }
+  }, [active, refreshBenchmarks]);
 
   useEffect(() => {
-    refreshBenchmark();
-  }, [refreshBenchmark]);
+    if (active) {
+      refreshBenchmark();
+    }
+  }, [active, refreshBenchmark]);
 
   // Poll while a run is in flight so progress + completion surface without a
   // manual refresh (SSE events also nudge the project view; polling is the

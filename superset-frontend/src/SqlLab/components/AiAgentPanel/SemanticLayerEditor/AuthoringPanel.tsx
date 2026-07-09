@@ -57,6 +57,7 @@ import {
   AuthoringDraft,
   AuthoringMode,
   Benchmark,
+  createBenchmark,
   importBenchmarkItems,
   listBenchmarks,
   streamBenchmarkAuthoring,
@@ -95,10 +96,23 @@ const ORIGIN_COLORS: Record<AuthoredItem['origin'], string> = {
 export interface AuthoringPanelProps {
   projectId: string;
   canWrite: boolean;
+  /**
+   * Whether the pane is visible. Tabs keep hidden panes mounted, so the
+   * benchmark list loaded at mount goes stale when a sibling tab creates or
+   * deletes benchmarks — refetch every time the pane becomes active.
+   */
+  active?: boolean;
 }
 
 interface ReviewRow extends AuthoredItem {
   approved: boolean;
+  /**
+   * Raw editing buffer for expected_values rows: JSON must stay editable
+   * through invalid intermediate states, so the text is kept verbatim and
+   * only parsed into answer_spec once it is valid JSON again.
+   */
+  specText: string;
+  specInvalid: boolean;
 }
 
 const readFileText = (file: File): Promise<string> =>
@@ -122,10 +136,13 @@ const answerPreview = (item: AuthoredItem): string => {
 export default function AuthoringPanel({
   projectId,
   canWrite,
+  active = true,
 }: AuthoringPanelProps) {
   const dispatch = useDispatch();
   const [benchmarks, setBenchmarks] = useState<Benchmark[]>([]);
   const [benchmarkId, setBenchmarkId] = useState<string>();
+  const [newBenchmarkName, setNewBenchmarkName] = useState('');
+  const [creating, setCreating] = useState(false);
   const [csvText, setCsvText] = useState('');
   const [csvName, setCsvName] = useState<string>();
   const [contextText, setContextText] = useState('');
@@ -142,27 +159,58 @@ export default function AuthoringPanel({
   // input opened programmatically from the button's onClick.
   const csvInputRef = useRef<HTMLInputElement>(null);
   const contextInputRef = useRef<HTMLInputElement>(null);
-  useEffect(() => {
-    let cancelled = false;
-    listBenchmarks(projectId)
-      .then(loaded => {
-        if (cancelled) {
-          return;
-        }
-        setBenchmarks(loaded);
-        setBenchmarkId(prev => prev ?? loaded[0]?.id);
-      })
-      .catch((ex: Error) => {
-        if (!cancelled) {
-          dispatch(
-            addDangerToast(t('Could not load benchmarks: %s', ex.message)),
-          );
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
+  // Lets a hung or failed streaming request be cancelled so the Author
+  // button never stays stuck in its loading state (the retry path).
+  const abortRef = useRef<AbortController>();
+  useEffect(() => () => abortRef.current?.abort(), []);
+
+  const refreshBenchmarks = useCallback(async (): Promise<void> => {
+    try {
+      const loaded = await listBenchmarks(projectId);
+      setBenchmarks(loaded);
+      // Keep the selection only while it still exists (it may have been
+      // deleted elsewhere, or belong to a previously selected project).
+      setBenchmarkId(prev =>
+        prev && loaded.some(benchmark => benchmark.id === prev)
+          ? prev
+          : loaded[0]?.id,
+      );
+    } catch (ex) {
+      dispatch(
+        addDangerToast(
+          t('Could not load benchmarks: %s', (ex as Error).message),
+        ),
+      );
+    }
   }, [projectId, dispatch]);
+
+  useEffect(() => {
+    if (active) {
+      refreshBenchmarks();
+    }
+  }, [active, refreshBenchmarks]);
+
+  const onCreateBenchmark = useCallback(async () => {
+    const name = newBenchmarkName.trim();
+    if (!name) {
+      return;
+    }
+    setCreating(true);
+    try {
+      const created = await createBenchmark(projectId, { name });
+      setNewBenchmarkName('');
+      setBenchmarks(prev => [...prev, created]);
+      setBenchmarkId(created.id);
+    } catch (ex) {
+      dispatch(
+        addDangerToast(
+          t('Could not create benchmark: %s', (ex as Error).message),
+        ),
+      );
+    } finally {
+      setCreating(false);
+    }
+  }, [projectId, newBenchmarkName, dispatch]);
 
   const onFile = useCallback(
     async (
@@ -196,6 +244,9 @@ export default function AuthoringPanel({
     if (!benchmarkId || !csvText) {
       return;
     }
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
     setRunning(true);
     setSteps([]);
     setDraft(undefined);
@@ -209,7 +260,10 @@ export default function AuthoringPanel({
           context_text: contextText || undefined,
           mode,
         },
-        { onProgress: step => setSteps(prev => [...prev, step]) },
+        {
+          onProgress: step => setSteps(prev => [...prev, step]),
+          signal: controller.signal,
+        },
       );
       setDraft(result);
       setRows(
@@ -217,10 +271,21 @@ export default function AuthoringPanel({
           ...item,
           // Verified items pre-approve; flagged ones need an explicit human tick.
           approved: item.validation === 'verified',
+          specText: answerPreview(item),
+          specInvalid: false,
         })),
       );
     } catch (ex) {
-      dispatch(addDangerToast(t('Authoring failed: %s', (ex as Error).message)));
+      if ((ex as Error).name !== 'AbortError') {
+        dispatch(
+          addDangerToast(
+            t(
+              'Authoring failed: %s — click "Author draft" to retry.',
+              (ex as Error).message,
+            ),
+          ),
+        );
+      }
     } finally {
       setRunning(false);
     }
@@ -251,7 +316,8 @@ export default function AuthoringPanel({
       dispatch(
         addSuccessToast(
           t(
-            'Imported %s item(s); %s duplicate(s) skipped.',
+            'Imported %s item(s); %s duplicate(s) skipped. ' +
+              'Review and run them in the Benchmarks tab.',
             result.created,
             result.skipped_duplicates,
           ),
@@ -259,15 +325,21 @@ export default function AuthoringPanel({
       );
       result.errors.forEach(error => dispatch(addDangerToast(error)));
       setRows(prev => prev.filter(row => !row.approved));
+      // Keep the dropdown's item counts honest after the bulk insert.
+      await refreshBenchmarks();
     } catch (ex) {
       dispatch(addDangerToast(t('Import failed: %s', (ex as Error).message)));
     } finally {
       setImporting(false);
     }
-  }, [projectId, benchmarkId, rows, dispatch]);
+  }, [projectId, benchmarkId, rows, dispatch, refreshBenchmarks]);
 
   const approvedCount = useMemo(
     () => rows.filter(row => row.approved).length,
+    [rows],
+  );
+  const approvedInvalidCount = useMemo(
+    () => rows.filter(row => row.approved && row.specInvalid).length,
     [rows],
   );
 
@@ -292,6 +364,35 @@ export default function AuthoringPanel({
         )}
       </Typography.Text>
 
+      {benchmarks.length === 0 && (
+        <Flex gap={8} wrap="wrap" align="center">
+          <Alert
+            type="info"
+            message={t(
+              'Authored items are imported into a benchmark — create one first.',
+            )}
+          />
+          <Input
+            data-test="authoring-new-benchmark-name"
+            placeholder={t('New benchmark name')}
+            value={newBenchmarkName}
+            onChange={event => setNewBenchmarkName(event.target.value)}
+            onPressEnter={onCreateBenchmark}
+            css={css`
+              width: 200px;
+            `}
+          />
+          <Button
+            data-test="authoring-create-benchmark"
+            loading={creating}
+            disabled={!newBenchmarkName.trim()}
+            onClick={onCreateBenchmark}
+          >
+            {t('Create benchmark')}
+          </Button>
+        </Flex>
+      )}
+
       <Flex gap={8} wrap="wrap" align="center">
         <Select
           data-test="authoring-benchmark-select"
@@ -299,7 +400,7 @@ export default function AuthoringPanel({
           value={benchmarkId}
           onChange={value => setBenchmarkId(value as string)}
           options={benchmarks.map(benchmark => ({
-            label: benchmark.name,
+            label: t('%s (%s items)', benchmark.name, benchmark.item_count),
             value: benchmark.id,
           }))}
           css={css`
@@ -361,6 +462,14 @@ export default function AuthoringPanel({
         >
           {t('Author draft')}
         </Button>
+        {running && (
+          <Button
+            data-test="authoring-cancel"
+            onClick={() => abortRef.current?.abort()}
+          >
+            {t('Cancel')}
+          </Button>
+        )}
       </Flex>
 
       {steps.length > 0 && (
@@ -402,12 +511,47 @@ export default function AuthoringPanel({
         />
       )}
 
+      {draft?.context_doc && (
+        <Typography.Text type="secondary" data-test="authoring-context-note">
+          {t(
+            'The context document grounded this authoring pass only. To make ' +
+              'it available to the SQL agent at query time, upload it under ' +
+              "the project's Documents.",
+          )}
+        </Typography.Text>
+      )}
+
       {draft && rows.length === 0 && (
         <Empty description={t('The pass produced no importable items.')} />
       )}
 
       {rows.length > 0 && (
         <>
+          <Flex gap={8} align="center" wrap="wrap">
+            <Button
+              size="small"
+              data-test="authoring-approve-all"
+              disabled={approvedCount === rows.length}
+              onClick={() =>
+                setRows(prev => prev.map(row => ({ ...row, approved: true })))
+              }
+            >
+              {t('Approve all (%s)', rows.length)}
+            </Button>
+            <Button
+              size="small"
+              data-test="authoring-approve-none"
+              disabled={!approvedCount}
+              onClick={() =>
+                setRows(prev => prev.map(row => ({ ...row, approved: false })))
+              }
+            >
+              {t('Clear approvals')}
+            </Button>
+            <Typography.Text type="secondary">
+              {t('%s of %s approved', approvedCount, rows.length)}
+            </Typography.Text>
+          </Flex>
           <List
             data-test="authoring-draft-rows"
             bordered
@@ -452,7 +596,11 @@ export default function AuthoringPanel({
                       <Input.TextArea
                         data-test={`authoring-spec-${index}`}
                         autoSize={{ minRows: 1, maxRows: 6 }}
-                        value={answerPreview(row)}
+                        value={
+                          row.answer_type === 'expected_values'
+                            ? row.specText
+                            : answerPreview(row)
+                        }
                         onChange={event =>
                           setRows(prev =>
                             prev.map((r, i) => {
@@ -472,12 +620,42 @@ export default function AuthoringPanel({
                                   answer_spec: { note: value },
                                 };
                               }
-                              return r;
+                              let parsed:
+                                | Record<string, unknown>
+                                | undefined;
+                              try {
+                                const candidate = JSON.parse(value);
+                                if (
+                                  candidate &&
+                                  typeof candidate === 'object' &&
+                                  !Array.isArray(candidate)
+                                ) {
+                                  parsed = candidate;
+                                }
+                              } catch {
+                                // keep editing through invalid states
+                              }
+                              return {
+                                ...r,
+                                specText: value,
+                                specInvalid: !parsed,
+                                answer_spec: parsed ?? r.answer_spec,
+                              };
                             }),
                           )
                         }
-                        disabled={row.answer_type === 'expected_values'}
                       />
+                      {row.specInvalid && (
+                        <Typography.Text
+                          type="danger"
+                          data-test={`authoring-spec-invalid-${index}`}
+                        >
+                          {t(
+                            'Expected values must be a JSON object, e.g. ' +
+                              '{"nums": [42], "names": ["EMEA"]}',
+                          )}
+                        </Typography.Text>
+                      )}
                       {row.problems.map(problem => (
                         <Typography.Text key={problem} type="warning">
                           {problem}
@@ -489,16 +667,24 @@ export default function AuthoringPanel({
               </List.Item>
             )}
           />
-          <Flex gap={8}>
+          <Flex gap={8} align="center">
             <Button
               type="primary"
               data-test="authoring-import"
-              disabled={!approvedCount}
+              disabled={!approvedCount || approvedInvalidCount > 0}
               loading={importing}
               onClick={onImport}
             >
               {t('Import %s approved item(s)', approvedCount)}
             </Button>
+            {approvedInvalidCount > 0 && (
+              <Typography.Text type="danger">
+                {t(
+                  '%s approved row(s) have invalid JSON — fix them to import.',
+                  approvedInvalidCount,
+                )}
+              </Typography.Text>
+            )}
           </Flex>
         </>
       )}

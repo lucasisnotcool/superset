@@ -519,3 +519,51 @@ optional `wren_benchmark_author_model: str | None`, `wren_benchmark_author_max_s
   rig's grounding matrix as offline science; strip only the product surface).
 - Native Superset dashboard vs in-app BenchmarksPanel charts as the *primary* results
   surface — DP-B6 (plan builds the dataset either way; dashboard polish scales with this).
+
+## 8. Post-ship UI fix pass (2026-07-10, user-reported)
+
+Live-UI defects reported after first real use, all fixed + regression-tested
+(53 jest across 4 suites green, `tsc --noEmit` clean):
+
+- [x] **File pickers dead** — antd `<Button>` nested in `<label htmlFor>` swallows
+  the label activation (HTML spec: interactive content). Fixed with the
+  AttachDocumentDialog ref-click idiom (`csvInputRef.current?.click()`); regression
+  test clicks the visible buttons and spies on `input.click`.
+- [x] **Benchmarks tab stale after Authoring import** — antd Tabs keep hidden panes
+  mounted; BenchmarksPanel fetched only on mount/selection change. Fixed by tracking
+  `activeContentTab` in `index.tsx` (`onChange` on ContentTabs) and passing
+  `active` to BenchmarksPanel / AuthoringPanel / GoldenQueriesPanel; each refetches
+  every time its pane becomes active (also recovers from transient fetch failures —
+  the "(31) in dropdown, empty list" symptom). InstructionsPanel deliberately NOT
+  given the pattern: it is an editable form; silent refetch could clobber unsaved text.
+- [x] **Stale `benchmarkId` across project switches/deletes** — `current ?? loaded[0]`
+  kept a selection that no longer exists; both panels validate the selection against
+  the freshly loaded list.
+- [x] **502 left Author button stuck / no retry** — `AbortController` threaded into
+  `streamBenchmarkAuthoring` (`signal` was already supported); Cancel button shown
+  while running; abort on unmount; failure toast says "click Author draft to retry";
+  regression test proves a failed run can be re-clicked (2 POSTs).
+- [x] **Zero-benchmark dead end in Authoring** — inline "New benchmark name + Create"
+  affordance when the project has no benchmarks (was: disabled Author button, no hint).
+- [x] Post-import: benchmark dropdown counts refresh, toast points at Benchmarks tab;
+  Authoring dropdown labels now include item counts.
+- [x] Context-doc expectation gap surfaced in UI: note that the context .md grounds
+  the authoring pass only — query-time RAG needs it uploaded under Documents.
+
+Verified NOT broken server-side: nginx `/ai-agent/` has `proxy_buffering off` +
+`proxy_read_timeout 3600`, and the authoring stream emits keep-alive frames — the
+reported 502 was a genuine upstream/connection failure, so the fix is client-side
+retryability, not stream plumbing.
+
+### §8 follow-up (same day): review-grid gaps closed
+
+- [x] **expected_values rows editable** — the review grid's spec TextArea now edits
+  all three answer types; expected_values keeps a raw `specText` buffer so JSON
+  stays editable through invalid intermediate states, parses into `answer_spec`
+  when valid, flags the row (`authoring-spec-invalid-*`) and disables Import while
+  any APPROVED row holds invalid JSON (client-side mirror of the server's
+  `_validated_answer_spec` gate).
+- [x] **Approve all / Clear approvals** toolbar above the draft rows (+ "N of M
+  approved" counter). Approve-all ticks needs_review rows too — the human click is
+  the review act; import still stamps verified_by.
+- Evidence: AuthoringPanel jest 9/9, `tsc --noEmit` exit 0.

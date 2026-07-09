@@ -118,6 +118,24 @@ const renderPanel = (canWrite = true) =>
     useRedux: true,
   });
 
+test('re-activating the pane refetches benchmarks and items', async () => {
+  // Regression: Tabs keep hidden panes mounted, so items imported from the
+  // Authoring tab never appeared when toggling back to Benchmarks.
+  itemsResponse = [];
+  const { rerender } = render(
+    <BenchmarksPanel projectId="proj-1" canWrite active />,
+    { useRedux: true },
+  );
+  expect(await screen.findByText(/No test questions yet/)).toBeInTheDocument();
+
+  // A sibling tab imports an item while this pane is hidden.
+  itemsResponse = [ITEM];
+  rerender(<BenchmarksPanel projectId="proj-1" canWrite active={false} />);
+  rerender(<BenchmarksPanel projectId="proj-1" canWrite active />);
+
+  expect(await screen.findByText('Revenue by region?')).toBeInTheDocument();
+});
+
 test('lists benchmark questions with type and verified badges', async () => {
   renderPanel();
   expect(await screen.findByText('Revenue by region?')).toBeInTheDocument();

@@ -83,9 +83,12 @@ const sseBody = [
   '',
 ].join('\n');
 
+let benchmarksResponse: unknown[];
+
 beforeEach(() => {
   process.env.SUPERSET_AI_AGENT_URL = 'http://agent.local/';
-  fetchMock.get(BASE, [BENCHMARK]);
+  benchmarksResponse = [BENCHMARK];
+  fetchMock.get(BASE, () => benchmarksResponse);
 });
 
 afterEach(() => {
@@ -193,5 +196,182 @@ test('a streamed error event surfaces as a toast, not a crash', async () => {
   await userEvent.click(run);
   await waitFor(() =>
     expect(screen.queryByTestId('authoring-draft-rows')).not.toBeInTheDocument(),
+  );
+});
+
+test('expected_values rows are editable JSON and invalid JSON gates import', async () => {
+  const evDraft = {
+    items: [
+      {
+        question: 'Total revenue?',
+        answer_type: 'expected_values',
+        answer_spec: { nums: [1] },
+        capability_tags: [],
+        origin: 'extracted',
+        validation: 'verified',
+        problems: [],
+      },
+    ],
+    context_doc: null,
+    warnings: [],
+    steps_taken: 1,
+    model_failed: false,
+  };
+  fetchMock.post(`${BASE}/bm-1/author/stream`, {
+    body: `data: ${JSON.stringify({ type: 'complete', draft: evDraft })}\n\n`,
+    headers: { 'Content-Type': 'text/event-stream' },
+  });
+  fetchMock.post(`${BASE}/bm-1/items/import`, {
+    created: 1,
+    skipped_duplicates: 0,
+    errors: [],
+  });
+
+  renderPanel();
+  await uploadCsv();
+  const run = await screen.findByTestId('authoring-run');
+  await waitFor(() => expect(run).toBeEnabled());
+  await userEvent.click(run);
+
+  const spec = await screen.findByTestId('authoring-spec-0');
+  expect(spec).toBeEnabled();
+
+  // Invalid JSON keeps the text editable, flags the row and gates import.
+  await userEvent.clear(spec);
+  await userEvent.paste(spec, '{broken');
+  expect(
+    await screen.findByTestId('authoring-spec-invalid-0'),
+  ).toBeInTheDocument();
+  expect(screen.getByTestId('authoring-import')).toBeDisabled();
+
+  // Fixing the JSON clears the flag and the edited spec is what imports.
+  await userEvent.clear(spec);
+  await userEvent.paste(spec, '{"nums": [42], "names": ["EMEA"]}');
+  await waitFor(() =>
+    expect(
+      screen.queryByTestId('authoring-spec-invalid-0'),
+    ).not.toBeInTheDocument(),
+  );
+  await userEvent.click(screen.getByTestId('authoring-import'));
+  await waitFor(() =>
+    expect(
+      fetchMock.callHistory.calls(`${BASE}/bm-1/items/import`),
+    ).toHaveLength(1),
+  );
+  const [call] = fetchMock.callHistory.calls(`${BASE}/bm-1/items/import`);
+  const payload = JSON.parse(String(call.options?.body));
+  expect(payload.items[0].answer_spec).toEqual({
+    nums: [42],
+    names: ['EMEA'],
+  });
+});
+
+test('Approve all ticks every row, Clear approvals unticks them', async () => {
+  fetchMock.post(`${BASE}/bm-1/author/stream`, {
+    body: sseBody,
+    headers: { 'Content-Type': 'text/event-stream' },
+  });
+  fetchMock.post(`${BASE}/bm-1/items/import`, {
+    created: 2,
+    skipped_duplicates: 0,
+    errors: [],
+  });
+
+  renderPanel();
+  await uploadCsv();
+  const run = await screen.findByTestId('authoring-run');
+  await waitFor(() => expect(run).toBeEnabled());
+  await userEvent.click(run);
+  await screen.findByText('Who buys most?');
+
+  // The needs_review row starts unapproved; Approve all ticks it too.
+  await userEvent.click(screen.getByTestId('authoring-approve-all'));
+  screen
+    .getAllByRole('checkbox')
+    .forEach(checkbox => expect(checkbox).toBeChecked());
+
+  await userEvent.click(screen.getByTestId('authoring-approve-none'));
+  screen
+    .getAllByRole('checkbox')
+    .forEach(checkbox => expect(checkbox).not.toBeChecked());
+  expect(screen.getByTestId('authoring-import')).toBeDisabled();
+
+  // Approve all → import sends BOTH rows.
+  await userEvent.click(screen.getByTestId('authoring-approve-all'));
+  await userEvent.click(screen.getByTestId('authoring-import'));
+  await waitFor(() =>
+    expect(
+      fetchMock.callHistory.calls(`${BASE}/bm-1/items/import`),
+    ).toHaveLength(1),
+  );
+  const [call] = fetchMock.callHistory.calls(`${BASE}/bm-1/items/import`);
+  const payload = JSON.parse(String(call.options?.body));
+  expect(payload.items).toHaveLength(2);
+});
+
+test('a failed run can be retried by clicking Author draft again', async () => {
+  // Regression: a 502/connection failure must leave the button ready for a
+  // rerun, not stuck in its loading state.
+  const streamUrl = `${BASE}/bm-1/author/stream`;
+  fetchMock.post(streamUrl, {
+    body: `data: ${JSON.stringify({ type: 'error', detail: 'upstream 502' })}\n\n`,
+    headers: { 'Content-Type': 'text/event-stream' },
+  });
+  renderPanel();
+  await uploadCsv();
+  const run = await screen.findByTestId('authoring-run');
+  await waitFor(() => expect(run).toBeEnabled());
+
+  await userEvent.click(run);
+  // The Cancel affordance disappears when the run settles (failure included).
+  await waitFor(() =>
+    expect(screen.queryByTestId('authoring-cancel')).not.toBeInTheDocument(),
+  );
+  expect(fetchMock.callHistory.calls(streamUrl)).toHaveLength(1);
+
+  await waitFor(() => expect(run).toBeEnabled());
+  await userEvent.click(run);
+  await waitFor(() =>
+    expect(fetchMock.callHistory.calls(streamUrl)).toHaveLength(2),
+  );
+});
+
+test('with no benchmarks, inline create unblocks authoring', async () => {
+  benchmarksResponse = [];
+  fetchMock.post(BASE, { ...BENCHMARK, id: 'bm-9', name: 'Fresh' });
+  renderPanel();
+
+  const nameInput = await screen.findByTestId('authoring-new-benchmark-name');
+  await userEvent.type(nameInput, 'Fresh');
+  await userEvent.click(screen.getByTestId('authoring-create-benchmark'));
+
+  // The created benchmark is selected and the create affordance goes away.
+  await waitFor(() =>
+    expect(
+      screen.queryByTestId('authoring-create-benchmark'),
+    ).not.toBeInTheDocument(),
+  );
+  expect(
+    fetchMock.callHistory.calls(BASE, { method: 'POST' }),
+  ).toHaveLength(1);
+});
+
+test('re-activating the pane refetches the benchmark list', async () => {
+  // Tabs keep hidden panes mounted; a benchmark created or filled from a
+  // sibling tab must appear when the user toggles back.
+  const { rerender } = render(
+    <AuthoringPanel projectId="proj-1" canWrite active />,
+    { useRedux: true },
+  );
+  await screen.findByTestId('authoring-run');
+  const callsBefore = fetchMock.callHistory.calls(BASE).length;
+
+  rerender(<AuthoringPanel projectId="proj-1" canWrite active={false} />);
+  rerender(<AuthoringPanel projectId="proj-1" canWrite active />);
+
+  await waitFor(() =>
+    expect(fetchMock.callHistory.calls(BASE).length).toBeGreaterThan(
+      callsBefore,
+    ),
   );
 });

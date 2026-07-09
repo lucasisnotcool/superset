@@ -69,11 +69,18 @@ const parseQueries = (file: MdlFile | undefined): GoldenQuery[] => {
 export interface GoldenQueriesPanelProps {
   projectId: string;
   canWrite: boolean;
+  /**
+   * Whether the pane is visible. Tabs keep hidden panes mounted, so queries
+   * promoted from the Benchmarks tab never appeared here without a remount —
+   * refetch every time the pane becomes active.
+   */
+  active?: boolean;
 }
 
 export default function GoldenQueriesPanel({
   projectId,
   canWrite,
+  active = true,
 }: GoldenQueriesPanelProps) {
   const dispatch = useDispatch();
   const [file, setFile] = useState<MdlFile | undefined>(undefined);
@@ -102,8 +109,10 @@ export default function GoldenQueriesPanel({
   }, [projectId, dispatch]);
 
   useEffect(() => {
-    refresh();
-  }, [refresh]);
+    if (active) {
+      refresh();
+    }
+  }, [active, refresh]);
 
   const removeQuery = async (entry: GoldenQuery) => {
     if (!file) {

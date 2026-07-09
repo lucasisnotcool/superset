@@ -438,6 +438,9 @@ export default function SemanticLayerEditor({
   );
   const [editorPath, setEditorPath] = useState('models/new_model.json');
   const [editorValue, setEditorValue] = useState(defaultMdl);
+  // Tabs keep hidden panes mounted; data panels take `active` so they can
+  // refetch on activation instead of showing state from their first mount.
+  const [activeContentTab, setActiveContentTab] = useState('models');
   const [showOnboardPicker, setShowOnboardPicker] = useState(false);
   const [showAutoOnboard, setShowAutoOnboard] = useState(false);
   // The kickstart handed to the Copilot when the user confirms Auto-onboard. A
@@ -1480,6 +1483,7 @@ export default function SemanticLayerEditor({
               <RecoveryBanner projectId={project.id} canWrite={canWrite} />
               <ContentTabs
                 defaultActiveKey="models"
+                onChange={key => setActiveContentTab(key)}
                 items={[
                   {
                     key: 'models',
@@ -1819,6 +1823,7 @@ export default function SemanticLayerEditor({
                       <GoldenQueriesPanel
                         projectId={project?.id ?? ''}
                         canWrite={canWrite}
+                        active={activeContentTab === 'golden-queries'}
                       />
                     ),
                   },
@@ -1829,6 +1834,7 @@ export default function SemanticLayerEditor({
                       <BenchmarksPanel
                         projectId={project?.id ?? ''}
                         canWrite={canWrite}
+                        active={activeContentTab === 'benchmarks'}
                       />
                     ),
                   },
@@ -1839,6 +1845,7 @@ export default function SemanticLayerEditor({
                       <AuthoringPanel
                         projectId={project?.id ?? ''}
                         canWrite={canWrite}
+                        active={activeContentTab === 'authoring'}
                       />
                     ),
                   },
