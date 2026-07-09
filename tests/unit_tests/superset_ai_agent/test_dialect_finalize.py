@@ -119,6 +119,36 @@ def test_finalization_guidance_for_oracle() -> None:
     assert "ANSI-standard" in g or "portable" in g.lower() or "avoid" in g.lower()
 
 
+def test_finalization_guidance_steers_limit_not_fetch() -> None:
+    # wren-core (DataFusion) rejects the FETCH clause in semantic SQL, so the
+    # guidance must steer toward LIMIT — telling the model to write "ANSI" SQL
+    # (whose standard row cap IS `FETCH FIRST`) sent it into the engine gap.
+    from superset_ai_agent.semantic_layer.engine.dialect_finalize import (
+        finalization_guidance,
+    )
+
+    g = finalization_guidance("oracle")
+    assert g is not None
+    assert "LIMIT n" in g
+    assert "FETCH FIRST" in g  # named explicitly as the thing to avoid
+    assert "ANSI" not in g
+
+
+def test_semantic_guidance_steers_limit_in_both_graphs() -> None:
+    # The guidance string is intentionally duplicated in the two graphs; the
+    # FETCH-rejection steer must be present in both and the copies must not
+    # drift.
+    from superset_ai_agent import conversation_graph, graph
+
+    for guidance in (
+        conversation_graph._SEMANTIC_SQL_GUIDANCE,
+        graph._SEMANTIC_SQL_GUIDANCE,
+    ):
+        assert "LIMIT n" in guidance
+        assert "FETCH FIRST" in guidance
+    assert conversation_graph._SEMANTIC_SQL_GUIDANCE == graph._SEMANTIC_SQL_GUIDANCE
+
+
 def test_finalization_guidance_none_for_native_or_disabled() -> None:
     from superset_ai_agent.semantic_layer.engine.dialect_finalize import (
         finalization_guidance,
@@ -148,6 +178,59 @@ def test_oracle_preserves_reserved_words_quoted_and_mixed_case() -> None:
     result = finalize_native_sql(sql, backend="oracle")
     assert '"NUMBER"' in result.sql  # reserved word, still quoted
     assert '"MixedCase"' in result.sql  # untouched
+
+
+# Byte-for-byte shape of wren-core 0.7.1 `transform_sql` output for a one-model
+# manifest (verified by live repro): the internal ``__source`` alias is UNQUOTED,
+# which Oracle rejects with ORA-00911 (nonquoted identifiers must start with a
+# letter).
+_WREN_UNQUOTED_OUT = (
+    "SELECT count(DISTINCT table_x.lot_id) AS current_wip "
+    "FROM (SELECT table_x.lot_id "
+    "FROM (SELECT __source.lot_id AS lot_id "
+    "FROM schema_f.table_x AS __source) AS table_x) AS table_x"
+)
+
+
+def test_oracle_quotes_wren_source_alias() -> None:
+    # The ORA-00911 root cause: every wren model expansion aliases the physical
+    # table as ``__source``; unquoted, Oracle rejects the leading underscore.
+    result = finalize_native_sql(_WREN_UNQUOTED_OUT, backend="oracle")
+    assert result.transpiled is True
+    # Both the alias definition and its column references must be quoted, and no
+    # bare ``__source`` may survive anywhere in the emitted SQL.
+    assert '"__source".lot_id' in result.sql
+    assert 'table_x "__source"' in result.sql
+    assert "__source" not in result.sql.replace('"__source"', "")
+
+
+def test_oracle_quoted_source_alias_is_not_case_folded() -> None:
+    # Quoting runs after the uppercase fold: the alias keeps its authored case so
+    # definition and references stay byte-identical.
+    result = finalize_native_sql(_WREN_UNQUOTED_OUT, backend="oracle")
+    assert "__SOURCE" not in result.sql
+
+
+def test_oracle_leaves_safe_unquoted_identifiers_unquoted() -> None:
+    # Ordinary identifiers (letter-leading) stay unquoted — Oracle's own case
+    # folding must keep applying to them.
+    result = finalize_native_sql(_WREN_UNQUOTED_OUT, backend="oracle")
+    assert '"lot_id"' not in result.sql
+    assert '"table_x"' not in result.sql
+    assert '"schema_f"' not in result.sql
+
+
+def test_oracle_quotes_any_invalid_leading_character() -> None:
+    result = finalize_native_sql("SELECT _weird FROM t AS _alias", backend="oracle")
+    assert '"_weird"' in result.sql
+    assert '"_alias"' in result.sql
+
+
+def test_mssql_does_not_quote_underscore_identifiers() -> None:
+    # T-SQL regular identifiers may start with ``_`` — no quoting needed there.
+    result = finalize_native_sql(_WREN_UNQUOTED_OUT, backend="mssql")
+    assert '"__source"' not in result.sql
+    assert "[__source]" not in result.sql
 
 
 def test_mssql_does_not_uppercase_identifiers() -> None:

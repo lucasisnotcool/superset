@@ -123,7 +123,9 @@ _SEMANTIC_SQL_GUIDANCE = (
     "rewrites your query into native SQL. A metric is a formula, NOT a "
     "selectable column: substitute its measure expression inline (e.g. write "
     "SUM(amount) AS total_revenue), never SELECT the metric by its name. "
-    "Never reference tables or columns absent from the provided semantic context."
+    "Never reference tables or columns absent from the provided semantic context. "
+    "To cap rows write LIMIT n; never write FETCH FIRST ... ROWS ONLY — the "
+    "semantic engine cannot parse the FETCH clause and rejects the query."
 )
 
 

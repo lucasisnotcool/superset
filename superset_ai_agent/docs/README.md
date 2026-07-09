@@ -90,6 +90,9 @@ The founding design corpus; code comments cite these by name and section.
   says Draft).
 - [plan_relationships_only_activation_fix.md](plans/plan_relationships_only_activation_fix.md):
   let relationships-only MDL files activate (Implemented Phases 1–5).
+- [plan_mdl_activation_stability_impl.md](plans/plan_mdl_activation_stability_impl.md):
+  deterministic MDL activation — schema-qualified column truth, eager
+  budget-exempt reflection at the gate, onboarding gate parity (In progress).
 - [plan_ai_sql_project_selection_spec.md](plans/plan_ai_sql_project_selection_spec.md):
   AI SQL agent MDL-project picker + per-conversation pin (Shipped Tier 1+2).
 - [plan_conversation_management_spec.md](plans/plan_conversation_management_spec.md)
@@ -241,6 +244,10 @@ The founding design corpus; code comments cite these by name and section.
   Superset-core dataset endpoint performance — eager-load + ETag, picker
   storm (Implemented Tracks 0/A/B/C; scope is Superset core, filed here with
   the fork's planning corpus).
+- [plan_oracle_ora00911_fix_impl.md](plans/plan_oracle_ora00911_fix_impl.md):
+  Oracle ORA-00911 semantic-pipeline fix — quote wren-core's unquoted
+  `__source` alias in dialect finalization, duplicate-gate error surfacing,
+  LIMIT-not-FETCH authoring guidance (Shipped, all items).
 - [plan_testing_platform_impl.md](plans/plan_testing_platform_impl.md):
   testing & evaluation platform — benchmarks, run job, prompt registry, judge,
   Scientist (**Active** — P0+P1 shipped, P2/P3 in progress; spec at

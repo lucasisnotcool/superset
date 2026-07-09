@@ -34,12 +34,19 @@ ensure the backend is in ``BACKEND_TO_WREN_DIALECT``.
 from __future__ import annotations
 
 import logging
+import re
 
 import sqlglot
 from pydantic import BaseModel, Field
 from sqlglot import exp
 
 logger = logging.getLogger(__name__)
+
+#: Oracle's nonquoted-identifier grammar: must start with a letter, then
+#: letters/digits/``_``/``$``/``#``. Anything else — notably wren-core's internal
+#: ``__source`` alias, whose leading underscore Oracle rejects with ORA-00911
+#: "invalid character" — must be quoted to execute at all.
+_ORACLE_SAFE_UNQUOTED = re.compile(r"^[A-Za-z][A-Za-z0-9_$#]*$")
 
 #: Target dialects whose UNQUOTED identifiers fold to UPPERCASE at parse time AND
 #: whose columns SQLAlchemy reflects back as lowercase (so Superset's metadata — and
@@ -101,9 +108,12 @@ def finalization_guidance(backend: str | None, *, enabled: bool = True) -> str |
         return None
     return (
         f"Note: this database's SQL is finalized by transpiling the engine's "
-        f"output to {target}. Prefer ANSI-standard SQL and semantic-layer metrics; "
-        f"avoid engine- or dialect-specific functions that may not translate to "
-        f"{target}."
+        f"output to {target}. Write portable, engine-parseable SQL and "
+        f"semantic-layer metrics; avoid {target}-specific functions or syntax "
+        f"the semantic engine cannot parse. To cap rows, write LIMIT n — it is "
+        f"transpiled to the correct {target} clause automatically. Never write "
+        f"FETCH FIRST ... ROWS ONLY: the semantic engine rejects the FETCH "
+        f"clause."
     )
 
 
@@ -121,6 +131,24 @@ def _fold_lowercase_identifiers_upper(expression: exp.Expression) -> None:
     for identifier in expression.find_all(exp.Identifier):
         if identifier.quoted and identifier.name.islower():
             identifier.set("this", identifier.name.upper())
+
+
+def _quote_invalid_unquoted_identifiers(expression: exp.Expression) -> None:
+    """Quote identifiers Oracle rejects unquoted (ORA-00911), in place.
+
+    wren-core expands every model as ``SELECT __source.col ... FROM tbl AS
+    __source`` with its internal ``__source`` alias UNQUOTED, and sqlglot's
+    Oracle writer preserves the unquoted flag — so every semantic query reached
+    Oracle with an identifier whose leading underscore raises ORA-00911.
+    Quoting is safe: the alias definition and all its references render from
+    this same tree, so they stay consistent. Runs AFTER the uppercase fold so a
+    newly-quoted name keeps its authored case — SQLAlchemy preserves the stored
+    case of names that require quoting, so folding them would mismatch storage.
+    """
+
+    for identifier in expression.find_all(exp.Identifier):
+        if not identifier.quoted and not _ORACLE_SAFE_UNQUOTED.match(identifier.name):
+            identifier.set("quoted", True)
 
 
 def finalize_native_sql(
@@ -147,6 +175,7 @@ def finalize_native_sql(
         tree = sqlglot.parse_one(native_sql, read=WREN_OUTPUT_READ_DIALECT)
         if target in UPPERCASE_FOLD_DIALECTS:
             _fold_lowercase_identifiers_upper(tree)
+            _quote_invalid_unquoted_identifiers(tree)
         finalized = tree.sql(dialect=target)
     except Exception as ex:  # pylint: disable=broad-except
         logger.debug("dialect finalization to %s failed", target, exc_info=True)

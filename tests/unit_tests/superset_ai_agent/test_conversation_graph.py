@@ -706,6 +706,73 @@ def test_conversation_graph_skips_duplicate_sql_retry() -> None:
     assert duplicate_reflection_payload["sql_observations"][-1]["is_duplicate"] is True
 
 
+def test_duplicate_sql_observation_repeats_the_prior_execution_error() -> None:
+    # A duplicate retry after a FAILED execution must repeat the underlying
+    # driver error (e.g. ORA-00911) — the generic "materially different query"
+    # message alone hides the real cause from the model.
+    store = InMemoryConversationStore()
+    scope = ConversationScope(database_id=1, dataset_ids=[16])
+    conversation = store.create(scope)
+    superset_client = FakeSupersetClient(
+        results=[RuntimeError("ORA-00911: invalid character")]
+    )
+    repeated_sql = (
+        "SELECT name, SUM(num) AS total_births FROM birth_names GROUP BY name LIMIT 5"
+    )
+    model_client = FakeModelClient(
+        [
+            {
+                "response_type": "sql",
+                "message": "I will inspect top names.",
+                "sql": repeated_sql,
+                "explanation": "Gets candidate top names.",
+            },
+            {
+                "outcome": "retry",
+                "message": "The query failed; trying again.",
+                "retry_feedback": "Retry the query.",
+            },
+            {
+                "response_type": "sql",
+                "message": "I will retry.",
+                "sql": repeated_sql,
+                "explanation": "Repeats the same query.",
+            },
+            {
+                "outcome": "clarify",
+                "message": "I could not resolve the failure.",
+                "retry_feedback": None,
+            },
+        ]
+    )
+    graph = ConversationGraph(
+        config=AgentConfig(max_agent_sql_iterations=2),
+        model_client=model_client,
+        context_provider=FakeContextProvider(),
+        superset_client=superset_client,
+        conversation_store=store,
+    )
+
+    response = graph.run(
+        conversation_id=conversation.id,
+        request=ConversationTurnRequest(
+            message="Find top names and try again if needed",
+            scope=scope,
+            execution_mode="auto",
+        ),
+    )
+
+    assert response.status == "ok"
+    assert [event.step for event in response.trace].count("duplicate_sql") == 1
+    duplicate_reflection_payload = json.loads(
+        model_client.messages[3][1].content.split("\n", 1)[1]
+    )
+    duplicate_observation = duplicate_reflection_payload["sql_observations"][-1]
+    assert duplicate_observation["is_duplicate"] is True
+    assert "ORA-00911: invalid character" in duplicate_observation["error"]
+    assert "limit syntax" in duplicate_observation["error"]
+
+
 def test_conversation_graph_retries_empty_result_with_different_sql() -> None:
     store = InMemoryConversationStore()
     scope = ConversationScope(database_id=1, dataset_ids=[16])

@@ -137,7 +137,9 @@ _SEMANTIC_SQL_GUIDANCE = (
     "rewrites your query into native SQL. A metric is a formula, NOT a "
     "selectable column: substitute its measure expression inline (e.g. write "
     "SUM(amount) AS total_revenue), never SELECT the metric by its name. "
-    "Never reference tables or columns absent from the provided semantic context."
+    "Never reference tables or columns absent from the provided semantic context. "
+    "To cap rows write LIMIT n; never write FETCH FIRST ... ROWS ONLY — the "
+    "semantic engine cannot parse the FETCH clause and rejects the query."
 )
 
 
@@ -1668,6 +1670,9 @@ class ConversationGraph:
         sql_key = _sql_match_key(sql)
         attempted_sql = state.get("attempted_sql", [])
         if sql_key in attempted_sql:
+            prior_error = _prior_attempt_error(
+                state.get("sql_observations", []), sql_key=sql_key
+            )
             trace = [
                 *state.get("trace", []),
                 TraceEvent(
@@ -1689,8 +1694,17 @@ class ConversationGraph:
                         result=None,
                         max_prompt_result_rows=self.config.max_prompt_result_rows,
                         error=(
-                            "The same SQL was already attempted in this turn. "
-                            "A retry must use a materially different query."
+                            "The same SQL was already attempted in this turn"
+                            + (
+                                f" and failed with: {prior_error}"
+                                if prior_error
+                                else ""
+                            )
+                            + ". Row-limit clauses are normalized before "
+                            "execution (LIMIT and FETCH FIRST become the same "
+                            "query), so changing only the limit syntax is NOT a "
+                            "different query. A retry must change the query "
+                            "itself — or address the error above."
                         ),
                         is_duplicate=True,
                     ),
@@ -2296,6 +2310,31 @@ def _execution_observation(
         "row_count": result.row_count,
         "is_empty": result.row_count == 0,
     }
+
+
+def _prior_attempt_error(
+    observations: list[dict[str, Any]],
+    *,
+    sql_key: str,
+) -> str | None:
+    """The newest real execution error recorded for this exact SQL, if any.
+
+    Lets the duplicate-SQL gate repeat the underlying failure (e.g. an ORA-
+    error) instead of only saying "duplicate" — without it, the model is told to
+    write a "materially different query" while the actual cause stays hidden.
+    Duplicate-gate observations themselves are skipped so the message never
+    nests.
+    """
+
+    for observation in reversed(observations):
+        if observation.get("is_duplicate"):
+            continue
+        if _sql_match_key(observation.get("sql")) != sql_key:
+            continue
+        error = observation.get("error")
+        if error:
+            return str(error)
+    return None
 
 
 def _fallback_sql_reflection(
