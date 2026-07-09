@@ -24,7 +24,14 @@
  * approved rows into a benchmark. The draft is never persisted server-side —
  * import is the explicit human review gate (R4).
  */
-import { ChangeEvent, useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  ChangeEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import { useDispatch } from 'react-redux';
 import { t } from '@apache-superset/core/translation';
 import { css, styled } from '@apache-superset/core/theme';
@@ -129,6 +136,12 @@ export default function AuthoringPanel({
   const [steps, setSteps] = useState<AgentStep[]>([]);
   const [draft, setDraft] = useState<AuthoringDraft>();
   const [rows, setRows] = useState<ReviewRow[]>([]);
+  // A hidden <input type="file"> cannot be opened by a nested antd <Button>
+  // inside a <label> — an interactive element swallows the label activation
+  // (HTML spec). Follow the AttachDocumentDialog idiom: a ref-held sibling
+  // input opened programmatically from the button's onClick.
+  const csvInputRef = useRef<HTMLInputElement>(null);
+  const contextInputRef = useRef<HTMLInputElement>(null);
   useEffect(() => {
     let cancelled = false;
     listBenchmarks(projectId)
@@ -156,7 +169,10 @@ export default function AuthoringPanel({
       event: ChangeEvent<HTMLInputElement>,
       kind: 'csv' | 'context',
     ): Promise<void> => {
-      const file = event.target.files?.[0];
+      const input = event.target;
+      const file = input.files?.[0];
+      // Reset so re-selecting the SAME file still fires onChange next time.
+      input.value = '';
       if (!file) {
         return;
       }
@@ -302,32 +318,40 @@ export default function AuthoringPanel({
             min-width: 210px;
           `}
         />
-        <label htmlFor="authoring-csv-upload">
-          <input
-            id="authoring-csv-upload"
-            data-test="authoring-csv-input"
-            type="file"
-            accept=".csv,text/csv"
-            hidden
-            onChange={event => onFile(event, 'csv')}
-          />
-          <Button size="small">
-            {csvName ? t('CSV: %s', csvName) : t('Choose CSV…')}
-          </Button>
-        </label>
-        <label htmlFor="authoring-context-upload">
-          <input
-            id="authoring-context-upload"
-            data-test="authoring-context-input"
-            type="file"
-            accept=".md,.txt,text/markdown,text/plain"
-            hidden
-            onChange={event => onFile(event, 'context')}
-          />
-          <Button size="small">
-            {contextName ? t('Context: %s', contextName) : t('Context .md (optional)')}
-          </Button>
-        </label>
+        <input
+          ref={csvInputRef}
+          data-test="authoring-csv-input"
+          type="file"
+          accept=".csv,text/csv"
+          css={css`
+            display: none;
+          `}
+          onChange={event => onFile(event, 'csv')}
+        />
+        <Button
+          size="small"
+          data-test="authoring-csv-choose"
+          onClick={() => csvInputRef.current?.click()}
+        >
+          {csvName ? t('CSV: %s', csvName) : t('Choose CSV…')}
+        </Button>
+        <input
+          ref={contextInputRef}
+          data-test="authoring-context-input"
+          type="file"
+          accept=".md,.txt,text/markdown,text/plain"
+          css={css`
+            display: none;
+          `}
+          onChange={event => onFile(event, 'context')}
+        />
+        <Button
+          size="small"
+          data-test="authoring-context-choose"
+          onClick={() => contextInputRef.current?.click()}
+        >
+          {contextName ? t('Context: %s', contextName) : t('Context .md (optional)')}
+        </Button>
         <Button
           type="primary"
           data-test="authoring-run"

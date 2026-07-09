@@ -115,6 +115,26 @@ test('read-only users see the write-access notice', async () => {
   ).toBeInTheDocument();
 });
 
+test('the Choose buttons open their file inputs (ref-click wiring)', async () => {
+  // Regression: a hidden input nested under a <label> with an antd <Button>
+  // never opened the picker (the button swallowed the label activation).
+  // Assert the visible button programmatically clicks its sibling input.
+  renderPanel();
+  await screen.findByTestId('authoring-run');
+  const csvInput = screen.getByTestId('authoring-csv-input') as HTMLInputElement;
+  const contextInput = screen.getByTestId(
+    'authoring-context-input',
+  ) as HTMLInputElement;
+  const csvClick = jest.spyOn(csvInput, 'click');
+  const contextClick = jest.spyOn(contextInput, 'click');
+
+  await userEvent.click(screen.getByTestId('authoring-csv-choose'));
+  await userEvent.click(screen.getByTestId('authoring-context-choose'));
+
+  expect(csvClick).toHaveBeenCalledTimes(1);
+  expect(contextClick).toHaveBeenCalledTimes(1);
+});
+
 test('author flow: upload, stream steps, review rows, import approved', async () => {
   fetchMock.post(`${BASE}/bm-1/author/stream`, {
     body: sseBody,
