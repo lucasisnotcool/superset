@@ -41,6 +41,7 @@ from superset_ai_agent.conversations.schemas import (
 )
 from superset_ai_agent.conversations.store import (
     ConversationArtifactNotFoundError,
+    ConversationNotFoundError,
     ConversationStore,
     DEFAULT_OWNER_ID,
 )
@@ -97,6 +98,7 @@ from superset_ai_agent.semantic_layer.schemas import (
 from superset_ai_agent.semantic_layer.store import scope_hash
 from superset_ai_agent.semantic_layer.wren_runtime import (
     materialize_request_semantic_project,
+    resolve_effective_schema,
 )
 from superset_ai_agent.tools.sql import validate_read_only_sql
 from superset_ai_agent.tools.sql_policy import decide, SqlClassification
@@ -451,6 +453,50 @@ class ConversationGraph:
             "error": None,
         }
 
+    def _with_inferred_scope(
+        self,
+        *,
+        conversation_id: str,
+        request: ConversationTurnRequest,
+        owner_id: str,
+    ) -> ConversationTurnRequest:
+        """Backfill the turn scope's schema from the grounding project (project-wins).
+
+        The AI SQL panel sends ``project_id`` but takes ``schema_name`` from the
+        SQL Lab tab, so a pinned project can arrive with no schema. Resolution
+        mirrors ``_resolve_semantic_grounding``: an explicit scope pin wins, else
+        the project pinned to this conversation, so a mid-thread turn that omits
+        ``project_id`` still grounds. The project's schema set then backfills the
+        scope before the context fetch + schema gate downstream.
+        """
+
+        scope = request.scope
+        project_id = scope.project_id
+        if project_id is None and not scope.schema_name:
+            try:
+                conversation = self.conversation_store.get(
+                    conversation_id, owner_id=owner_id
+                )
+                project_id = conversation.project_id
+            except ConversationNotFoundError:
+                project_id = None
+        schema_name, schema_names = resolve_effective_schema(
+            semantic_project_store=self.semantic_project_store,
+            owner_id=owner_id,
+            database_id=scope.database_id,
+            schema_name=scope.schema_name,
+            project_id=project_id,
+        )
+        # A single-schema scope leaves ``schema_names`` unset (the scalar is the
+        # source of truth); only a genuine multi-schema project populates it.
+        new_schema_names = schema_names if len(schema_names) > 1 else None
+        if schema_name == scope.schema_name and new_schema_names == scope.schema_names:
+            return request
+        new_scope = scope.model_copy(
+            update={"schema_name": schema_name, "schema_names": new_schema_names}
+        )
+        return request.model_copy(update={"scope": new_scope})
+
     def _invoke_graph(
         self,
         *,
@@ -458,6 +504,11 @@ class ConversationGraph:
         request: ConversationTurnRequest,
         owner_id: str,
     ) -> ConversationState:
+        request = self._with_inferred_scope(
+            conversation_id=conversation_id,
+            request=request,
+            owner_id=owner_id,
+        )
         initial_state = self._initial_state(
             conversation_id=conversation_id,
             request=request,
@@ -883,7 +934,10 @@ class ConversationGraph:
             wren_context = WrenContextArtifact(
                 enabled=self.config.wren_enabled,
                 available=False,
-                warnings=["Select a database schema before loading Wren context."],
+                warnings=[
+                    "Select a semantic project or a database schema before "
+                    "loading Wren context."
+                ],
             )
             return {
                 **state,
@@ -893,7 +947,7 @@ class ConversationGraph:
                     TraceEvent(
                         step="load_wren_context",
                         status="warning",
-                        summary="Wren context requires a selected schema.",
+                        summary="Wren context requires a selected project or schema.",
                         details=wren_context.model_dump(),
                     ),
                 ],

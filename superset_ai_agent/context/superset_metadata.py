@@ -50,11 +50,15 @@ class SupersetMetadataContextProvider(ContextProvider):
                 dataset_ids=request.dataset_ids,
             )
 
+        # Only the database shell is needed here — ``datasets`` is replaced by the
+        # candidate scan below, so fetching them in the base context too would pay
+        # the per-dataset N+1 a second time for nothing.
         base_context = self.superset_client.get_agent_context(
             database_id=request.database_id,
             catalog_name=request.catalog_name,
             schema_name=request.schema_name,
             dataset_ids=[],
+            include_datasets=False,
         )
         candidate_datasets = self.superset_client.list_datasets(
             database_id=request.database_id,
@@ -93,11 +97,15 @@ class SupersetMetadataContextProvider(ContextProvider):
                 schema_name=request.schema_name,
                 dataset_ids=request.dataset_ids,
             )
+        # Only the database shell is needed here — ``datasets`` is replaced by the
+        # candidate scan below, so fetching them in the base context too would pay
+        # the per-dataset N+1 a second time for nothing.
         base_context = self.superset_client.get_agent_context(
             database_id=request.database_id,
             catalog_name=request.catalog_name,
             schema_name=request.schema_name,
             dataset_ids=[],
+            include_datasets=False,
         )
         candidate_datasets = self.superset_client.list_datasets(
             database_id=request.database_id,

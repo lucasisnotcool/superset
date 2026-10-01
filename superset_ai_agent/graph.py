@@ -82,6 +82,7 @@ from superset_ai_agent.semantic_layer.store import (
 )
 from superset_ai_agent.semantic_layer.wren_runtime import (
     materialize_request_semantic_project,
+    resolve_effective_schema,
 )
 from superset_ai_agent.tools.sql import validate_read_only_sql
 
@@ -264,12 +265,36 @@ class TextToSqlGraph:
         self.instruction_store = instruction_store or NullInstructionStore()
         self.graph = self._compile_graph()
 
+    def _with_inferred_schema(
+        self, request: AgentQueryRequest, *, owner_id: str
+    ) -> AgentQueryRequest:
+        """Backfill the request schema from the pinned project (project-wins).
+
+        The AI SQL panel's project dropdown sends ``project_id`` but takes
+        ``schema_name`` from the SQL Lab tab, so a pinned project can arrive with
+        no schema. Inferring it here lets the whole graph (context fetch, gate,
+        materialization, retrieval, execution) ground on the project without the
+        user also having to select a schema.
+        """
+
+        schema_name, _ = resolve_effective_schema(
+            semantic_project_store=self.semantic_project_store,
+            owner_id=owner_id,
+            database_id=request.database_id,
+            schema_name=request.schema_name,
+            project_id=request.project_id,
+        )
+        if schema_name == request.schema_name:
+            return request
+        return request.model_copy(update={"schema_name": schema_name})
+
     def run(
         self,
         request: AgentQueryRequest,
         *,
         owner_id: str = DEFAULT_OWNER_ID,
     ) -> AgentQueryResponse:
+        request = self._with_inferred_schema(request, owner_id=owner_id)
         initial_state: AgentState = {
             "owner_id": owner_id,
             "request": request,
@@ -405,7 +430,10 @@ class TextToSqlGraph:
             wren_context = WrenContextArtifact(
                 enabled=self.config.wren_enabled,
                 available=False,
-                warnings=["Select a database schema before loading Wren context."],
+                warnings=[
+                    "Select a semantic project or a database schema before "
+                    "loading Wren context."
+                ],
             )
             return {
                 **state,
@@ -415,7 +443,7 @@ class TextToSqlGraph:
                     TraceEvent(
                         step="load_wren_context",
                         status="warning",
-                        summary="Wren context requires a selected schema.",
+                        summary="Wren context requires a selected project or schema.",
                         details=wren_context.model_dump(),
                     ),
                 ],

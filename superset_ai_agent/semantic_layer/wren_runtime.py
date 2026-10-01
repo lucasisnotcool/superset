@@ -22,7 +22,10 @@ from pathlib import Path
 from superset_ai_agent.config import AgentConfig
 from superset_ai_agent.conversations.store import DEFAULT_OWNER_ID
 from superset_ai_agent.semantic_layer.mdl_files import MdlFileStore
-from superset_ai_agent.semantic_layer.projects import SemanticProjectStore
+from superset_ai_agent.semantic_layer.projects import (
+    SemanticProjectNotFoundError,
+    SemanticProjectStore,
+)
 from superset_ai_agent.semantic_layer.schemas import (
     SemanticProject,
     WrenMaterializationResult,
@@ -30,6 +33,49 @@ from superset_ai_agent.semantic_layer.schemas import (
 from superset_ai_agent.semantic_layer.wren_materializer import (
     materialize_wren_project,
 )
+
+
+def resolve_effective_schema(
+    *,
+    semantic_project_store: SemanticProjectStore | None,
+    owner_id: str,
+    database_id: int | None,
+    schema_name: str | None,
+    project_id: str | None,
+) -> tuple[str | None, list[str]]:
+    """Infer the grounding schema(s) from a selected semantic project.
+
+    The AI SQL agent's project dropdown sets ``project_id`` while ``schema_name``
+    comes from the SQL Lab tab, so a pinned project can arrive with no schema. A
+    project already declares the schema(s) it covers, so a pinned project is the
+    source of truth: when ``project_id`` resolves to a project visible to the
+    owner (and on the same database), its schema set wins over and backfills
+    ``schema_name``. Without a resolvable project the passed ``schema_name`` is
+    returned unchanged.
+
+    Access is preserved — the project is fetched through the owner-filtered store,
+    and downstream Superset metadata/execution still gate the actual data per
+    schema, so inferring a schema selects *context*; it does not grant access.
+
+    Returns ``(schema_name, schema_names)`` where ``schema_names`` is the ordered
+    full set (primary first), or ``[]`` when no schema can be determined.
+    """
+
+    if semantic_project_store is not None and project_id:
+        try:
+            project = semantic_project_store.get(project_id, owner_id=owner_id)
+        except SemanticProjectNotFoundError:
+            project = None
+        if project is not None and (
+            project.default_database_id is None
+            or database_id is None
+            or project.default_database_id == database_id
+        ):
+            names = project.schema_names or (
+                [project.schema_name] if project.schema_name else []
+            )
+            return project.schema_name, names
+    return schema_name, [schema_name] if schema_name else []
 
 
 def materialize_request_semantic_project(
@@ -55,8 +101,23 @@ def materialize_request_semantic_project(
     for the caller to surface. Returns ``(project, materialization, warnings)``.
     """
 
-    if semantic_project_store is None or mdl_file_store is None or schema_name is None:
+    if semantic_project_store is None or mdl_file_store is None:
         return None
+    if schema_name is None:
+        # No tab schema: a pinned project is the source of truth for its schema(s).
+        # Callers normally backfill the schema before this; resolve here too so a
+        # project_id-only request still materializes when called directly.
+        if not project_id:
+            return None
+        schema_name, _ = resolve_effective_schema(
+            semantic_project_store=semantic_project_store,
+            owner_id=owner_id,
+            database_id=database_id,
+            schema_name=None,
+            project_id=project_id,
+        )
+        if schema_name is None:
+            return None
     projects = semantic_project_store.list(
         owner_id=owner_id,
         database_id=database_id,

@@ -338,10 +338,17 @@ class SupersetMcpClient:
         catalog_name: str | None = None,
         schema_name: str | None = None,
         dataset_ids: list[int] | None = None,
+        include_datasets: bool = True,
     ) -> AgentContext:
-        """Build compact metadata context from MCP tools."""
+        """Build compact metadata context from MCP tools.
+
+        ``include_datasets=False`` returns just the database shell (no dataset
+        scan), for callers that replace ``datasets`` with their own candidates.
+        """
 
         database = _normalize_database(_as_dict(self.get_database_raw(database_id)))
+        if not include_datasets:
+            return AgentContext(database=database, datasets=[])
         datasets = self.list_datasets(
             database_id=database_id,
             catalog_name=catalog_name,

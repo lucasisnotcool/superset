@@ -48,6 +48,7 @@ import {
 } from 'src/components/MessageToasts/actions';
 import { logEvent } from 'src/logger/actions';
 import { Logger, LOG_ACTIONS_LOAD_CHART } from 'src/logger/LogUtils';
+import parseServerTiming from 'src/utils/parseServerTiming';
 import { allowCrossDomain as domainShardingEnabled } from 'src/utils/hostNamesConfig';
 import { updateDataMask } from 'src/dataMask/actions';
 import { waitForAsyncData } from 'src/middleware/asyncEvent';
@@ -778,10 +779,16 @@ export function exploreJSON(
     });
 
     const [useLegacyApi] = getQuerySettings(formData);
+    // Captured from the response's Server-Timing header so the load_chart log
+    // can attribute latency to the backend (total/db/cache) vs the frontend.
+    let serverTiming: Record<string, number> | undefined;
     const chartDataRequestCaught = chartDataRequest
-      .then(({ response, json }) =>
-        handleChartDataResponse(response, json, useLegacyApi),
-      )
+      .then(({ response, json }) => {
+        serverTiming = parseServerTiming(
+          response?.headers?.get('Server-Timing'),
+        );
+        return handleChartDataResponse(response, json, useLegacyApi);
+      })
       .then(queriesResponse => {
         // Drop stale responses: if a newer query has started for this chart,
         // its controller will have replaced ours in state, so ignore this
@@ -805,6 +812,7 @@ export function exploreJSON(
                 start_offset: logStart,
                 ts: new Date().getTime(),
                 duration: Logger.getTimestamp() - logStart,
+                server_timing: serverTiming,
                 has_extra_filters:
                   formData.extra_filters && formData.extra_filters.length > 0,
                 viz_type: formData.viz_type,

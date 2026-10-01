@@ -79,6 +79,7 @@ from superset_ai_agent.persistence.database import (
     create_session_factory,
     run_migrations,
 )
+from superset_ai_agent.persistence.ttl_cache import TtlCache
 from superset_ai_agent.schemas import (
     AgentQueryRequest,
     AgentQueryResponse,
@@ -1585,6 +1586,12 @@ def create_app(  # noqa: C901
             raise HTTPException(status_code=404, detail="MDL file not found.")
         return file
 
+    # Shared across requests (the app factory runs once); keyed per project so an
+    # unauthorized caller never reaches a cached entry (access is checked upstream).
+    _schema_index_cache: TtlCache[tuple[str, tuple[str, ...]], SchemaIndex] = TtlCache(
+        ttl_seconds=app_config.wren_schema_index_cache_ttl_seconds,
+    )
+
     def _schema_index_for_project(
         project: SemanticProject,
         fastapi_request: Request,
@@ -1595,10 +1602,22 @@ def create_app(  # noqa: C901
         a Superset outage the last snapshot is used so physical validation keeps
         catching hallucinated columns instead of degrading to structural-only.
         Returns ``None`` only when neither a live fetch nor a snapshot exists.
+
+        A short TTL cache (``wren_schema_index_cache_ttl_seconds``) fronts the live
+        fetch: Copilot/MDL operations (validate-on-edit, deploy preview, copilot
+        turns) call this repeatedly, and each live build is a Superset dataset list
+        + a per-dataset N+1 per project schema. Caching by project id is safe — the
+        caller has already authorized the project for this request, and the index
+        is project-scoped. Keyed on the schema set so a multi-schema change is a
+        miss; only successful live builds are cached (never the outage fallback).
         """
 
         if project.default_database_id is None:
             return None
+        cache_key = (project.id, tuple(sorted(project.schema_names)))
+        cached_index = _schema_index_cache.get(cache_key)
+        if cached_index is not None:
+            return cached_index
         try:
             request_context_provider, _ = build_superset_runtime(fastapi_request)
             # CR3: ground modeling/validation on the *complete* scope schema, not a
@@ -1651,6 +1670,7 @@ def create_app(  # noqa: C901
         except Exception:  # noqa: S110  # pylint: disable=broad-except
             # Snapshotting is best-effort; never block validation on it.
             pass
+        _schema_index_cache.set(cache_key, index)
         return index
 
     def _project_has_models(project_id: str, *, owner_id: str) -> bool:

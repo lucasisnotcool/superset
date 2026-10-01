@@ -140,8 +140,13 @@ class SupersetClient(Protocol):
         catalog_name: str | None = None,
         schema_name: str | None = None,
         dataset_ids: list[int] | None = None,
+        include_datasets: bool = True,
     ) -> AgentContext:
-        """Build compact metadata context for the agent."""
+        """Build compact metadata context for the agent.
+
+        ``include_datasets=False`` returns just the database shell (no dataset
+        scan), for callers that replace ``datasets`` with their own candidates.
+        """
 
     def execute_sql(
         self,

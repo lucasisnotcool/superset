@@ -53,6 +53,7 @@ from superset.utils.core import (
     is_adhoc_metric,
 )
 from superset.utils.pandas_postprocessing.utils import unescape_separator
+from superset.utils.server_timing import server_timing
 from superset.views.utils import get_viz
 from superset.viz import viz_types
 
@@ -91,12 +92,13 @@ class QueryContextProcessor:
         cache_key = self.query_cache_key(query_obj)
         timeout = self.get_cache_timeout()
         force_query = self._query_context.force or timeout == CACHE_DISABLED_TIMEOUT
-        cache = QueryCacheManager.get(
-            key=cache_key,
-            region=CacheRegion.DATA,
-            force_query=force_query,
-            force_cached=force_cached,
-        )
+        with server_timing("cache", "Cache lookup"):
+            cache = QueryCacheManager.get(
+                key=cache_key,
+                region=CacheRegion.DATA,
+                force_query=force_query,
+                force_cached=force_cached,
+            )
 
         # If cache is loaded but missing applied_filter_columns and query has filters,
         # treat as cache miss to ensure fresh query with proper applied_filter_columns
@@ -128,7 +130,8 @@ class QueryContextProcessor:
                         )
                     )
 
-                query_result = self.get_query_result(query_obj)
+                with server_timing("db", "Query execution"):
+                    query_result = self.get_query_result(query_obj)
                 annotation_data = self.get_annotation_data(query_obj)
                 cache.set_query_result(
                     key=cache_key,

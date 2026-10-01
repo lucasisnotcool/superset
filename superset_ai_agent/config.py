@@ -213,6 +213,12 @@ class AgentConfig:
     wren_coverage_debounce_seconds: float = 0.0
     # Also flag MDL facts unsupported by any document (overreach) in auto runs.
     wren_coverage_include_overreach: bool = False
+    # TTL (seconds) for the per-project physical schema index. Copilot/MDL
+    # operations (validate-on-edit, deploy preview, copilot turns) otherwise rebuild
+    # it from Superset's dataset API every call — a list + per-dataset N+1, per
+    # project schema. The physical schema rarely changes mid-session, so a short
+    # cache collapses the repeated bursts. 0 disables caching.
+    wren_schema_index_cache_ttl_seconds: float = 60.0
     # Prior Copilot turns fed back into the edit loop as conversation history
     # (multi-turn memory). Mirrors ``max_history_messages`` for the SQL agent;
     # windows the most recent N messages to bound token cost.
@@ -728,6 +734,12 @@ class AgentConfig:
             wren_coverage_include_overreach=_env_bool(
                 "WREN_COVERAGE_INCLUDE_OVERREACH",
                 cls.wren_coverage_include_overreach,
+            ),
+            wren_schema_index_cache_ttl_seconds=float(
+                os.getenv(
+                    "WREN_SCHEMA_INDEX_CACHE_TTL_SECONDS",
+                    str(cls.wren_schema_index_cache_ttl_seconds),
+                )
             ),
             wren_copilot_max_history_messages=int(
                 os.getenv(

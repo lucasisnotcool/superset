@@ -774,6 +774,30 @@ class SupersetAppInitializer:  # pylint: disable=too-many-public-methods
 
             return response
 
+        @self.superset_app.before_request
+        def start_server_timing() -> None:
+            """Stamp the request start so total server time can be reported."""
+            from superset.utils import server_timing
+
+            server_timing.mark_request_start()
+
+        @self.superset_app.after_request
+        def add_server_timing_header(response: Response) -> Response:
+            """Expose backend per-phase timings via the Server-Timing header."""
+            from superset.utils import server_timing
+
+            if not server_timing.is_enabled():
+                return response
+
+            header_value = server_timing.build_header_value(server_timing.elapsed_ms())
+            if header_value and "Server-Timing" not in response.headers:
+                response.headers["Server-Timing"] = header_value
+                allow_origin = self.superset_app.config["SERVER_TIMING_ALLOW_ORIGIN"]
+                if allow_origin and "Timing-Allow-Origin" not in response.headers:
+                    response.headers["Timing-Allow-Origin"] = allow_origin
+
+            return response
+
         @self.superset_app.after_request
         def cleanup_analytics_memory(response: Response) -> Response:
             """Force garbage collection after each request if feature flag enabled"""
